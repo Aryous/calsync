@@ -91,7 +91,7 @@ credential = { backend = "keychain", ref = "calsync/family-icloud" }
 
 [[rules]]
 name = "family-schedule"
-source = { account = "me-google", calendar = "<日历 ID 或名称>" }
+source = { account = "me-google", calendar = "家庭日程" }
 target = { account = "family-icloud", calendar = "家庭日程", create_if_missing = true }
 window = { past = "7d", future = "180d" }
 alarms = "copy"
@@ -186,6 +186,9 @@ class Target(Protocol):
   - `status = "cancelled"` 的实例转为 `exdates`。
   - 主事件不在窗口内、但有实例落在窗口内时，按 `recurringEventId` 额外 `events.get` 主事件。
 - 全天事件：`start.date` / `end.date` 映射为 date 类型的 `When`。
+- 描述：Google 返回的 `description` 可能是 HTML（实测"家庭日程"日历为 `<p>…</p>` 包裹、`\n` 换行）。转为纯文本：`<br>`、`</p>` 转为换行，去除其余标签，解码 HTML 实体，保留原有换行。
+- 不同步的字段：`attendees`、`organizer`、会议链接（`conferenceData`）。写入 CalDAV 的事件不带 `ATTENDEE` / `ORGANIZER`，避免目标服务器向参与者发送邀请邮件。
+- 实测样本（2026-10-23，"家庭日程"日历）：事件为重复系列，几乎每个实例都单独修改过标题（例如带进度计数），提醒为 `useDefaultReminders = false` + `popup, 0 分钟`。因此"一个系列 + 大量单次改动"是主要场景，渲染和比对都要覆盖。
 - 网络：HTTP 客户端遵循 `HTTPS_PROXY` / `HTTP_PROXY` 环境变量。
 
 ### 6.3 CalDAV 目标
@@ -200,6 +203,7 @@ class Target(Protocol):
   - `UID:<sha256(rule + "\0" + source_calendar_id + "\0" + source_id)[:24]>@calsync`
   - `X-CALSYNC-RULE:<规则名>`
   - `X-CALSYNC-HASH:<内容哈希>`
+- 注意：CalendarServer 默认把 `X-` 属性也视为每个用户自己的数据。托管标记只对写入它的账号可见，因此一条规则的写入和读取必须使用同一个目标账号；不要用另一个账号对同一个共享日历运行规则。
 - `list_managed`：REPORT `calendar-query` 取出全部 VEVENT 资源，只保留 `X-CALSYNC-RULE` 等于当前规则、且 UID 以 `@calsync` 结尾的资源。
 - 写入：
   - 新建：PUT 并带 `If-None-Match: *`。若返回 412（资源已存在），重新读取后转为更新。
@@ -268,7 +272,7 @@ calsync config check                   只校验配置
 
 ### 8.5 部署
 
-- **Mac mini**：`uv tool install` 安装；`~/Library/LaunchAgents/com.aryous.calsync.plist` 每 300 秒执行 `calsync run`，并设置 `HTTPS_PROXY` 指向本机 Surge；日志写入 `~/Library/Logs/calsync/`，按天轮转，保留 14 天。
+- **Mac mini**：`uv tool install` 安装；`~/Library/LaunchAgents/com.aryous.calsync.plist` 每 300 秒执行 `calsync run`，并设置 `HTTPS_PROXY` 指向本机 Surge；日志写入 `~/Library/Logs/calsync/`，按天轮转，保留 14 天。`keychain` 后端要求用户已登录且登录钥匙串已解锁：mini 需开启自动登录，否则改用 `file` 后端，以免停在登录界面时每轮都报授权错误。
 - **Docker**：`Dockerfile` 基于 `python:3.12-slim`，入口 `calsync daemon`；配置、凭证文件、状态目录通过挂载传入；凭证后端使用 `env` 或 `file`。
 
 ## 9. 待验证事项（实现第一步）
@@ -282,7 +286,9 @@ calsync config check                   只校验配置
    - 实验 A：账号 1 写入带 `VALARM` 的事件到日历 C，C 共享给账号 2，观察账号 2 的设备是否提醒。
    - 实验 B：直接用账号 2 的凭证写入账号 2 自己的日历，观察提醒。
    - 结论决定"给家人同步"的推荐配置：目标写在自己账号再共享，还是直接写在家人账号。
-3. **iCloud 中国区**：`caldav.icloud.com.cn` 的发现和写入流程是否与国际区一致（有中国区账号时验证）。
+3. **Google 窗口查询与重复事件**：确认 `events.list(singleEvents=false, timeMin, timeMax)` 会返回"开始时间早于 `timeMin`、但仍有实例落在窗口内"的重复主事件。§7 的删除逻辑依赖这一点；若不返回，进行中的旧系列会被误删，需改为按 `recurringEventId` 补取主事件或扩大查询下限。
+4. **iCloud 建日历**：确认 iCloud 接受 CalDAV 的 MKCALENDAR。若不接受，`create_if_missing` 改为报错并提示"先在日历 App 中创建该日历"。
+5. **iCloud 中国区**：`caldav.icloud.com.cn` 的发现和写入流程是否与国际区一致（有中国区账号时验证）。
 
 ## 10. 测试
 
