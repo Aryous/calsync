@@ -169,7 +169,7 @@ def daily() -> Series:
         original_start=at(2026, 10, 25, 9, 30),
         start=at(2026, 10, 25, 8, 0),
         end=at(2026, 10, 25, 8, 5),
-        title="Reminder 1/4",
+        title="Item 1/4",
         description="",
         location="",
         alarms=(Alarm(timedelta(0)),),
@@ -213,10 +213,25 @@ def test_digest_ignores_server_and_phone_additions() -> None:
         lambda s: replace(s, overrides=(replace(s.overrides[0], start=at(2026, 10, 25, 7, 0)),)),
         lambda s: replace(s, conference_url="https://meet.example.com/x"),
         lambda s: replace(s, description="Changed"),
+        lambda s: replace(s, location="Room 2"),
+        lambda s: replace(s, overrides=(replace(s.overrides[0], title="Item 2/4"),)),
+        lambda s: replace(s, overrides=(replace(s.overrides[0], alarms=(Alarm(timedelta(minutes=-10)),)),)),
+        lambda s: replace(s, recurrence=("RRULE:FREQ=DAILY;COUNT=14",)),
     ],
 )
 def test_digest_sees_what_people_see(change: Callable[[Series], Series]) -> None:
-    assert content_digest(body(change(daily()))) != content_digest(body(daily()))
+    changed = content_digest(body(change(daily())))
+    assert changed is not None
+    assert changed != content_digest(body(daily()))
+
+
+def test_digest_sees_alarm_relative_to_end() -> None:
+    original = body(daily())
+    to_end = original.replace(b"TRIGGER:P0D\r\n", b"TRIGGER;RELATED=END:P0D\r\n", 1)
+    assert to_end != original
+    changed = content_digest(to_end)
+    assert changed is not None
+    assert changed != content_digest(original)
 
 
 def test_digest_of_garbage_is_none() -> None:
@@ -266,3 +281,40 @@ def test_digest_of_malformed_event_is_none() -> None:
     assert content_digest(_body("DTSTART:garbage")) is None
     assert content_digest(_body("SUMMARY:no start")) is None
     assert content_digest(_body("DTSTART:99991231T230000Z", "DURATION:PT2H")) is None
+
+
+def test_digest_ignores_zone_label_on_exdate() -> None:
+    original = body(replace(daily(), exdates=(at(2026, 10, 27, 9, 30),)))
+    rewritten = original.replace(b"EXDATE;TZID=Asia/Shanghai:20261027T093000", b"EXDATE:20261027T013000Z")
+    assert rewritten != original
+    assert content_digest(rewritten) == content_digest(original) is not None
+
+
+def test_digest_ignores_zone_label_on_recurrence_id() -> None:
+    original = body(daily())
+    rewritten = original.replace(
+        b"RECURRENCE-ID;TZID=Asia/Shanghai:20261025T093000", b"RECURRENCE-ID:20261025T013000Z"
+    )
+    assert rewritten != original
+    assert content_digest(rewritten) == content_digest(original) is not None
+
+
+def test_digest_ignores_zone_label_on_rdate() -> None:
+    s = series(recurrence=("RRULE:FREQ=DAILY;COUNT=2", "RDATE;TZID=Asia/Shanghai:20261201T093000"))
+    original = body(s)
+    rewritten = original.replace(b"RDATE;TZID=Asia/Shanghai:20261201T093000", b"RDATE:20261201T013000Z")
+    assert rewritten != original
+    assert content_digest(rewritten) == content_digest(original) is not None
+
+
+def test_digest_ignores_event_order_even_with_duplicate_recurrence_ids() -> None:
+    s = daily()
+    a = s.overrides[0]
+    b = replace(a, title="Item 2/4")
+    other = replace(
+        a, original_start=at(2026, 10, 26, 9, 30), start=at(2026, 10, 26, 8, 0), end=at(2026, 10, 26, 8, 5)
+    )
+    first = body(replace(s, overrides=(a, other, b)))
+    second = body(replace(s, overrides=(b, other, a)))
+    assert first != second
+    assert content_digest(first) == content_digest(second) is not None
