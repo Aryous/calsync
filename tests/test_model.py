@@ -175,3 +175,11 @@ def test_span_override_conversion_overflow_is_guarded() -> None:
     lo, hi = series_span(s)
     assert hi == MAX_TIME
     assert lo == datetime(2026, 10, 23, 13, 30, tzinfo=UTC)
+
+
+def test_span_count_reaching_year_9999_is_unbounded() -> None:
+    s = series(
+        start=at(2026, 12, 31, 23, tz="America/New_York"),
+        recurrence=("RRULE:FREQ=YEARLY;COUNT=9000",),
+    )
+    assert series_span(s)[1] == MAX_TIME

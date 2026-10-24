@@ -223,7 +223,10 @@ def compute_span(
             unbounded = True
             continue
         if last is not None:
-            last_start = max(last_start, _as_utc(last))
+            try:
+                last_start = max(last_start, _as_utc(last))
+            except OverflowError:
+                unbounded = True
     hi = MAX_TIME
     if not unbounded:
         try:
