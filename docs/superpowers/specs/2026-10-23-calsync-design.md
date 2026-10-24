@@ -71,25 +71,32 @@ calsync 是一个通用的单向日历同步引擎：持续把源日历的变化
 
 ```
 calsync/
+  errors.py        统一错误类型
+  durations.py     时长字符串解析（30s、5m、7d、-15m）
   config.py        读取并校验 TOML 配置
-  secrets.py       凭证后端：keychain / env / file
-  model.py         统一事件模型、规范化、内容哈希
-  http.py          共享 httpx 客户端工厂：HTTP/2、gzip、代理、超时、请求计数
+  credentials.py   凭证后端：keychain / env / file（不叫 secrets.py，避免与标准库同名）
+  model.py         统一事件模型、规范化、内容哈希、跨度、时间窗口
+  icalutil.py      iCalendar 小工具（EXDATE/RDATE 解析、时区还原）
+  naming.py        确定性的资源名、UID、规则标签
+  http.py          共享 httpx 客户端工厂：HTTP/2、gzip、代理、超时、请求计数、重试退避
   sources/
     base.py        源适配器接口
-    google.py      Google Calendar REST 客户端 + 映射到统一模型
-    google_auth.py OAuth（loopback + PKCE），只被 auth 命令和令牌刷新使用
+    google_map.py  Google 事件 → 统一模型（纯函数）
+    google.py      Google Calendar REST 客户端（增量同步、日历默认提醒）
+    google_auth.py access token 刷新；浏览器授权（loopback + PKCE）在计划 3 加入
   targets/
-    base.py        目标适配器接口
-    dav.py         最小 WebDAV/CalDAV 协议层：PROPFIND、REPORT、PUT、DELETE、XML 解析
-    caldav.py      CalDAV 目标适配器：发现、变化检测阶梯、托管资源识别
-  render.py        统一模型 → iCalendar
-  mirror.py        源镜像：应用增量、按系列分组
-  planner.py       纯函数：(应有集合, 现有集合, 窗口, 策略) → 计划
-  engine.py        一个同步周期的编排：拉取、检测、规划、安全检查、推送
+    base.py        目标适配器接口、目标缓存数据结构
+    dav.py         最小 WebDAV/CalDAV 协议层：PROPFIND、REPORT、PUT、DELETE、MKCALENDAR、重定向
+    caldav.py      CalDAV 目标适配器：发现、变化检测阶梯、托管资源识别、写入限流
+  render.py        统一模型 → iCalendar；读取已写入资源的标记与跨度
+  mirror.py        把一次源拉取应用到内存镜像
+  planner.py       纯函数：(应有集合, 现有集合, 窗口) → 计划；防误删检查
+  engine.py        一个同步周期的编排：拉取、检测、规划、安全检查、推送、记录
   store.py         SQLite：镜像、目标缓存、游标、运行记录、告警状态
-  notify.py        Bark / 通用 webhook
-  runtime.py       常驻进程：调度、信号、锁、优雅退出
+  lock.py          单实例文件锁（记录 PID）
+  wiring.py        按配置构建适配器和引擎（唯一把账号变成客户端的地方）
+  notify.py        Bark / 通用 webhook（计划 3）
+  runtime.py       常驻进程：调度、信号、优雅退出（计划 3）
   cli.py           命令行入口（按命令延迟导入模块）
 ```
 
@@ -367,7 +374,7 @@ XML 用标准库 `xml.etree` 解析，命名空间常量集中定义。
    - `actual` 有、`desired` 无，且跨度与窗口无交集 → 不处理（例如早已结束的旧事件）。
    - 用跨度而不是开始时间判断，是为了覆盖"系列开始于窗口之前、但仍在持续"的情况：这类系列在源头被删除后，目标副本必须被清理。
    - 时间窗口在本地计算，所以随着时间推移进入窗口的事件，即使源头没有任何变化，也会被新建。
-4. **安全检查**：计划删除数 `> max_count`，或 `> max_ratio × len(actual)`（`len(actual) > 0` 时），则该规则本轮不执行，立即告警，并在告警中列出计划删除的事件标题。
+4. **安全检查**：计划删除数 `> max_count`，或计划删除数 `≥ 3` 且 `> max_ratio × len(actual)`，则该规则本轮不执行，立即告警，并在告警中列出计划删除的事件标题。比例检查要求至少删 3 条，是为了让小日历删掉最后一两条事件时不被拦截。确认是有意删除时，用 `calsync run --allow-deletes` 放行一次。
 5. **推送**：只渲染需要新建和更新的系列。按目标账号分组：不同账号并发执行，同一账号受信号量限制；先新建，再更新，最后删除。单个资源失败时记录错误，继续处理其余资源，本轮结果为"部分失败"。
 6. **记录**：写入运行记录，包括各类数量、请求数、传输字节数、耗时。
 
@@ -416,7 +423,7 @@ XML 用标准库 `xml.etree` 解析，命名空间常量集中定义。
 
 - 共享 httpx 客户端通过事件钩子统计每个周期、每个主机的请求数、状态码和传输字节数。
 - 每个周期结束时写入运行记录，并输出一行结构化日志。
-- `calsync status` 显示每条规则最近一轮的请求数、耗时和结果。
+- `calsync status` 显示每条规则最近一轮的结果和耗时，以及该周期的总请求数。请求数按周期统计，同一周期内的规则共享同一个数字；按规则拆分留到计划 3 再考虑。
 - §14 的测试断言空闲周期的请求数严格等于 §8.1 的预算，并且没有读取任何正文。任何让请求数变多的改动都会让测试失败。
 
 ## 9. 本地状态
@@ -433,7 +440,7 @@ SQLite 文件默认在 `~/.local/state/calsync/state.db`（Docker 中为数据�
 | `alert` | 告警键 → 状态、最后发送时间（用于去重） |
 
 - 镜像和游标在同一个事务中提交：游标前进时，对应的事件一定已经写入。
-- 目标缓存的更新紧跟每次成功写入。进程中途退出后，下一轮的变化检测会自动纠正缓存。
+- 目标缓存在每次成功写入后立即更新内存，在周期结束时统一落盘。进程在推送中途退出时，正确性不受影响：下一轮的变化检测会发现这些资源的 etag 与缓存不符，每个受影响的 href 多花一次 multiget 读取，然后缓存恢复正确。
 - `store.py` 带模式版本号。版本不匹配时直接清空重建，不写迁移脚本，这正是"一切皆缓存"带来的好处。
 
 ## 10. 运行时与部署
@@ -485,9 +492,11 @@ SQLite 文件默认在 `~/.local/state/calsync/state.db`（Docker 中为数据�
 ## 12. 命令行
 
 ```
-calsync auth <account>                 Google：浏览器 OAuth；CalDAV：从标准输入读取密码。写入凭证后端并验证可用
+calsync auth <account>                 CalDAV：从标准输入读取密码。Google：浏览器授权（计划 3）；
+                                       在此之前用 --refresh-token-stdin 读入已有的 refresh token。写入凭证后端并验证可用
 calsync calendars <account>            列出日历的 ID 和名称
-calsync run [--rule NAME] [--dry-run]  执行一个周期
+calsync run [--rule NAME] [--dry-run] [--allow-deletes]
+                                       执行一个周期；--allow-deletes 放行一次防误删拦截
 calsync daemon                         常驻运行
 calsync trigger                        让常驻进程立即执行一个周期
 calsync status [--json] [--health]     每条规则最近一轮的结果、请求数、耗时
@@ -514,7 +523,8 @@ calsync service install|uninstall      macOS：生成并加载/卸载 launchd pl
 5. **建日历**：iCloud 是否接受 `MKCALENDAR`。若不接受，`create_if_missing` 改为报错，并提示"先在日历 App 中创建该日历"。
 6. **ETag 返回**：iCloud 的 PUT 响应是否返回 `ETag`。这决定 §6.3 的"etag 待定"路径是不是常态。
 7. **HTTP/2**：`caldav.icloud.com` 和 `www.googleapis.com` 是否协商出 HTTP/2。不影响正确性，只影响连接数。
-8. **iCloud 中国区**：`caldav.icloud.com.cn` 的发现和写入流程是否与国际区一致（有中国区账号时验证）。
+8. **跨主机发现**：iCloud 的 `calendar-home-set` 通常是另一个主机上的绝对地址（`pNN-caldav.icloud.com`），并可能伴随重定向。实现已按此设计：手动跟随重定向（每一跳重新带认证，禁止改变协议），所有 href 按返回它的响应的最终 URL 转成绝对地址。需要实测确认。
+9. **iCloud 中国区**：`caldav.icloud.com.cn` 的发现和写入流程是否与国际区一致（有中国区账号时验证）。
 
 ## 14. 测试
 
