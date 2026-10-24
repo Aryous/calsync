@@ -5,7 +5,7 @@ import argparse
 import asyncio
 import getpass
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
@@ -13,8 +13,7 @@ from calsync import __version__
 
 if TYPE_CHECKING:  # type-only: importing these at runtime would load httpx/icalendar
     from calsync.config import Config
-    from calsync.engine import CycleResult
-    from calsync.errors import CalsyncError
+    from calsync.engine import CycleResult, RuleResult
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_AUTH, EXIT_RUNNING = 0, 1, 2, 3, 4
 
@@ -64,7 +63,8 @@ def _state_dir(args: argparse.Namespace) -> Path:
     return args.state_dir or default_state_dir()
 
 
-def exit_code_for(exc: "CalsyncError") -> int:
+def exit_code_for(exc: BaseException) -> int:
+    """The exit code for an error that stopped a command."""
     from calsync.errors import AuthError, ConfigError
     from calsync.lock import AlreadyRunning
 
@@ -75,6 +75,33 @@ def exit_code_for(exc: "CalsyncError") -> int:
     if isinstance(exc, AlreadyRunning):
         return EXIT_RUNNING
     return EXIT_FAILED
+
+
+def exit_code_for_results(results: Iterable["RuleResult"]) -> int:
+    """`calsync run`: any auth failure 3, else any config error 2, else any non-ok rule 1."""
+    results = list(results)
+    kinds = {r.error_kind for r in results}
+    if "auth" in kinds:
+        return EXIT_AUTH
+    if "config" in kinds:
+        return EXIT_CONFIG
+    return EXIT_OK if all(r.status == "ok" for r in results) else EXIT_FAILED
+
+
+def _describe(exc: BaseException) -> str:
+    """The message for an error that stopped a command (no traceback)."""
+    from calsync.errors import AuthError, CalsyncError, ConfigError
+    from calsync.lock import AlreadyRunning
+
+    if isinstance(exc, ConfigError):
+        return "configuration error:\n" + "".join(f"  - {p}\n" for p in exc.problems)
+    if isinstance(exc, AuthError):
+        return f"authentication error: {exc}\n"
+    if isinstance(exc, AlreadyRunning):
+        return f"{exc} (a later version will support `calsync trigger`)\n"
+    if isinstance(exc, CalsyncError):  # network and other expected failures
+        return f"error: {exc}\n"
+    return f"error: {type(exc).__name__}: {exc}\n"
 
 
 def cmd_config_check(args: argparse.Namespace, out: TextIO) -> int:
@@ -222,7 +249,7 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
                     start, end = result.started_at, result.finished_at
                     store.record_runs(
                         [
-                            RunRecord(r.rule, start, end, r.status, 0, 0, 0, 0, 0, r.error)
+                            RunRecord(r.rule, start, end, r.status, 0, 0, 0, 0, result.requests, r.error)
                             for r in skipped.values()
                         ]
                     )
@@ -232,9 +259,7 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
             await adapters.aclose()
     result.rules = {r.name: result.rules.get(r.name) or skipped[r.name] for r in selected}
     _print_cycle(result, out, verbose=args.dry_run)
-    if any(r.error_kind == "auth" for r in result.rules.values()):
-        return EXIT_AUTH
-    return EXIT_OK if result.ok else EXIT_FAILED
+    return exit_code_for_results(result.rules.values())
 
 
 def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: TextIO = sys.stdin) -> int:
@@ -242,8 +267,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
     if args.version:
         out.write(f"calsync {__version__}\n")
         return EXIT_OK
-    from calsync.errors import AuthError, CalsyncError, ConfigError
-    from calsync.lock import AlreadyRunning
+    from calsync.errors import CalsyncError
 
     try:
         if args.command == "config":
@@ -254,17 +278,19 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
             return asyncio.run(_auth(args, out, stdin))
         if args.command == "run":
             return asyncio.run(_run(args, out))
-    except ConfigError as exc:
-        out.write("configuration error:\n" + "".join(f"  - {p}\n" for p in exc.problems))
-        return EXIT_CONFIG
-    except AuthError as exc:
-        out.write(f"authentication error: {exc}\n")
-        return EXIT_AUTH
-    except AlreadyRunning as exc:
-        out.write(f"{exc} (a later version will support `calsync trigger`)\n")
-        return EXIT_RUNNING
-    except CalsyncError as exc:  # network and other expected failures: a message, not a traceback
-        out.write(f"error: {exc}\n")
-        return EXIT_FAILED
+    except CalsyncError as exc:
+        out.write(_describe(exc))
+        return exit_code_for(exc)
+    except Exception as exc:
+        # The network, the state database or the filesystem failing outside an adapter:
+        # a message, not a traceback. Imported here so a normal start stays fast.
+        import sqlite3
+
+        import httpx
+
+        if not isinstance(exc, httpx.HTTPError | sqlite3.Error | OSError):
+            raise
+        out.write(_describe(exc))
+        return exit_code_for(exc)
     _parser().print_help(out)
     return EXIT_CONFIG

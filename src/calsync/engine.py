@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from calsync.config import Config, Rule
-from calsync.errors import AuthError, CalsyncError, ConflictError, NotFoundError
+from calsync.errors import AuthError, CalsyncError, ConfigError, ConflictError, NotFoundError
 from calsync.http import RequestLog
 from calsync.mirror import Mirror, apply_pull
 from calsync.model import Window, apply_alarm_policy, series_hash, series_span
@@ -35,7 +35,15 @@ from calsync.targets.base import (
 log = logging.getLogger(__name__)
 
 Status = Literal["ok", "partial", "failed", "blocked"]
-ErrorKind = Literal["auth", "guard", "other"]
+ErrorKind = Literal["auth", "config", "guard", "other"]
+
+
+def error_kind_for(exc: BaseException) -> ErrorKind:
+    if isinstance(exc, AuthError):
+        return "auth"
+    if isinstance(exc, ConfigError):
+        return "config"
+    return "other"
 
 
 @dataclass(slots=True)
@@ -57,7 +65,7 @@ class RuleResult:
     def fail(self, exc: BaseException) -> None:
         self.status = "failed"
         self.error = f"{type(exc).__name__}: {exc}"
-        self.error_kind = "auth" if isinstance(exc, AuthError) else "other"
+        self.error_kind = error_kind_for(exc)
 
 
 @dataclass(slots=True)
@@ -374,8 +382,6 @@ class Engine:
                     if not isinstance(outcome, Exception):
                         raise outcome
                     errors.append(outcome)
-                    if isinstance(outcome, AuthError):
-                        result.error_kind = "auth"
                     log.warning("rule %s: write failed: %s", rule.name, outcome)
         if errors:
             result.failed = len(errors)
@@ -384,7 +390,9 @@ class Engine:
             result.error = f"{type(first).__name__}: {first}{more}"
             done = result.created + result.updated + result.deleted
             result.status = "partial" if done else "failed"
-            result.error_kind = result.error_kind or "other"
+            # The most actionable kind wins: one revoked credential means "run calsync auth".
+            kinds = {error_kind_for(e) for e in errors}
+            result.error_kind = "auth" if "auth" in kinds else "config" if "config" in kinds else "other"
 
     # ----- the cycle ----------------------------------------------------
     async def cycle(

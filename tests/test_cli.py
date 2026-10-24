@@ -326,3 +326,220 @@ def test_build_adapters_closes_clients_when_building_raises(
     with pytest.raises(RuntimeError, match="unexpected"):
         asyncio.run(wiring.build_adapters(config, {"a", "b"}))
     assert len(made) == 2 and all(c.is_closed for c in made)
+
+
+# ----- exit codes ---------------------------------------------------------------
+
+
+def _result(name: str, status: str = "ok", kind: str | None = None) -> "RuleResult":
+    from calsync.engine import RuleResult
+
+    return RuleResult(name, status=status, error_kind=kind)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("results", "code"),
+    [
+        ([], EXIT_OK),
+        ([("a", "ok", None)], EXIT_OK),
+        ([("a", "blocked", "guard")], EXIT_FAILED),
+        ([("a", "partial", "other")], EXIT_FAILED),
+        ([("a", "failed", "other"), ("b", "failed", "config")], EXIT_CONFIG),
+        ([("a", "failed", "config"), ("b", "failed", "auth")], EXIT_AUTH),
+        ([("a", "blocked", "guard"), ("b", "partial", "auth"), ("c", "ok", None)], EXIT_AUTH),
+    ],
+)
+def test_run_exit_code_precedence(results: list[tuple[str, str, str | None]], code: int) -> None:
+    from calsync.cli import exit_code_for_results
+
+    assert exit_code_for_results([_result(*r) for r in results]) == code
+
+
+def test_rule_result_fail_classifies_config_errors() -> None:
+    from calsync.engine import RuleResult
+    from calsync.errors import AuthError, ConfigError, ForbiddenError, TransientError
+
+    kinds = {}
+    for exc in (ConfigError(["x"]), AuthError("x"), ForbiddenError("x"), TransientError("x")):
+        r = RuleResult("r")
+        r.fail(exc)
+        kinds[type(exc).__name__] = r.error_kind
+    assert kinds == {
+        "ConfigError": "config",
+        "AuthError": "auth",
+        "ForbiddenError": "other",
+        "TransientError": "other",
+    }
+
+
+def _run_config(tmp_path: Path, *parts: str) -> list[str]:
+    cfg = tmp_path / "c.toml"
+    cfg.write_text("\n".join(parts))
+    return ["--config", str(cfg), "--state-dir", str(tmp_path / "state")]
+
+
+def _dav(name: str, url: str, secret: Path) -> str:
+    return CONFIG.format(url=url, user="u", secret=secret).replace("[accounts.dav]", f"[accounts.{name}]")
+
+
+def _rule(name: str, source: str, target: str) -> str:
+    return (
+        f'[[rules]]\nname = "{name}"\nsource = {{ account = "{source}", calendar = "Family" }}\n'
+        f'target = {{ account = "{target}", calendar = "{name}" }}\n'
+    )
+
+
+def _google(client_secret_file: Path) -> str:
+    return (
+        f'[google]\nclient_secret_file = "{client_secret_file}"\n\n'
+        '[accounts.me]\nprovider = "google"\ncredential = { backend = "env", ref = "CALSYNC_TEST_GOOGLE" }\n'
+    )
+
+
+def _runs(tmp_path: Path) -> dict[str, Any]:
+    from calsync.store import Store
+
+    with Store(tmp_path / "state" / "state.db") as store:
+        return {r.rule: r for r in store.latest_runs()}
+
+
+def test_setup_config_error_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A credential file readable by others is a configuration error, as in `calsync calendars`."""
+    from tests.fakes.google import FakeGoogle
+
+    _patch_google(monkeypatch, FakeGoogle())
+    loose = secret_file(tmp_path / "loose", "pw")
+    loose.chmod(0o644)
+    args = _run_config(
+        tmp_path, _google(tmp_path / "unused.json"), _dav("dav", CLOSED, loose), _rule("r", "me", "dav")
+    )
+    code, text = run([*args, "run"])
+    assert code == EXIT_CONFIG and "rule=r status=failed" in text and "0600" in text
+    assert run(["--config", args[1], "calendars", "dav"])[0] == EXIT_CONFIG  # the same verdict
+
+
+def test_missing_google_client_secret_file_exits_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CALSYNC_TEST_GOOGLE", '{"refresh_token": "rt"}')
+    secret = secret_file(tmp_path / "pw", "pw")
+    args = _run_config(
+        tmp_path, _google(tmp_path / "missing.json"), _dav("dav", CLOSED, secret), _rule("r", "me", "dav")
+    )
+    code, text = run([*args, "run"])
+    assert code == EXIT_CONFIG and "client secret file not found" in text
+
+
+def test_auth_beats_config_beats_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from tests.fakes.google import FakeGoogle
+
+    no_backoff(monkeypatch)
+    fake = FakeGoogle()
+    fake.add_calendar("family@x", "Family")
+    _patch_google(monkeypatch, fake)
+    secret = secret_file(tmp_path / "pw", "pw")
+    loose = secret_file(tmp_path / "loose", "pw")
+    loose.chmod(0o644)
+    accounts = [
+        _google(tmp_path / "unused.json"),
+        _dav("down", CLOSED, secret),  # unreachable: the rule fails ("other")
+        _dav("loose", CLOSED, loose),  # setup ConfigError
+        _dav("gone", CLOSED, tmp_path / "missing-secret"),  # setup AuthError
+    ]
+    failed_only = _run_config(tmp_path, *accounts, _rule("down", "me", "down"))
+    assert run([*failed_only, "run"])[0] == EXIT_FAILED
+    with_config = _run_config(tmp_path, *accounts, _rule("down", "me", "down"), _rule("cfg", "me", "loose"))
+    assert run([*with_config, "run"])[0] == EXIT_CONFIG
+    with_auth = _run_config(
+        tmp_path,
+        *accounts,
+        _rule("down", "me", "down"),
+        _rule("cfg", "me", "loose"),
+        _rule("unauthed", "me", "gone"),
+    )
+    assert run([*with_auth, "run"])[0] == EXIT_AUTH
+
+
+def test_skipped_rules_record_the_cycle_request_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from tests.fakes.google import FakeGoogle
+
+    no_backoff(monkeypatch)
+    fake = FakeGoogle()
+    fake.add_calendar("family@x", "Family")
+    _patch_google(monkeypatch, fake)
+    monkeypatch.setenv("CALSYNC_TEST_GOOGLE", '{"refresh_token": "rt"}')
+    secret = secret_file(tmp_path / "pw", "pw")
+    args = _run_config(
+        tmp_path,
+        _google(tmp_path / "unused.json"),
+        _dav("dav", CLOSED, secret),
+        _dav("gone", CLOSED, tmp_path / "missing-secret"),
+        _rule("live", "me", "dav"),
+        _rule("skipped", "me", "gone"),
+    )
+    code, text = run([*args, "run"])
+    assert code == EXIT_AUTH and "rule=live status=failed" in text
+    runs = _runs(tmp_path)
+    assert runs["live"].requests > 0
+    assert runs["skipped"].requests == runs["live"].requests
+
+
+def _patch_google(monkeypatch: pytest.MonkeyPatch, fake: Any) -> None:
+    from collections.abc import Mapping
+
+    from calsync import wiring
+    from calsync.http import make_client
+    from calsync.sources.google import GoogleSource
+    from calsync.sources.google_auth import StaticToken
+    from tests.fakes.google import BASE_URL
+
+    real = wiring.build_adapters
+
+    async def build(config: Any, names: set[str], *, environ: Mapping[str, str] | None = None) -> Any:
+        google = {n for n in names if config.accounts[n].provider == "google"}
+        adapters = await real(config, names - google)
+        for name in google:
+            client = make_client(adapters.log, transport=fake.transport())
+            adapters.clients.append(client)
+            adapters.sources[name] = GoogleSource(client, StaticToken("t"), base_url=BASE_URL)
+        return adapters
+
+    monkeypatch.setattr(wiring, "build_adapters", build)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        __import__("sqlite3").OperationalError("disk I/O error"),
+        PermissionError(13, "Permission denied"),
+        __import__("httpx").DecodingError("bad gzip"),
+    ],
+    ids=["sqlite", "oserror", "httpx"],
+)
+def test_escaped_infrastructure_errors_exit_1_without_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exc: Exception
+) -> None:
+    from calsync import store
+
+    def boom(*_: object, **__: object) -> None:
+        raise exc
+
+    monkeypatch.setattr(store, "Store", boom)
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(CONFIG.format(url=CLOSED, user="u", secret=tmp_path / "pw"))
+    code, text = run(["--config", str(cfg), "--state-dir", str(tmp_path / "s"), "run"])
+    assert code == EXIT_FAILED
+    assert text == f"error: {type(exc).__name__}: {exc}\n"
+
+
+def test_unrelated_exceptions_still_raise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from calsync import store
+
+    def boom(*_: object, **__: object) -> None:
+        raise RuntimeError("a bug")
+
+    monkeypatch.setattr(store, "Store", boom)
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(CONFIG.format(url=CLOSED, user="u", secret=tmp_path / "pw"))
+    with pytest.raises(RuntimeError, match="a bug"):
+        run(["--config", str(cfg), "--state-dir", str(tmp_path / "s"), "run"])

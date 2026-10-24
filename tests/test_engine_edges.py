@@ -111,7 +111,7 @@ async def test_unknown_source_calendar_fails_only_its_rule(tmp_path: Path) -> No
     good, bad = result.rules["good"], result.rules["bad"]
     assert good.status == "ok" and good.created == 2
     assert len(h.target.managed(h.target.calendars["Good"])) == 2
-    assert bad.status == "failed" and bad.error_kind == "other" and "ConfigError" in (bad.error or "")
+    assert bad.status == "failed" and bad.error_kind == "config" and "ConfigError" in (bad.error or "")
     assert {r.rule: r.status for r in h.store.latest_runs()} == {"bad": "failed", "good": "ok"}
 
 
