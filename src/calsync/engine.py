@@ -128,8 +128,6 @@ class Engine:
         self._calendars: dict[TargetKey, TargetCalendar] = {}
         self._caches: dict[tuple[str, str], TargetCache] = {}
         self._warned_degraded: set[tuple[str, str]] = set()  # (rule, source id), once per process
-        # (account, href) -> content_digest of a managed body read by detection this cycle
-        self._fresh: dict[tuple[str, str], str | None] = {}
 
     # ----- phase 1: ingest ---------------------------------------------
     async def _ingest(self, account: str, rules: list[Rule]) -> dict[str, Exception]:
@@ -200,13 +198,15 @@ class Engine:
             if name is None:
                 continue
             found = inspect(obj.data)
-            self._fresh[(account, obj.href)] = content_digest(obj.data)
+            # Changed by someone else (or unknown to us): its rule compares it with the source
+            # version when it next runs, which need not be this cycle (see _classify_reads).
             cache.objects[obj.href] = CachedObject(
                 etag=obj.etag,
                 rule_tag=name[0],
                 object_id=name[1],
                 content_hash=found.content_hash if found else None,
                 span=found.span if found else None,
+                verify_digest=content_digest(obj.data),
             )
         if unread:
             # Keep the previous cursor: sync-collection replays (ctag re-lists) these hrefs
@@ -280,14 +280,16 @@ class Engine:
         # delete); a degraded one without a copy is still created from its parseable part.
         protected = (unparsed | incomplete) & actual.keys()
         result.protected = len(protected)
-        foreign = self._foreign_edits(rule, actual, desired, protected, window)
-        if foreign:
-            # Marked in the cache and saved now (also in a dry run): detection has already
-            # consumed the change, so a dry run or a failed write must not forget the edit.
-            for oid in foreign:
-                have = actual[oid] = replace(actual[oid], content_hash=None)
-                cache.objects[have.href] = replace(cache.objects[have.href], content_hash=None)
+        if self._classify_reads(rule, cache, actual, desired, protected, window):
+            # Saved now (also in a dry run): detection has already consumed the change, so a
+            # dry run or a failed write must not forget the edit.
             self._store.save_target_cache(rule.target.account, cal.href, cache)
+            # A copy edited on the target has an unknown hash now: planned as an update until
+            # a write succeeds (remember() then clears ``reverting``).
+            actual = {
+                oid: replace(have, content_hash=cache.objects[have.href].content_hash)
+                for oid, have in actual.items()
+            }
         result.plan = plan(desired, actual, window, frozenset(protected))
         result.out_of_window = result.plan.out_of_window
         # The guard counts only non-protected actuals.
@@ -300,48 +302,60 @@ class Engine:
             )
             return
         if not dry_run and not result.plan.empty:
-            await self._push(rule, cal, cache, result.plan, result, foreign)
+            await self._push(rule, cal, cache, result.plan, result)
 
-    def _foreign_edits(
+    def _classify_reads(
         self,
         rule: Rule,
+        cache: TargetCache,
         actual: Mapping[str, Actual],
         desired: Mapping[str, Desired],
         protected: Set[str],
         window: Window,
-    ) -> set[str]:
-        """Copies read this cycle whose visible content differs from what we would write
-        although their marker says they are current: someone edited them on the target."""
-        found: set[str] = set()
+    ) -> bool:
+        """Classify this rule's copies whose body detection read but no run has judged yet.
+
+        A copy whose visible content differs from what we would write although its marker says
+        it is current was edited on the target: it is marked ``reverting`` (cleared only by a
+        successful write). Returns whether any cached object changed.
+        """
+        changed = foreign = 0
         now = self._clock()
         for oid, have in actual.items():
-            key = (rule.target.account, have.href)
-            want = desired.get(oid)
-            if key not in self._fresh or want is None or oid in protected:
-                continue
-            if have.content_hash != want.content_hash or not window.intersects(want.span):
-                continue  # the source changed too (a normal update follows), or out of reach
-            seen = self._fresh[key]
+            obj = cache.objects[have.href]
+            seen = obj.verify_digest
             if seen is None:
-                continue  # unreadable to us: never start rewriting on a parser limitation
-            expected = content_digest(
-                render(
-                    want.series,
-                    uid=uid_for(oid),
-                    rule_name=rule.name,
-                    content_hash=want.content_hash,
-                    now=now,
+                continue
+            if oid in protected:
+                continue  # no trustworthy source version now: judge it once it is readable again
+            want = desired.get(oid)
+            edited = False
+            # Gone or out of window (the planner decides), source changed too (a normal update
+            # follows), or unreadable to us (never start rewriting on a parser limitation).
+            if want is not None and have.content_hash == want.content_hash and window.intersects(want.span):
+                expected = content_digest(
+                    render(
+                        want.series,
+                        uid=uid_for(oid),
+                        rule_name=rule.name,
+                        content_hash=want.content_hash,
+                        now=now,
+                    )
                 )
-            )
-            if expected is not None and seen != expected:
-                found.add(oid)
-        if found:
+                edited = expected is not None and seen != expected
+            if edited:  # the planner sees an unknown hash and plans an update (PUT with If-Match)
+                cache.objects[have.href] = replace(obj, verify_digest=None, content_hash=None, reverting=True)
+            else:
+                cache.objects[have.href] = replace(obj, verify_digest=None)
+            changed += 1
+            foreign += edited
+        if foreign:
             log.info(
-                "rule %s: %d copy(ies) edited on the target, writing the source version back",
+                "rule %s: %d copy(ies) edited on the target; the source version will be written back",
                 rule.name,
-                len(found),
+                foreign,
             )
-        return found
+        return changed > 0
 
     async def _titles(self, rule: Rule, cal: TargetCalendar, deletes: list[Actual]) -> tuple[list[str], bool]:
         """SUMMARY of each planned delete and whether every one was read; only blocked rules pay."""
@@ -366,7 +380,6 @@ class Engine:
         cache: TargetCache,
         p: Plan,
         result: RuleResult,
-        reverted_ids: set[str],
     ) -> None:
         target = self._targets[rule.target.account]
         tag = rule_tag(rule.name)
@@ -387,6 +400,7 @@ class Engine:
             return fetched[0] if fetched else None
 
         def remember(href: str, etag: str | None, want: Desired) -> None:
+            """After a successful write: nothing pending, nothing left to revert."""
             cache.objects[href] = CachedObject(etag, tag, want.object_id, want.content_hash, want.span)
 
         # Strict servers answer 412 to If-Match (even "*") for a missing resource, so
@@ -412,6 +426,8 @@ class Engine:
             result.created += 1
 
         async def update(want: Desired, have: Actual) -> None:
+            prior = cache.objects.get(have.href)
+            reverting = prior is not None and prior.reverting  # may be from an earlier cycle
             data = body(want)
             try:
                 etag = await target.update(have.href, have.etag, data)
@@ -423,8 +439,7 @@ class Engine:
                     etag = await target.update(have.href, found.etag, data)
             remember(have.href, etag, want)
             result.updated += 1
-            if want.object_id in reverted_ids:
-                result.reverted += 1
+            result.reverted += reverting
 
         async def delete(have: Actual) -> None:
             try:
@@ -475,7 +490,6 @@ class Engine:
         results = {r.name: RuleResult(r.name) for r in selected}
         for target in self._targets.values():
             target.reset()
-        self._fresh.clear()
 
         by_source: dict[str, list[Rule]] = defaultdict(list)
         for rule in selected:

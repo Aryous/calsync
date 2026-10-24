@@ -56,6 +56,9 @@ def test_target_roundtrip(tmp_path: Path) -> None:
         objects={
             "/u/cal/x.ics": CachedObject('"e1"', "tag", "oid", "hash", (T0, T1)),
             "/u/cal/y.ics": CachedObject(None, "tag", "oid2", None, None),
+            # read but not yet classified / classified as edited on the target, not yet written back
+            "/u/cal/z.ics": CachedObject('"e3"', "tag", "oid3", "hash", None, verify_digest="d1"),
+            "/u/cal/w.ics": CachedObject('"e4"', "tag", "oid4", None, (T0, T1), reverting=True),
         },
     )
     with Store(db) as store:

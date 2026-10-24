@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 
+import calsync.engine
+import calsync.store as store_mod
 from calsync.errors import ConflictError, ForbiddenError, TransientError
 from calsync.http import RequestLog, make_client
 from calsync.model import Series
@@ -575,9 +577,9 @@ MOVE_FROM, MOVE_TO = (
 )
 
 
-def move_pills_on_target(h: FakeHarness) -> str:
+def move_pills_on_target(h: FakeHarness, rule_name: str = "family", source_id: str = "pills") -> str:
     """Move the start of the "pills" copy by 30 minutes, keeping our marker (like a phone)."""
-    href = copy_href(h, "pills")
+    href = copy_href(h, source_id, rule_name)
     data = h.target.objects[href][1]
     edited = data.replace(MOVE_FROM, MOVE_TO)
     assert edited != data and b"X-CALSYNC-HASH" in edited
@@ -597,15 +599,25 @@ async def test_copy_deleted_on_target_is_recreated(tmp_path: Path) -> None:
     assert href in target.managed(cal)
 
 
+def fetched_since(target: FakeTarget, mark: int) -> list[str]:
+    """Hrefs whose bodies were requested from the target since ``mark`` (an index into calls)."""
+    return [href for op, hrefs in target.calls[mark:] if op == "fetch" for href in hrefs.split(",") if href]
+
+
 async def test_alarm_dismissed_on_phone_is_not_rewritten(tmp_path: Path) -> None:
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
     cal = target.calendars["Family"]
     href, data = next(iter(target.managed(cal).items()))
-    target.put(href, data.replace(b"BEGIN:VALARM\r\n", b"BEGIN:VALARM\r\nACKNOWLEDGED:20261025T000500Z\r\n"))
+    edited = data.replace(b"BEGIN:VALARM\r\n", b"BEGIN:VALARM\r\nACKNOWLEDGED:20261025T000500Z\r\n")
+    assert edited != data
+    target.put(href, edited)
+    mark = len(target.calls)
     res = (await h.engine.cycle()).rules["family"]
+    assert fetched_since(target, mark) == [href]  # the body was read and compared, not skipped
     assert res.updated == 0 and res.reverted == 0
+    assert h.store.load_target_cache("dav", cal.href).objects[href].verify_digest is None
     assert (await h.engine.cycle()).rules["family"].updated == 0
 
 
@@ -622,8 +634,29 @@ async def test_lost_state_does_not_rewrite_unchanged_copies(tmp_path: Path) -> N
     await h.engine.cycle()
     forget_state(h, tmp_path)
     h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    mark = len(target.calls)
     res = (await h2.engine.cycle()).rules["family"]
+    managed = target.managed(target.calendars["Family"])
+    assert len(managed) == 2 and sorted(fetched_since(target, mark)) == sorted(managed)
     assert (res.created, res.updated, res.reverted) == (0, 0, 0)
+
+
+async def test_schema_change_cold_start_does_not_rewrite_unchanged_copies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new store schema rebuilds the state (a cold start): every body is read, none is written."""
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    h.store.close()
+    monkeypatch.setattr(store_mod, "SCHEMA_VERSION", store_mod.SCHEMA_VERSION + 1)
+    h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    mark = len(target.calls)
+    res = (await h2.engine.cycle()).rules["family"]
+    managed = target.managed(target.calendars["Family"])
+    assert len(managed) == 2 and sorted(fetched_since(target, mark)) == sorted(managed)
+    assert (res.created, res.updated, res.reverted) == (0, 0, 0)
+    assert not [op for op, _ in target.calls[mark:] if op in {"create", "update", "delete"}]
 
 
 async def test_lost_state_reverts_a_copy_edited_meanwhile(tmp_path: Path) -> None:
@@ -638,18 +671,36 @@ async def test_lost_state_reverts_a_copy_edited_meanwhile(tmp_path: Path) -> Non
     assert MOVE_FROM in target.objects[href][1]
 
 
+@pytest.mark.parametrize("unreadable", ["fetched", "expected"])
 async def test_unreadable_digest_is_not_treated_as_an_edit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unreadable: str
 ) -> None:
-    """If calsync cannot digest a body it never starts rewriting it (no loops on parser limits)."""
+    """If calsync cannot digest one side (the body read from the target, or the body it would
+    write) it never starts rewriting the copy (no loops on parser limits)."""
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
     href = move_pills_on_target(h)
-    monkeypatch.setattr("calsync.engine.content_digest", lambda data: None)
+    real = calsync.engine.content_digest
+    # The edited body read from the target carries MOVE_TO, the rendered source version MOVE_FROM.
+    blind = MOVE_TO if unreadable == "fetched" else MOVE_FROM
+    calls: list[bool] = []
+
+    def digest(data: bytes) -> str | None:
+        calls.append(blind in data)
+        return None if blind in data else real(data)
+
+    monkeypatch.setattr("calsync.engine.content_digest", digest)
+    mark = len(target.calls)
     res = (await h.engine.cycle()).rules["family"]
+    assert fetched_since(target, mark) == [href]
+    assert True in calls  # the unreadable side really was digested
+    if unreadable == "expected":
+        assert False in calls  # and the readable side too: only one side is unreadable
     assert (res.updated, res.reverted) == (0, 0)
     assert MOVE_TO in target.objects[href][1]
+    cached = h.store.load_target_cache("dav", target.calendars["Family"].href).objects[href]
+    assert cached.verify_digest is None and not cached.reverting
 
 
 async def test_edit_on_a_protected_series_is_not_reverted(tmp_path: Path) -> None:
@@ -664,6 +715,18 @@ async def test_edit_on_a_protected_series_is_not_reverted(tmp_path: Path) -> Non
     res = (await h.engine.cycle()).rules["family"]
     assert res.protected == 1 and (res.updated, res.reverted, res.deleted) == (0, 0, 0)
     assert MOVE_TO in target.objects[href][1]
+    again = (await h.engine.cycle()).rules["family"]  # still protected: still untouched
+    assert again.protected == 1 and (again.updated, again.reverted) == (0, 0)
+    assert MOVE_TO in target.objects[href][1]
+    # The series parses again, unchanged: the edit read while it was protected is now reverted.
+    fake.put_event(
+        GCAL, google_event("pills", "Reminders", "2026-10-25T08:00:00+08:00", "2026-10-25T08:05:00+08:00")
+    )
+    mark = len(target.calls)
+    fixed = (await h.engine.cycle()).rules["family"]
+    assert fetched_since(target, mark) == []  # decided from the saved digest, no re-read
+    assert (fixed.protected, fixed.updated, fixed.reverted) == (0, 1, 1)
+    assert MOVE_FROM in target.objects[href][1]
 
 
 async def test_source_change_wins_over_a_target_edit(tmp_path: Path) -> None:
@@ -680,21 +743,26 @@ async def test_source_change_wins_over_a_target_edit(tmp_path: Path) -> None:
     assert b"20261025T090000" in target.objects[href][1]
 
 
-async def test_dry_run_plans_the_revert_and_the_next_run_writes_it(tmp_path: Path) -> None:
+async def test_dry_run_plans_the_revert_and_the_next_run_writes_it(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
     href = move_pills_on_target(h)
-    dry = (await h.engine.cycle(dry_run=True)).rules["family"]
+    with caplog.at_level(logging.INFO, logger="calsync.engine"):
+        dry = (await h.engine.cycle(dry_run=True)).rules["family"]
     assert dry.plan is not None and len(dry.plan.update) == 1
     assert (dry.updated, dry.reverted) == (0, 0)
     assert MOVE_TO in target.objects[href][1]
+    [line] = [r.getMessage() for r in caplog.records if "edited on the target" in r.getMessage()]
+    assert "writing" not in line  # a dry run writes nothing, and the log must not claim it does
     # Detection consumed the change during the dry run; the edit must still be reverted, also by
     # a fresh process reading the saved state.
     h.store.close()
     h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     res = (await h2.engine.cycle()).rules["family"]
-    assert res.updated == 1
+    assert (res.updated, res.reverted) == (1, 1)
     assert MOVE_FROM in target.objects[href][1]
     assert (await h2.engine.cycle()).rules["family"].updated == 0
 
@@ -714,5 +782,124 @@ async def test_failed_revert_counts_as_failed_and_is_retried(tmp_path: Path) -> 
     assert MOVE_TO in target.objects[href][1]
     h.target.before_write = None
     again = (await h.engine.cycle()).rules["family"]
-    assert (again.status, again.updated) == ("ok", 1)
+    assert (again.status, again.updated, again.reverted) == ("ok", 1, 1)
     assert MOVE_FROM in target.objects[href][1]
+    assert (await h.engine.cycle()).rules["family"].updated == 0
+
+
+# ----- an edit read by detection is never lost before its rule classifies it ---
+
+
+def fail_desired(h: FakeHarness, rule_name: str, times: int = 1) -> None:
+    """Make the rule's desired-state step raise ``times`` times (after detection already ran)."""
+    real = h.engine._desired
+    left = [times]
+
+    def flaky(r: Any) -> Any:
+        if r.name == rule_name and left[0] > 0:
+            left[0] -= 1
+            raise TransientError("source mirror unavailable")
+        return real(r)
+
+    h.engine._desired = flaky  # type: ignore[method-assign]
+
+
+async def test_edit_read_by_a_subset_cycle_is_reverted_by_its_own_rule(tmp_path: Path) -> None:
+    """Two rules share one target calendar; a cycle that runs only rule a still reads the copy
+    rule b owns. Rule b must revert it on its next run."""
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule("a"), rule("b")]), target=target)
+    await h.engine.cycle()
+    href = move_pills_on_target(h, "b")
+    mark = len(target.calls)
+    only_a = (await h.engine.cycle(rules=["a"])).rules
+    assert set(only_a) == {"a"} and only_a["a"].updated == 0
+    assert fetched_since(target, mark) == [href]  # rule a's detection consumed the change
+    assert MOVE_TO in target.objects[href][1]
+    res = (await h.engine.cycle()).rules
+    assert (res["b"].updated, res["b"].reverted) == (1, 1) and res["a"].updated == 0
+    assert MOVE_FROM in target.objects[href][1]
+    assert (await h.engine.cycle()).rules["b"].updated == 0  # converged
+
+
+async def test_edit_survives_a_failure_of_the_owning_rule(tmp_path: Path) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = move_pills_on_target(h)
+    fail_desired(h, "family")
+    failed = (await h.engine.cycle()).rules["family"]
+    assert failed.status == "failed" and "TransientError" in (failed.error or "")
+    assert MOVE_TO in target.objects[href][1]
+    mark = len(target.calls)
+    res = (await h.engine.cycle()).rules["family"]
+    assert fetched_since(target, mark) == []  # detection already consumed the change
+    assert (res.status, res.updated, res.reverted) == ("ok", 1, 1)
+    assert MOVE_FROM in target.objects[href][1]
+
+
+class FlakySource:
+    """Wraps a source; calendar refs in ``failing`` fail on their own (like a 5xx for one calendar)."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.failing: set[str] = set()
+
+    async def list_calendars(self) -> list[CalendarInfo]:
+        return await self._inner.list_calendars()
+
+    async def pull(self, calendar_refs: Sequence[str], state: Mapping[str, Any]) -> SourcePull:
+        good = [ref for ref in calendar_refs if ref not in self.failing]
+        pull = await self._inner.pull(good, state) if good else SourcePull({}, dict(state))
+        bad = {ref: TransientError("events.list: HTTP 503") for ref in calendar_refs if ref in self.failing}
+        return SourcePull(pull.calendars, pull.state, {**pull.errors, **bad})
+
+    def to_series(self, raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Series]:
+        return self._inner.to_series(raw_events, meta)
+
+    def series_ids(self, raw_events: Iterable[RawEvent]) -> set[str]:
+        return self._inner.series_ids(raw_events)
+
+
+async def test_edit_survives_a_source_failure_of_the_owning_rule(tmp_path: Path) -> None:
+    """Rule b's source fails while rule a, on the same target calendar, runs and reads b's copy."""
+    fake = simple()
+    source = FlakySource(
+        GoogleSource(
+            make_client(RequestLog(), transport=fake.transport()), StaticToken("t"), base_url=BASE_URL
+        )
+    )
+    rules = [rule("a", source="Family"), rule("b", source=GCAL)]
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, fake, config_for(rules), target=target, sources={"me": source})
+    first = await h.engine.cycle()
+    assert first.ok and first.rules["b"].created == 2
+    href = move_pills_on_target(h, "b")
+    source.failing = {GCAL}
+    mark = len(target.calls)
+    broken = (await h.engine.cycle()).rules
+    assert broken["b"].status == "failed" and broken["a"].status == "ok"
+    assert fetched_since(target, mark) == [href]  # rule a's detection consumed the change
+    source.failing = set()
+    res = (await h.engine.cycle()).rules["b"]
+    assert (res.status, res.updated, res.reverted) == ("ok", 1, 1)
+    assert MOVE_FROM in target.objects[href][1]
+
+
+async def test_edit_read_before_a_crash_is_reverted_by_a_fresh_process(tmp_path: Path) -> None:
+    """The process stops after detection saved the cache but before the rule ran (simulated by a
+    rule that fails right after detection). A new process on the same state file reverts it."""
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = move_pills_on_target(h)
+    fail_desired(h, "family")
+    assert (await h.engine.cycle()).rules["family"].status == "failed"
+    h.store.close()
+    h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    mark = len(target.calls)
+    res = (await h2.engine.cycle()).rules["family"]
+    assert fetched_since(target, mark) == []  # nothing re-read: the saved state carries the edit
+    assert (res.status, res.updated, res.reverted) == ("ok", 1, 1)
+    assert MOVE_FROM in target.objects[href][1]
+    assert (await h2.engine.cycle()).rules["family"].updated == 0
