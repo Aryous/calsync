@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from calsync.config import Config, Rule
-from calsync.errors import AuthError, ConflictError, NotFoundError
+from calsync.errors import AuthError, CalsyncError, ConflictError, NotFoundError
 from calsync.http import RequestLog
 from calsync.mirror import Mirror, apply_pull
 from calsync.model import Window, apply_alarm_policy, series_hash, series_span
@@ -51,6 +51,7 @@ class RuleResult:
     plan: Plan | None = None
     protected: int = 0  # source series that could not be parsed; their target copy is left alone
     blocked_titles: list[str] = field(default_factory=list)  # planned deletes, for the guard alert
+    blocked_titles_complete: bool = True  # False: the lookup failed or some bodies were unreadable
 
     def fail(self, exc: BaseException) -> None:
         self.status = "failed"
@@ -115,6 +116,7 @@ class Engine:
         self._resolved: dict[tuple[str, str], str] = {}
         self._calendars: dict[TargetKey, TargetCalendar] = {}
         self._caches: dict[tuple[str, str], TargetCache] = {}
+        self._warned_protected: set[tuple[str, str]] = set()  # (rule, source id), once per process
 
     # ----- phase 1: ingest ---------------------------------------------
     async def _ingest(self, account: str, rules: list[Rule]) -> dict[str, Exception]:
@@ -123,7 +125,14 @@ class Engine:
             self._source_state[account], self._mirrors[account] = self._store.load_source(account)
         refs = sorted({r.source.calendar for r in rules})
         pull = await self._sources[account].pull(refs, self._source_state[account])
-        for ref, exc in pull.errors.items():
+        errors = dict(pull.errors)
+        for ref in refs:
+            if ref not in pull.calendars and ref not in errors:
+                errors[ref] = CalsyncError(
+                    f"source {account!r} returned neither a result nor an error for calendar {ref!r} "
+                    "(source contract violation)"
+                )
+        for ref, exc in errors.items():
             log.warning("source %s calendar %r failed: %s", account, ref, exc)
         # Failed calendars are absent from ``calendars`` and keep their old cursor in ``state``.
         unique = {p.calendar_id: p for p in pull.calendars.values()}
@@ -135,7 +144,7 @@ class Engine:
             self._meta[(account, cal_pull.calendar_id)] = cal_pull.meta
         for cal_id, cal_pull in unique.items():
             apply_pull(mirrors.setdefault(cal_id, {}), cal_pull)
-        return pull.errors
+        return errors
 
     # ----- phase 2: detect ---------------------------------------------
     async def _detect(self, key: TargetKey, rules: list[Rule], dry_run: bool) -> None:
@@ -215,6 +224,9 @@ class Engine:
             desired[oid] = Desired(oid, shaped, series_hash(shaped), series_span(shaped))
         unparsed = source.series_ids(raw) - {item.source_id for item in series}
         for sid in sorted(unparsed):
+            if (rule.name, sid) in self._warned_protected:
+                continue
+            self._warned_protected.add((rule.name, sid))
             log.warning(
                 "rule %s: source series %s could not be parsed; protecting its target copy", rule.name, sid
             )
@@ -241,23 +253,28 @@ class Engine:
         reason = None if allow_deletes else check_delete_guard(result.plan, deletable, rule.delete_guard)
         if reason:
             result.status, result.error, result.error_kind = "blocked", reason, "guard"
-            result.blocked_titles = await self._titles(rule, cal, result.plan.delete)
+            result.blocked_titles, result.blocked_titles_complete = await self._titles(
+                rule, cal, result.plan.delete
+            )
             return
         if not dry_run and not result.plan.empty:
             await self._push(rule, cal, cache, result.plan, result)
 
-    async def _titles(self, rule: Rule, cal: TargetCalendar, deletes: list[Actual]) -> list[str]:
-        """SUMMARY of each planned delete, for the guard alert; only blocked rules pay for this."""
+    async def _titles(self, rule: Rule, cal: TargetCalendar, deletes: list[Actual]) -> tuple[list[str], bool]:
+        """SUMMARY of each planned delete and whether every one was read; only blocked rules pay."""
         try:
             fetched = await self._targets[rule.target.account].fetch(cal, [a.href for a in deletes])
         except Exception as exc:  # the alert loses detail, but the rule stays blocked
             log.warning("rule %s: could not read the titles of planned deletes: %s", rule.name, exc)
-            return []
+            return [], False
         titles: dict[str, str] = {}
+        unreadable = 0
         for obj in fetched:
             found = inspect(obj.data)
-            titles[obj.href] = (found.summary if found else None) or "(untitled)"
-        return [titles[a.href] for a in deletes if a.href in titles]
+            unreadable += found is None
+            titles[obj.href] = "(unreadable)" if found is None else found.summary or "(untitled)"
+        listed = [titles[a.href] for a in deletes if a.href in titles]
+        return listed, len(listed) == len(deletes) and not unreadable
 
     async def _push(
         self, rule: Rule, cal: TargetCalendar, cache: TargetCache, p: Plan, result: RuleResult

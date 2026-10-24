@@ -99,12 +99,16 @@ def build_fake(
     config: Config,
     *,
     target: FakeTarget | None = None,
+    sources: dict[str, Any] | None = None,
     clock: Any = lambda: NOW,
 ) -> FakeHarness:
-    """Like ``build`` but with an in-memory FakeTarget instead of Radicale."""
+    """Like ``build`` but with an in-memory FakeTarget instead of Radicale.
+
+    ``sources`` replaces individual source accounts (by account name).
+    """
     log = RequestLog()
     google_client = make_client(log, transport=fake.transport())
-    sources: dict[str, Any] = {"me": GoogleSource(google_client, StaticToken("t"), base_url=BASE_URL)}
+    sources = {"me": GoogleSource(google_client, StaticToken("t"), base_url=BASE_URL), **(sources or {})}
     target = target or FakeTarget()
     store = Store(tmp_path / "state.db")
     engine = Engine(config, store, sources, {"dav": target}, request_log=log, clock=clock)

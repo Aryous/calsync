@@ -8,11 +8,14 @@ from typing import Any
 import pytest
 
 from calsync.errors import ConflictError, TransientError
+from calsync.http import RequestLog, make_client
 from calsync.model import Series
 from calsync.naming import object_id, resource_name
 from calsync.sources.base import CalendarInfo, CalendarMeta, RawEvent, SourcePull
+from calsync.sources.google import GoogleSource
+from calsync.sources.google_auth import StaticToken
 from tests.factories import google_event
-from tests.fakes.google import FakeGoogle
+from tests.fakes.google import BASE_URL, FakeGoogle
 from tests.fakes.target import FakeTarget
 from tests.harness import GCAL, FakeHarness, build_fake, config_for, rule
 
@@ -70,6 +73,11 @@ async def test_unparseable_series_keeps_its_target_copy(
     assert h.target.managed(cal) == before
     warnings = [r.getMessage() for r in caplog.records if "protect" in r.getMessage()]
     assert len(warnings) == 1 and "pills" in warnings[0] and "Reminders" not in warnings[0]
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        again = (await h.engine.cycle()).rules["family"]
+    assert again.protected == 1 and again.plan is not None and again.plan.empty
+    assert not [r for r in caplog.records if "protect" in r.getMessage()]  # warned once per process
 
 
 async def test_delete_guard_ignores_protected_actuals(tmp_path: Path) -> None:
@@ -221,8 +229,21 @@ async def test_blocked_rule_lists_titles_with_one_fetch(tmp_path: Path) -> None:
     h.target.calls.clear()
     res = (await h.engine.cycle()).rules["family"]
     assert res.status == "blocked"
-    assert sorted(res.blocked_titles) == ["E0", "E1", "E2", "E3"]
+    assert sorted(res.blocked_titles) == ["E0", "E1", "E2", "E3"] and res.blocked_titles_complete
     assert [op for op, _ in h.target.calls] == ["changes", "fetch"]
+
+
+async def test_unreadable_planned_delete_marks_titles_incomplete(tmp_path: Path) -> None:
+    fake = many(4)
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    garbled = sorted(h.target.managed(h.target.calendars["Family"]))[0]
+    h.target.put(garbled, b"not icalendar")
+    for i in range(4):
+        fake.cancel_event(GCAL, f"e{i}")
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.status == "blocked" and not res.blocked_titles_complete
+    assert len(res.blocked_titles) == 4 and res.blocked_titles.count("(unreadable)") == 1
 
 
 async def test_title_lookup_failure_keeps_the_rule_blocked(tmp_path: Path) -> None:
@@ -234,6 +255,7 @@ async def test_title_lookup_failure_keeps_the_rule_blocked(tmp_path: Path) -> No
     h.target.fail_fetch = TransientError("multiget timed out")
     res = (await h.engine.cycle()).rules["family"]
     assert res.status == "blocked" and res.error_kind == "guard" and res.blocked_titles == []
+    assert not res.blocked_titles_complete
     assert len(h.target.objects) == 4
 
 
@@ -241,7 +263,7 @@ async def test_title_lookup_failure_keeps_the_rule_blocked(tmp_path: Path) -> No
 
 
 class ForgetfulSource:
-    """Wraps a source; after ``forget()`` its pulls silently omit every calendar."""
+    """Wraps a source; while ``forgetful`` its pulls silently omit every calendar."""
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
@@ -261,15 +283,20 @@ class ForgetfulSource:
         return self._inner.series_ids(raw_events)
 
 
-async def test_missing_mirror_fails_loudly_instead_of_deleting(tmp_path: Path) -> None:
-    h = build_fake(tmp_path, simple(), config_for([rule()]))
-    await h.engine.cycle()
-    source = ForgetfulSource(h.engine._sources["me"])
-    h.engine._sources = {"me": source}
-    h.engine._mirrors["me"].clear()
-    source.forgetful = True
+async def test_source_omitting_a_calendar_fails_the_rule_instead_of_reusing_data(tmp_path: Path) -> None:
+    fake = simple()
+    source = ForgetfulSource(
+        GoogleSource(
+            make_client(RequestLog(), transport=fake.transport()), StaticToken("t"), base_url=BASE_URL
+        )
+    )
+    h = build_fake(tmp_path, fake, config_for([rule()]), sources={"me": source})
+    assert (await h.engine.cycle()).rules["family"].created == 2
+    fake.cancel_event(GCAL, "checkup")
+    fake.cancel_event(GCAL, "pills")
+    source.forgetful = True  # neither in calendars nor in errors: a contract violation
     res = (await h.engine.cycle()).rules["family"]
-    assert res.status == "failed" and "KeyError" in (res.error or "")
+    assert res.status == "failed" and "contract" in (res.error or "")
     assert len(h.target.managed(h.target.calendars["Family"])) == 2
 
 
