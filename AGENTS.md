@@ -55,11 +55,11 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
 | `naming.py` | `rule_tag`, `object_id`, resource name `calsync-<8hex>-<24hex>.ics`, UID `<id>@calsync` |
 | `render.py` | Series → iCalendar bytes (VTIMEZONE, RRULE/EXDATE/RDATE, RECURRENCE-ID overrides each with own VALARMs, `URL`, `X-CALSYNC-RULE` / `X-CALSYNC-HASH`); `inspect()` reads them back and never raises; `content_digest()` hashes only what a person sees (ignores DTSTAMP, SEQUENCE, X- properties, property/event order, VTIMEZONE text, zone labels on RECURRENCE-ID/EXDATE/RDATE, alarm ACTION/DESCRIPTION and phone alarm bookkeeping); `None` for unreadable bodies, never raises |
 | `planner.py` | pure `plan(desired, actual, window, protected)` (counts `out_of_window`); `check_delete_guard` (ratio only from 3 deletions on) |
-| `engine.py` | one cycle; per-calendar/per-rule isolation; protected/degraded handling; cursor hold; delete-guard titles; full sync when `rule.window is None`; `_classify_reads` compares a read body's digest with the digest of what we would write: equal → adopted as current whatever the marker says (no write); different with a current marker → `reverting` (the update that follows counts as `reverted`); different with no or another marker → ordinary update |
-| `store.py` | SQLite (WAL, 0600): `source_state`, `source_event`, `target_calendar` (keyed by account+ref), `target_object` (incl. `verify_digest`, `reverting`), `run` (500 per rule), `alert`; `SCHEMA_VERSION` 2; schema mismatch → rebuild; corrupt DB → quarantined |
+| `engine.py` | one cycle; per-calendar/per-rule isolation; protected/degraded handling; cursor hold; delete-guard titles; full sync when `rule.window is None`; `_classify_reads` compares a read body's digest with the digest of what we would write: equal → adopted as current whatever the marker says (no write); different with a current marker → `reverting` (the update that follows counts as `reverted`); different with no or another marker → ordinary update; rewrite-loop breaker: a copy reverted `REVERT_LIMIT` (3) times within `REVERT_WINDOW` (6 h) that differs again is adopted instead for `REVERT_HOLD` (24 h), one warning (rule + object id) per hold |
+| `store.py` | SQLite (WAL, 0600): `source_state`, `source_event`, `target_calendar` (keyed by account+ref), `target_object` (incl. `verify_digest`, `reverting`, `revert_times`, `hold_until`), `run` (500 per rule), `alert`; `SCHEMA_VERSION` 3; schema mismatch → rebuild; corrupt DB → quarantined |
 | `sources/google.py` | REST client: calendarList + events.list with `syncToken`, 410 → full resync, request-params fingerprint (`events_params` state key) → full resync when `EVENTS_LIST_PARAMS` change, attendees and conference data requested, per-calendar `SourcePull.errors`, 403 rate limit → transient, 401 → one refresh + retry |
 | `targets/dav.py` | PROPFIND/REPORT/PUT/DELETE/MKCALENDAR, manual redirects, absolute hrefs, error mapping (401 auth, 403 `ForbiddenError`, `valid-sync-token` → `CursorExpired`, 412 conflict) |
-| `targets/base.py` | target protocol; `TargetCache` / `CachedObject` — `verify_digest` (digest of a read body its rule has not classified yet; persisted so an edit survives a cycle the rule does not finish) and `reverting` (classified as edited; cleared by the successful write-back) |
+| `targets/base.py` | target protocol; `TargetCache` / `CachedObject` — `verify_digest` (digest of a read body its rule has not classified yet; persisted so an edit survives a cycle the rule does not finish) `reverting` (classified as edited; cleared by the successful write-back), and the loop breaker's `revert_times` / `hold_until` (carried across detection reads and writes) |
 | `targets/caldav.py` | discovery (iCloud region detection via `server_url = "icloud"`), detection ladder sync → ctag → full, multiget, conditional writes, adaptive `Limiter` |
 | `config.py` / `credentials.py` | validated TOML (all problems at once; `Rule.window` is `None` when omitted = full sync, `window = {}` = 7d/180d; `fields` → `FieldPolicy`; `on_target_edit` accepts only `"revert"`); keychain / env / 0600-file secrets |
 | `wiring.py` | the only place account definitions become clients; one `CalDavTarget` per account; `build_adapters` is **async**; per-account setup errors in `Adapters.errors` |
@@ -160,6 +160,12 @@ uv run ruff check src tests && uv run ruff format --check src tests && uv run py
   equals what we would write is adopted (desired hash and span cached), never
   rewritten. The marker only decides between "edited on the target" (revert)
   and "source changed" (ordinary update) once the digests differ.
+- Rewrite-loop breaker: a server or phone that rewrites visible content after
+  every write would otherwise be reverted every cycle. The breaker uses the
+  engine's injected clock, is persisted on `CachedObject`, and must be carried
+  wherever a `CachedObject` is rebuilt (`_detect`, `remember()`). It only
+  holds reverts (marker current, digest differs); a source change is still
+  written during a hold.
 - Changing `EVENTS_LIST_PARAMS` (e.g. `EVENT_FIELDS`) changes the
   `events_params` fingerprint and forces a full pull of every source calendar
   once; changing rendered bytes needs a `RENDER_VERSION` bump. A bump rewrites

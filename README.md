@@ -94,6 +94,11 @@ directly in the other person's account.
   that still shows exactly the source version is never rewritten, even if
   the phone dropped or changed calsync's hidden marker; a check on a real
   iPhone is pending.
+- If a copy keeps changing on the target right after calsync writes it (a
+  server or app that rewrites events on its own), calsync stops reverting
+  that copy after three reverts within six hours, for 24 hours, and logs one
+  warning naming the rule and the event's internal id. Changes made in
+  Google are still written meanwhile.
 - All local state (mirror, cursors, target cache, run history) is a
   **rebuildable cache**. Delete the state directory and the next run
   reconciles from both ends without creating duplicates.
@@ -473,6 +478,7 @@ stale one.
 | `status=blocked` | the mass-delete guard fired; check the printed titles, then `calsync run --rule NAME --allow-deletes` if intended |
 | exit code 4 | another `calsync run` holds the lock; wait for it |
 | an event changed on the iPhone snaps back (`reverted=1`) | expected: sync is one way, the Google version wins. Make the change in Google |
+| log says an object "was reverted 3 times within 6:00:00 … not reverting it until …" | something on the target rewrites that event after every write (the loop breaker stepped in). calsync leaves it alone for 24 hours; changes made in Google still sync. If it keeps happening, look for another app or sync service editing that calendar |
 | events arrive on a family member's iPhone but no alert fires | check, in order: notifications for the Calendar app are on (Settings → Notifications → Calendar); the calendar's own Event Alerts switch is on; the calendar is shared rather than in their account, in which case only their Default Alert Time applies (see Known limitations) |
 | no alert while the Calendar app is open | expected: iOS shows the alert inside the app instead of as a notification |
 | behind a proxy | set `HTTPS_PROXY`; calsync honours the standard proxy variables |

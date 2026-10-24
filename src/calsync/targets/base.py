@@ -43,6 +43,10 @@ class CachedObject:
     verify_digest: str | None = None
     # Classified as edited on the target; the source version has not been written back yet.
     reverting: bool = False
+    # Rewrite-loop breaker (see engine.REVERT_LIMIT): when recent reverts of this copy were
+    # written, and until when further target edits to it are adopted instead of reverted.
+    revert_times: tuple[datetime, ...] = ()
+    hold_until: datetime | None = None
 
 
 @dataclass(slots=True)

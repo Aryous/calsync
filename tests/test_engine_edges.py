@@ -3,6 +3,7 @@
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,7 @@ from calsync.sources.google_auth import StaticToken
 from tests.factories import google_event
 from tests.fakes.google import BASE_URL, FakeGoogle
 from tests.fakes.target import FakeTarget
-from tests.harness import GCAL, FakeHarness, build_fake, config_for, rule
+from tests.harness import GCAL, NOW, FakeHarness, build_fake, config_for, rule
 
 pytestmark = pytest.mark.anyio
 
@@ -1080,3 +1081,112 @@ async def test_render_version_bump_on_a_cold_start_rewrites_nothing_unchanged(
     mark = len(target.calls)
     assert (await h2.engine.cycle()).rules["family"].updated == 0
     assert writes_since(target, mark) == [] and fetched_since(target, mark) == []
+
+
+# ----- rewrite-loop breaker ---------------------------------------------------
+
+
+def start_at(hhmmss: bytes) -> bytes:
+    return b"DTSTART;TZID=Asia/Shanghai:20261025T" + hhmmss
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = NOW
+
+    def __call__(self) -> datetime:
+        return self.now
+
+
+async def edit_and_cycle(h: FakeHarness, clock: Clock, at: timedelta) -> Any:
+    """Like a server or phone that rewrites the copy after every write: move it, run a cycle."""
+    clock.now = NOW + at
+    move_stretch_on_target(h)
+    return (await h.engine.cycle()).rules["family"]
+
+
+def breaker_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "reverted" in r.getMessage()
+    ]
+
+
+async def test_copy_reverted_three_times_in_six_hours_is_held(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = Clock()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target, clock=clock)
+    await h.engine.cycle()
+    href = copy_href(h, "stretch")
+    with caplog.at_level(logging.INFO, logger="calsync.engine"):
+        for hour in (1, 2, 3):
+            res = await edit_and_cycle(h, clock, timedelta(hours=hour))
+            assert (res.updated, res.reverted) == (1, 1)
+        assert breaker_warnings(caplog) == []
+        mark = len(target.calls)
+        res = await edit_and_cycle(h, clock, timedelta(hours=4))
+        assert (res.updated, res.reverted) == (0, 0) and writes_since(target, mark) == []
+        assert MOVE_TO in target.objects[href][1]
+        [line] = breaker_warnings(caplog)
+        oid = object_id("family", GCAL, "stretch")
+        assert "family" in line and oid in line and href not in line and "Stretch" not in line
+        # Still held: no write and no second warning.
+        clock.now = NOW + timedelta(hours=10)
+        edit_copy(h, lambda d: d.replace(MOVE_TO, start_at(b"084500")))
+        res = (await h.engine.cycle()).rules["family"]
+        assert (res.updated, res.reverted) == (0, 0)
+        assert len(breaker_warnings(caplog)) == 1
+        assert (await h.engine.cycle()).rules["family"].updated == 0  # idle while held
+    # The hold survives a new process.
+    h.store.close()
+    h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target, clock=clock)
+    clock.now = NOW + timedelta(hours=20)
+    edit_copy(h2, lambda d: d.replace(start_at(b"084500"), start_at(b"085000")))
+    assert (await h2.engine.cycle()).rules["family"].updated == 0
+    # After 24 hours reverting resumes.
+    clock.now = NOW + timedelta(hours=28, minutes=1)
+    edit_copy(h2, lambda d: d.replace(start_at(b"085000"), start_at(b"085500")))
+    res = (await h2.engine.cycle()).rules["family"]
+    assert (res.updated, res.reverted) == (1, 1)
+    assert MOVE_FROM in target.objects[href][1]
+
+
+async def test_source_change_during_a_hold_is_still_written(tmp_path: Path) -> None:
+    clock = Clock()
+    fake = simple()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, fake, config_for([rule()]), target=target, clock=clock)
+    await h.engine.cycle()
+    href = copy_href(h, "stretch")
+    for hour in (1, 2, 3, 4):
+        await edit_and_cycle(h, clock, timedelta(hours=hour))
+    assert MOVE_TO in target.objects[href][1]  # held
+    clock.now = NOW + timedelta(hours=5)
+    fake.put_event(
+        GCAL, google_event("stretch", "Stretch", "2026-10-25T09:00:00+08:00", "2026-10-25T09:05:00+08:00")
+    )
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.updated, res.reverted) == (1, 0)
+    assert b"20261025T090000" in target.objects[href][1]
+    # The hold is kept across that write: a further rewrite by the target is not reverted.
+    clock.now = NOW + timedelta(hours=6)
+    data = target.objects[href][1]
+    target.put(href, data.replace(start_at(b"090000"), MOVE_TO))
+    assert (await h.engine.cycle()).rules["family"].updated == 0
+
+
+async def test_spaced_phone_edits_are_always_reverted(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    clock = Clock()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target, clock=clock)
+    await h.engine.cycle()
+    with caplog.at_level(logging.INFO, logger="calsync.engine"):
+        for step in range(1, 7):
+            res = await edit_and_cycle(h, clock, timedelta(hours=2.5 * step))
+            assert (res.updated, res.reverted) == (1, 1)
+    assert breaker_warnings(caplog) == []

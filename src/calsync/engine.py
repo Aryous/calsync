@@ -10,7 +10,7 @@ import logging
 from collections import defaultdict
 from collections.abc import Callable, Coroutine, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from calsync.config import Config, Rule
@@ -33,6 +33,13 @@ from calsync.targets.base import (
 )
 
 log = logging.getLogger(__name__)
+
+# Rewrite-loop breaker: a copy reverted REVERT_LIMIT times within REVERT_WINDOW that differs
+# again is not reverted for REVERT_HOLD (a server or phone that rewrites what calsync writes
+# would otherwise be rewritten every cycle). Source changes are still written meanwhile.
+REVERT_LIMIT = 3
+REVERT_WINDOW = timedelta(hours=6)
+REVERT_HOLD = timedelta(hours=24)
 
 Status = Literal["ok", "partial", "failed", "blocked"]
 ErrorKind = Literal["auth", "config", "guard", "other"]
@@ -198,6 +205,7 @@ class Engine:
             if name is None:
                 continue
             found = inspect(obj.data)
+            known = cache.objects.get(obj.href)
             # Changed by someone else (or unknown to us): its rule compares it with the source
             # version when it next runs, which need not be this cycle (see _classify_reads).
             cache.objects[obj.href] = CachedObject(
@@ -207,6 +215,8 @@ class Engine:
                 content_hash=found.content_hash if found else None,
                 span=found.span if found else None,
                 verify_digest=content_digest(obj.data),
+                revert_times=known.revert_times if known else (),
+                hold_until=known.hold_until if known else None,
             )
         if unread:
             # Keep the previous cursor: sync-collection replays (ctag re-lists) these hrefs
@@ -363,9 +373,35 @@ class Engine:
                     obj, content_hash=want.content_hash, span=want.span, verify_digest=None, reverting=False
                 )
             elif have.content_hash == want.content_hash:
-                # Edited on the target: the planner sees an unknown hash and plans an update.
-                cache.objects[have.href] = replace(obj, verify_digest=None, content_hash=None, reverting=True)
-                foreign += 1
+                # Edited on the target, again: the planner sees an unknown hash and plans an update,
+                # unless this copy keeps changing after our writes (then it is held as it is).
+                held = obj.hold_until is not None and now < obj.hold_until
+                recent = [t for t in obj.revert_times if t > now - REVERT_WINDOW]
+                if not held and len(recent) >= REVERT_LIMIT:
+                    held = True
+                    obj = replace(obj, revert_times=(), hold_until=now + REVERT_HOLD)
+                    log.warning(
+                        "rule %s: object %s was reverted %d times within %s and changed on the target "
+                        "again; not reverting it until %s",
+                        rule.name,
+                        obj.object_id,
+                        len(recent),
+                        REVERT_WINDOW,
+                        obj.hold_until,
+                    )
+                if held:
+                    cache.objects[have.href] = replace(
+                        obj,
+                        content_hash=want.content_hash,
+                        span=want.span,
+                        verify_digest=None,
+                        reverting=False,
+                    )
+                else:
+                    cache.objects[have.href] = replace(
+                        obj, verify_digest=None, content_hash=None, reverting=True
+                    )
+                    foreign += 1
             else:
                 cache.objects[have.href] = replace(obj, verify_digest=None)  # the source changed too
         if unrenderable:
@@ -434,9 +470,22 @@ class Engine:
             fetched = await target.fetch(cal, [href])
             return fetched[0] if fetched else None
 
-        def remember(href: str, etag: str | None, want: Desired) -> None:
-            """After a successful write: nothing pending, nothing left to revert."""
-            cache.objects[href] = CachedObject(etag, tag, want.object_id, want.content_hash, want.span)
+        def remember(href: str, etag: str | None, want: Desired, *, reverted: bool = False) -> None:
+            """After a successful write: nothing pending, nothing left to revert. The loop
+            breaker's record is kept, plus this write if it was a revert."""
+            prior = cache.objects.get(href)
+            times = prior.revert_times if prior else ()
+            if reverted:
+                times = (*(t for t in times if t > now - REVERT_WINDOW), now)
+            cache.objects[href] = CachedObject(
+                etag,
+                tag,
+                want.object_id,
+                want.content_hash,
+                want.span,
+                revert_times=times,
+                hold_until=prior.hold_until if prior else None,
+            )
 
         # Strict servers answer 412 to If-Match (even "*") for a missing resource, so
         # every conflict re-reads the resource before deciding how to retry once.
@@ -472,7 +521,7 @@ class Engine:
                     etag = await target.create(have.href, data)
                 else:
                     etag = await target.update(have.href, found.etag, data)
-            remember(have.href, etag, want)
+            remember(have.href, etag, want, reverted=reverting)
             result.updated += 1
             result.reverted += reverting
 
