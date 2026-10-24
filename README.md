@@ -84,7 +84,7 @@ each other's copies as their own and fight over them.
 ```sh
 calsync config check
 calsync auth family-icloud                      # reads an app-specific password from stdin
-calsync auth me-google --refresh-token-stdin    # until the browser sign-in lands
+calsync auth me-google                          # opens the browser to sign in to Google
 calsync calendars family-icloud
 calsync run --dry-run                           # show the plan
 calsync run                                     # one sync cycle

@@ -543,3 +543,29 @@ def test_unrelated_exceptions_still_raise(tmp_path: Path, monkeypatch: pytest.Mo
     cfg.write_text(CONFIG.format(url=CLOSED, user="u", secret=tmp_path / "pw"))
     with pytest.raises(RuntimeError, match="a bug"):
         run(["--config", str(cfg), "--state-dir", str(tmp_path / "s"), "run"])
+
+
+def test_auth_google_browser_failure_keeps_existing_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from calsync import cli
+    from calsync.errors import AuthError
+
+    secret = tmp_path / "google-cred"
+    secret.write_text('{"refresh_token": "old"}')
+    secret.chmod(0o600)
+    client = tmp_path / "client.json"
+    client.write_text('{"installed": {"client_id": "id", "client_secret": "sec"}}')
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(
+        f'[google]\nclient_secret_file = "{client}"\n'
+        f'[accounts.g]\nprovider = "google"\ncredential = {{ backend = "file", ref = "{secret}" }}\n'
+    )
+
+    async def refused(config: object) -> str:
+        raise AuthError("Google sign-in was not completed: access_denied")
+
+    monkeypatch.setattr(cli, "_google_browser_sign_in", refused)
+    code, text = run(["--config", str(cfg), "auth", "g"])
+    assert code == EXIT_AUTH and "sign-in failed" in text and "access_denied" in text
+    assert secret.read_text() == '{"refresh_token": "old"}'

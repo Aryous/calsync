@@ -131,6 +131,28 @@ async def _calendars(args: argparse.Namespace, out: TextIO) -> int:
     return EXIT_OK
 
 
+async def _google_browser_sign_in(config: "Config") -> str:
+    """Browser OAuth (loopback + PKCE); returns a refresh token. Progress goes to stderr."""
+    import webbrowser
+
+    from calsync.errors import ConfigError
+    from calsync.http import RequestLog, make_client
+    from calsync.sources.google_auth import load_client_secret
+    from calsync.sources.google_oauth import sign_in
+
+    if config.google_client_secret_file is None:
+        raise ConfigError(["google.client_secret_file: required for google accounts"])
+    client_id, client_secret = load_client_secret(config.google_client_secret_file)
+    async with make_client(RequestLog()) as client:
+        return await sign_in(
+            client,
+            client_id=client_id,
+            client_secret=client_secret,
+            open_browser=webbrowser.open,
+            out=sys.stderr,
+        )
+
+
 def _read_stdin_secret(prompt: str, stdin: TextIO) -> str:
     if stdin.isatty():
         return getpass.getpass(prompt)
@@ -154,9 +176,13 @@ async def _auth(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
         out.write(f"--refresh-token-stdin applies only to google accounts; {args.account!r} is caldav\n")
         return EXIT_CONFIG
     if google and not args.refresh_token_stdin:
-        out.write("google browser sign-in is not available yet; pass --refresh-token-stdin\n")
-        return EXIT_CONFIG
-    raw = _read_stdin_secret("Refresh token: " if google else "App-specific password: ", stdin)
+        try:
+            raw = await _google_browser_sign_in(config)
+        except CalsyncError as exc:
+            out.write(f"sign-in failed, credentials not stored (existing ones unchanged): {exc}\n")
+            return exit_code_for(exc)
+    else:
+        raw = _read_stdin_secret("Refresh token: " if google else "App-specific password: ", stdin)
     if not raw:
         out.write("empty input: nothing stored, the existing credential is unchanged\n")
         return EXIT_CONFIG
