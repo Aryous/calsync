@@ -545,15 +545,12 @@ async def test_forbidden_detection_is_not_an_auth_failure(tmp_path: Path) -> Non
     assert res.status == "failed" and res.error_kind == "other"
 
 
-# ----- known limitation: target-side edits ----------------------------------
+# ----- edits made on the target are reverted --------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True, reason="repair of target-side edits needs plan-2 evidence on iCloud etag behaviour"
-)
 async def test_manual_target_edit_is_repaired(tmp_path: Path) -> None:
-    """Someone moves a reminder on the phone; the client keeps X-CALSYNC-HASH. Today only an
-    edit that drops or changes the hash is overwritten (see spec §2)."""
+    """Someone moves a reminder on the phone; the client keeps X-CALSYNC-HASH. The next cycle writes
+    the source version back."""
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
@@ -568,3 +565,154 @@ async def test_manual_target_edit_is_repaired(tmp_path: Path) -> None:
     res = (await h.engine.cycle()).rules["family"]
     assert res.updated == 1
     assert b"MOVED" not in target.objects[href][1]
+    assert res.reverted == 1
+    assert (await h.engine.cycle()).rules["family"].updated == 0  # converged
+
+
+MOVE_FROM, MOVE_TO = (
+    b"DTSTART;TZID=Asia/Shanghai:20261025T080000",
+    b"DTSTART;TZID=Asia/Shanghai:20261025T083000",
+)
+
+
+def move_pills_on_target(h: FakeHarness) -> str:
+    """Move the start of the "pills" copy by 30 minutes, keeping our marker (like a phone)."""
+    href = copy_href(h, "pills")
+    data = h.target.objects[href][1]
+    edited = data.replace(MOVE_FROM, MOVE_TO)
+    assert edited != data and b"X-CALSYNC-HASH" in edited
+    h.target.put(href, edited)
+    return href
+
+
+async def test_copy_deleted_on_target_is_recreated(tmp_path: Path) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    cal = target.calendars["Family"]
+    href = next(iter(target.managed(cal)))
+    target.remove(href)
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.created == 1 and res.deleted == 0
+    assert href in target.managed(cal)
+
+
+async def test_alarm_dismissed_on_phone_is_not_rewritten(tmp_path: Path) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    cal = target.calendars["Family"]
+    href, data = next(iter(target.managed(cal).items()))
+    target.put(href, data.replace(b"BEGIN:VALARM\r\n", b"BEGIN:VALARM\r\nACKNOWLEDGED:20261025T000500Z\r\n"))
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.updated == 0 and res.reverted == 0
+    assert (await h.engine.cycle()).rules["family"].updated == 0
+
+
+def forget_state(h: FakeHarness, tmp_path: Path) -> None:
+    """Lose the local state like a wiped state directory (WAL side files included)."""
+    h.store.close()
+    for suffix in ("", "-wal", "-shm"):
+        (tmp_path / f"state.db{suffix}").unlink(missing_ok=True)
+
+
+async def test_lost_state_does_not_rewrite_unchanged_copies(tmp_path: Path) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    forget_state(h, tmp_path)
+    h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    res = (await h2.engine.cycle()).rules["family"]
+    assert (res.created, res.updated, res.reverted) == (0, 0, 0)
+
+
+async def test_lost_state_reverts_a_copy_edited_meanwhile(tmp_path: Path) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = move_pills_on_target(h)
+    forget_state(h, tmp_path)
+    h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    res = (await h2.engine.cycle()).rules["family"]
+    assert (res.created, res.updated, res.reverted) == (0, 1, 1)
+    assert MOVE_FROM in target.objects[href][1]
+
+
+async def test_unreadable_digest_is_not_treated_as_an_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If calsync cannot digest a body it never starts rewriting it (no loops on parser limits)."""
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = move_pills_on_target(h)
+    monkeypatch.setattr("calsync.engine.content_digest", lambda data: None)
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.updated, res.reverted) == (0, 0)
+    assert MOVE_TO in target.objects[href][1]
+
+
+async def test_edit_on_a_protected_series_is_not_reverted(tmp_path: Path) -> None:
+    fake = simple()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, fake, config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = move_pills_on_target(h)
+    broken = google_event("pills", "Reminders", "2026-10-25T08:00:00+08:00", "2026-10-25T08:05:00+08:00")
+    del broken["start"]
+    fake.put_event(GCAL, broken)
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.protected == 1 and (res.updated, res.reverted, res.deleted) == (0, 0, 0)
+    assert MOVE_TO in target.objects[href][1]
+
+
+async def test_source_change_wins_over_a_target_edit(tmp_path: Path) -> None:
+    fake = simple()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, fake, config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = move_pills_on_target(h)
+    fake.put_event(
+        GCAL, google_event("pills", "Reminders", "2026-10-25T09:00:00+08:00", "2026-10-25T09:05:00+08:00")
+    )
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.updated, res.reverted) == (1, 0)  # an ordinary update, not a revert
+    assert b"20261025T090000" in target.objects[href][1]
+
+
+async def test_dry_run_plans_the_revert_and_the_next_run_writes_it(tmp_path: Path) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = move_pills_on_target(h)
+    dry = (await h.engine.cycle(dry_run=True)).rules["family"]
+    assert dry.plan is not None and len(dry.plan.update) == 1
+    assert (dry.updated, dry.reverted) == (0, 0)
+    assert MOVE_TO in target.objects[href][1]
+    # Detection consumed the change during the dry run; the edit must still be reverted, also by
+    # a fresh process reading the saved state.
+    h.store.close()
+    h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    res = (await h2.engine.cycle()).rules["family"]
+    assert res.updated == 1
+    assert MOVE_FROM in target.objects[href][1]
+    assert (await h2.engine.cycle()).rules["family"].updated == 0
+
+
+async def test_failed_revert_counts_as_failed_and_is_retried(tmp_path: Path) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = move_pills_on_target(h)
+
+    def refuse(op: str, path: str) -> None:
+        raise TransientError("PUT timed out")
+
+    h.target.before_write = refuse
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.updated, res.reverted, res.failed) == ("failed", 0, 0, 1)
+    assert MOVE_TO in target.objects[href][1]
+    h.target.before_write = None
+    again = (await h.engine.cycle()).rules["family"]
+    assert (again.status, again.updated) == ("ok", 1)
+    assert MOVE_FROM in target.objects[href][1]

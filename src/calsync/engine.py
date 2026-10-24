@@ -8,7 +8,7 @@ up exactly where the last one stopped.
 import asyncio
 import logging
 from collections import defaultdict
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -20,7 +20,7 @@ from calsync.mirror import Mirror, apply_pull
 from calsync.model import Window, apply_alarm_policy, apply_field_policy, series_hash, series_span
 from calsync.naming import object_id, parse_resource_name, resource_name, rule_tag, uid_for
 from calsync.planner import Actual, Desired, Plan, check_delete_guard, plan
-from calsync.render import inspect, render
+from calsync.render import content_digest, inspect, render
 from calsync.sources.base import CalendarMeta, Source
 from calsync.store import RunRecord, Store
 from calsync.targets.base import (
@@ -52,6 +52,7 @@ class RuleResult:
     status: Status = "ok"
     created: int = 0
     updated: int = 0
+    reverted: int = 0  # copies edited on the target and written back (counted in updated)
     deleted: int = 0
     failed: int = 0
     error: str | None = None
@@ -127,6 +128,8 @@ class Engine:
         self._calendars: dict[TargetKey, TargetCalendar] = {}
         self._caches: dict[tuple[str, str], TargetCache] = {}
         self._warned_degraded: set[tuple[str, str]] = set()  # (rule, source id), once per process
+        # (account, href) -> content_digest of a managed body read by detection this cycle
+        self._fresh: dict[tuple[str, str], str | None] = {}
 
     # ----- phase 1: ingest ---------------------------------------------
     async def _ingest(self, account: str, rules: list[Rule]) -> dict[str, Exception]:
@@ -197,6 +200,7 @@ class Engine:
             if name is None:
                 continue
             found = inspect(obj.data)
+            self._fresh[(account, obj.href)] = content_digest(obj.data)
             cache.objects[obj.href] = CachedObject(
                 etag=obj.etag,
                 rule_tag=name[0],
@@ -276,6 +280,14 @@ class Engine:
         # delete); a degraded one without a copy is still created from its parseable part.
         protected = (unparsed | incomplete) & actual.keys()
         result.protected = len(protected)
+        foreign = self._foreign_edits(rule, actual, desired, protected, window)
+        if foreign:
+            # Marked in the cache and saved now (also in a dry run): detection has already
+            # consumed the change, so a dry run or a failed write must not forget the edit.
+            for oid in foreign:
+                have = actual[oid] = replace(actual[oid], content_hash=None)
+                cache.objects[have.href] = replace(cache.objects[have.href], content_hash=None)
+            self._store.save_target_cache(rule.target.account, cal.href, cache)
         result.plan = plan(desired, actual, window, frozenset(protected))
         result.out_of_window = result.plan.out_of_window
         # The guard counts only non-protected actuals.
@@ -288,7 +300,48 @@ class Engine:
             )
             return
         if not dry_run and not result.plan.empty:
-            await self._push(rule, cal, cache, result.plan, result)
+            await self._push(rule, cal, cache, result.plan, result, foreign)
+
+    def _foreign_edits(
+        self,
+        rule: Rule,
+        actual: Mapping[str, Actual],
+        desired: Mapping[str, Desired],
+        protected: Set[str],
+        window: Window,
+    ) -> set[str]:
+        """Copies read this cycle whose visible content differs from what we would write
+        although their marker says they are current: someone edited them on the target."""
+        found: set[str] = set()
+        now = self._clock()
+        for oid, have in actual.items():
+            key = (rule.target.account, have.href)
+            want = desired.get(oid)
+            if key not in self._fresh or want is None or oid in protected:
+                continue
+            if have.content_hash != want.content_hash or not window.intersects(want.span):
+                continue  # the source changed too (a normal update follows), or out of reach
+            seen = self._fresh[key]
+            if seen is None:
+                continue  # unreadable to us: never start rewriting on a parser limitation
+            expected = content_digest(
+                render(
+                    want.series,
+                    uid=uid_for(oid),
+                    rule_name=rule.name,
+                    content_hash=want.content_hash,
+                    now=now,
+                )
+            )
+            if expected is not None and seen != expected:
+                found.add(oid)
+        if found:
+            log.info(
+                "rule %s: %d copy(ies) edited on the target, writing the source version back",
+                rule.name,
+                len(found),
+            )
+        return found
 
     async def _titles(self, rule: Rule, cal: TargetCalendar, deletes: list[Actual]) -> tuple[list[str], bool]:
         """SUMMARY of each planned delete and whether every one was read; only blocked rules pay."""
@@ -307,7 +360,13 @@ class Engine:
         return listed, len(listed) == len(deletes) and not unreadable
 
     async def _push(
-        self, rule: Rule, cal: TargetCalendar, cache: TargetCache, p: Plan, result: RuleResult
+        self,
+        rule: Rule,
+        cal: TargetCalendar,
+        cache: TargetCache,
+        p: Plan,
+        result: RuleResult,
+        reverted_ids: set[str],
     ) -> None:
         target = self._targets[rule.target.account]
         tag = rule_tag(rule.name)
@@ -364,6 +423,8 @@ class Engine:
                     etag = await target.update(have.href, found.etag, data)
             remember(have.href, etag, want)
             result.updated += 1
+            if want.object_id in reverted_ids:
+                result.reverted += 1
 
         async def delete(have: Actual) -> None:
             try:
@@ -414,6 +475,7 @@ class Engine:
         results = {r.name: RuleResult(r.name) for r in selected}
         for target in self._targets.values():
             target.reset()
+        self._fresh.clear()
 
         by_source: dict[str, list[Rule]] = defaultdict(list)
         for rule in selected:

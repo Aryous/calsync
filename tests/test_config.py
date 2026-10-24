@@ -290,3 +290,22 @@ def test_bad_fields_reported_with_other_problems_of_the_rule(tmp_path: Path) -> 
     text = "\n".join(info.value.problems)
     assert "rules[family].fields.content" in text
     assert "rules[family].delete_guard.max_count" in text
+
+
+def test_on_target_edit_default_and_rejects_others(tmp_path: Path) -> None:
+    assert parse_config(copy.deepcopy(VALID), tmp_path).rules[0].on_target_edit == "revert"
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["on_target_edit"] = "keep"
+    with pytest.raises(ConfigError) as err:
+        parse_config(data, tmp_path)
+    assert 'rules[family].on_target_edit: only "revert" is supported' in err.value.problems
+
+
+def test_bad_on_target_edit_reported_with_other_problems_of_the_rule(tmp_path: Path) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["on_target_edit"] = "keep"
+    data["rules"][0]["fields"] = {"content": "hidden"}
+    with pytest.raises(ConfigError) as err:
+        parse_config(data, tmp_path)
+    text = "\n".join(err.value.problems)
+    assert "rules[family].on_target_edit" in text and "rules[family].fields.content" in text

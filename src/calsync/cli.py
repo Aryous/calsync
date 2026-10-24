@@ -219,6 +219,8 @@ def _print_cycle(result: "CycleResult", out: TextIO, verbose: bool) -> None:
             line += f" degraded={r.degraded}"
         if r.out_of_window:
             line += f" out_of_window={r.out_of_window}"
+        if r.reverted:
+            line += f" reverted={r.reverted}"
         if r.error:
             line += f" error={r.error!r}"
         out.write(line + "\n")

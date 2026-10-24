@@ -68,6 +68,7 @@ class Rule:
     alarms: AlarmPolicy
     delete_guard: DeleteGuard
     fields: FieldPolicy = field(default_factory=FieldPolicy)
+    on_target_edit: Literal["revert"] = "revert"  # a copy edited on the target is written back
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +369,8 @@ def _rule(index: int, raw: Any, accounts: Mapping[str, Account], problems: list[
         ),
     )
     fields = _fields(raw.get("fields"), f"{where}.fields", problems)
+    if raw.get("on_target_edit", "revert") != "revert":
+        problems.append(f'{where}.on_target_edit: only "revert" is supported')
     if source is None or target is None or not window_ok:
         return None
     return Rule(name, source, target, window, alarms, guard, fields)
