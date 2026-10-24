@@ -71,6 +71,12 @@ calsync run --dry-run                           # show the plan
 calsync run                                     # one sync cycle
 ```
 
+Known limitation: sync is one way, but a manual edit of a synced event on the
+target (e.g. moving it on the iPhone) is only overwritten when the edit drops
+or changes the event's `X-CALSYNC-HASH` property. Most clients keep it, so such
+an edit stays until the source event changes again. Full repair is planned
+once plan 2 has verified how iCloud treats these edits.
+
 `calsync run --allow-deletes` lets one cycle through the mass-delete guard.
 
 A blocked mass delete prints the titles of the events it would delete.

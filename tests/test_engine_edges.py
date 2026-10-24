@@ -543,3 +543,28 @@ async def test_forbidden_detection_is_not_an_auth_failure(tmp_path: Path) -> Non
     h.target.fail_changes["Family"] = ForbiddenError("REPORT /cal/: HTTP 403 {DAV:}need-privileges")
     res = (await h.engine.cycle()).rules["family"]
     assert res.status == "failed" and res.error_kind == "other"
+
+
+# ----- known limitation: target-side edits ----------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True, reason="repair of target-side edits needs plan-2 evidence on iCloud etag behaviour"
+)
+async def test_manual_target_edit_is_repaired(tmp_path: Path) -> None:
+    """Someone moves a reminder on the phone; the client keeps X-CALSYNC-HASH. Today only an
+    edit that drops or changes the hash is overwritten (see spec §2)."""
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    await h.engine.cycle()
+    cal = target.calendars["Family"]
+    href, data = next(iter(target.managed(cal).items()))
+    edited = data.replace(b"SUMMARY:Reminders", b"SUMMARY:Reminders MOVED").replace(
+        b"SUMMARY:Checkup", b"SUMMARY:Checkup MOVED"
+    )
+    assert edited != data and b"X-CALSYNC-HASH" in edited
+    target.put(href, edited)
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.updated == 1
+    assert b"MOVED" not in target.objects[href][1]
