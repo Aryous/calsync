@@ -80,9 +80,19 @@ async def test_idle_cycle_records_no_change(tmp_path: Path) -> None:
 
 
 async def test_dry_run_records_no_change(tmp_path: Path) -> None:
-    h = build_fake(tmp_path, standup_and_lunch(), config_for([rule()]))
-    await h.engine.cycle(dry_run=True)
-    assert changes(tmp_path) == []
+    fake = standup_and_lunch()
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    mark = last_id(tmp_path)
+    fake.put_event(
+        GCAL,
+        google_event("standup", "Weekly review", "2026-10-26T09:00:00+08:00", "2026-10-26T09:15:00+08:00"),
+    )
+    res = (await h.engine.cycle(dry_run=True)).rules["family"]
+    assert res.plan is not None and len(res.plan.update) == 1  # planned, not written
+    assert changes(tmp_path, mark) == []
+    await h.engine.cycle()
+    assert changes(tmp_path, mark) == [(oid("standup"), "updated", "Weekly review")]
 
 
 async def test_target_edit_written_back_is_recorded_as_reverted(tmp_path: Path) -> None:
