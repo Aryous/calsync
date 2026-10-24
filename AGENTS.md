@@ -25,6 +25,7 @@ relative's iPhone. That use case sets the priorities:
 | Document | Role |
 | --- | --- |
 | `docs/superpowers/specs/2026-10-23-calsync-design.md` | design spec (v3, in sync with the code). Wins over everything else; if code and spec disagree, report it |
+| `docs/superpowers/specs/2026-10-24-calsync-v2-product-design.md` | phase-2 design (full sync, daemon, web UI). Wins over v3 where they conflict; its §10 lists the affected v3 sections |
 | `docs/superpowers/plans/2026-10-24-calsync-core-engine.md` | plan 1, executed. Historical: the code has been hardened well beyond its verbatim listings |
 | `docs/ROADMAP.md` | what is done, next, later; product decisions for the web UI |
 | `README.md` | user-facing behaviour; keep it accurate when behaviour changes |

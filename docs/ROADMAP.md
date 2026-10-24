@@ -19,57 +19,41 @@ tested merge to `main`.
 
 ## Next
 
-### Plan 2 — real-service verification
+The phase-2 design is in
+[`docs/superpowers/specs/2026-10-24-calsync-v2-product-design.md`](superpowers/specs/2026-10-24-calsync-v2-product-design.md)
+(product principles, decisions D1–D17, three blocks built in order).
 
-Measure what iCloud actually does and close the gaps that depend on it
-(design spec §13). In priority order:
+### Plan 2 — block ①: sync engine adjustments
 
-1. Edits made on the target (iOS): does the body keep `X-CALSYNC-HASH`, does
-   the etag change after our own PUT? Decides how to repair target-side edits
-   (pinned by the strict xfail `test_manual_target_edit_is_repaired`).
-2. Wrong or revoked app-specific password: 401 or 403?
-3. Alerts on a calendar shared to another Apple ID. **Measured 2026-10-24
-   (spec §13 item 1):** the sharer's alerts do not reach the sharee. The
-   sharee only gets alerts from their own iPhone's Default Alert Times, and
-   only with notifications for the Calendar app enabled; early and multiple
-   alerts are lost. Still to verify: writing directly into the family
-   member's own account (experiment B), which is the recommended setup for
-   "sync to family".
-4. `MKCALENDAR` support, ETag on PUT, HTTP/2, the remaining §13 items.
+- Full sync by default; the time window becomes an optional advanced setting.
+- Configurable field policy (`fields`: attendees into notes, conference link,
+  busy-only mode).
+- `on_target_edit = "revert"`: edits made on the target (e.g. on an iPhone)
+  are reverted to the source on the next cycle; deleted copies are recreated.
+  First task: measure on iCloud whether phone edits keep `X-CALSYNC-HASH`
+  and whether PUT returns an `ETag` (experiments E1, E2).
+- Still open from the first real run: 401 vs 403 for a bad app-specific
+  password; writing into a family member's own account (E5); `MKCALENDAR`.
+- Already measured (2026-10-24, spec v3 §13 item 1): alerts on a calendar
+  shared to another Apple ID do not reach the sharee.
 
-### Plan 3 — background service and alerts
+### Plan 3 — block ②: background service and notifications
 
-- `calsync daemon` (asyncio, interval + jitter, per-rule backoff, signals),
-  `calsync trigger`, `calsync status`.
-- Alerts via Bark / webhook (`[notify]`), including blocked deletes with
-  titles and series held as protected/degraded.
-- launchd install (`calsync service install`) and a Docker image; first
-  deployment target is a home server (Mac mini).
-- Persist `protected` / `degraded` / blocked titles in run history.
+- `calsync daemon` with a local control socket; the CLI acts as its client
+  (`trigger`, `status`, `upcoming`, `changes`, `approve`, `pause`/`resume`),
+  every command with `--json` for Agents.
+- Config hot reload and safe writes (comment-preserving, validated,
+  conflict-checked, atomic, backed up, attributed).
+- Change history (`change`, `config_change` tables); Bark and webhook
+  notifications; `calsync service install` for launchd; Mac mini deployment.
 
-### Plan 4 — self-hosted web UI (product direction agreed, design pending)
+### Plan 4 — block ③: web UI v1
 
-Decisions so far:
-
-- **Form:** a self-hosted web UI served by the calsync service and opened from
-  any browser on the network, in the spirit of Home Assistant / Syncthing.
-  Visual language inspired by keeper.sh: each sync shown as
-  *service · account · calendar → service · account · calendar*.
-- **Users:** single administrator in the first version, but accounts and
-  rules carry an owner from day one so n8n-style multi-user can be added
-  without a data migration.
-- **Google sign-in:** users keep bringing their own OAuth client; the UI
-  provides a step-by-step wizard (screenshots, deep links, where to paste
-  what). No Google app verification for now.
-- **iCloud:** app-specific passwords cannot be avoided (Apple offers no OAuth
-  for CalDAV); the UI links straight to the right Apple page.
-- **Sync to family:** the wizard defaults to writing into the family
-  member's own account. If the user picks "my calendar, shared with them"
-  instead, the UI says plainly that the other person will not get these
-  alerts, only their own default alert.
-
-Open: page layout and flows (next brainstorming step), tech stack, how the UI
-and the CLI share configuration.
+- Served by the daemon (Starlette), Preact + htm without a build step, usable
+  over plain HTTP (Tailscale or Surge Ponte), phone-first for viewing pages.
+- Pairing by key link / QR code; secrets entered only on localhost or HTTPS.
+- Pages: overview (connection map, status, attention cards, next 24 hours),
+  rule detail, run history, settings, onboarding wizard.
 
 ## Later
 
