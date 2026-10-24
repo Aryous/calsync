@@ -174,7 +174,8 @@ def build_series(raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Ser
     exceptions: dict[str, list[RawEvent]] = defaultdict(list)
     for event in raw_events:
         if not event.get("id"):
-            log.warning("skipping entry without id: %r", event.get("summary", ""))
+            # Never log event content (titles, descriptions): only where the entry belongs.
+            log.warning("skipping an entry without id (recurringEventId=%s)", event.get("recurringEventId"))
             continue
         parent = event.get("recurringEventId")
         if parent:

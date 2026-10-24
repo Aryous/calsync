@@ -80,20 +80,37 @@ class RefreshTokenProvider:
             response = await request_with_retry(
                 self._client, "POST", self._url, kind="google-token", data=self._form
             )
-            if response.status_code in (400, 401):
-                raise AuthError(f"Google refused the refresh token: {response.text[:200]}")
-            if response.status_code >= 400:
-                raise TransientError(f"Google token endpoint: HTTP {response.status_code}")
-            try:
-                data = response.json()
-                token = data["access_token"]
-            except (ValueError, KeyError, TypeError):
-                raise AuthError("Google token response has no usable access_token") from None
-            if not isinstance(token, str) or not token:
-                raise AuthError("Google token response has an empty access_token")
+            token, lifetime = _parse_token_response(response)
             self._token = token
-            self._expires_at = self._clock() + float(data.get("expires_in", 3600))
+            self._expires_at = self._clock() + lifetime
             return token
+
+
+def _parse_token_response(response: httpx.Response) -> tuple[str, float]:
+    """(access token, lifetime in seconds). Only an OAuth error from Google itself (a JSON
+    ``error`` on 400/401, e.g. invalid_grant) is an AuthError; anything else that is not a
+    usable token - a captive portal, a proxy page, a mangled body - is transient."""
+    status = response.status_code
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if status in (400, 401) and isinstance(data, dict) and isinstance(data.get("error"), str):
+        detail = data.get("error_description")
+        reason = f"{data['error']}: {detail}" if isinstance(detail, str) else data["error"]
+        raise AuthError(f"Google refused the refresh token: {reason}")
+    if status >= 400:
+        raise TransientError(f"Google token endpoint: HTTP {status}")
+    if not isinstance(data, dict):
+        raise TransientError(f"Google token endpoint: HTTP {status} without a JSON body")
+    token = data.get("access_token")
+    try:
+        lifetime = float(data.get("expires_in", 3600))
+    except (TypeError, ValueError):
+        lifetime = None
+    if not isinstance(token, str) or not token or lifetime is None:
+        raise TransientError("Google token endpoint: response has no usable access_token")
+    return token, lifetime
 
 
 def load_client_secret(path: Path) -> tuple[str, str]:

@@ -326,15 +326,52 @@ async def test_refresh_provider_default_clock_is_wall_clock() -> None:
     assert provider._clock is time.time  # pyright: ignore[reportPrivateUsage]
 
 
-async def test_token_response_without_access_token_is_auth_error() -> None:
-    provider = RefreshTokenProvider(
-        make_client(RequestLog(), transport=httpx.MockTransport(lambda r: httpx.Response(200, json={}))),
+def token_provider(response: httpx.Response) -> RefreshTokenProvider:
+    return RefreshTokenProvider(
+        make_client(RequestLog(), transport=httpx.MockTransport(lambda r: response)),
         client_id="c",
         client_secret="s",
         refresh_token="r",
     )
-    with pytest.raises(AuthError, match="access_token"):
-        await provider()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"access_token": ""}),
+        httpx.Response(200, json={"access_token": 42}),
+        httpx.Response(200, json=["access_token"]),
+        httpx.Response(200, json={"access_token": "a", "expires_in": "soon"}),
+        httpx.Response(200, content=b"<html>captive portal</html>"),
+        httpx.Response(401, content=b"<html>proxy login</html>"),
+        httpx.Response(400, content=b"Bad Request"),
+        httpx.Response(400, json={"no": "error field"}),
+    ],
+    ids=[
+        "empty",
+        "blank",
+        "not-str",
+        "list",
+        "bad-expiry",
+        "portal-200",
+        "portal-401",
+        "text-400",
+        "json-400",
+    ],
+)
+async def test_unusable_token_response_is_transient_not_auth(response: httpx.Response) -> None:
+    """A captive portal or proxy answering for Google must not read as a revoked token."""
+    with pytest.raises(TransientError):
+        await token_provider(response)()
+
+
+@pytest.mark.parametrize("status", [400, 401])
+@pytest.mark.parametrize("error", ["invalid_grant", "invalid_client", "unauthorized_client"])
+async def test_token_endpoint_oauth_error_is_auth(status: int, error: str) -> None:
+    body = {"error": error, "error_description": "Token has been expired or revoked."}
+    with pytest.raises(AuthError, match=error):
+        await token_provider(httpx.Response(status, json=body))()
 
 
 async def test_non_json_success_body_is_transient() -> None:
