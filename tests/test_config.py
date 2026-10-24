@@ -187,3 +187,25 @@ def test_float_accepted_for_ratio_and_int_for_jitter(tmp_path: Path) -> None:
     cfg = parse_config(data, base_dir=tmp_path)
     assert cfg.runtime.jitter == 0.0
     assert cfg.rules[0].delete_guard.max_count == 5
+
+
+MORE_BAD_VALUES = [
+    ({"runtime__jitter": float("nan")}, "runtime.jitter"),
+    ({"runtime__jitter": 1.0}, "runtime.jitter"),
+    ({"rules__0__delete_guard": {"max_ratio": float("nan")}}, "delete_guard.max_ratio"),
+    ({"rules__0__delete_guard": {"max_ratio": float("inf")}}, "delete_guard.max_ratio"),
+    ({"rules__0__delete_guard": {"max_ratio": 1.5}}, "delete_guard.max_ratio"),
+    ({"notify__failure_threshold": 0}, "notify.failure_threshold"),
+    ({"accounts__family-icloud__max_concurrency": 0}, "accounts.family-icloud.max_concurrency"),
+    ({"rules": 5}, "rules: must be an array of tables (use [[rules]])"),
+    ({"rules": {"name": "x"}}, "rules: must be an array of tables (use [[rules]])"),
+    ({"notify": {"bark_url": 5}}, "notify.bark_url"),
+    ({"notify": {"webhook_url": ["x"]}}, "notify.webhook_url"),
+]
+
+
+@pytest.mark.parametrize(("changes", "expected"), MORE_BAD_VALUES)
+def test_more_malformed_values(tmp_path: Path, changes: dict[str, object], expected: str) -> None:
+    with pytest.raises(ConfigError) as info:
+        parse_config(_mutated(**changes), base_dir=tmp_path)
+    assert expected in "\n".join(info.value.problems)

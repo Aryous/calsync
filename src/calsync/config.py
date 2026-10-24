@@ -5,6 +5,7 @@ in one pass. Nothing in the code refers to a concrete account: everything
 comes from here.
 """
 
+import math
 import os
 import tomllib
 from collections.abc import Mapping
@@ -188,12 +189,22 @@ def _number(
         value: Any = int(raw)
     else:
         value = float(raw)
+    if not math.isfinite(value):
+        problems.append(f"{where}: must be {label}")
+        return default
     too_low = minimum is not None and (value <= minimum if exclusive_min else value < minimum)
     too_high = maximum is not None and (value >= maximum if exclusive_max else value > maximum)
     if too_low or too_high:
         problems.append(f"{where}: must be {label}")
         return default
     return value
+
+
+def _optional_str(raw: Any, where: str, problems: list[str]) -> str | None:
+    if raw is None or isinstance(raw, str):
+        return raw
+    problems.append(f"{where}: must be a string")
+    return None
 
 
 def _account(name: str, raw: Any, problems: list[str]) -> Account | None:
@@ -335,8 +346,8 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:
 
     notify_raw = _table(data.get("notify"), "notify", problems)
     notify = NotifyConfig(
-        bark_url=notify_raw.get("bark_url"),
-        webhook_url=notify_raw.get("webhook_url"),
+        bark_url=_optional_str(notify_raw.get("bark_url"), "notify.bark_url", problems),
+        webhook_url=_optional_str(notify_raw.get("webhook_url"), "notify.webhook_url", problems),
         failure_threshold=_number(
             notify_raw.get("failure_threshold"),
             "notify.failure_threshold",
@@ -373,7 +384,13 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:
 
     rules: list[Rule] = []
     seen: set[str] = set()
-    for index, raw in enumerate(data.get("rules") or []):
+    rules_raw = data.get("rules")
+    if rules_raw is None:
+        rules_raw = []
+    elif not isinstance(rules_raw, list):
+        problems.append("rules: must be an array of tables (use [[rules]])")
+        rules_raw = []
+    for index, raw in enumerate(rules_raw):
         rule = _rule(index, raw, accounts, problems)
         if rule is None:
             continue
