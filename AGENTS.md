@@ -55,7 +55,7 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
 | `naming.py` | `rule_tag`, `object_id`, resource name `calsync-<8hex>-<24hex>.ics`, UID `<id>@calsync` |
 | `render.py` | Series → iCalendar bytes (VTIMEZONE, RRULE/EXDATE/RDATE, RECURRENCE-ID overrides each with own VALARMs, `URL`, `X-CALSYNC-RULE` / `X-CALSYNC-HASH`); `inspect()` reads them back and never raises; `content_digest()` hashes only what a person sees (ignores DTSTAMP, SEQUENCE, X- properties, property/event order, VTIMEZONE text, zone labels on RECURRENCE-ID/EXDATE/RDATE, alarm ACTION/DESCRIPTION and phone alarm bookkeeping); `None` for unreadable bodies, never raises |
 | `planner.py` | pure `plan(desired, actual, window, protected)` (counts `out_of_window`); `check_delete_guard` (ratio only from 3 deletions on) |
-| `engine.py` | one cycle; per-calendar/per-rule isolation; protected/degraded handling; cursor hold; delete-guard titles; full sync when `rule.window is None`; `_classify_reads` compares a read body's digest with the digest of what we would write: equal → adopted as current whatever the marker says (no write); different with a current marker → `reverting` (the update that follows counts as `reverted`); different with no or another marker → ordinary update; rewrite-loop breaker: a copy reverted `REVERT_LIMIT` (3) times within `REVERT_WINDOW` (6 h) that differs again is adopted instead for `REVERT_HOLD` (24 h), one warning (rule + object id) per hold |
+| `engine.py` | one cycle; per-calendar/per-rule isolation; protected/degraded handling; cursor hold; delete-guard titles; full sync when `rule.window is None`; `_classify_reads` compares a read body's digest with the digest of what we would write: equal → adopted as current whatever the marker says (no write); different while the recorded hash (what we wrote or adopted; `_detect` keeps it for known hrefs, only a cache miss takes the body's marker) is current, or a revert is pending → `reverting` (the update that follows counts as `reverted`); different with an outdated or unknown recorded hash → ordinary update; rewrite-loop breaker: a copy reverted `REVERT_LIMIT` (3) times within `REVERT_WINDOW` (6 h) that differs again is adopted instead for `REVERT_HOLD` (24 h), one warning (rule + object id) per hold; when the hold ends the copy becomes `reverting` with an unknown hash (no body read), so the source version is written back once, counted as a revert |
 | `store.py` | SQLite (WAL, 0600): `source_state`, `source_event`, `target_calendar` (keyed by account+ref), `target_object` (incl. `verify_digest`, `reverting`, `revert_times`, `hold_until`), `run` (500 per rule), `alert`; `SCHEMA_VERSION` 3; schema mismatch → rebuild; corrupt DB → quarantined |
 | `sources/google.py` | REST client: calendarList + events.list with `syncToken`, 410 → full resync, request-params fingerprint (`events_params` state key) → full resync when `EVENTS_LIST_PARAMS` change, attendees and conference data requested, per-calendar `SourcePull.errors`, 403 rate limit → transient, 401 → one refresh + retry |
 | `targets/dav.py` | PROPFIND/REPORT/PUT/DELETE/MKCALENDAR, manual redirects, absolute hrefs, error mapping (401 auth, 403 `ForbiddenError`, `valid-sync-token` → `CursorExpired`, 412 conflict) |
@@ -158,14 +158,27 @@ uv run ruff check src tests && uv run ruff format --check src tests && uv run py
 - Digest equality wins over the marker. iOS may drop or keep a stale
   `X-CALSYNC-HASH` when it saves a snooze; a read copy whose visible content
   equals what we would write is adopted (desired hash and span cached), never
-  rewritten. The marker only decides between "edited on the target" (revert)
-  and "source changed" (ordinary update) once the digests differ.
+  rewritten.
+- The body's marker never classifies a copy we already know. `_detect` keeps
+  the cached `content_hash` (what we last wrote or adopted) and `reverting`
+  for a known href and takes the marker only on a cache miss (cold start,
+  lost state); an unparseable body gets `None` (rewritten). Once the digests
+  differ, the recorded hash decides between "edited on the target" (revert,
+  counts toward the breaker) and "source changed" (ordinary update).
+  Overwriting it from the body would let a target that strips the marker
+  turn every edit into an uncounted update. Detection logs (counts only) how
+  many known copies came back with no or another marker — the iOS check.
 - Rewrite-loop breaker: a server or phone that rewrites visible content after
   every write would otherwise be reverted every cycle. The breaker uses the
   engine's injected clock, is persisted on `CachedObject`, and must be carried
   wherever a `CachedObject` is rebuilt (`_detect`, `remember()`). It only
-  holds reverts (marker current, digest differs); a source change is still
-  written during a hold.
+  holds reverts (recorded hash current, digest differs); a source change is
+  still written during a hold. A held copy is recorded as current, so the hold
+  must end with a write: `_classify_reads` turns an expired hold into
+  `reverting` with `content_hash=None` (no body read, request budget
+  unchanged); that write counts as one revert (`revert_times` was emptied when
+  the hold started, so it cannot start a new hold by itself). Digest equality
+  clears a hold. A protected copy keeps its hold until it is readable again.
 - Changing `EVENTS_LIST_PARAMS` (e.g. `EVENT_FIELDS`) changes the
   `events_params` fingerprint and forces a full pull of every source calendar
   once; changing rendered bytes needs a `RENDER_VERSION` bump. A bump rewrites
