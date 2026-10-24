@@ -1098,8 +1098,9 @@ git add -A && git commit -m "docs: full sync, field policy and target-edit rever
 Not for a subagent: it touches the user's real calendars and phone.
 
 1. `uv tool install --reinstall --editable ~/Code/calsync` (the launchd job picks it up on its next run).
-2. With the user's approval, remove `window` from the local rule in `~/.config/calsync/config.toml`; `calsync config check`; `calsync run --dry-run` and review: expect a full Google resync, every managed series updated once (RENDER_VERSION 2 and new model fields), and the previously out-of-window events created.
-3. `calsync run`; then confirm the next cycle is idle (`requests` back to the idle count, `updated=0`).
-4. E1 on the iPhone: move one future event's time in the synced iCloud calendar; within one cycle `reverted=1` appears in `~/Library/Logs/calsync/calsync.log` and the phone shows the source time again.
-5. Snooze check: when an alert fires on the phone, snooze it; the following cycles must not report `reverted` for that event, and the snoozed alert must still fire.
-6. Record E1 and the snooze result in v3 spec §13 item 10 and in `docs/ROADMAP.md`.
+2. Before touching the real state, a throwaway-state dry run: `calsync --state-dir "$(mktemp -d)" run --dry-run` (same config and credentials, a fresh state directory, so it is a cold start that reads every managed body; the real state stays untouched). Expect no `~` (update) lines for events that were not changed in Google and have no attendees or conference link: their copies show the source version already and are adopted. A `~` line for such an event means the digest sees a difference that a person does not — stop and investigate before step 3.
+3. With the user's approval, remove `window` from the local rule in `~/.config/calsync/config.toml`; `calsync config check`; `calsync run --dry-run` and review: expect a full Google resync, the state rebuilt (SCHEMA_VERSION 3, run history cleared), updates only for series whose visible content changed (attendee or conference lines, `URL`), and the previously out-of-window events created.
+4. `calsync run`; then confirm the next cycle is idle (`requests` back to the idle count, `updated=0`).
+5. E1 on the iPhone: move one future event's time in the synced iCloud calendar; within one cycle `reverted=1` appears in `~/Library/Logs/calsync/calsync.log` and the phone shows the source time again.
+6. Snooze check, twice: once on a single event and once on one instance of a recurring daily event. When the alert fires on the phone, snooze it; the following cycles must report `updated=0` and `reverted=0` for that rule (no write at all, not only no revert), and the snoozed alert must fire again. Note whether the log shows "carry no or an outdated marker" (iOS dropped or kept `X-CALSYNC-HASH`) — either is safe now, but record which.
+7. Record E1 and the snooze result in v3 spec §13 item 10 and in `docs/ROADMAP.md`.
