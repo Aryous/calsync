@@ -324,9 +324,12 @@ stale one.
   old rule name are never updated or deleted again; delete them by hand. Two
   installs using the same rule name on the same target calendar would fight
   over each other's events.
-- **Alerts on shared iCloud calendars.** Alerts are stored per user on
-  Apple's servers, so alerts you sync into your own calendar may not fire on
-  the devices of people you share it with. Writing into their account works.
+- **Alerts on shared iCloud calendars.** Apple stores alerts per user, so
+  alerts synced into your calendar do not reach the people you share it
+  with. On their iPhone the shared events get only their own Default Alert
+  Time (Settings → Apps → Calendar), so "at time of event" works, but early or
+  multiple alerts are lost. To deliver every alert, sync directly into a
+  calendar in their own account (add their iCloud account and a second rule).
 - **Sources are Google only, targets CalDAV only** for now.
 
 ## Troubleshooting
@@ -338,6 +341,8 @@ stale one.
 | Google sign-in says "access blocked" | your account is not a test user of a "Testing" consent screen; publish it or add yourself |
 | `status=blocked` | the mass-delete guard fired; check the printed titles, then `calsync run --rule NAME --allow-deletes` if intended |
 | exit code 4 | another `calsync run` holds the lock; wait for it |
+| events arrive on a family member's iPhone but no alert fires | check, in order: notifications for the Calendar app are on (Settings → Notifications → Calendar); the calendar's own Event Alerts switch is on; the calendar is shared rather than in their account, in which case only their Default Alert Time applies (see Known limitations) |
+| no alert while the Calendar app is open | expected: iOS shows the alert inside the app instead of as a notification |
 | behind a proxy | set `HTTPS_PROXY`; calsync honours the standard proxy variables |
 
 ## Development

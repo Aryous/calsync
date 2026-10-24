@@ -147,9 +147,12 @@ uv run ruff check src tests && uv run ruff format --check src tests && uv run py
 The first real run (Google → iCloud China mainland, recurring series with
 hundreds of per-instance edits, events with up to three alerts) worked end to
 end: discovery across hosts, region detection, sync-collection mode, all alerts
-visible in Apple Calendar, idle second cycle at budget. Still unverified on
-iCloud: repair of edits made on the phone, 401 vs 403 for a bad password,
-alerts on calendars shared to another Apple ID, `MKCALENDAR` (spec §13).
+visible in Apple Calendar, idle second cycle at budget. Measured: alerts on a
+calendar shared to another Apple ID do **not** reach the sharee (per-user
+`VALARM`); the sharee sees only their own iPhone default alert (spec §13
+item 1). Still unverified on iCloud: writing into the family member's own
+account, repair of edits made on the phone, 401 vs 403 for a bad password,
+`MKCALENDAR` (spec §13).
 
 ## 8. Known limitations and debt
 

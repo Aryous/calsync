@@ -28,8 +28,13 @@ Measure what iCloud actually does and close the gaps that depend on it
    the etag change after our own PUT? Decides how to repair target-side edits
    (pinned by the strict xfail `test_manual_target_edit_is_repaired`).
 2. Wrong or revoked app-specific password: 401 or 403?
-3. Alerts on a calendar shared to another Apple ID: do they fire on the
-   sharee's device? Decides the recommended setup for "sync to family".
+3. Alerts on a calendar shared to another Apple ID. **Measured 2026-10-24
+   (spec §13 item 1):** the sharer's alerts do not reach the sharee. The
+   sharee only gets alerts from their own iPhone's Default Alert Times, and
+   only with notifications for the Calendar app enabled; early and multiple
+   alerts are lost. Still to verify: writing directly into the family
+   member's own account (experiment B), which is the recommended setup for
+   "sync to family".
 4. `MKCALENDAR` support, ETag on PUT, HTTP/2, the remaining §13 items.
 
 ### Plan 3 — background service and alerts
@@ -58,6 +63,10 @@ Decisions so far:
   what). No Google app verification for now.
 - **iCloud:** app-specific passwords cannot be avoided (Apple offers no OAuth
   for CalDAV); the UI links straight to the right Apple page.
+- **Sync to family:** the wizard defaults to writing into the family
+  member's own account. If the user picks "my calendar, shared with them"
+  instead, the UI says plainly that the other person will not get these
+  alerts, only their own default alert.
 
 Open: page layout and flows (next brainstorming step), tech stack, how the UI
 and the CLI share configuration.
