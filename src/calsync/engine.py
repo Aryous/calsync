@@ -49,7 +49,8 @@ class RuleResult:
     error: str | None = None
     error_kind: ErrorKind | None = None
     plan: Plan | None = None
-    protected: int = 0  # source series that could not be parsed; their target copy is left alone
+    protected: int = 0  # existing target copies held untouched this cycle (series unparsed or degraded)
+    degraded: int = 0  # series in the source calendar that are unparsed or degraded, copy or not
     blocked_titles: list[str] = field(default_factory=list)  # planned deletes, for the guard alert
     blocked_titles_complete: bool = True  # False: the lookup failed or some bodies were unreadable
 
@@ -116,7 +117,7 @@ class Engine:
         self._resolved: dict[tuple[str, str], str] = {}
         self._calendars: dict[TargetKey, TargetCalendar] = {}
         self._caches: dict[tuple[str, str], TargetCache] = {}
-        self._warned_protected: set[tuple[str, str]] = set()  # (rule, source id), once per process
+        self._warned_degraded: set[tuple[str, str]] = set()  # (rule, source id), once per process
 
     # ----- phase 1: ingest ---------------------------------------------
     async def _ingest(self, account: str, rules: list[Rule]) -> dict[str, Exception]:
@@ -224,15 +225,22 @@ class Engine:
             desired[oid] = Desired(oid, shaped, series_hash(shaped), series_span(shaped))
         unparsed = source.series_ids(raw) - {item.source_id for item in series}
         for sid in sorted(unparsed):
-            self._warn_protected(rule, sid, "could not be parsed")
+            self._warn_degraded(rule, sid, "could not be parsed")
+        for item in series:
+            if item.complete:
+                self._warned_degraded.discard((rule.name, item.source_id))  # warn again if it recurs
+            else:
+                self._warn_degraded(rule, item.source_id, "has instances that could not be parsed")
         return desired, frozenset(object_id(rule.name, cal_id, sid) for sid in unparsed)
 
-    def _warn_protected(self, rule: Rule, source_id: str, why: str) -> None:
+    def _warn_degraded(self, rule: Rule, source_id: str, why: str) -> None:
         """Once per process per (rule, series); names the source id only, never event content."""
-        if (rule.name, source_id) in self._warned_protected:
+        if (rule.name, source_id) in self._warned_degraded:
             return
-        self._warned_protected.add((rule.name, source_id))
-        log.warning("rule %s: source series %s %s; protecting its target copy", rule.name, source_id, why)
+        self._warned_degraded.add((rule.name, source_id))
+        log.warning(
+            "rule %s: source series %s %s; protecting any existing target copy", rule.name, source_id, why
+        )
 
     def _cache_for(self, rule: Rule) -> tuple[TargetCalendar, TargetCache]:
         key = (rule.target.account, rule.target.calendar)
@@ -249,17 +257,15 @@ class Engine:
         }
         window = Window.around(self._clock(), rule.window.past, rule.window.future)
         desired, unparsed = self._desired(rule)
-        # Degraded series (some instance failed to parse) keep an existing copy untouched;
-        # without a copy they are still created from their parseable part.
-        degraded = {oid for oid, want in desired.items() if not want.series.complete and oid in actual}
-        for oid in sorted(degraded):
-            self._warn_protected(
-                rule, desired[oid].series.source_id, "has instances that could not be parsed"
-            )
-        result.protected = len(unparsed) + len(degraded)
-        result.plan = plan(desired, actual, window, unparsed | degraded)
-        # The guard denominator excludes only copies whose series cannot be read at all.
-        deletable = len(actual.keys() - unparsed)
+        incomplete = {oid for oid, want in desired.items() if not want.series.complete}
+        result.degraded = len(unparsed) + len(incomplete)
+        # Unparsed and degraded series keep an existing copy untouched (no update, no
+        # delete); a degraded one without a copy is still created from its parseable part.
+        protected = (unparsed | incomplete) & actual.keys()
+        result.protected = len(protected)
+        result.plan = plan(desired, actual, window, frozenset(protected))
+        # The guard counts only non-protected actuals.
+        deletable = len(actual.keys() - protected)
         reason = None if allow_deletes else check_delete_guard(result.plan, deletable, rule.delete_guard)
         if reason:
             result.status, result.error, result.error_kind = "blocked", reason, "guard"
@@ -321,6 +327,12 @@ class Engine:
                 found = await current(href)
                 if found is None:
                     etag = await target.create(href, data)
+                elif not want.series.complete:
+                    # A copy we could not read before: never overwrite it with a degraded
+                    # series. Cache it with an unknown hash so it stays protected.
+                    cache.objects[href] = CachedObject(found.etag, tag, want.object_id, None, None)
+                    result.protected += 1
+                    return
                 else:
                     etag = await target.update(href, found.etag, data)
             remember(href, etag, want)

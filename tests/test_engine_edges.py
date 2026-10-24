@@ -427,26 +427,31 @@ async def test_degraded_series_keeps_existing_copy(tmp_path: Path, caplog: pytes
         again = (await h.engine.cycle()).rules["family"]
     assert res.status == "ok" and res.protected == 1 and res.plan is not None and res.plan.empty
     assert again.protected == 1 and again.plan is not None and again.plan.empty
+    assert res.degraded == 1 and again.degraded == 1
     assert h.target.objects == before
     warnings = [r.getMessage() for r in caplog.records if "protecting" in r.getMessage()]
     assert len(warnings) == 1 and "pills" in warnings[0] and "Reminders" not in warnings[0]
 
 
-async def test_degraded_series_without_copy_is_created_then_completed(tmp_path: Path) -> None:
+async def test_degraded_series_without_copy_is_created_then_completed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     fake = calendar_with_pills(broken=True)
     h = build_fake(tmp_path, fake, config_for([rule()]))
-    first = (await h.engine.cycle()).rules["family"]
-    assert (first.status, first.created, first.protected) == ("ok", 1, 0)
+    with caplog.at_level(logging.WARNING):
+        first = (await h.engine.cycle()).rules["family"]
+    assert (first.status, first.created, first.protected, first.degraded) == ("ok", 1, 0, 1)
+    assert len([r for r in caplog.records if "pills" in r.getMessage()]) == 1  # engine only, once
     (body,) = h.target.managed(h.target.calendars["Family"]).values()
     assert b"Reminders (late)" not in body
     recurring(fake, broken=False)
     fixed = (await h.engine.cycle()).rules["family"]
-    assert (fixed.status, fixed.updated, fixed.protected) == ("ok", 1, 0)
+    assert (fixed.status, fixed.updated, fixed.protected, fixed.degraded) == ("ok", 1, 0, 0)
     (body,) = h.target.managed(h.target.calendars["Family"]).values()
     assert b"Reminders (late)" in body
 
 
-async def test_degraded_copy_still_counts_in_the_delete_guard(tmp_path: Path) -> None:
+async def test_degraded_copy_is_excluded_from_the_delete_guard(tmp_path: Path) -> None:
     fake = many(3)
     recurring(fake, broken=False)
     h = build_fake(tmp_path, fake, config_for([rule(delete_guard={"max_ratio": 0.8, "max_count": 10})]))
@@ -454,7 +459,60 @@ async def test_degraded_copy_still_counts_in_the_delete_guard(tmp_path: Path) ->
     recurring(fake, broken=True)
     for i in range(3):
         fake.cancel_event(GCAL, f"e{i}")
-    # 3 deletes of 4 managed copies passes max_ratio=0.8; the degraded copy is not excluded.
+    # 3 of 4 managed would pass max_ratio=0.8; 3 of the 3 deletable (non-protected) ones must not.
     res = (await h.engine.cycle()).rules["family"]
-    assert (res.status, res.deleted, res.protected) == ("ok", 3, 1)
-    assert len(h.target.managed(h.target.calendars["Family"])) == 1
+    assert (res.status, res.deleted, res.protected) == ("blocked", 0, 1)
+    assert "3 of 3" in (res.error or "")
+    assert len(h.target.managed(h.target.calendars["Family"])) == 4
+
+
+# ----- fix 4: degraded series vs. the create fallback, counts, warnings ------
+
+
+async def test_create_fallback_never_overwrites_a_copy_with_a_degraded_series(tmp_path: Path) -> None:
+    fake = calendar_with_pills(broken=False)
+    h = build_fake(tmp_path, fake, config_for([rule()]), target=FakeTarget(mode="sync"))
+    await h.engine.cycle()
+    (href,) = h.target.managed(h.target.calendars["Family"])
+    good = h.target.objects[href][1]
+    assert b"Reminders (late)" in good
+    recurring(fake, broken=True)  # one instance now malformed: degraded
+    h.target.put(href, good)  # touched on the target (new etag), same body
+    h.target.hide_once = {href}  # multiget omits it once: not in actual, so the plan creates
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.created, res.updated, res.protected, res.degraded) == ("ok", 0, 0, 1, 1)
+    assert h.target.objects[href][1] == good
+    again = (await h.engine.cycle()).rules["family"]
+    assert again.protected == 1 and again.plan is not None and again.plan.empty
+    assert h.target.objects[href][1] == good
+    recurring(fake, broken=False, title="Reminders (new reminder)")
+    fixed = (await h.engine.cycle()).rules["family"]
+    assert (fixed.status, fixed.updated, fixed.protected, fixed.degraded) == ("ok", 1, 0, 0)
+    assert b"Reminders (new reminder)" in h.target.objects[href][1]
+
+
+async def test_unparsed_series_without_copy_is_degraded_not_protected(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = simple()
+    broken = google_event("walk", "Walk", "2026-10-26T18:00:00+08:00", "2026-10-26T18:30:00+08:00")
+    del broken["start"]
+    fake.put_event(GCAL, broken)
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    with caplog.at_level(logging.WARNING):
+        res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.created, res.protected, res.degraded) == ("ok", 2, 0, 1)
+    warnings = [r.getMessage() for r in caplog.records if "walk" in r.getMessage()]
+    assert len(warnings) == 1 and "Walk" not in warnings[0]
+
+
+async def test_degraded_warning_rearms_after_the_series_parses_again(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = calendar_with_pills(broken=False)
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    with caplog.at_level(logging.WARNING):
+        for broken in (True, True, False, True):
+            recurring(fake, broken=broken)
+            await h.engine.cycle()
+    assert len([r for r in caplog.records if "pills" in r.getMessage()]) == 2

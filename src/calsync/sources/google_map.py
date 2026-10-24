@@ -108,7 +108,9 @@ def _series(master: RawEvent, exceptions: list[RawEvent], meta: CalendarMeta) ->
         for ex in exceptions:
             original = ex.get("originalStartTime")
             if not original:
-                log.warning(
+                # Google guarantees id, recurringEventId and originalStartTime on every
+                # exception (cancelled ones included), so a missing one is genuinely malformed.
+                log.debug(
                     "skipping instance %s of series %s: no originalStartTime", ex.get("id"), master.get("id")
                 )
                 complete = False
@@ -131,7 +133,8 @@ def _series(master: RawEvent, exceptions: list[RawEvent], meta: CalendarMeta) ->
                 )
             except (KeyError, ValueError) as exc:
                 complete = False
-                log.warning(
+                # DEBUG: runs every cycle; the engine warns once per process per series.
+                log.debug(
                     "skipping malformed instance %s of series %s: %s", ex.get("id"), master.get("id"), exc
                 )
     return normalize_series(
@@ -183,7 +186,7 @@ def build_series(raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Ser
         try:
             result.append(_series(master, exceptions.pop(master_id, []), meta))
         except (KeyError, ValueError) as exc:
-            log.warning("skipping malformed event %s: %s", master_id, exc)
+            log.debug("skipping malformed event %s: %s", master_id, exc)  # the engine warns once
     for master_id, orphans in exceptions.items():
         live = [o for o in orphans if o.get("status") != "cancelled"]
         if live:

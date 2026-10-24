@@ -147,9 +147,9 @@ def test_malformed_instance_does_not_drop_series(caplog: pytest.LogCaptureFixtur
     assert s.complete is False  # degraded: one instance was skipped
     (whole,) = build_series([master, good], META)
     assert whole.complete is True
-    assert any(
-        r.levelno == logging.WARNING and "malformed instance" in r.getMessage() for r in caplog.records
-    )
+    # DEBUG: the engine warns once per process per series; this runs every cycle.
+    assert any(r.levelno == logging.DEBUG and "malformed instance" in r.getMessage() for r in caplog.records)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def _orphan(event_id: str, cancelled: bool) -> dict[str, Any]:
