@@ -1,7 +1,10 @@
 """Render a Series to iCalendar bytes, and inspect bytes we (may have) written."""
 
+import hashlib
+import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from icalendar import Alarm as IcalAlarm
 from icalendar import Calendar, Component, Event, vRecur
@@ -161,3 +164,80 @@ def inspect(data: bytes) -> Inspected | None:
         span=span,
         summary=_optional(master, "summary"),
     )
+
+
+def _when_key(value: Any) -> list[Any]:
+    when = when_from_ical(value)
+    return [when.utc().isoformat(), when.tzid, when.all_day]
+
+
+def _dates(component: Component, name: str) -> list[list[Any]]:
+    prop = component.get(name)
+    if prop is None:
+        return []
+    props = prop if isinstance(prop, list) else [prop]
+    # json.dumps as the sort key: tzid may be None, which plain list comparison cannot order
+    return sorted((_when_key(item.dt) for p in props for item in p.dts), key=json.dumps)
+
+
+def _alarm_keys(event: Component) -> list[list[Any]]:
+    """Relative alarms only. Snoozes (RELATED-TO, absolute trigger) and client
+    default alarms are a person's own bookkeeping, not content."""
+    keys: list[list[Any]] = []
+    for alarm in event.subcomponents:
+        if alarm.name != "VALARM" or "related-to" in alarm:
+            continue
+        if str(alarm.get("x-apple-default-alarm", "")).upper() == "TRUE":
+            continue
+        trigger = alarm.get("trigger")
+        if trigger is None:
+            continue
+        offset = alarm.decoded("trigger")
+        if not isinstance(offset, timedelta):
+            continue
+        related = str(trigger.params.get("RELATED", "START")).upper()
+        keys.append([int(offset.total_seconds()), related])
+    return sorted(keys)
+
+
+def _event_key(event: Component) -> dict[str, Any]:
+    start = event.decoded("dtstart")
+    if "dtend" in event:
+        end: Any = event.decoded("dtend")
+    elif "duration" in event:
+        end = start + event.decoded("duration")
+    else:
+        end = start
+    rid = event.decoded("recurrence-id") if "recurrence-id" in event else None
+    return {
+        "rid": None if rid is None else _when_key(rid),
+        "start": _when_key(start),
+        "end": _when_key(end),
+        "summary": str(event.get("summary", "")).strip(),
+        "description": str(event.get("description", "")).strip(),
+        "location": str(event.get("location", "")).strip(),
+        "url": str(event.get("url", "")).strip(),
+        "transp": str(event.get("transp", "OPAQUE")).upper(),
+        "rrule": sorted(_rrule_lines(event)),
+        "rdate": _dates(event, "rdate"),
+        "exdate": _dates(event, "exdate"),
+        "alarms": _alarm_keys(event),
+    }
+
+
+def content_digest(data: bytes) -> str | None:
+    """Digest of what a person sees in the events of a resource body.
+
+    Ignores what servers and phones add on their own: DTSTAMP, SEQUENCE,
+    CREATED/LAST-MODIFIED, X- properties, property order, VTIMEZONE text and
+    alarm bookkeeping. None if the body holds no readable event. Never raises:
+    the body comes from the target server and may be anything."""
+    try:
+        events = list(Calendar.from_ical(data).walk("VEVENT"))
+        if not events:
+            return None
+        keys = sorted((_event_key(e) for e in events), key=lambda k: json.dumps(k["rid"]))
+        payload = json.dumps(keys, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
+    except Exception:  # untrusted bytes: any parser failure means "unreadable"
+        return None
