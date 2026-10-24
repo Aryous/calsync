@@ -194,3 +194,4 @@ def test_unreadable_secret_fails_only_its_rules(
         runs = {r.rule: r for r in store.latest_runs()}
     assert runs["good"].status == "ok" and runs["bad"].status == "failed"
     assert runs["bad"].error is not None and "credential file not found" in runs["bad"].error
+    assert runs["bad"].error_kind == "auth" and runs["good"].error_kind is None

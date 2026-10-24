@@ -1,15 +1,16 @@
 import os
 import sqlite3
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from calsync import store as store_mod
 from calsync.mirror import apply_pull
 from calsync.sources.base import CalendarPull
-from calsync.store import RunRecord, Store
+from calsync.store import ChangeRecord, RunRecord, Store
 from calsync.targets.base import CachedObject, TargetCache, TargetCalendar
 
 T0 = datetime(2026, 10, 24, tzinfo=UTC)
@@ -210,3 +211,139 @@ def test_dropping_objects_resets_every_sibling_ref_cursor(tmp_path: Path, how: s
         assert _count(db, "SELECT COUNT(*) FROM target_calendar WHERE cursor IS NOT NULL") == 0
         again = store.load_target_cache("dav", a.href)
         assert again.cursor is None and again.objects == {}
+
+
+# ----- change history -------------------------------------------------------
+
+
+def _rows(db: Path, sql: str) -> list[tuple[Any, ...]]:
+    with closing(sqlite3.connect(db)) as conn:
+        return conn.execute(sql).fetchall()
+
+
+def test_record_runs_writes_changes_with_their_run_id(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    with Store(db) as store:
+        store.record_runs(
+            [
+                RunRecord("a", T0, T0, "ok", 1, 1, 0, 0, 3, None, reverted=1, protected=2, out_of_window=4),
+                RunRecord("b", T0, T0, "blocked", 0, 0, 0, 0, 3, "guard", error_kind="guard"),
+            ],
+            [
+                ChangeRecord("a", "o1", "created", T0, "Standup"),
+                ChangeRecord("a", "o2", "reverted", T0, "Lunch"),
+                ChangeRecord("b", "o3", "blocked", T0, None),
+            ],
+        )
+        latest = {r.rule: r for r in store.latest_runs()}
+    runs = dict(_rows(db, "SELECT rule, id FROM run"))
+    changes = _rows(db, "SELECT run_id, rule, object_id, action, at, title FROM change ORDER BY id")
+    assert changes == [
+        (runs["a"], "a", "o1", "created", T0.isoformat(), "Standup"),
+        (runs["a"], "a", "o2", "reverted", T0.isoformat(), "Lunch"),
+        (runs["b"], "b", "o3", "blocked", T0.isoformat(), None),
+    ]
+    a, b = latest["a"], latest["b"]
+    assert (a.reverted, a.protected, a.out_of_window, a.error_kind) == (1, 2, 4, None)
+    assert (b.reverted, b.protected, b.out_of_window, b.error_kind) == (0, 0, 0, "guard")
+
+
+def test_record_runs_without_runs_is_a_no_op(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    with Store(db) as store:
+        store.record_runs([])
+    assert _count(db, "SELECT COUNT(*) FROM run") == 0
+
+
+def test_changes_older_than_the_retention_are_pruned(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    old = T0 - store_mod.CHANGE_RETENTION - timedelta(seconds=1)
+    edge = T0 - store_mod.CHANGE_RETENTION
+    with Store(db) as store:
+        store.record_runs(
+            [RunRecord("a", old, old, "ok", 2, 0, 0, 0, 1, None)],
+            [
+                ChangeRecord("a", "o1", "created", old, "Standup"),
+                ChangeRecord("a", "o2", "created", edge, "Lunch"),
+            ],
+        )
+        assert _count(db, "SELECT COUNT(*) FROM change") == 2  # "now" is the newest finished_at
+        store.record_runs([RunRecord("b", T0, T0, "ok", 0, 0, 0, 0, 1, None)])
+    assert _rows(db, "SELECT object_id FROM change") == [("o2",)]
+
+
+def test_changes_of_pruned_runs_are_pruned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(store_mod, "RUN_RETENTION", 1)
+    db = tmp_path / "s.db"
+    with Store(db) as store:
+        store.record_runs(
+            [RunRecord("a", T0, T0, "ok", 1, 0, 0, 0, 1, None)],
+            [ChangeRecord("a", "o1", "created", T0, "Lunch")],
+        )
+        store.record_runs(
+            [RunRecord("b", T0, T0, "ok", 1, 0, 0, 0, 1, None)],
+            [ChangeRecord("b", "o2", "created", T0, "Lunch")],
+        )
+        assert _count(db, "SELECT COUNT(*) FROM change") == 2  # another rule's run does not prune "a"
+        store.record_runs(
+            [RunRecord("a", T1, T1, "ok", 0, 1, 0, 0, 1, None)],
+            [ChangeRecord("a", "o1", "updated", T1, "Brunch")],
+        )
+    assert _rows(db, "SELECT rule, action FROM change ORDER BY id") == [("b", "created"), ("a", "updated")]
+
+
+def test_last_title_is_the_newest_known_title(tmp_path: Path) -> None:
+    with Store(tmp_path / "s.db") as store:
+        assert store.last_title("a", "o1") is None
+        store.record_runs(
+            [
+                RunRecord("a", T0, T0, "ok", 1, 0, 0, 0, 1, None),
+                RunRecord("b", T0, T0, "ok", 1, 0, 0, 0, 1, None),
+            ],
+            [
+                ChangeRecord("a", "o1", "created", T0, "Standup"),
+                ChangeRecord("b", "o1", "created", T0, "Other"),
+            ],
+        )
+        store.record_runs(
+            [RunRecord("a", T1, T1, "ok", 0, 1, 0, 0, 1, None)],
+            [ChangeRecord("a", "o1", "updated", T1, "Weekly review")],
+        )
+        store.record_runs(
+            [RunRecord("a", T1, T1, "ok", 0, 0, 0, 0, 1, None)],
+            [ChangeRecord("a", "o1", "protected", T1, None)],
+        )
+        assert store.last_title("a", "o1") == "Weekly review"
+        assert store.last_title("b", "o1") == "Other"
+        assert store.last_title("a", "o2") is None
+
+
+V3_RUN = """
+CREATE TABLE run (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, rule TEXT NOT NULL, started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL,
+    updated INTEGER NOT NULL, deleted INTEGER NOT NULL, failed INTEGER NOT NULL,
+    requests INTEGER NOT NULL, error TEXT
+)
+"""
+
+
+def test_v3_database_is_rebuilt_to_v4(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO meta VALUES ('schema_version', '3')")
+        conn.execute(V3_RUN)
+        conn.execute("INSERT INTO run VALUES (1, 'a', 't', 't', 'ok', 0, 0, 0, 0, 1, NULL)")
+        conn.commit()
+    with Store(db) as store:
+        assert store.latest_runs() == []
+        store.record_runs(
+            [RunRecord("a", T0, T0, "ok", 1, 0, 0, 0, 1, None)],
+            [ChangeRecord("a", "o1", "created", T0, "Lunch")],
+        )
+    assert store_mod.SCHEMA_VERSION == 4
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("4",)]
+    run_columns = [r[1] for r in _rows(db, "PRAGMA table_info(run)")]
+    assert run_columns[-4:] == ["reverted", "protected", "out_of_window", "error_kind"]
+    assert _count(db, "SELECT COUNT(*) FROM change") == 1

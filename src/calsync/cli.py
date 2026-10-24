@@ -279,7 +279,19 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
                     start, end = result.started_at, result.finished_at
                     store.record_runs(
                         [
-                            RunRecord(r.rule, start, end, r.status, 0, 0, 0, 0, result.requests, r.error)
+                            RunRecord(
+                                r.rule,
+                                start,
+                                end,
+                                r.status,
+                                0,
+                                0,
+                                0,
+                                0,
+                                result.requests,
+                                r.error,
+                                error_kind=r.error_kind,
+                            )
                             for r in skipped.values()
                         ]
                     )

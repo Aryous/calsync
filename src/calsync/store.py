@@ -7,7 +7,7 @@ import sqlite3
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +15,9 @@ from calsync.mirror import Mirror
 from calsync.sources.base import CalendarPull
 from calsync.targets.base import CachedObject, TargetCache, TargetCalendar
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 RUN_RETENTION = 500  # newest runs kept per rule
+CHANGE_RETENTION = timedelta(days=90)  # change rows older than this (vs. the newest run) are pruned
 
 _SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -41,12 +42,28 @@ CREATE TABLE run (
     id INTEGER PRIMARY KEY AUTOINCREMENT, rule TEXT NOT NULL, started_at TEXT NOT NULL,
     finished_at TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL,
     updated INTEGER NOT NULL, deleted INTEGER NOT NULL, failed INTEGER NOT NULL,
-    requests INTEGER NOT NULL, error TEXT
+    requests INTEGER NOT NULL, error TEXT, reverted INTEGER NOT NULL DEFAULT 0,
+    protected INTEGER NOT NULL DEFAULT 0, out_of_window INTEGER NOT NULL DEFAULT 0,
+    error_kind TEXT
 );
 CREATE INDEX run_rule ON run (rule, id);
+CREATE TABLE change (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, rule TEXT NOT NULL,
+    object_id TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL, title TEXT
+);
+CREATE INDEX change_rule ON change (rule, id);
 CREATE TABLE alert (key TEXT PRIMARY KEY, state TEXT NOT NULL, last_sent_at TEXT);
 """
-_TABLES = ("meta", "source_state", "source_event", "target_calendar", "target_object", "run", "alert")
+_TABLES = (
+    "meta",
+    "source_state",
+    "source_event",
+    "target_calendar",
+    "target_object",
+    "run",
+    "change",
+    "alert",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +78,27 @@ class RunRecord:
     failed: int
     requests: int
     error: str | None
+    reverted: int = 0
+    protected: int = 0
+    out_of_window: int = 0
+    error_kind: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ChangeRecord:
+    """One object-level change. ``title`` is event content: it may be stored here and shown in
+    --json/API output, never logged."""
+
+    rule: str
+    object_id: str
+    action: str  # created, updated, reverted, deleted, protected, blocked
+    at: datetime
+    title: str | None
+
+
+def _utc(t: datetime) -> str:
+    """Change times are stored in UTC so the retention cutoff compares as text."""
+    return t.astimezone(UTC).isoformat()
 
 
 class Store:
@@ -283,12 +321,17 @@ class Store:
             )
 
     # ----- runs ---------------------------------------------------------
-    def record_runs(self, runs: Sequence[RunRecord]) -> None:
+    def record_runs(self, runs: Sequence[RunRecord], changes: Sequence[ChangeRecord] = ()) -> None:
+        """Runs, their changes and the retention pruning commit together. Each change belongs to
+        the run of its rule in this call (a change for a rule with no run here is a bug: KeyError,
+        nothing is written)."""
         with self._tx():
-            self._db.executemany(
-                "INSERT INTO run (rule, started_at, finished_at, status, created, updated, deleted, "
-                "failed, requests, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                [
+            run_ids: dict[str, int] = {}
+            for r in runs:
+                cursor = self._db.execute(
+                    "INSERT INTO run (rule, started_at, finished_at, status, created, updated, deleted, "
+                    "failed, requests, error, reverted, protected, out_of_window, error_kind) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         r.rule,
                         r.started_at.isoformat(),
@@ -300,20 +343,46 @@ class Store:
                         r.failed,
                         r.requests,
                         r.error,
-                    )
-                    for r in runs
-                ],
+                        r.reverted,
+                        r.protected,
+                        r.out_of_window,
+                        r.error_kind,
+                    ),
+                )
+                assert cursor.lastrowid is not None
+                run_ids[r.rule] = cursor.lastrowid
+            self._db.executemany(
+                "INSERT INTO change (run_id, rule, object_id, action, at, title) VALUES (?, ?, ?, ?, ?, ?)",
+                [(run_ids[c.rule], c.rule, c.object_id, c.action, _utc(c.at), c.title) for c in changes],
             )
-            for rule in {r.rule for r in runs}:
+            for rule in run_ids:
                 self._db.execute(
                     "DELETE FROM run WHERE rule = ? AND id NOT IN "
                     "(SELECT id FROM run WHERE rule = ? ORDER BY id DESC LIMIT ?)",
                     (rule, rule, RUN_RETENTION),
                 )
+                self._db.execute(
+                    "DELETE FROM change WHERE rule = ? AND run_id NOT IN (SELECT id FROM run WHERE rule = ?)",
+                    (rule, rule),
+                )
+            if runs:
+                # "Now" is the newest run in this call, never the wall clock: deterministic.
+                now = max(r.finished_at for r in runs)
+                self._db.execute("DELETE FROM change WHERE at < ?", (_utc(now - CHANGE_RETENTION),))
+
+    def last_title(self, rule: str, object_id: str) -> str | None:
+        """The newest known title of an object: the only one left once its source is gone."""
+        row = self._db.execute(
+            "SELECT title FROM change WHERE rule = ? AND object_id = ? AND title IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (rule, object_id),
+        ).fetchone()
+        return row[0] if row else None
 
     def latest_runs(self) -> list[RunRecord]:
         rows = self._db.execute(
-            "SELECT rule, started_at, finished_at, status, created, updated, deleted, failed, requests, error "
+            "SELECT rule, started_at, finished_at, status, created, updated, deleted, failed, requests, error, "
+            "reverted, protected, out_of_window, error_kind "
             "FROM run WHERE id IN (SELECT MAX(id) FROM run GROUP BY rule) ORDER BY rule"
         ).fetchall()
         return [

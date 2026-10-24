@@ -22,7 +22,7 @@ from calsync.naming import object_id, parse_resource_name, resource_name, rule_t
 from calsync.planner import Actual, Desired, Plan, check_delete_guard, plan
 from calsync.render import content_digest, inspect, render
 from calsync.sources.base import CalendarMeta, Source
-from calsync.store import RunRecord, Store
+from calsync.store import ChangeRecord, RunRecord, Store
 from calsync.targets.base import (
     CachedObject,
     FetchedObject,
@@ -70,6 +70,7 @@ class RuleResult:
     out_of_window: int = 0  # desired series skipped by the rule's time window
     blocked_titles: list[str] = field(default_factory=list)  # planned deletes, for the guard alert
     blocked_titles_complete: bool = True  # False: the lookup failed or some bodies were unreadable
+    changes: list[ChangeRecord] = field(default_factory=list)  # carries titles: never log
 
     def fail(self, exc: BaseException) -> None:
         self.status = "failed"
@@ -135,6 +136,10 @@ class Engine:
         self._calendars: dict[TargetKey, TargetCalendar] = {}
         self._caches: dict[tuple[str, str], TargetCache] = {}
         self._warned_degraded: set[tuple[str, str]] = set()  # (rule, source id), once per process
+        # Last recorded protected / blocked object ids per rule: a set is recorded only when it
+        # changes, not every cycle. In memory: a fresh process records the current set once.
+        self._last_protected: dict[str, frozenset[str]] = {}
+        self._last_blocked: dict[str, frozenset[str]] = {}
 
     # ----- phase 1: ingest ---------------------------------------------
     async def _ingest(self, account: str, rules: list[Rule]) -> dict[str, Exception]:
@@ -314,6 +319,15 @@ class Engine:
         # delete); a degraded one without a copy is still created from its parseable part.
         protected = (unparsed | incomplete) & actual.keys()
         result.protected = len(protected)
+        if not dry_run and self._last_protected.get(rule.name) != protected:
+            self._last_protected[rule.name] = frozenset(protected)
+            now = self._clock()
+            result.changes.extend(
+                ChangeRecord(
+                    rule.name, oid, "protected", now, desired[oid].series.title if oid in desired else None
+                )
+                for oid in sorted(protected)
+            )
         if self._classify_reads(rule, cache, actual, desired, protected, window):
             # Saved now (also in a dry run): detection has already consumed the change, so a
             # dry run or a failed write must not forget the edit.
@@ -339,7 +353,23 @@ class Engine:
             result.blocked_titles, result.blocked_titles_complete = await self._titles(
                 rule, cal, result.plan.delete
             )
+            blocked = frozenset(a.object_id for a in result.plan.delete)
+            if not dry_run and self._last_blocked.get(rule.name) != blocked:
+                self._last_blocked[rule.name] = blocked
+                # Complete titles are aligned with the planned deletes; otherwise none is trusted.
+                titles: list[str | None] = (
+                    list(result.blocked_titles)
+                    if result.blocked_titles_complete
+                    else [None] * len(result.plan.delete)
+                )
+                now = self._clock()
+                result.changes.extend(
+                    ChangeRecord(rule.name, a.object_id, "blocked", now, title)
+                    for a, title in zip(result.plan.delete, titles, strict=True)
+                )
             return
+        if not dry_run:
+            self._last_blocked[rule.name] = frozenset()  # a later block of the same set is new again
         if not dry_run and not result.plan.empty:
             await self._push(rule, cal, cache, result.plan, result)
 
@@ -559,6 +589,7 @@ class Engine:
                     etag = await target.update(href, found.etag, data)
             remember(href, etag, want)
             result.created += 1
+            result.changes.append(ChangeRecord(rule.name, want.object_id, "created", now, want.series.title))
 
         async def update(want: Desired, have: Actual) -> None:
             prior = cache.objects.get(have.href)
@@ -575,8 +606,12 @@ class Engine:
             remember(have.href, etag, want, reverted=reverting)
             result.updated += 1
             result.reverted += reverting
+            action = "reverted" if reverting else "updated"
+            result.changes.append(ChangeRecord(rule.name, want.object_id, action, now, want.series.title))
 
         async def delete(have: Actual) -> None:
+            # The source event is gone: the last recorded title is the only one left.
+            title = self._store.last_title(rule.name, have.object_id)
             try:
                 await target.delete(have.href, have.etag)
             except ConflictError:
@@ -585,6 +620,7 @@ class Engine:
                     await target.delete(have.href, found.etag)
             cache.objects.pop(have.href, None)
             result.deleted += 1
+            result.changes.append(ChangeRecord(rule.name, have.object_id, "deleted", now, title))
 
         # Coroutines are created per phase, so a cancelled cycle leaves none un-awaited.
         phases: list[Callable[[], list[Coroutine[Any, Any, None]]]] = [
@@ -693,8 +729,13 @@ class Engine:
                         r.failed,
                         requests,
                         r.error,
+                        reverted=r.reverted,
+                        protected=r.protected,
+                        out_of_window=r.out_of_window,
+                        error_kind=r.error_kind,
                     )
                     for r in results.values()
-                ]
+                ],
+                [c for r in results.values() for c in r.changes],
             )
         return CycleResult(started, finished, results, requests)
