@@ -176,7 +176,7 @@ class DavClient:
             if response.status_code not in REDIRECT_STATUS or not location:
                 break
             target = urljoin(url, location)
-            if urlsplit(target).scheme != urlsplit(url).scheme:
+            if urlsplit(url).scheme == "https" and urlsplit(target).scheme != "https":
                 raise CalsyncError(f"{method} {href}: refusing redirect to {target}")
             url = target
         else:
@@ -204,11 +204,14 @@ class DavClient:
             content=propfind_body(props),
             headers={**_XML_HEADERS, "Depth": str(depth)},
         )
-        return parse_multistatus(response.content, str(response.url))[0]
+        return self._parse(method="PROPFIND", href=href, response=response)[0]
 
     async def report(
-        self, href: str, body: bytes, *, kind: str, depth: int = 1
+        self, href: str, body: bytes, *, kind: str, depth: int | None = None
     ) -> tuple[list[DavResponse], str | None]:
+        if depth is None:
+            # RFC 6578 section 3.2: sync-collection is only defined with Depth: 0.
+            depth = 0 if kind == "sync-collection" else 1
         response = await self._send(
             "REPORT",
             href,
@@ -217,7 +220,14 @@ class DavClient:
             content=body,
             headers={**_XML_HEADERS, "Depth": str(depth)},
         )
-        return parse_multistatus(response.content, str(response.url))
+        return self._parse(method="REPORT", href=href, response=response)
+
+    @staticmethod
+    def _parse(*, method: str, href: str, response: httpx.Response) -> tuple[list[DavResponse], str | None]:
+        try:
+            return parse_multistatus(response.content, str(response.url))
+        except ET.ParseError as exc:
+            raise CalsyncError(f"{method} {href}: invalid multistatus XML: {exc}") from exc
 
     async def put(
         self, href: str, data: bytes, *, if_match: str | None = None, create_only: bool = False

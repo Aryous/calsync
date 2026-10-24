@@ -10,6 +10,7 @@ from calsync.targets.dav import (
     CS,
     DAV,
     DavClient,
+    calendar_query_etags_body,
     multiget_body,
     parse_multistatus,
     q,
@@ -115,3 +116,68 @@ async def test_redirect_loop_and_scheme_change_are_refused() -> None:
         )
         with pytest.raises(CalsyncError, match=message):
             await dav.propfind("", [q(DAV, "displayname")], depth=0)
+
+
+MULTISTATUS_REL = b"""<?xml version='1.0' encoding='utf-8'?>
+<multistatus xmlns="DAV:"><response><href>/root/cal/</href>
+<propstat><prop><displayname>X</displayname></prop><status>HTTP/1.1 200 OK</status></propstat>
+</response></multistatus>"""
+
+
+@pytest.mark.parametrize(
+    ("kind", "body", "depth", "expected"),
+    [
+        ("sync-collection", sync_collection_body(None), None, "0"),
+        ("calendar-query", calendar_query_etags_body(), None, "1"),
+        ("calendar-multiget", multiget_body(["/a.ics"]), None, "1"),
+        ("calendar-query", calendar_query_etags_body(), 0, "0"),
+        ("sync-collection", sync_collection_body(None), 1, "1"),
+    ],
+)
+async def test_report_depth(kind: str, body: bytes, depth: int | None, expected: str) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(207, content=MULTISTATUS_REL)
+
+    dav = DavClient(make_client(RequestLog(), transport=httpx.MockTransport(handler)), "https://dav.test/")
+    await dav.report("/cal/", body, kind=kind, **({} if depth is None else {"depth": depth}))
+    assert seen[0].headers["depth"] == expected
+
+
+async def test_invalid_multistatus_xml_is_typed_error() -> None:
+    dav = client_with(207, b"<html><body>captive portal</html>")
+    with pytest.raises(CalsyncError, match="invalid multistatus XML"):
+        await dav.propfind("/cal/", [q(DAV, "displayname")], depth=0)
+    with pytest.raises(CalsyncError, match="invalid multistatus XML"):
+        await dav.report("/cal/", sync_collection_body(None), kind="sync-collection")
+
+
+async def test_https_upgrade_redirect_is_allowed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.scheme == "http":
+            return httpx.Response(301, headers={"Location": "https://dav.test/root/"})
+        return httpx.Response(207, content=MULTISTATUS_REL)
+
+    dav = DavClient(make_client(RequestLog(), transport=httpx.MockTransport(handler)), "http://dav.test/")
+    (item,) = await dav.propfind("", [q(DAV, "displayname")], depth=0)
+    assert item.href == "https://dav.test/root/cal/"
+
+
+async def test_cross_host_redirect_keeps_auth_and_resolves_hrefs() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.host == "caldav.test":
+            return httpx.Response(301, headers={"Location": "https://p07-caldav.test/root/"})
+        return httpx.Response(207, content=MULTISTATUS_REL)
+
+    client = make_client(RequestLog(), transport=httpx.MockTransport(handler), auth=httpx.BasicAuth("u", "p"))
+    dav = DavClient(client, "https://caldav.test/")
+    (item,) = await dav.propfind("", [q(DAV, "displayname")], depth=0)
+    assert [r.url.host for r in seen] == ["caldav.test", "p07-caldav.test"]
+    assert seen[1].headers["authorization"].startswith("Basic ")
+    assert seen[1].headers["depth"] == "0"
+    assert item.href == "https://p07-caldav.test/root/cal/"
