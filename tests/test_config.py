@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from calsync.config import CredentialRef, default_config_path, load_config, parse_config
+from calsync.config import CredentialRef, WindowSpec, default_config_path, load_config, parse_config
 from calsync.durations import parse_duration
 from calsync.errors import ConfigError
 
@@ -57,8 +57,32 @@ def test_parse_valid_config(tmp_path: Path) -> None:
     (rule,) = cfg.rules
     assert rule.target.create_if_missing is True
     assert rule.alarms == (timedelta(minutes=-5), timedelta(0))
+    assert rule.window is not None
     assert rule.window.future == timedelta(days=180)
     assert rule.delete_guard.max_count == 10
+
+
+def test_window_is_optional(tmp_path: Path) -> None:
+    data = copy.deepcopy(VALID)
+    del data["rules"][0]["window"]
+    cfg = parse_config(data, tmp_path)
+    assert cfg.rules[0].window is None
+
+
+def test_window_given_is_kept(tmp_path: Path) -> None:
+    cfg = parse_config(copy.deepcopy(VALID), tmp_path)
+    assert cfg.rules[0].window == WindowSpec(timedelta(days=7), timedelta(days=180))
+
+
+def test_bad_window_still_reports_later_rule_problems(tmp_path: Path) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["window"] = {"past": "soon"}
+    data["rules"][0]["alarms"] = 5
+    with pytest.raises(ConfigError) as info:
+        parse_config(data, tmp_path)
+    text = "\n".join(info.value.problems)
+    assert "rules[family].window.past" in text
+    assert "rules[family].alarms" in text
 
 
 def test_collects_all_problems(tmp_path: Path) -> None:

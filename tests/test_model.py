@@ -91,6 +91,12 @@ def test_window_intersects() -> None:
     assert not w.intersects((now + timedelta(days=181), now + timedelta(days=182)))
 
 
+def test_window_everything_intersects_any_span() -> None:
+    w = Window.everything()
+    assert w.intersects((datetime(1970, 1, 1, tzinfo=UTC), datetime(1970, 1, 2, tzinfo=UTC)))
+    assert w.intersects((datetime(2026, 10, 1, tzinfo=UTC), MAX_TIME))
+
+
 def test_hash_is_stable_under_normalization() -> None:
     a = series(title="Standup", alarms=(Alarm(timedelta(0)), Alarm(timedelta(minutes=-5))))
     b = series(title="  Standup ", alarms=(Alarm(timedelta(minutes=-5)), Alarm(timedelta(0))))

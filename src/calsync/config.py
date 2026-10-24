@@ -64,7 +64,7 @@ class Rule:
     name: str
     source: CalendarSel
     target: CalendarSel
-    window: WindowSpec
+    window: WindowSpec | None  # None: all of time (full sync)
     alarms: AlarmPolicy
     delete_guard: DeleteGuard
 
@@ -307,12 +307,19 @@ def _rule(index: int, raw: Any, accounts: Mapping[str, Account], problems: list[
     where = f"rules[{name}]"
     source = _selection(raw.get("source"), f"{where}.source", accounts, "google", problems)
     target = _selection(raw.get("target"), f"{where}.target", accounts, "caldav", problems)
-    window_raw = _table(raw.get("window"), f"{where}.window", problems)
-    past = _duration(window_raw.get("past", "7d"), f"{where}.window.past", problems)
-    future = _duration(window_raw.get("future", "180d"), f"{where}.window.future", problems)
-    for label, value in (("past", past), ("future", future)):
-        if value is not None and value < timedelta(0):
-            problems.append(f"{where}.window.{label}: must not be negative")
+    window: WindowSpec | None = None  # omitted: all of time
+    window_ok = True
+    if "window" in raw:
+        window_raw = _table(raw.get("window"), f"{where}.window", problems)
+        past = _duration(window_raw.get("past", "7d"), f"{where}.window.past", problems)
+        future = _duration(window_raw.get("future", "180d"), f"{where}.window.future", problems)
+        for label, value in (("past", past), ("future", future)):
+            if value is not None and value < timedelta(0):
+                problems.append(f"{where}.window.{label}: must not be negative")
+        if past is None or future is None:
+            window_ok = False  # keep collecting this rule's other problems
+        else:
+            window = WindowSpec(past, future)
     alarms = _alarms(raw.get("alarms", "copy"), f"{where}.alarms", problems)
     guard_raw = _table(raw.get("delete_guard"), f"{where}.delete_guard", problems)
     guard = DeleteGuard(
@@ -337,9 +344,9 @@ def _rule(index: int, raw: Any, accounts: Mapping[str, Account], problems: list[
             expect="an integer >= 0",
         ),
     )
-    if source is None or target is None or past is None or future is None:
+    if source is None or target is None or not window_ok:
         return None
-    return Rule(name, source, target, WindowSpec(past, future), alarms, guard)
+    return Rule(name, source, target, window, alarms, guard)
 
 
 def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:

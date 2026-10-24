@@ -103,6 +103,11 @@ class Window:
     def around(cls, now: datetime, past: timedelta, future: timedelta) -> "Window":
         return cls(now - past, now + future)
 
+    @classmethod
+    def everything(cls) -> "Window":
+        """All of time: every span intersects it (full sync)."""
+        return cls(datetime(1, 1, 1, tzinfo=UTC), MAX_TIME)
+
     def intersects(self, span: tuple[datetime, datetime]) -> bool:
         lo, hi = span
         return lo < self.end and hi > self.start

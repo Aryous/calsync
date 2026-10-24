@@ -59,6 +59,7 @@ class RuleResult:
     plan: Plan | None = None
     protected: int = 0  # existing target copies held untouched this cycle (series unparsed or degraded)
     degraded: int = 0  # series in the source calendar that are unparsed or degraded, copy or not
+    out_of_window: int = 0  # desired series skipped by the rule's time window
     blocked_titles: list[str] = field(default_factory=list)  # planned deletes, for the guard alert
     blocked_titles_complete: bool = True  # False: the lookup failed or some bodies were unreadable
 
@@ -263,7 +264,11 @@ class Engine:
             for href, obj in cache.objects.items()
             if obj.rule_tag == tag
         }
-        window = Window.around(self._clock(), rule.window.past, rule.window.future)
+        window = (
+            Window.everything()
+            if rule.window is None
+            else Window.around(self._clock(), rule.window.past, rule.window.future)
+        )
         desired, unparsed = self._desired(rule)
         incomplete = {oid for oid, want in desired.items() if not want.series.complete}
         result.degraded = len(unparsed) + len(incomplete)
@@ -272,6 +277,7 @@ class Engine:
         protected = (unparsed | incomplete) & actual.keys()
         result.protected = len(protected)
         result.plan = plan(desired, actual, window, frozenset(protected))
+        result.out_of_window = result.plan.out_of_window
         # The guard counts only non-protected actuals.
         deletable = len(actual.keys() - protected)
         reason = None if allow_deletes else check_delete_guard(result.plan, deletable, rule.delete_guard)
