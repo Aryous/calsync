@@ -1,3 +1,4 @@
+import copy
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -16,7 +17,7 @@ from calsync.errors import (
 from calsync.http import RequestLog, make_client
 from calsync.model import Alarm
 from calsync.sources import google as google_mod
-from calsync.sources.google import GoogleSource
+from calsync.sources.google import EVENTS_PARAMS_ID, GoogleSource
 from calsync.sources.google_auth import (
     RefreshTokenProvider,
     StaticToken,
@@ -517,3 +518,24 @@ def test_invalidate_reports_whether_a_fresh_token_is_possible() -> None:
         refresh_token="r",
     )
     assert provider.invalidate() is True
+
+
+async def test_state_from_older_params_forces_a_full_pull() -> None:
+    fake, log = seeded(), RequestLog()
+    source = make_source(fake, log)
+    first = await source.pull(["Family"], {})
+    assert first.state["events_params"] == EVENTS_PARAMS_ID
+    old = copy.deepcopy(first.state)
+    del old["events_params"]  # as saved by a version that requested fewer fields
+    again = await source.pull(["Family"], old)
+    pull = again.calendars["Family"]
+    assert pull.full and sorted(e["id"] for e in pull.upserts) == ["e1", "e2"]
+    assert again.state["events_params"] == EVENTS_PARAMS_ID
+
+
+async def test_matching_params_pull_incrementally() -> None:
+    fake, log = seeded(), RequestLog()
+    source = make_source(fake, log)
+    first = await source.pull(["Family"], {})
+    again = await source.pull(["Family"], first.state)
+    assert not again.calendars["Family"].full

@@ -60,6 +60,12 @@ class Alarm:
 
 
 @dataclass(frozen=True, slots=True)
+class Attendee:
+    name: str
+    email: str
+
+
+@dataclass(frozen=True, slots=True)
 class Occurrence:
     """One modified instance of a recurring series.
 
@@ -74,6 +80,8 @@ class Occurrence:
     description: str
     location: str
     alarms: tuple[Alarm, ...]
+    attendees: tuple[Attendee, ...] = ()
+    conference_url: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +96,8 @@ class Series:
     exdates: tuple[When, ...] = ()
     overrides: tuple[Occurrence, ...] = ()
     alarms: tuple[Alarm, ...] = ()
+    attendees: tuple[Attendee, ...] = ()
+    conference_url: str = ""
     transparent: bool = False
     # False: some instance failed to parse and was left out ("degraded"). An existing
     # target copy of a degraded series is kept as is; a missing one is created anyway.
@@ -117,6 +127,11 @@ def _alarm_key(alarm: Alarm) -> timedelta:
     return alarm.offset
 
 
+def _normalize_attendees(attendees: tuple[Attendee, ...]) -> tuple[Attendee, ...]:
+    cleaned = {Attendee(a.name.strip(), a.email.strip()) for a in attendees}
+    return tuple(sorted(cleaned, key=lambda a: (a.email.lower(), a.name)))
+
+
 def _normalize_occurrence(occ: Occurrence) -> Occurrence:
     return replace(
         occ,
@@ -124,6 +139,8 @@ def _normalize_occurrence(occ: Occurrence) -> Occurrence:
         description=occ.description.strip(),
         location=occ.location.strip(),
         alarms=tuple(sorted(set(occ.alarms), key=_alarm_key)),
+        attendees=_normalize_attendees(occ.attendees),
+        conference_url=occ.conference_url.strip(),
     )
 
 
@@ -143,6 +160,8 @@ def normalize_series(series: Series) -> Series:
             )
         ),
         alarms=tuple(sorted(set(series.alarms), key=_alarm_key)),
+        attendees=_normalize_attendees(series.attendees),
+        conference_url=series.conference_url.strip(),
     )
 
 

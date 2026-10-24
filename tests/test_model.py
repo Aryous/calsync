@@ -9,6 +9,7 @@ from calsync.model import (
     MAX_TIME,
     SPAN_EXPANSION_LIMIT,
     Alarm,
+    Attendee,
     Occurrence,
     When,
     Window,
@@ -189,3 +190,17 @@ def test_span_count_reaching_year_9999_is_unbounded() -> None:
         recurrence=("RRULE:FREQ=YEARLY;COUNT=9000",),
     )
     assert series_span(s)[1] == MAX_TIME
+
+
+def test_attendees_are_normalized_and_hashed() -> None:
+    a = replace(
+        series(), attendees=(Attendee("Bob", "bob@example.com"), Attendee("Alice", "alice@example.com"))
+    )
+    b = replace(
+        series(), attendees=(Attendee("Alice", "alice@example.com"), Attendee("Bob", "bob@example.com"))
+    )
+    assert series_hash(a) == series_hash(b)
+    assert series_hash(a) != series_hash(series())
+    assert series_hash(replace(series(), conference_url="https://meet.example.com/a")) != series_hash(
+        series()
+    )

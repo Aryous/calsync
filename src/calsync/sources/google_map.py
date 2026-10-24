@@ -10,7 +10,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from calsync.icalutil import parse_date_line
-from calsync.model import Alarm, Occurrence, Series, When, normalize_series
+from calsync.model import Alarm, Attendee, Occurrence, Series, When, normalize_series
 from calsync.sources.base import CalendarMeta, RawEvent
 
 log = logging.getLogger(__name__)
@@ -84,6 +84,28 @@ def event_alarms(event: RawEvent, defaults: tuple[Alarm, ...]) -> tuple[Alarm, .
     return alarms_from_reminders(reminders.get("overrides") or [])
 
 
+def event_attendees(event: RawEvent) -> tuple[Attendee, ...]:
+    """People invited to the event; rooms and other resources are left out."""
+    result: list[Attendee] = []
+    for entry in event.get("attendees") or ():
+        if not isinstance(entry, Mapping) or entry.get("resource"):
+            continue
+        name = str(entry.get("displayName") or "")
+        email = str(entry.get("email") or "")
+        if name or email:
+            result.append(Attendee(name, email))
+    return tuple(result)
+
+
+def event_conference(event: RawEvent) -> str:
+    """The video meeting link: the conference video entry point, else ``hangoutLink``."""
+    data = event.get("conferenceData") or {}
+    for entry in data.get("entryPoints") or ():
+        if isinstance(entry, Mapping) and entry.get("entryPointType") == "video" and entry.get("uri"):
+            return str(entry["uri"])
+    return str(event.get("hangoutLink") or "")
+
+
 def split_recurrence(lines: Iterable[str], tz: str) -> tuple[tuple[str, ...], tuple[When, ...]]:
     rules: list[str] = []
     exdates: list[When] = []
@@ -129,6 +151,8 @@ def _series(master: RawEvent, exceptions: list[RawEvent], meta: CalendarMeta) ->
                         description=html_to_text(ex.get("description", "")),
                         location=ex.get("location", ""),
                         alarms=event_alarms(ex, meta.default_alarms),
+                        attendees=event_attendees(ex),
+                        conference_url=event_conference(ex),
                     )
                 )
             except (KeyError, ValueError) as exc:
@@ -149,6 +173,8 @@ def _series(master: RawEvent, exceptions: list[RawEvent], meta: CalendarMeta) ->
             exdates=tuple(excluded),
             overrides=tuple(overrides),
             alarms=event_alarms(master, meta.default_alarms),
+            attendees=event_attendees(master),
+            conference_url=event_conference(master),
             transparent=master.get("transparency") == "transparent",
             complete=complete,
         )
@@ -167,8 +193,8 @@ def master_ids(raw_events: Iterable[RawEvent]) -> set[str]:
 def build_series(raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Series]:
     """Group mirror entries into series: masters plus their modified/cancelled instances.
 
-    Attendees, organizer and conference data are deliberately never read, so
-    a target server can never send invitations on our behalf.
+    Attendees and conference links are read into the model; the renderer never writes
+    them as ATTENDEE or ORGANIZER, so a target server cannot send invitations on our behalf.
     """
     masters: dict[str, RawEvent] = {}
     exceptions: dict[str, list[RawEvent]] = defaultdict(list)
