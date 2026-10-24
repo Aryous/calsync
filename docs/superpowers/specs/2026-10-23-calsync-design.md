@@ -1,7 +1,7 @@
 # calsync 设计规格
 
-- 日期：2026-10-23（v2 修订：2026-10-24）
-- 状态：v2 待确认
+- 日期：2026-10-23（v2 修订：2026-10-24；v3 与计划 1 的实现同步：2026-10-24）
+- 状态：v3（实现同步）, 2026-10-24
 - 作者：Aryous 与 Claude
 
 > v2 相对 v1 的变化：
@@ -10,6 +10,12 @@
 > - Google 和 CalDAV 客户端改为基于 httpx 自写。
 > - 常驻进程成为推荐运行方式，并新增"性能设计"一节，把每轮请求数写成可测试的预算。
 > - 去除了背景中的个人信息，为开源做准备。
+>
+> v3 相对 v2 的变化（与计划 1 的实现对齐，不改变目标）：
+> - §6.1 接口改为实际签名：`Source.pull` 一次拉取一个账号的多个日历，单个日历的失败彼此隔离；目标写入接口以 href 为参数。
+> - 403 不再一律视为授权失败（§6.1、§6.2、§6.3、§12）；配置错误单独归类并以退出码 2 结束。
+> - 写明了无法解析的源系列、412 冲突、重定向、重新发现等边界行为（§6.3、§7）。
+> - §9 表结构与实现一致；§2 写明目标端手动修改的现有局限，§13 增加对应实验。
 
 ## 1. 背景与目标
 
@@ -160,7 +166,9 @@ delete_guard = { max_ratio = 0.5, max_count = 10 }
   - `"copy"`：照搬源事件的提醒。
   - `"strip"`：不写任何提醒。
   - 偏移数组，例如 `["-5m", "0m"]`：所有事件统一使用这组提醒。
-- `rules[].name` 在配置内唯一。它参与生成资源名和 UID，**修改规则名等于重建该规则的全部托管资源**。
+- `rules[].name` 在配置内唯一。它参与生成资源名和 UID，**修改规则名等于以新名字重建该规则的全部托管资源**。
+  - 改名或删除一条规则后，旧名字写入的副本留在目标日历中：calsync 不再更新它们，也不会删除它们（它们不属于任何现有规则）。需要手动删除。
+  - 两处 calsync 安装若在同一个目标日历上使用同名规则，会把对方的副本当作自己的，互相覆盖和删除。不要这样配置。
 - 配置加载时校验：账号引用存在、源账号类型为 `google`、目标账号类型为 `caldav`、规则名唯一、时长格式合法。校验失败时不运行任何规则。
 - "同一个共享日历被不同账号的规则写入"无法在配置层静态识别（不同账号下的同名日历未必是同一个），只在文档中警告，见 §6.3。
 
@@ -208,31 +216,42 @@ class Series:
 ```python
 class Source(Protocol):
     async def list_calendars(self) -> list[CalendarInfo]: ...
-    async def pull(self, calendar_id: str, cursor: SourceCursor | None) -> SourceDelta: ...
-    # SourceDelta = 变化的原始事件 + 是否为全量 + 新游标 + 日历默认提醒（若变化）
+    async def pull(self, calendar_refs: Sequence[str], state: Mapping[str, Any]) -> SourcePull: ...
+    # SourcePull = calendars（按传入的日历引用索引的 CalendarPull）+ state + errors
+    #   CalendarPull = 解析后的日历 ID + 是否为全量 + 新增/修改的原始事件 + 删除的事件 ID + 日历元数据
+    #   state = 适配器自己的游标（可 JSON 序列化，引擎原样保存、下次原样交回）
+    #   errors = 单个日历自己的失败（名称不存在、404、403 等）；它们的游标不前进。账号级失败直接抛出
+    def to_series(self, raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Series]: ...
+    def series_ids(self, raw_events: Iterable[RawEvent]) -> set[str]: ...
+    # 镜像中所有存活系列的源 ID，无论 to_series 能否解析（用于保护无法解析的系列，见 §7）
 
 class Target(Protocol):
-    async def list_calendars(self) -> list[CalendarInfo]: ...
-    async def ensure_calendar(self, ref: CalendarRef, create: bool) -> TargetCalendar: ...
-    async def changes(self, cal: TargetCalendar, cursor: TargetCursor | None) -> TargetDelta: ...
-    # TargetDelta = 变化的托管资源（href、etag）+ 被删除的 href + 是否为全量 + 新游标
-    async def fetch(self, cal: TargetCalendar, hrefs: list[str]) -> list[RemoteObject]: ...
-    async def create(self, cal: TargetCalendar, href: str, ics: bytes) -> str | None: ...  # 返回 etag
-    async def update(self, cal: TargetCalendar, href: str, etag: str, ics: bytes) -> str | None: ...
-    async def delete(self, cal: TargetCalendar, href: str, etag: str) -> None: ...
+    def reset(self) -> None: ...  # 每个周期开始时调用：恢复本轮被限流降低的并发
+    async def list_calendars(self) -> list[TargetCalendar]: ...
+    async def ensure_calendar(self, ref: str, *, create: bool) -> TargetCalendar: ...
+    async def changes(self, cal: TargetCalendar, cursor: str | None) -> TargetDelta: ...
+    # TargetDelta = 变化的托管资源（href → etag，服务器未给出时为 None）+ 被删除的 href + 是否为全量 + 新游标
+    async def fetch(self, cal: TargetCalendar, hrefs: Sequence[str]) -> list[FetchedObject]: ...
+    def href_for(self, cal: TargetCalendar, name: str) -> str: ...  # 资源名 → 绝对 href
+    async def create(self, href: str, data: bytes) -> str | None: ...  # 返回 etag
+    async def update(self, href: str, etag: str | None, data: bytes) -> str | None: ...
+    async def delete(self, href: str, etag: str | None) -> None: ...
+    # etag 为 None 表示未知，此时以 If-Match: * 写入（§6.3）
 ```
 
-`RemoteObject` 包含 `href`、`etag`、`uid`、`rule`、`content_hash`、`span_start`、`span_end`。
+`FetchedObject` 是读到的资源：`href`、`etag`、正文。目标缓存中每个托管资源记为 `CachedObject`：`etag`（自己写入且服务器未返回 ETag 时为 None）、规则标签、对象 ID、内容哈希、跨度。
 
 **跨度**是资源覆盖的时间范围：从第一次发生的开始，到最后一次发生的结束。它从 `DTSTART`、`DTEND` 和 RRULE 的 `UNTIL` / `COUNT` 计算；没有结束的重复规则，`span_end` 记为无穷大。
 
 适配器只抛出统一的错误类型：
 
-- `AuthError`：凭证失效，不重试。
-- `TransientError`：网络错误、429、5xx，可重试。
+- `AuthError`：凭证缺失或失效（HTTP 401、OAuth `invalid_grant` 等），不重试，提示运行 `calsync auth`。
+- `ForbiddenError`：凭证有效，但服务器拒绝了这个请求（不属于限流的 403：权限不足、`valid-calendar-data`、`no-uid-conflict` 等前置条件）。按普通失败处理，不提示重新授权。
+- `TransientError`：网络错误、429、5xx、Google 的限流 403、无法使用的令牌响应（例如强制门户页面），可重试。
 - `ConflictError`：412 版本冲突。
+- `NotFoundError`：日历或资源不存在（404）。
 - `CursorExpired`：游标失效，需要全量。
-- `ConfigError`：配置问题。
+- `ConfigError`：配置问题，包括运行时才发现的（源日历名称不存在、凭证文件权限不是 `0600`、Google 客户端密钥文件不存在）。
 
 ### 6.2 Google 源
 
@@ -242,6 +261,9 @@ class Target(Protocol):
 - `calsync auth` 走 loopback + PKCE：打开浏览器，在本机临时端口接收回调，把 refresh token 写入凭证后端。
 - **OAuth 同意屏幕必须发布为 "In production"**。Google 官方文档说明：外部用户类型、处于 "Testing" 状态的项目，refresh token 7 天后失效。个人使用无需审核，授权时会出现"未经验证的应用"提示。
 - access token 只保存在进程内存中，过期前 5 分钟刷新，不落盘。
+- API 返回 401 时丢弃缓存的 access token，刷新一次并重试一次；仍为 401 则抛出 `AuthError`。
+- 令牌接口：只有 400/401 且 JSON 正文带 `error`（如 `invalid_grant`）才是 `AuthError`；非 JSON 正文，或 200 却没有可用的 `access_token`（强制门户、代理页面）是 `TransientError`。
+- 403：原因是限流（`rateLimitExceeded`、`userRateLimitExceeded`、`quotaExceeded`、`dailyLimitExceeded`、`RESOURCE_EXHAUSTED`）时为 `TransientError`；其他 403 为 `ForbiddenError`，消息带 Google 给出的原因。它通常只影响一个日历，经 `SourcePull.errors` 只让依赖该日历的规则失败。
 
 **增量同步**
 
@@ -268,7 +290,8 @@ EVENTS_LIST_PARAMS = {
 
 **日历默认提醒**
 
-- 每个 Google 账号每轮发一次 `calendarList.list`，带它自己的 `syncToken`，`fields` 只取 `items(id,defaultReminders),nextSyncToken,nextPageToken`。
+- 每个 Google 账号每轮发一次 `calendarList.list`，带它自己的 `syncToken`，参数 `showDeleted=true`、`showHidden=true`，`fields` 只取 `nextPageToken,nextSyncToken,items(id,summary,summaryOverride,timeZone,defaultReminders,deleted)`。
+- 同一份结果也用于把配置里的日历名称解析为 ID：先匹配 `summaryOverride`（用户自己看到的名字），再匹配 `summary`；匹配到多个时报错。不在列表中、但包含 `@` 的引用按 ID 原样使用（用户有权访问但没有加入列表的日历）。
 - 默认提醒变化时，标记该日历中"使用默认提醒"的系列需要重新计算哈希。
 
 **映射到统一模型**
@@ -285,8 +308,9 @@ EVENTS_LIST_PARAMS = {
   - 若某个实例的主事件不在镜像中（异常数据），记录警告并跳过该实例。
 - 全天事件：`start.date` / `end.date` 映射为 date 类型的 `When`。
 - 描述：Google 的 `description` 可能是 HTML。转为纯文本：
-  - `<br>`、`</p>` 转为换行。
-  - 去除其余标签，解码 HTML 实体，保留原有换行。
+  - `<br>` 和块级标签（`p`、`div`、`li`、`ul`、`ol`、`h1`–`h6`、`tr`）的结束转为换行。
+  - 链接保留地址，写成"文字 (地址)"；文字与地址相同时只写一次。
+  - 去除其余标签，解码 HTML 实体（不换行空格转为普通空格），保留原有换行。
 - 不同步的字段：`attendees`、`organizer`、会议链接。写入目标的事件不带 `ATTENDEE` / `ORGANIZER`，避免目标服务器向参与者发送邀请邮件。
 
 **典型数据形态**：由 AI 助手生成的日历里，常见"一个重复系列，几乎每个实例都单独改过标题（例如带进度计数）"，事件级提醒为 `popup, 0 分钟`，描述为 HTML。渲染、哈希和比对必须高效覆盖"一个系列 + 大量单次改动"的情况。
@@ -307,7 +331,8 @@ XML 用标准库 `xml.etree` 解析，命名空间常量集中定义。
 **发现**
 
 - 从 `server_url` 解析 principal → calendar-home-set → 日历列表。
-- 发现结果写入 store，后续周期直接复用。只有遇到 404、301 或 401 时才重新发现。
+- 发现结果写入 store，后续周期直接复用。只有变化检测返回 404 时才清除发现结果，下一轮重新发现。
+- 重定向（301、302、307、308）在协议层透明跟随，最多 5 跳：每一跳重新带上认证，拒绝从 https 降级到 http；href 按最终响应的 URL 转成绝对地址。重定向本身不触发重新发现。
 - 发现时同时读取每个日历的 `supported-report-set`，确定变化检测用哪一级（见下）。
 
 **资源命名与托管标记**
@@ -335,20 +360,25 @@ XML 用标准库 `xml.etree` 解析，命名空间常量集中定义。
 
 每个目标日历每轮只发一次检测请求，按服务器能力取最高一级：
 
-1. **`sync-collection`（RFC 6578）**：带上次的 sync-token，只返回变化和删除的 href 与 etag。没有变化时响应为空。
+1. **`sync-collection`（RFC 6578）**：带上次的 sync-token，只返回变化和删除的 href 与 etag。没有变化时响应为空。按 RFC 6578 以 `Depth: 0` 发送。集合本身返回 507 表示结果被截断，此时这次结果不当作全量。
 2. **`getctag`**：PROPFIND 读取日历的 ctag。未变化则跳过；变化则执行第 3 级。
 3. **全量列表**：`calendar-query` REPORT，只请求 `getetag`，不请求正文。
 
 检测结果与目标缓存比对：
 
 - 只对"资源名属于 calsync、且 etag 与缓存不同或缓存中没有"的 href 发起 `calendar-multiget`，每批最多 100 个，读取正文以取得哈希和跨度。
-- 第 1 级的 sync-token 失效（服务器返回 `valid-sync-token` 前置条件错误）时，执行一次第 3 级，并重新取得 sync-token。
+- 某个发生变化的 href 读不到正文（multiget 没有返回它）时，本轮把它当作不存在来规划（新建会 412 并转为更新），并且不推进游标，让下一轮的检测再次报告它。
+- 第 1 级的 sync-token 失效（服务器返回 `valid-sync-token` 前置条件错误）时，用空 sync-token 重新做一次初始 `sync-collection`（列出全部资源，相当于全量列表），并取得新的 sync-token。
 
 **写入**
 
-- 新建：PUT 并带 `If-None-Match: *`。若返回 412（资源已存在），把该 href 加入下一次 multiget，再按更新处理。
-- 更新：PUT 并带 `If-Match: <etag>`。若返回 412，multiget 取最新 etag 后重试一次。
-- 删除：DELETE 并带 `If-Match: <etag>`。404 视为已删除。
+- 新建：PUT 并带 `If-None-Match: *`。
+- 更新：PUT 并带 `If-Match: <etag>`；etag 未知时带 `If-Match: *`（资源必须仍然存在）。
+- 删除：DELETE 并带 `If-Match: <etag>`，etag 未知时同样用 `*`。404 视为已删除。
+- 严格的服务器对不存在的资源也会用 412 回应 `If-Match`，所以每次 412 都先重新读取该资源，再决定如何重试一次：
+  - 新建 412：资源已存在则按更新处理（若该系列是降级的，见 §7，则保留现有副本不覆盖）；读取时已不存在则重新新建。
+  - 更新 412：资源仍在则用读到的 etag 重试；已不存在则重新新建。
+  - 删除 412：资源仍在则用读到的 etag 再删一次；已不存在则视为删除完成。
 - 写入成功后立即用新 etag 和哈希更新目标缓存。
   - 若响应没有返回 ETag，缓存记录"已写入、etag 待定"。
   - 下一次变化检测返回该 href 时，直接采信新 etag，不读取正文。
@@ -374,13 +404,14 @@ XML 用标准库 `xml.etree` 解析，命名空间常量集中定义。
    - `actual` 有、`desired` 无，且跨度与窗口无交集 → 不处理（例如早已结束的旧事件）。
    - 用跨度而不是开始时间判断，是为了覆盖"系列开始于窗口之前、但仍在持续"的情况：这类系列在源头被删除后，目标副本必须被清理。
    - 时间窗口在本地计算，所以随着时间推移进入窗口的事件，即使源头没有任何变化，也会被新建。
-4. **安全检查**：计划删除数 `> max_count`，或计划删除数 `≥ 3` 且 `> max_ratio × len(actual)`，则该规则本轮不执行，立即告警，并在告警中列出计划删除的事件标题。比例检查要求至少删 3 条，是为了让小日历删掉最后一两条事件时不被拦截。确认是有意删除时，用 `calsync run --allow-deletes` 放行一次。
+   - 源镜像中存在、但无法解析的系列（未解析），以及只有部分实例能解析的系列（降级），它们在目标中已有的副本既不更新也不删除，并且不计入安全检查的分母；降级系列若还没有副本，则按能解析的部分新建。每个系列每个进程只警告一次，日志只写源 ID，不写事件内容。
+4. **安全检查**：计划删除数 `> max_count`，或计划删除数 `≥ 3` 且 `> max_ratio × len(actual)`，则该规则本轮不执行：不删除，也不新建、不更新。立即告警，并在告警中列出计划删除的事件标题；读取标题需要 ⌈d/100⌉ 次 multiget（d 为计划删除数），只有被拦截的规则付出这个代价。比例检查要求至少删 3 条，是为了让小日历删掉最后一两条事件时不被拦截。确认是有意删除时，用 `calsync run --allow-deletes` 放行一次。
 5. **推送**：只渲染需要新建和更新的系列。按目标账号分组：不同账号并发执行，同一账号受信号量限制；先新建，再更新，最后删除。单个资源失败时记录错误，继续处理其余资源，本轮结果为"部分失败"。
-6. **记录**：写入运行记录，包括各类数量、请求数、传输字节数、耗时。
+6. **记录**：写入运行记录，包括各类数量、请求数、开始和结束时间、错误。传输字节数留到计划 3。
 
-规则之间相互隔离：一条规则失败，只影响它自己的结果。某个源或目标拉取失败，只跳过依赖它的规则。
+规则之间相互隔离：一条规则失败，只影响它自己的结果。某个源或目标拉取失败，只跳过依赖它的规则。源的失败按日历隔离：同一账号下一个日历失败（名称不存在、404、403），不影响该账号的其他日历；只有账号级失败（例如 `calendarList` 授权失败）才让该账号的全部规则失败。
 
-`--dry-run` 执行第 1–4 步并打印计划，不推送，也不更新失败计数。拉取和检测得到的缓存照常写入，因为它们是对外部状态的如实记录。
+`--dry-run` 执行第 1–4 步并打印计划，不推送，也不更新失败计数。拉取和检测得到的缓存照常写入，因为它们是对外部状态的如实记录。目标日历不存在时，`--dry-run` 不会创建它，该规则失败（配置了 `create_if_missing` 时提示"正式运行会创建它"）。
 
 ## 8. 性能设计
 
@@ -400,6 +431,12 @@ XML 用标准库 `xml.etree` 解析，命名空间常量集中定义。
 | 冷启动（本地状态为空） | 每个源日历 ⌈N/2500⌉ 次全量翻页 | 发现（约 3 次）+ 每个目标日历 1 次全量列表 + ⌈托管数/100⌉ 次 multiget | 全部托管资源 |
 
 另有每个 Google 账号约每小时 1 次 access token 刷新。
+
+上表的 CalDAV 列按 `sync-collection` 模式计算：
+
+- `getctag` 模式下，任何变化之后的周期（包括我们自己的写入改变了 ctag）都要付 PROPFIND + 一次 `calendar-query` 全量列表；之后 ctag 不变的周期才是 1 次请求。
+- 全量列表模式每轮都列出全部 etag。
+- "上一轮刚写入后的周期"一行假设服务器在检测中报告的 etag 就是 PUT 返回的 etag；iCloud 是否如此待 §13 第 6、10 项验证。
 
 以一条规则为例：空闲周期共 3 次请求，每次响应都只有几百字节。按 60 秒周期，每天约 4,300 次 Google 请求，远低于 Google 的默认配额（每用户每分钟 600 次，每项目每天 1,000,000 次）。
 
@@ -421,7 +458,7 @@ XML 用标准库 `xml.etree` 解析，命名空间常量集中定义。
 
 ### 8.4 度量
 
-- 共享 httpx 客户端通过事件钩子统计每个周期、每个主机的请求数、状态码和传输字节数。
+- 共享 httpx 客户端通过事件钩子统计每个周期、每个主机的请求数、状态码和传输字节数（计划 1 只统计请求数，字节数在计划 3 加入）。
 - 每个周期结束时写入运行记录，并输出一行结构化日志。
 - `calsync status` 显示每条规则最近一轮的结果和耗时，以及该周期的总请求数。请求数按周期统计，同一周期内的规则共享同一个数字；按规则拆分留到计划 3 再考虑。
 - §14 的测试断言空闲周期的请求数严格等于 §8.1 的预算，并且没有读取任何正文。任何让请求数变多的改动都会让测试失败。
@@ -432,16 +469,19 @@ SQLite 文件默认在 `~/.local/state/calsync/state.db`（Docker 中为数据�
 
 | 表 | 内容 |
 | --- | --- |
-| `source_cursor` | (账号, 日历) → events syncToken；账号 → calendarList syncToken；日历默认提醒 |
-| `source_event` | (账号, 日历, 事件 ID) → 主事件 ID、原始开始时间、状态、`updated`、规范化字段 JSON |
-| `target_calendar` | (账号, 日历 href) → 变化检测级别、sync-token 或 ctag、发现信息 |
-| `target_object` | (账号, 日历 href, 资源 href) → etag、规则、内容哈希、跨度 |
-| `run` | 规则、开始和结束时间、结果、各类数量、请求数、字节数、错误 |
+| `source_state` | 账号 → JSON：`calendars_token`（calendarList syncToken）、`meta`（每个日历的名称、时区、默认提醒）、`events_tokens`（每个日历的 events syncToken） |
+| `source_event` | (账号, 日历, 事件 ID) → Google 返回的原始事件 JSON（字段子集），规划时再分组、规范化 |
+| `target_calendar` | (账号, 配置中的日历引用) → 日历 href、名称、变化检测级别、游标（sync-token 或 ctag） |
+| `target_object` | (账号, 日历 href, 资源 href) → etag、规则标签、对象 ID、内容哈希、跨度 |
+| `run` | 规则、开始和结束时间、结果、各类数量、请求数、错误；每条规则保留最近 500 条。字节数留到计划 3 |
 | `alert` | 告警键 → 状态、最后发送时间（用于去重） |
 
 - 镜像和游标在同一个事务中提交：游标前进时，对应的事件一定已经写入。
-- 目标缓存在每次成功写入后立即更新内存，在周期结束时统一落盘。进程在推送中途退出时，正确性不受影响：下一轮的变化检测会发现这些资源的 etag 与缓存不符，每个受影响的 href 多花一次 multiget 读取，然后缓存恢复正确。
+- 目标缓存在变化检测之后落盘一次，在每次成功写入后立即更新内存，在周期结束时再统一落盘。进程在推送中途退出时，正确性不受影响：下一轮的变化检测会发现这些资源的 etag 与缓存不符，每个受影响的 href 多花一次 multiget 读取，然后缓存恢复正确。
 - `store.py` 带模式版本号。版本不匹配时直接清空重建，不写迁移脚本，这正是"一切皆缓存"带来的好处。
+- 同一个日历可能被多个引用指向（名称和 href）。删除某个 href 的缓存资源时，指向它的所有引用的游标一并清空，下一轮对它做一次冷启动检测。
+- 数据库文件损坏或不是 SQLite 文件时，把它连同 `-wal`、`-shm` 改名为 `.corrupt-<时间>` 隔离，然后新建一个空库。
+- 数据库文件以 `0600` 权限创建，所在目录为 `0700`。
 
 ## 10. 运行时与部署
 
@@ -493,10 +533,13 @@ SQLite 文件默认在 `~/.local/state/calsync/state.db`（Docker 中为数据�
 
 ```
 calsync auth <account>                 CalDAV：从标准输入读取密码。Google：浏览器授权（计划 3）；
-                                       在此之前用 --refresh-token-stdin 读入已有的 refresh token。写入凭证后端并验证可用
+                                       在此之前用 --refresh-token-stdin 读入已有的 refresh token。
+                                       先用新凭证验证（列出日历），成功后才写入凭证后端；空输入直接拒绝；
+                                       验证失败时保留原有凭证
 calsync calendars <account>            列出日历的 ID 和名称
 calsync run [--rule NAME] [--dry-run] [--allow-deletes]
-                                       执行一个周期；--allow-deletes 放行一次防误删拦截
+                                       执行一个周期；--allow-deletes 对本次选中的每条规则放行一次
+                                       防误删拦截（用 --rule 缩小范围）
 calsync daemon                         常驻运行
 calsync trigger                        让常驻进程立即执行一个周期
 calsync status [--json] [--health]     每条规则最近一轮的结果、请求数、耗时
@@ -504,7 +547,9 @@ calsync config check                   只校验配置
 calsync service install|uninstall      macOS：生成并加载/卸载 launchd plist
 ```
 
-退出码：0 成功；1 至少一条规则失败；2 配置错误；3 授权错误；4 常驻进程已在运行。
+全局选项：`--config`（默认 `$CALSYNC_CONFIG` 或 `~/.config/calsync/config.toml`），`--state-dir`（默认 `$CALSYNC_STATE_DIR` 或 `~/.local/state/calsync`）。
+
+退出码：0 成功；1 至少一条规则失败、部分失败或被防误删拦截（包括 `ForbiddenError`）；2 配置错误（包括账号初始化时的配置错误，例如凭证文件权限不是 `0600`）；3 授权错误；4 常驻进程已在运行。`calsync run` 有多条规则时按优先级取一个：任一授权错误为 3，否则任一配置错误为 2，否则任一失败为 1，否则为 0。网络、状态数据库或文件系统的意外错误只打印一行 `error: <类型>: <消息>`，退出码 1，不输出 traceback。
 
 ## 13. 待验证事项（实现第一步）
 
