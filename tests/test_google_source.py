@@ -189,9 +189,10 @@ async def test_403_rate_limit_reasons_are_transient(reason: str) -> None:
         await forbidden_source(error_body(reason)).list_calendars()
 
 
-async def test_403_rate_limit_via_error_status_is_transient() -> None:
+@pytest.mark.parametrize("status", ["rateLimitExceeded", "RESOURCE_EXHAUSTED"])
+async def test_403_rate_limit_via_error_status_is_transient(status: str) -> None:
     with pytest.raises(TransientError):
-        await forbidden_source(error_body(status="rateLimitExceeded")).list_calendars()
+        await forbidden_source(error_body(status=status)).list_calendars()
 
 
 @pytest.mark.parametrize("body", [error_body("forbidden"), error_body(), {"nope": 1}, "plain"])
@@ -242,7 +243,7 @@ async def test_static_token_401_is_not_retried() -> None:
     client = make_client(log, transport=httpx.MockTransport(handler))
     with pytest.raises(AuthError):
         await GoogleSource(client, StaticToken("t"), base_url=BASE_URL).list_calendars()
-    assert log.count() == 2  # invalidate() is a no-op, but the one retry still happens
+    assert log.count() == 1  # a static token cannot be refreshed, so no retry
 
 
 async def test_refresh_provider_default_clock_is_wall_clock() -> None:
@@ -392,3 +393,22 @@ async def test_default_reminder_change_flows_through_incremental_pull() -> None:
     second = await source.pull([CAL], first.state)
     assert second.calendars[CAL].meta.default_alarms == (Alarm(timedelta(minutes=-30)),)
     assert not second.calendars[CAL].full
+
+
+async def test_fake_sync_token_is_per_calendar() -> None:
+    fake = seeded()
+    fake.add_calendar("other@x", "Other")
+    token = (await fake_get(fake, f"/calendars/{CAL}/events")).json()["nextSyncToken"]
+    assert (await fake_get(fake, f"/calendars/{CAL}/events", syncToken=token)).status_code == 200
+    assert (await fake_get(fake, "/calendars/other@x/events", syncToken=token)).status_code == 400
+
+
+def test_invalidate_reports_whether_a_fresh_token_is_possible() -> None:
+    assert StaticToken("t").invalidate() is False
+    provider = RefreshTokenProvider(
+        make_client(RequestLog(), transport=httpx.MockTransport(lambda r: httpx.Response(500))),
+        client_id="c",
+        client_secret="s",
+        refresh_token="r",
+    )
+    assert provider.invalidate() is True

@@ -79,11 +79,11 @@ class FakeGoogle:
     # ----- protocol -----------------------------------------------------
     @staticmethod
     def _fingerprint(request: httpx.Request) -> str:
-        """Short hash of every request param except the paging cursors."""
+        """Short hash of the path plus every param except the paging cursors."""
         pairs = sorted(
             (k, v) for k, v in request.url.params.multi_items() if k not in ("syncToken", "pageToken")
         )
-        return hashlib.sha1(json.dumps(pairs).encode()).hexdigest()[:8]
+        return hashlib.sha1(json.dumps([request.url.path, pairs]).encode()).hexdigest()[:8]
 
     def _token(self, request: httpx.Request) -> str:
         return f"g{self.generation}-{self._seq}-{self._fingerprint(request)}"

@@ -19,6 +19,8 @@ from calsync.http import request_with_retry
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 REFRESH_MARGIN = 300.0
 
+# A provider may also define ``invalidate() -> bool``: drop the cached token and
+# report whether a fresh one can be obtained (used to retry once after a 401).
 TokenProvider = Callable[[], Awaitable[str]]
 
 
@@ -29,8 +31,9 @@ class StaticToken:
     async def __call__(self) -> str:
         return self._token
 
-    def invalidate(self) -> None:
-        """A static token cannot be refreshed; nothing to drop."""
+    def invalidate(self) -> bool:
+        """A static token cannot be refreshed, so a retry would be futile."""
+        return False
 
 
 class RefreshTokenProvider:
@@ -60,10 +63,11 @@ class RefreshTokenProvider:
     def _fresh(self) -> bool:
         return self._token is not None and self._clock() < self._expires_at - REFRESH_MARGIN
 
-    def invalidate(self) -> None:
-        """Drop the cached token (e.g. after a 401) so the next call refreshes."""
+    def invalidate(self) -> bool:
+        """Drop the cached token (e.g. after a 401); True: the next call fetches a fresh one."""
         self._token = None
         self._expires_at = 0.0
+        return True
 
     async def __call__(self) -> str:
         if self._fresh():

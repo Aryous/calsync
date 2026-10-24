@@ -57,7 +57,13 @@ CALENDAR_LIST_PARAMS: Mapping[str, str] = {
 
 
 RATE_LIMIT_REASONS = frozenset(
-    {"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded", "dailyLimitExceeded"}
+    {
+        "rateLimitExceeded",
+        "userRateLimitExceeded",
+        "quotaExceeded",
+        "dailyLimitExceeded",
+        "RESOURCE_EXHAUSTED",
+    }
 )
 
 
@@ -96,9 +102,8 @@ class GoogleSource:
         if response.status_code == 401:
             # The cached access token may have died (sleep, revocation): refresh once.
             invalidate = getattr(self._token, "invalidate", None)
-            if invalidate is not None:
-                invalidate()
-            response = await self._send(path, params, kind)
+            if invalidate is not None and invalidate():
+                response = await self._send(path, params, kind)
         status = response.status_code
         if status == 410:
             raise CursorExpired(path)
