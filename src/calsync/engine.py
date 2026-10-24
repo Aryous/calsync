@@ -167,7 +167,10 @@ class Engine:
             self._caches.pop(cache_key, None)
             raise
         need = apply_target_delta(cache, delta)
-        for obj in await target.fetch(cal, need) if need else []:
+        fetched = await target.fetch(cal, need) if need else []
+        for href in set(need) - {obj.href for obj in fetched}:
+            cache.objects.pop(href, None)  # changed but unreadable now: re-fetch and repair next time
+        for obj in fetched:
             name = parse_resource_name(obj.href)
             if name is None:
                 continue
@@ -189,7 +192,8 @@ class Engine:
         source = self._sources[account]
         cal_id = self._resolved[(account, rule.source.calendar)]
         meta = self._meta.get((account, cal_id), CalendarMeta())
-        raw = self._mirrors[account].get(cal_id, {}).values()
+        # A missing mirror must fail the rule, never read as "the source is empty".
+        raw = self._mirrors[account][cal_id].values()
         series = source.to_series(raw, meta)
         desired: dict[str, Desired] = {}
         for item in series:
@@ -305,20 +309,27 @@ class Engine:
             cache.objects.pop(have.href, None)
             result.deleted += 1
 
-        phases: list[list[Coroutine[Any, Any, None]]] = [
-            [create(w) for w in p.create],
-            [update(w, a) for w, a in p.update],
-            [delete(a) for a in p.delete],
+        # Coroutines are created per phase, so a cancelled cycle leaves none un-awaited.
+        phases: list[Callable[[], list[Coroutine[Any, Any, None]]]] = [
+            lambda: [create(w) for w in p.create],
+            lambda: [update(w, a) for w, a in p.update],
+            lambda: [delete(a) for a in p.delete],
         ]
+        errors: list[Exception] = []
         for jobs in phases:
-            for outcome in await asyncio.gather(*jobs, return_exceptions=True):
-                if isinstance(outcome, Exception):
-                    result.failed += 1
-                    result.error = f"{type(outcome).__name__}: {outcome}"
+            for outcome in await asyncio.gather(*jobs(), return_exceptions=True):
+                if isinstance(outcome, BaseException):
+                    if not isinstance(outcome, Exception):
+                        raise outcome
+                    errors.append(outcome)
                     if isinstance(outcome, AuthError):
                         result.error_kind = "auth"
                     log.warning("rule %s: write failed: %s", rule.name, outcome)
-        if result.failed:
+        if errors:
+            result.failed = len(errors)
+            first = errors[0]
+            more = f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""
+            result.error = f"{type(first).__name__}: {first}{more}"
             done = result.created + result.updated + result.deleted
             result.status = "partial" if done else "failed"
             result.error_kind = result.error_kind or "other"

@@ -27,6 +27,7 @@ class FakeTarget:
     objects: dict[str, tuple[str, bytes]] = field(default_factory=dict)  # href -> (etag, data)
     fail_changes: dict[str, Exception] = field(default_factory=dict)
     fail_fetch: Exception | None = None  # raised by every fetch() while set
+    hide_once: set[str] = field(default_factory=set)  # left out of the next fetch() only
     before_write: Callable[[str, str], None] | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
     _seq: int = 0
@@ -78,7 +79,8 @@ class FakeTarget:
         self.calls.append(("fetch", ",".join(hrefs)))
         if self.fail_fetch is not None:
             raise self.fail_fetch
-        return [FetchedObject(h, *self.objects[h]) for h in hrefs if h in self.objects]
+        hidden, self.hide_once = self.hide_once, set()
+        return [FetchedObject(h, *self.objects[h]) for h in hrefs if h in self.objects and h not in hidden]
 
     def href_for(self, cal: TargetCalendar, name: str) -> str:
         return f"{cal.href}{name}"

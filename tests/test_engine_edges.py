@@ -1,12 +1,15 @@
 """Engine edge cases against FakeGoogle + an in-memory FakeTarget (no Radicale)."""
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from calsync.errors import ConflictError, TransientError
+from calsync.model import Series
+from calsync.sources.base import CalendarInfo, CalendarMeta, RawEvent, SourcePull
 from tests.factories import google_event
 from tests.fakes.google import FakeGoogle
 from tests.harness import GCAL, build_fake, config_for, rule
@@ -230,3 +233,76 @@ async def test_title_lookup_failure_keeps_the_rule_blocked(tmp_path: Path) -> No
     res = (await h.engine.cycle()).rules["family"]
     assert res.status == "blocked" and res.error_kind == "guard" and res.blocked_titles == []
     assert len(h.target.objects) == 4
+
+
+# ----- 6. minor ---------------------------------------------------------------
+
+
+class ForgetfulSource:
+    """Wraps a source; after ``forget()`` its pulls silently omit every calendar."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.forgetful = False
+
+    async def list_calendars(self) -> list[CalendarInfo]:
+        return await self._inner.list_calendars()
+
+    async def pull(self, calendar_refs: Sequence[str], state: Mapping[str, Any]) -> SourcePull:
+        pull = await self._inner.pull(calendar_refs, state)
+        return SourcePull({}, dict(state)) if self.forgetful else pull
+
+    def to_series(self, raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Series]:
+        return self._inner.to_series(raw_events, meta)
+
+    def series_ids(self, raw_events: Iterable[RawEvent]) -> set[str]:
+        return self._inner.series_ids(raw_events)
+
+
+async def test_missing_mirror_fails_loudly_instead_of_deleting(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, simple(), config_for([rule()]))
+    await h.engine.cycle()
+    source = ForgetfulSource(h.engine._sources["me"])
+    h.engine._sources = {"me": source}
+    h.engine._mirrors["me"].clear()
+    source.forgetful = True
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.status == "failed" and "KeyError" in (res.error or "")
+    assert len(h.target.managed(h.target.calendars["Family"])) == 2
+
+
+async def test_unfetchable_changed_href_leaves_cache_and_is_repaired(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, simple(), config_for([rule()]))
+    await h.engine.cycle()
+    cal = h.target.calendars["Family"]
+    href = sorted(h.target.managed(cal))[0]
+    h.target.put(href, b"edited elsewhere")
+    h.target.hide_once = {href}  # e.g. a multiget that skips the resource this time
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.status == "ok" and res.created == 1  # repaired via create -> 412 -> update
+    assert h.target.objects[href][1] != b"edited elsewhere"
+    assert (await h.engine.cycle()).rules["family"].plan.empty
+
+
+async def test_partial_failure_keeps_first_error_and_counts_the_rest(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, many(4), config_for([rule()]))
+    seen: list[str] = []
+
+    def flaky(op: str, href: str) -> None:
+        seen.append(href)
+        if len(seen) > 1:
+            raise TransientError("PUT timed out")
+
+    h.target.before_write = flaky
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.created, res.failed) == ("partial", 1, 3)
+    assert res.error == "TransientError: PUT timed out (+2 more)" and res.error_kind == "other"
+    assert [r.status for r in h.store.latest_runs()] == ["partial"]
+
+
+async def test_dry_run_against_missing_target_calendar(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, simple(), config_for([rule()]))
+    res = (await h.engine.cycle(dry_run=True)).rules["family"]
+    assert res.status == "failed" and "a real run creates it" in (res.error or "")
+    assert h.target.calendars == {} and h.target.objects == {}
+    assert h.store.latest_runs() == []
