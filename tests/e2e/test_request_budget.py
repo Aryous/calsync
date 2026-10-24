@@ -3,15 +3,24 @@
 from collections import Counter
 from pathlib import Path
 
+import httpx
 import pytest
 
+from calsync.engine import CycleResult, Engine
+from calsync.http import RequestLog, make_client
+from calsync.sources.google import GoogleSource
+from calsync.sources.google_auth import StaticToken
+from calsync.store import Store
+from calsync.targets.caldav import CalDavTarget
 from tests.factories import google_event
-from tests.fakes.google import FakeGoogle
-from tests.harness import GCAL, build, config_for, rule
+from tests.fakes.google import BASE_URL, FakeGoogle
+from tests.harness import GCAL, NOW, build, config_for, rule
 
 pytestmark = [pytest.mark.anyio, pytest.mark.e2e]
 
 WORK = "work@group.calendar.google.com"
+# Two rules, one Google account, two source and two target calendars.
+IDLE = Counter({"google-calendarlist": 1, "google-events": 2, "sync-collection": 2})
 
 
 def fake_with_two_calendars() -> FakeGoogle:
@@ -47,11 +56,11 @@ async def test_idle_cycles_meet_budget(tmp_path: Path, radicale_url: str, dav_us
     h = build(tmp_path, radicale_url, dav_user, fake, config_for(rules))
     await h.engine.cycle()  # cold start
 
-    # The cycle right after our own writes must not download any body.
+    # The cycle right after our own writes costs exactly an idle cycle: no body read.
     mark = h.log.mark()
     after_write = await h.engine.cycle()
     assert all(r.plan.empty for r in after_write.rules.values())
-    assert "calendar-multiget" not in [e.kind for e in h.log.since(mark)]
+    assert Counter(e.kind for e in h.log.since(mark)) == IDLE
 
     for _ in range(2):
         mark = h.log.mark()
@@ -60,8 +69,41 @@ async def test_idle_cycles_meet_budget(tmp_path: Path, radicale_url: str, dav_us
         kinds = Counter(e.kind for e in h.log.since(mark))
         # 1 calendarList per Google account + 1 events.list per source calendar
         # + 1 change check per target calendar. Nothing else.
-        assert kinds == Counter({"google-calendarlist": 1, "google-events": 2, "sync-collection": 2})
+        assert kinds == IDLE
         assert idle.requests == 5
+
+
+async def test_fresh_process_per_cycle_meets_budget(tmp_path: Path, radicale_url: str, dav_user: str) -> None:
+    """`calsync run` from cron: every cycle is a new Engine and Store reading the saved state."""
+    fake = fake_with_two_calendars()
+    config = config_for([rule("family"), rule("work", source="Work", target="Work")])
+
+    async def one_process() -> tuple[Counter[str], CycleResult]:
+        log = RequestLog()
+        async with (
+            make_client(log, transport=fake.transport()) as google,
+            make_client(log, auth=httpx.BasicAuth(dav_user, "pw")) as dav,
+        ):
+            with Store(tmp_path / "state.db") as store:
+                engine = Engine(
+                    config,
+                    store,
+                    {"me": GoogleSource(google, StaticToken("t"), base_url=BASE_URL)},
+                    {"dav": CalDavTarget(dav, radicale_url)},
+                    request_log=log,
+                    clock=lambda: NOW,
+                )
+                result = await engine.cycle()
+        assert all(r.status == "ok" for r in result.rules.values()), result.rules
+        return Counter(e.kind for e in log.entries), result
+
+    _, cold = await one_process()
+    assert sum(r.created for r in cold.rules.values()) == 6
+    after_write, result = await one_process()
+    assert after_write == IDLE and all(r.plan.empty for r in result.rules.values())
+    for _ in range(2):
+        idle, result = await one_process()
+        assert idle == IDLE and result.requests == 5
 
 
 async def test_k_changes_cost_k_writes(tmp_path: Path, radicale_url: str, dav_user: str) -> None:
