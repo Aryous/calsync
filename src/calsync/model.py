@@ -18,13 +18,17 @@ from dateutil.rrule import rrulestr
 
 # Bump whenever render.py changes the bytes it produces: every managed
 # resource is then rewritten once on the next cycle.
-RENDER_VERSION = 1
+RENDER_VERSION = 2
 
 MAX_TIME = datetime(9999, 12, 31, tzinfo=UTC)
 # Beyond this many occurrences the series is treated as unbounded (safe direction: never mistaken for finished).
 SPAN_EXPANSION_LIMIT = 10_000
 
 AlarmPolicy = Literal["copy", "strip"] | tuple[timedelta, ...]
+AttendeeMode = Literal["none", "notes"]
+ConferenceMode = Literal["copy", "none"]
+ContentMode = Literal["full", "busy"]
+BUSY_TITLE = "Busy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -219,6 +223,60 @@ def apply_alarm_policy(series: Series, policy: AlarmPolicy) -> Series:
         series,
         alarms=alarms,
         overrides=tuple(replace(o, alarms=alarms) for o in series.overrides),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FieldPolicy:
+    attendees: AttendeeMode = "notes"
+    conference: ConferenceMode = "copy"
+    content: ContentMode = "full"
+
+
+def _attendee_label(a: Attendee) -> str:
+    return f"{a.name} <{a.email}>" if a.name and a.email else a.name or a.email
+
+
+def _notes(description: str, attendees: tuple[Attendee, ...], url: str, policy: FieldPolicy) -> str:
+    blocks = [description.strip()] if description.strip() else []
+    if policy.attendees == "notes" and attendees:
+        blocks.append("Attendees: " + ", ".join(_attendee_label(a) for a in attendees))
+    if policy.conference == "copy" and url:
+        blocks.append("Conference: " + url)
+    return "\n\n".join(blocks)
+
+
+def apply_field_policy(series: Series, policy: FieldPolicy) -> Series:
+    """Shape what reaches the target. Attendees never stay structured: they are
+    either written into the notes or dropped, so no server can invite anyone."""
+    if policy.content == "busy":
+        return replace(
+            series,
+            title=BUSY_TITLE,
+            description="",
+            location="",
+            attendees=(),
+            conference_url="",
+            overrides=tuple(
+                replace(o, title=BUSY_TITLE, description="", location="", attendees=(), conference_url="")
+                for o in series.overrides
+            ),
+        )
+    keep_url = policy.conference == "copy"
+    return replace(
+        series,
+        description=_notes(series.description, series.attendees, series.conference_url, policy),
+        attendees=(),
+        conference_url=series.conference_url if keep_url else "",
+        overrides=tuple(
+            replace(
+                o,
+                description=_notes(o.description, o.attendees, o.conference_url, policy),
+                attendees=(),
+                conference_url=o.conference_url if keep_url else "",
+            )
+            for o in series.overrides
+        ),
     )
 
 

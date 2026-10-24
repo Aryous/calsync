@@ -9,14 +9,14 @@ import math
 import os
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal, overload
 
 from calsync.durations import parse_duration
 from calsync.errors import ConfigError
-from calsync.model import AlarmPolicy
+from calsync.model import AlarmPolicy, FieldPolicy
 
 Backend = Literal["keychain", "env", "file"]
 Provider = Literal["google", "caldav"]
@@ -67,6 +67,7 @@ class Rule:
     window: WindowSpec | None  # None: all of time (full sync)
     alarms: AlarmPolicy
     delete_guard: DeleteGuard
+    fields: FieldPolicy = field(default_factory=FieldPolicy)
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +296,28 @@ def _alarms(raw: Any, where: str, problems: list[str]) -> AlarmPolicy:
     return "copy"
 
 
+_FIELD_CHOICES: dict[str, tuple[str, ...]] = {
+    "attendees": ("none", "notes"),
+    "conference": ("copy", "none"),
+    "content": ("full", "busy"),
+}
+
+
+def _fields(raw: Any, where: str, problems: list[str]) -> FieldPolicy:
+    table = _table(raw, where, problems)
+    values: dict[str, Any] = {}  # each value checked against _FIELD_CHOICES
+    for key, value in table.items():
+        choices = _FIELD_CHOICES.get(key)
+        if choices is None:
+            problems.append(f"{where}.{key}: unknown setting")
+        elif value not in choices:
+            allowed = ", ".join(f'"{c}"' for c in choices)
+            problems.append(f"{where}.{key}: expected one of {allowed}")
+        else:
+            values[key] = value
+    return FieldPolicy(**values)
+
+
 def _rule(index: int, raw: Any, accounts: Mapping[str, Account], problems: list[str]) -> Rule | None:
     where = f"rules[{index}]"
     if not isinstance(raw, Mapping):
@@ -344,9 +367,10 @@ def _rule(index: int, raw: Any, accounts: Mapping[str, Account], problems: list[
             expect="an integer >= 0",
         ),
     )
+    fields = _fields(raw.get("fields"), f"{where}.fields", problems)
     if source is None or target is None or not window_ok:
         return None
-    return Rule(name, source, target, window, alarms, guard)
+    return Rule(name, source, target, window, alarms, guard, fields)
 
 
 def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:

@@ -7,6 +7,7 @@ import pytest
 from calsync.config import CredentialRef, WindowSpec, default_config_path, load_config, parse_config
 from calsync.durations import parse_duration
 from calsync.errors import ConfigError
+from calsync.model import FieldPolicy
 
 VALID = {
     "google": {"client_secret_file": "google-client.json"},
@@ -250,3 +251,42 @@ def test_icloud_server_alias_is_accepted(tmp_path: Path) -> None:
     data["accounts"]["i"]["server_url"] = "icloud.com"
     with pytest.raises(ConfigError, match="server_url"):
         parse_config(data, base_dir=tmp_path)
+
+
+def test_fields_default(tmp_path: Path) -> None:
+    assert parse_config(copy.deepcopy(VALID), tmp_path).rules[0].fields == FieldPolicy()
+
+
+def test_fields_parsed(tmp_path: Path) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["fields"] = {"attendees": "none", "conference": "none", "content": "busy"}
+    assert parse_config(data, tmp_path).rules[0].fields == FieldPolicy("none", "none", "busy")
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"attendees": "invite"}, 'rules[family].fields.attendees: expected one of "none", "notes"'),
+        ({"conference": True}, 'rules[family].fields.conference: expected one of "copy", "none"'),
+        ({"content": "hidden"}, 'rules[family].fields.content: expected one of "full", "busy"'),
+        ({"colour": "red"}, "rules[family].fields.colour: unknown setting"),
+        ("busy", "rules[family].fields: must be a table"),
+    ],
+)
+def test_fields_rejected(tmp_path: Path, fields: object, expected: str) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["fields"] = fields
+    with pytest.raises(ConfigError) as info:
+        parse_config(data, tmp_path)
+    assert expected in info.value.problems
+
+
+def test_bad_fields_reported_with_other_problems_of_the_rule(tmp_path: Path) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["fields"] = {"content": "hidden"}
+    data["rules"][0]["delete_guard"] = {"max_count": -1}
+    with pytest.raises(ConfigError) as info:
+        parse_config(data, tmp_path)
+    text = "\n".join(info.value.problems)
+    assert "rules[family].fields.content" in text
+    assert "rules[family].delete_guard.max_count" in text

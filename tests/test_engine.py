@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from icalendar import Calendar
 
 from calsync.engine import apply_target_delta
 from calsync.naming import parse_resource_name
@@ -232,3 +233,42 @@ async def test_two_rules_share_one_target_calendar(tmp_path: Path, radicale_url:
     assert result.rules["work"].deleted == 1 and result.rules["family"].plan.empty
     titles = [inspect(b) for b in (await managed(h)).values()]
     assert len(titles) == 2 and {t.rule for t in titles if t} == {"family"}
+
+
+def with_attendees() -> FakeGoogle:
+    fake = FakeGoogle()
+    fake.add_calendar(GCAL, "Family")
+    fake.put_event(
+        GCAL,
+        google_event(
+            "m1",
+            "Visit",
+            "2026-10-28T10:00:00+08:00",
+            "2026-10-28T10:30:00+08:00",
+            attendees=[{"email": "alice@example.com", "displayName": "Alice"}],
+            hangoutLink="https://meet.example.com/abc",
+        ),
+    )
+    return fake
+
+
+async def test_default_fields_write_notes_not_invitations(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, with_attendees(), config_for([rule()]))
+    await h.engine.cycle()
+    [body] = h.target.managed(h.target.calendars["Family"]).values()
+    text = body.decode()
+    assert "Attendees: Alice <alice@example.com>" in text.replace("\r\n ", "")
+    assert "URL:https://meet.example.com/abc" in text
+    assert "ATTENDEE" not in text
+
+
+async def test_busy_rule_hides_content(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, with_attendees(), config_for([rule(fields={"content": "busy"})]))
+    await h.engine.cycle()
+    [body] = h.target.managed(h.target.calendars["Family"]).values()
+    [event] = Calendar.from_ical(body).walk("VEVENT")
+    assert event["summary"] == "Busy"
+    # The alarm stays (its own DESCRIPTION is the title, "Busy"); the event carries no content.
+    assert event.walk("VALARM")
+    assert "description" not in event and "location" not in event and "url" not in event
+    assert b"Visit" not in body and b"alice@example.com" not in body and b"meet.example.com" not in body

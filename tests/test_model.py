@@ -13,10 +13,13 @@ from calsync.model import (
     SPAN_EXPANSION_LIMIT,
     Alarm,
     Attendee,
+    FieldPolicy,
     Occurrence,
+    Series,
     When,
     Window,
     apply_alarm_policy,
+    apply_field_policy,
     compute_span,
     series_hash,
     series_span,
@@ -273,3 +276,61 @@ def test_attendee_normalization_does_not_depend_on_hash_seed() -> None:
         for seed in range(6)
     }
     assert len(outputs) == 1
+
+
+ALICE = Attendee("Alice", "alice@example.com")
+BOB = Attendee("", "bob@example.com")
+
+
+def rich() -> Series:
+    occ = Occurrence(
+        original_start=at(2026, 10, 30, 9, 30),
+        start=at(2026, 10, 30, 10, 0),
+        end=at(2026, 10, 30, 10, 5),
+        title="Standup moved",
+        description="",
+        location="Room B",
+        alarms=(),
+        attendees=(BOB,),
+        conference_url="",
+    )
+    return replace(
+        series(recurrence=("RRULE:FREQ=DAILY;COUNT=10",), overrides=(occ,)),
+        description="Agenda",
+        location="Room A",
+        attendees=(ALICE, BOB),
+        conference_url="https://meet.example.com/abc",
+    )
+
+
+def test_notes_and_copy_by_default() -> None:
+    s = apply_field_policy(rich(), FieldPolicy())
+    assert s.description == (
+        "Agenda\n\nAttendees: Alice <alice@example.com>, bob@example.com\n\n"
+        "Conference: https://meet.example.com/abc"
+    )
+    assert s.attendees == () and s.conference_url == "https://meet.example.com/abc"
+    assert s.overrides[0].description == "Attendees: bob@example.com"
+    assert s.overrides[0].attendees == ()
+
+
+def test_none_drops_attendees_and_conference() -> None:
+    s = apply_field_policy(rich(), FieldPolicy(attendees="none", conference="none"))
+    assert s.description == "Agenda"
+    assert s.attendees == () and s.conference_url == ""
+
+
+def test_busy_hides_content_but_keeps_time_and_alarms() -> None:
+    original = rich()
+    s = apply_field_policy(original, FieldPolicy(content="busy"))
+    assert (s.title, s.description, s.location, s.conference_url) == ("Busy", "", "", "")
+    assert s.start == original.start and s.alarms == original.alarms
+    occ = s.overrides[0]
+    assert (occ.title, occ.description, occ.location) == ("Busy", "", "")
+    assert occ.start == original.overrides[0].start
+
+
+def test_policy_changes_the_hash() -> None:
+    assert series_hash(apply_field_policy(rich(), FieldPolicy())) != series_hash(
+        apply_field_policy(rich(), FieldPolicy(attendees="none"))
+    )

@@ -1,8 +1,9 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from calsync.model import Alarm, Occurrence, series_hash, series_span
+from calsync.model import Alarm, Attendee, Occurrence, series_hash, series_span
 from calsync.naming import object_id, parse_resource_name, resource_name, rule_tag, uid_for
 from calsync.render import inspect, render
 from tests.factories import at, day, series
@@ -144,3 +145,14 @@ def test_inspect_never_raises_from_the_parser(monkeypatch: pytest.MonkeyPatch, e
 
     monkeypatch.setattr(render_mod.Calendar, "from_ical", staticmethod(broken))
     assert inspect(_body("DTSTART:20261025T010000Z")) is None
+
+
+def test_url_is_rendered_and_attendees_never_are() -> None:
+    s = replace(
+        series(),
+        conference_url="https://meet.example.com/abc",
+        attendees=(Attendee("Alice", "alice@example.com"),),
+    )
+    data = render(s, uid="u@calsync", rule_name="r", content_hash="h", now=NOW)
+    assert b"URL:https://meet.example.com/abc" in data
+    assert b"ATTENDEE" not in data and b"ORGANIZER" not in data

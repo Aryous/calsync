@@ -19,6 +19,7 @@ def _event(
     title: str,
     description: str,
     location: str,
+    url: str,
     alarms: tuple[Alarm, ...],
     transparent: bool,
     rule_name: str,
@@ -35,6 +36,8 @@ def _event(
         event.add("description", description)
     if location:
         event.add("location", location)
+    if url:
+        event.add("url", url)
     event.add("transp", "TRANSPARENT" if transparent else "OPAQUE")
     event.add("x-calsync-rule", rule_name)
     event.add("x-calsync-hash", content_hash)
@@ -58,6 +61,7 @@ def render(series: Series, *, uid: str, rule_name: str, content_hash: str, now: 
         series.title,
         series.description,
         series.location,
+        series.conference_url,
         series.alarms,
         series.transparent,
         rule_name,
@@ -84,6 +88,7 @@ def render(series: Series, *, uid: str, rule_name: str, content_hash: str, now: 
             occ.title,
             occ.description,
             occ.location,
+            occ.conference_url,
             occ.alarms,
             series.transparent,
             rule_name,

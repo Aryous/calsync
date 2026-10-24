@@ -17,7 +17,7 @@ from calsync.config import Config, Rule
 from calsync.errors import AuthError, CalsyncError, ConfigError, ConflictError, NotFoundError
 from calsync.http import RequestLog
 from calsync.mirror import Mirror, apply_pull
-from calsync.model import Window, apply_alarm_policy, series_hash, series_span
+from calsync.model import Window, apply_alarm_policy, apply_field_policy, series_hash, series_span
 from calsync.naming import object_id, parse_resource_name, resource_name, rule_tag, uid_for
 from calsync.planner import Actual, Desired, Plan, check_delete_guard, plan
 from calsync.render import inspect, render
@@ -229,7 +229,7 @@ class Engine:
         series = source.to_series(raw, meta)
         desired: dict[str, Desired] = {}
         for item in series:
-            shaped = apply_alarm_policy(item, rule.alarms)
+            shaped = apply_field_policy(apply_alarm_policy(item, rule.alarms), rule.fields)
             oid = object_id(rule.name, cal_id, item.source_id)
             desired[oid] = Desired(oid, shaped, series_hash(shaped), series_span(shaped))
         unparsed = source.series_ids(raw) - {item.source_id for item in series}
