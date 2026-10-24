@@ -160,6 +160,17 @@ def test_source_auth_failure_exits_3(monkeypatch: pytest.MonkeyPatch, one_rule: 
     assert code == EXIT_AUTH and "status=failed" in text and "AuthError" in text
 
 
+def test_source_forbidden_exits_1_not_auth(monkeypatch: pytest.MonkeyPatch, one_rule: list[str]) -> None:
+    def forbid() -> httpx.AsyncBaseTransport:
+        body = {"error": {"code": 403, "errors": [{"reason": "forbidden"}], "message": "nope"}}
+        return httpx.MockTransport(lambda request: httpx.Response(403, json=body))
+
+    patch_google(monkeypatch, {"me": forbid})
+    code, text = run([*one_rule, "run"])
+    assert code == EXIT_FAILED and "status=failed" in text and "ForbiddenError" in text
+    assert "calsync auth" not in text
+
+
 def test_unreadable_secret_fails_only_its_rules(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, radicale_url: str, dav_user: str
 ) -> None:

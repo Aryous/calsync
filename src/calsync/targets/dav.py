@@ -13,7 +13,14 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-from calsync.errors import AuthError, CalsyncError, ConflictError, CursorExpired, NotFoundError
+from calsync.errors import (
+    AuthError,
+    CalsyncError,
+    ConflictError,
+    CursorExpired,
+    ForbiddenError,
+    NotFoundError,
+)
 from calsync.http import Sleep, request_with_retry
 
 DAV = "DAV:"
@@ -76,6 +83,19 @@ def parse_multistatus(body: bytes, base_url: str) -> tuple[list[DavResponse], st
         responses.append(DavResponse(href, status, props))
     token = root.findtext(q(DAV, "sync-token"))
     return responses, token.strip() if token else None
+
+
+def _precondition(body: bytes) -> str | None:
+    """The first precondition element of a DAV:error body (RFC 4918 16), e.g.
+    ``{urn:ietf:params:xml:ns:caldav}valid-calendar-data``; None if there is none."""
+    try:
+        root = ET.fromstring(body)
+    except (ET.ParseError, ValueError):
+        return None
+    if root.tag != q(DAV, "error"):
+        return None
+    first = next(iter(root), None)
+    return None if first is None else first.tag
 
 
 def _xml(root: ET.Element) -> bytes:
@@ -187,8 +207,12 @@ class DavClient:
         sync_token_invalid = b"valid-sync-token" in response.content
         if status in (403, 409) and sync_token_invalid:
             raise CursorExpired(href)
-        if status in (401, 403):
-            raise AuthError(f"{method} {href}: HTTP {status}")
+        if status == 401:
+            raise AuthError(f"{method} {href}: HTTP 401")
+        if status == 403:
+            # Credentials worked; the server refused this request (privileges, a
+            # precondition such as valid-calendar-data or no-uid-conflict, ...).
+            raise ForbiddenError(f"{method} {href}: {_precondition(response.content) or 'HTTP 403'}")
         if status == 404:
             raise NotFoundError(href)
         if status == 412:

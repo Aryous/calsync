@@ -35,3 +35,9 @@ class NotFoundError(CalsyncError):
 
 class CursorExpired(CalsyncError):
     """An incremental sync cursor is no longer valid; a full resync is required."""
+
+
+class ForbiddenError(CalsyncError):
+    """The server understood the credentials but refused the request (HTTP 403 that is
+    neither throttling nor an expired sync token): a permission or data problem, so
+    re-entering credentials would not help."""

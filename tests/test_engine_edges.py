@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from calsync.errors import ConflictError, TransientError
+from calsync.errors import ConflictError, ForbiddenError, TransientError
 from calsync.http import RequestLog, make_client
 from calsync.model import Series
 from calsync.naming import object_id, resource_name
@@ -516,3 +516,30 @@ async def test_degraded_warning_rearms_after_the_series_parses_again(
             recurring(fake, broken=broken)
             await h.engine.cycle()
     assert len([r for r in caplog.records if "pills" in r.getMessage()]) == 2
+
+
+# ----- 403 is not an authentication failure --------------------------------
+
+
+async def test_single_forbidden_write_is_not_an_auth_failure(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, simple(), config_for([rule()]))
+    seen: list[str] = []
+
+    def refuse_first(op: str, href: str) -> None:
+        seen.append(href)
+        if len(seen) == 1:
+            raise ForbiddenError("PUT x.ics: HTTP 403 {urn:ietf:params:xml:ns:caldav}valid-calendar-data")
+
+    h.target.before_write = refuse_first
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.created, res.failed) == ("partial", 1, 1)
+    assert res.error_kind == "other" and "ForbiddenError" in (res.error or "")
+
+
+async def test_forbidden_detection_is_not_an_auth_failure(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, simple(), config_for([rule()]))
+    h.target.fail_changes["Family"] = ForbiddenError("REPORT /cal/: HTTP 403 {DAV:}need-privileges")
+    await h.engine.cycle()  # the first cycle discovers the calendar and creates the copies
+    h.target.fail_changes["Family"] = ForbiddenError("REPORT /cal/: HTTP 403 {DAV:}need-privileges")
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.status == "failed" and res.error_kind == "other"

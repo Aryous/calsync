@@ -3,7 +3,14 @@ import xml.etree.ElementTree as ET
 import httpx
 import pytest
 
-from calsync.errors import AuthError, CalsyncError, ConflictError, CursorExpired, NotFoundError
+from calsync.errors import (
+    AuthError,
+    CalsyncError,
+    ConflictError,
+    CursorExpired,
+    ForbiddenError,
+    NotFoundError,
+)
 from calsync.http import RequestLog, make_client
 from calsync.targets.dav import (
     CALDAV,
@@ -74,7 +81,7 @@ def client_with(status: int, body: bytes = b"", headers: dict[str, str] | None =
     ("status", "body", "error"),
     [
         (401, b"", AuthError),
-        (403, b"", AuthError),
+        (403, b"", ForbiddenError),  # a 403 is a permission problem, not dead credentials
         (403, b"<error xmlns='DAV:'><valid-sync-token/></error>", CursorExpired),
         (409, b"<error xmlns='DAV:'><valid-sync-token/></error>", CursorExpired),
         (404, b"", NotFoundError),
@@ -84,6 +91,31 @@ def client_with(status: int, body: bytes = b"", headers: dict[str, str] | None =
 async def test_error_mapping(status: int, body: bytes, error: type[Exception]) -> None:
     with pytest.raises(error):
         await client_with(status, body).report("/cal/", sync_collection_body("t"), kind="sync-collection")
+
+
+@pytest.mark.parametrize(
+    ("body", "named"),
+    [
+        (
+            b"<D:error xmlns:D='DAV:' xmlns:C='urn:ietf:params:xml:ns:caldav'><C:valid-calendar-data/></D:error>",
+            "{urn:ietf:params:xml:ns:caldav}valid-calendar-data",
+        ),
+        (
+            b"<D:error xmlns:D='DAV:' xmlns:C='urn:ietf:params:xml:ns:caldav'><C:no-uid-conflict>"
+            b"<D:href>/x</D:href></C:no-uid-conflict></D:error>",
+            "{urn:ietf:params:xml:ns:caldav}no-uid-conflict",
+        ),
+        (b"<error xmlns='DAV:'><need-privileges/></error>", "{DAV:}need-privileges"),
+        (b"<html>Forbidden</html>", "HTTP 403"),
+        (b"not xml at all", "HTTP 403"),
+        (b"", "HTTP 403"),
+    ],
+)
+async def test_403_names_the_dav_precondition(body: bytes, named: str) -> None:
+    with pytest.raises(ForbiddenError) as caught:
+        await client_with(403, body).put("/cal/x.ics", b"ICS", create_only=True)
+    assert not isinstance(caught.value, AuthError)
+    assert named in str(caught.value)
 
 
 async def test_put_headers_and_etag() -> None:

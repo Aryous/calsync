@@ -5,7 +5,14 @@ from pathlib import Path
 import httpx
 import pytest
 
-from calsync.errors import AuthError, CalsyncError, ConfigError, NotFoundError, TransientError
+from calsync.errors import (
+    AuthError,
+    CalsyncError,
+    ConfigError,
+    ForbiddenError,
+    NotFoundError,
+    TransientError,
+)
 from calsync.http import RequestLog, make_client
 from calsync.model import Alarm
 from calsync.sources import google as google_mod
@@ -227,10 +234,39 @@ async def test_403_rate_limit_via_error_status_is_transient(status: str) -> None
         await forbidden_source(error_body(status=status)).list_calendars()
 
 
-@pytest.mark.parametrize("body", [error_body("forbidden"), error_body(), {"nope": 1}, "plain"])
-async def test_403_other_reasons_stay_auth_errors(body: object) -> None:
-    with pytest.raises(AuthError):
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        (error_body("forbidden"), "forbidden"),
+        (error_body("accessNotConfigured"), "accessNotConfigured"),
+        (error_body(status="PERMISSION_DENIED"), "PERMISSION_DENIED"),
+        (error_body(), None),
+        ({"nope": 1}, None),
+        ("plain", None),
+    ],
+)
+async def test_403_other_reasons_are_forbidden_not_auth(body: object, reason: str | None) -> None:
+    """A 403 that is not throttling is a permission problem: never "run calsync auth"."""
+    with pytest.raises(ForbiddenError) as caught:
         await forbidden_source(body).list_calendars()
+    assert not isinstance(caught.value, AuthError)
+    if reason:
+        assert reason in str(caught.value)
+
+
+async def test_forbidden_calendar_fails_on_its_own() -> None:
+    fake = seeded()
+    fake.add_calendar("other@x", "Other")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/calendars/other%40x/" in request.url.raw_path.decode():
+            return httpx.Response(403, json=error_body("forbidden"))
+        return fake.handler(request)
+
+    client = make_client(RequestLog(), transport=httpx.MockTransport(handler))
+    pull = await GoogleSource(client, StaticToken("t"), base_url=BASE_URL).pull([CAL, "other@x"], {})
+    assert isinstance(pull.errors["other@x"], ForbiddenError)
+    assert list(pull.calendars) == [CAL]
 
 
 def refreshing_setup(api_ok_token: str, token_calls: list[int]):

@@ -18,6 +18,7 @@ from calsync.errors import (
     CalsyncError,
     ConfigError,
     CursorExpired,
+    ForbiddenError,
     NotFoundError,
     TransientError,
 )
@@ -67,15 +68,20 @@ RATE_LIMIT_REASONS = frozenset(
 )
 
 
-def _is_rate_limited(response: httpx.Response) -> bool:
-    """403 bodies carry the real cause: quota exhaustion is retryable, the rest is not."""
+def _error_reasons(response: httpx.Response) -> list[str]:
+    """The machine-readable causes in a Google error body: ``errors[0].reason``, then ``status``."""
     try:
         error = response.json()["error"]
-        reasons = {error["errors"][0]["reason"]} if error.get("errors") else set()
-        reasons.add(error.get("status"))
+        candidates = [error["errors"][0].get("reason")] if error.get("errors") else []
+        candidates.append(error.get("status"))
     except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-        return False
-    return bool(reasons & RATE_LIMIT_REASONS)
+        return []
+    return [c for c in candidates if isinstance(c, str) and c]
+
+
+def _is_rate_limited(response: httpx.Response) -> bool:
+    """403 bodies carry the real cause: quota exhaustion is retryable, the rest is not."""
+    return bool(set(_error_reasons(response)) & RATE_LIMIT_REASONS)
 
 
 def _is_removal(event: Mapping[str, Any]) -> bool:
@@ -109,8 +115,12 @@ class GoogleSource:
             raise CursorExpired(path)
         if status == 403 and _is_rate_limited(response):
             raise TransientError(f"Google API rate limit for {path}: {response.text[:200]}")
-        if status in (401, 403):
-            raise AuthError(f"Google API {status}: {response.text[:200]}")
+        if status == 401:
+            raise AuthError(f"Google API 401: {response.text[:200]}")
+        if status == 403:
+            # Not throttling: a permission problem for this request (often one calendar).
+            reasons = _error_reasons(response)
+            raise ForbiddenError(f"Google API 403 for {path}: {reasons[0] if reasons else 'forbidden'}")
         if status == 404:
             raise NotFoundError(path)
         if status >= 400:
