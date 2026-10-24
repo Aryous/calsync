@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from calsync.errors import AuthError, CalsyncError, ConfigError, TransientError
+from calsync.errors import AuthError, CalsyncError, ConfigError, NotFoundError, TransientError
 from calsync.http import RequestLog, make_client
 from calsync.model import Alarm
 from calsync.sources import google as google_mod
@@ -84,13 +84,45 @@ async def test_missing_sync_token_in_fields_is_detected(monkeypatch: pytest.Monk
     monkeypatch.setattr(
         google_mod, "EVENTS_LIST_PARAMS", {**google_mod.EVENTS_LIST_PARAMS, "fields": "items(id)"}
     )
+    pull = await make_source(seeded(), RequestLog()).pull([CAL], {})
+    # A per-calendar failure: reported in ``errors``, never silently ignored.
     with pytest.raises(CalsyncError, match="nextSyncToken"):
-        await make_source(seeded(), RequestLog()).pull([CAL], {})
+        raise pull.errors[CAL]
+    assert pull.calendars == {} and CAL not in pull.state["events_tokens"]
 
 
 async def test_unknown_calendar_name() -> None:
-    with pytest.raises(ConfigError, match="not found"):
-        await make_source(seeded(), RequestLog()).pull(["Nope"], {})
+    pull = await make_source(seeded(), RequestLog()).pull(["Nope", "Family"], {})
+    assert isinstance(pull.errors["Nope"], ConfigError)
+    assert "not found" in str(pull.errors["Nope"])
+    assert list(pull.calendars) == ["Family"]
+
+
+async def test_failed_calendar_keeps_its_token_and_others_advance() -> None:
+    fake = seeded()
+    fake.add_calendar("other@x", "Other")
+    source = make_source(fake, RequestLog())
+    first = await source.pull([CAL, "other@x"], {})
+    assert first.errors == {}
+    old_tokens = dict(first.state["events_tokens"])
+
+    fake.remove_calendar("other@x")  # events.list now answers 404
+    fake.put_event(CAL, google_event("e3", "Three", "2026-10-27T09:00:00+08:00", "2026-10-27T09:05:00+08:00"))
+    second = await source.pull([CAL, "other@x"], first.state)
+    assert isinstance(second.errors["other@x"], NotFoundError)
+    assert list(second.calendars) == [CAL]
+    assert [e["id"] for e in second.calendars[CAL].upserts] == ["e3"]
+    assert second.state["events_tokens"]["other@x"] == old_tokens["other@x"]
+    assert second.state["events_tokens"][CAL] != old_tokens[CAL]
+
+
+async def test_account_wide_failure_still_raises_from_pull() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "invalid"})
+
+    client = make_client(RequestLog(), transport=httpx.MockTransport(handler))
+    with pytest.raises(AuthError):
+        await GoogleSource(client, StaticToken("t"), base_url=BASE_URL).pull([CAL], {})
 
 
 async def test_list_calendars_and_to_series() -> None:

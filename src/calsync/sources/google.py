@@ -215,15 +215,37 @@ class GoogleSource:
             return items, next_token, True
 
     async def pull(self, calendar_refs: Sequence[str], state: Mapping[str, Any]) -> SourcePull:
+        """Pull every referenced calendar.
+
+        The calendarList refresh is account-wide: if it fails (including an
+        expired or revoked token), ``pull`` raises. After that, each calendar
+        succeeds or fails on its own: its failure lands in ``errors`` and its
+        events token is left untouched, so the next pull retries it.
+        """
         new_state: dict[str, Any] = copy.deepcopy(dict(state))
         await self._refresh_calendar_meta(new_state)
         meta = new_state["meta"]
         tokens: dict[str, str] = new_state.setdefault("events_tokens", {})
-        resolved = {ref: self._resolve(ref, meta) for ref in calendar_refs}
+        errors: dict[str, Exception] = {}
+        resolved: dict[str, str] = {}
+        for ref in calendar_refs:
+            try:
+                resolved[ref] = self._resolve(ref, meta)
+            except ConfigError as exc:
+                errors[ref] = exc
         unique_ids = sorted(set(resolved.values()))
-        results = await asyncio.gather(*(self._pull_events(cid, tokens.get(cid)) for cid in unique_ids))
+        results = await asyncio.gather(
+            *(self._pull_events(cid, tokens.get(cid)) for cid in unique_ids), return_exceptions=True
+        )
         pulls: dict[str, CalendarPull] = {}
-        for cid, (items, next_token, full) in zip(unique_ids, results, strict=True):
+        failed: dict[str, Exception] = {}
+        for cid, outcome in zip(unique_ids, results, strict=True):
+            if isinstance(outcome, BaseException):
+                if not isinstance(outcome, Exception):
+                    raise outcome  # cancellation and the like are not per-calendar failures
+                failed[cid] = outcome
+                continue
+            items, next_token, full = outcome
             tokens[cid] = next_token
             pulls[cid] = CalendarPull(
                 calendar_id=cid,
@@ -232,7 +254,14 @@ class GoogleSource:
                 deletes=[item["id"] for item in items if _is_removal(item)],
                 meta=_meta_from_state(meta.get(cid)),
             )
-        return SourcePull(calendars={ref: pulls[cid] for ref, cid in resolved.items()}, state=new_state)
+        for ref, cid in resolved.items():
+            if cid in failed:
+                errors[ref] = failed[cid]
+        return SourcePull(
+            calendars={ref: pulls[cid] for ref, cid in resolved.items() if cid in pulls},
+            state=new_state,
+            errors=errors,
+        )
 
     def to_series(self, raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Series]:
         return build_series(raw_events, meta)

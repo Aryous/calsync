@@ -109,11 +109,15 @@ class Engine:
         self._caches: dict[tuple[str, str], TargetCache] = {}
 
     # ----- phase 1: ingest ---------------------------------------------
-    async def _ingest(self, account: str, rules: list[Rule]) -> None:
+    async def _ingest(self, account: str, rules: list[Rule]) -> dict[str, Exception]:
+        """Pull and persist one source account; return the calendar refs that failed on their own."""
         if account not in self._source_state:
             self._source_state[account], self._mirrors[account] = self._store.load_source(account)
         refs = sorted({r.source.calendar for r in rules})
         pull = await self._sources[account].pull(refs, self._source_state[account])
+        for ref, exc in pull.errors.items():
+            log.warning("source %s calendar %r failed: %s", account, ref, exc)
+        # Failed calendars are absent from ``calendars`` and keep their old cursor in ``state``.
         unique = {p.calendar_id: p for p in pull.calendars.values()}
         self._store.save_source(account, pull.state, unique.values())
         self._source_state[account] = pull.state
@@ -123,6 +127,7 @@ class Engine:
             self._meta[(account, cal_pull.calendar_id)] = cal_pull.meta
         for cal_id, cal_pull in unique.items():
             apply_pull(mirrors.setdefault(cal_id, {}), cal_pull)
+        return pull.errors
 
     # ----- phase 2: detect ---------------------------------------------
     async def _detect(self, key: TargetKey, rules: list[Rule], dry_run: bool) -> None:
@@ -305,9 +310,15 @@ class Engine:
             *(self._ingest(a, rs) for a, rs in by_source.items()), return_exceptions=True
         )
         for (_, rs), outcome in zip(by_source.items(), outcomes, strict=True):
-            if isinstance(outcome, Exception):
+            if isinstance(outcome, BaseException):
+                if not isinstance(outcome, Exception):
+                    raise outcome
                 for rule in rs:
                     results[rule.name].fail(outcome)
+                continue
+            for rule in rs:
+                if rule.source.calendar in outcome:
+                    results[rule.name].fail(outcome[rule.source.calendar])
 
         by_target: dict[TargetKey, list[Rule]] = defaultdict(list)
         for rule in selected:
@@ -317,7 +328,9 @@ class Engine:
             *(self._detect(k, rs, dry_run) for k, rs in by_target.items()), return_exceptions=True
         )
         for (_, rs), outcome in zip(by_target.items(), outcomes, strict=True):
-            if isinstance(outcome, Exception):
+            if isinstance(outcome, BaseException):
+                if not isinstance(outcome, Exception):
+                    raise outcome
                 for rule in rs:
                     results[rule.name].fail(outcome)
 

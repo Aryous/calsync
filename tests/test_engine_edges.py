@@ -85,3 +85,42 @@ async def test_delete_guard_ignores_protected_actuals(tmp_path: Path) -> None:
     res = (await h.engine.cycle()).rules["family"]
     assert res.status == "blocked" and res.protected == 1
     assert "3 of 3" in (res.error or "")
+
+
+# ----- 3. per-calendar source isolation -------------------------------------
+
+
+async def test_unknown_source_calendar_fails_only_its_rule(tmp_path: Path) -> None:
+    rules = [rule("good", target="Good"), rule("bad", source="No such calendar", target="Bad")]
+    h = build_fake(tmp_path, simple(), config_for(rules))
+    result = await h.engine.cycle()
+    good, bad = result.rules["good"], result.rules["bad"]
+    assert good.status == "ok" and good.created == 2
+    assert len(h.target.managed(h.target.calendars["Good"])) == 2
+    assert bad.status == "failed" and bad.error_kind == "other" and "ConfigError" in (bad.error or "")
+    assert {r.rule: r.status for r in h.store.latest_runs()} == {"bad": "failed", "good": "ok"}
+
+
+async def test_missing_source_calendar_404_fails_only_its_rule(tmp_path: Path) -> None:
+    fake = simple()
+    fake.add_calendar("gone@group.calendar.google.com", "Gone")
+    fake.put_event(
+        "gone@group.calendar.google.com",
+        google_event("nap", "Nap", "2026-10-26T13:00:00+08:00", "2026-10-26T14:00:00+08:00"),
+    )
+    rules = [rule("good", target="Good"), rule("bad", source="gone@group.calendar.google.com", target="Bad")]
+    h = build_fake(tmp_path, fake, config_for(rules))
+    first = await h.engine.cycle()
+    assert first.ok
+    fake.remove_calendar("gone@group.calendar.google.com")
+    fake.put_event(
+        GCAL, google_event("walk", "Walk", "2026-10-26T18:00:00+08:00", "2026-10-26T18:30:00+08:00")
+    )
+    result = await h.engine.cycle()
+    good, bad = result.rules["good"], result.rules["bad"]
+    assert good.status == "ok" and good.created == 1
+    assert bad.status == "failed" and "NotFoundError" in (bad.error or "")
+    assert len(h.target.managed(h.target.calendars["Bad"])) == 1  # a failed rule deletes nothing
+    _, mirrors = h.store.load_source("me")
+    assert set(mirrors["gone@group.calendar.google.com"]) == {"nap"}  # failed pull persisted nothing
+    assert "walk" in mirrors[GCAL]

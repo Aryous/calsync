@@ -39,6 +39,9 @@ class CalendarPull:
 class SourcePull:
     calendars: dict[str, CalendarPull]  # keyed by the calendar reference passed in
     state: dict[str, Any]
+    # Calendar references that failed on their own (unknown name, 404, ...). Their
+    # cursors in ``state`` are unchanged; account-wide failures raise from ``pull``.
+    errors: dict[str, Exception] = field(default_factory=dict)
 
 
 class Source(Protocol):
