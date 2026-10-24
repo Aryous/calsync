@@ -1029,8 +1029,9 @@ async def test_snooze_that_strips_the_marker_is_not_rewritten(
     assert SNOOZE in target.objects[href][1]
     cached = h.store.load_target_cache("dav", target.calendars["Family"].href).objects[href]
     assert (cached.content_hash, cached.verify_digest, cached.reverting) == (expected, None, False)
-    [line] = [r.getMessage() for r in caplog.records if "marker" in r.getMessage()]
-    assert "1" in line and href not in line and "Stretch" not in line
+    [line] = marker_lines(caplog)
+    assert "1 copy" in line and "no calsync marker" in line
+    assert href not in line and "Stretch" not in line
     mark = len(target.calls)
     idle = (await h.engine.cycle()).rules["family"]
     assert idle.updated == 0 and fetched_since(target, mark) == [] and writes_since(target, mark) == []
@@ -1040,18 +1041,27 @@ def other_marker(data: bytes) -> bytes:
     return MARKER.sub(b"X-CALSYNC-HASH:" + b"0" * 32 + b"\r\n", data)
 
 
-@pytest.mark.parametrize("marker", [strip_marker, other_marker], ids=["stripped", "other"])
+def marker_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "marker" in r.getMessage()]
+
+
+@pytest.mark.parametrize(
+    ("marker", "logged"), [(strip_marker, 1), (other_marker, 0)], ids=["stripped", "other"]
+)
 async def test_target_edit_that_drops_the_marker_is_reverted(
-    tmp_path: Path, marker: Callable[[bytes], bytes]
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, marker: Callable[[bytes], bytes], logged: int
 ) -> None:
     """Whether an edit is reverted does not depend on the target keeping X-CALSYNC-HASH: the hash
-    calsync recorded for the copy (what it wrote) is compared with the source version."""
+    calsync recorded for the copy (what it wrote) is compared with the source version. Only a
+    body with no marker at all is logged (another marker can be an old one we adopted)."""
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
     href = edit_copy(h, lambda d: marker(d.replace(MOVE_FROM, MOVE_TO)))
-    res = (await h.engine.cycle()).rules["family"]
+    with caplog.at_level(logging.INFO, logger="calsync.engine"):
+        res = (await h.engine.cycle()).rules["family"]
     assert (res.updated, res.reverted) == (1, 1)
+    assert len(marker_lines(caplog)) == logged
     assert MOVE_FROM in target.objects[href][1]
     assert (await h.engine.cycle()).rules["family"].updated == 0
 
@@ -1071,8 +1081,9 @@ async def test_stripped_marker_without_a_visible_change_is_not_rewritten(
     cached = h.store.load_target_cache("dav", target.calendars["Family"].href).objects[href]
     assert (cached.content_hash, cached.verify_digest) == (expected, None)
     # The diagnostic for the real-device check: counts only.
-    [line] = [r.getMessage() for r in caplog.records if "marker" in r.getMessage()]
-    assert "1 copy" in line and href not in line and "Stretch" not in line
+    [line] = marker_lines(caplog)
+    assert "1 copy" in line and "no calsync marker" in line
+    assert href not in line and "Stretch" not in line
 
 
 async def test_cold_start_with_a_stripped_marker_and_a_visible_change_is_an_ordinary_update(
@@ -1149,6 +1160,50 @@ async def test_render_version_bump_on_a_cold_start_rewrites_nothing_unchanged(
     mark = len(target.calls)
     assert (await h2.engine.cycle()).rules["family"].updated == 0
     assert writes_since(target, mark) == [] and fetched_since(target, mark) == []
+
+
+async def test_cold_start_adopted_copy_that_keeps_its_old_marker_is_not_logged_as_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cold start adopts a copy without rewriting it, so its body keeps the marker of the old
+    RENDER_VERSION. Read back later with that marker intact (here after a snooze), it must not
+    be reported as a lost marker: the real-device check would wrongly blame the phone."""
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    forget_state(h, tmp_path)
+    monkeypatch.setattr("calsync.model.RENDER_VERSION", calsync.model.RENDER_VERSION + 1)
+    h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h2.engine.cycle()  # adopted: the stored hash is new, the body's marker is old
+    old = MARKER.search(target.objects[copy_href(h2, "stretch")][1])
+    href = edit_copy(h2, snooze)
+    assert old is not None and old.group() in target.objects[href][1]
+    mark = len(target.calls)
+    with caplog.at_level(logging.INFO, logger="calsync.engine"):
+        res = (await h2.engine.cycle()).rules["family"]
+    assert fetched_since(target, mark) == [href]
+    assert (res.updated, res.reverted) == (0, 0) and writes_since(target, mark) == []
+    assert marker_lines(caplog) == []
+
+
+async def test_cold_start_read_of_a_copy_without_the_marker_is_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A copy whose body lost the marker before the state was lost is reported too (every copy
+    calsync writes carries one), and adopted without a rewrite when it shows the source version."""
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = edit_copy(h, strip_marker)
+    forget_state(h, tmp_path)
+    h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    mark = len(target.calls)
+    with caplog.at_level(logging.INFO, logger="calsync.engine"):
+        res = (await h2.engine.cycle()).rules["family"]
+    assert (res.created, res.updated, res.reverted) == (0, 0, 0) and writes_since(target, mark) == []
+    [line] = marker_lines(caplog)
+    assert "1 copy" in line and "no calsync marker" in line
+    assert href not in line and "Stretch" not in line
 
 
 # ----- rewrite-loop breaker ---------------------------------------------------

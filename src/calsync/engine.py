@@ -207,6 +207,11 @@ class Engine:
                 continue
             found = inspect(obj.data)
             known = cache.objects.get(obj.href)
+            if found is not None:
+                # Every body calsync writes carries the marker: without one, the target dropped it.
+                # Another marker is not counted: a copy adopted on a cold start keeps the marker of
+                # the version it was written with (adoption does not rewrite it).
+                marker_lost += found.content_hash is None
             # The recorded hash is what we last wrote or adopted, whatever marker the target kept
             # in the body: only a copy unknown to us (cold start, lost state) is judged by its
             # marker. An unparseable body has no usable hash: the planner rewrites it.
@@ -214,7 +219,6 @@ class Engine:
                 content_hash = None
             elif known is not None:
                 content_hash = known.content_hash
-                marker_lost += known.content_hash is not None and found.content_hash != known.content_hash
             else:
                 content_hash = found.content_hash
             # Changed by someone else (or unknown to us): its rule compares it with the source
@@ -233,8 +237,7 @@ class Engine:
         if marker_lost:
             # Counts only: tells whether the target keeps the marker (the real-device check).
             log.info(
-                "target %s %r: %d copy(ies) read back with no or another marker than calsync wrote; "
-                "judged by visible content",
+                "target %s %r: %d copy(ies) read back with no calsync marker; judged by visible content",
                 account,
                 ref,
                 marker_lost,
