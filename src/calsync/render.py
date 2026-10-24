@@ -114,6 +114,8 @@ def _rrule_lines(component: Component) -> list[str]:
 
 def _optional(component: Component, name: str) -> str | None:
     value = component.get(name)
+    if isinstance(value, list):
+        value = value[0] if value else None
     return None if value is None else str(value)
 
 
@@ -130,14 +132,19 @@ def inspect(data: bytes) -> Inspected | None:
     span: tuple[datetime, datetime] | None
     try:
         start = when_from_ical(master.decoded("dtstart"))
-        end = when_from_ical(master.decoded("dtend")) if "dtend" in master else start
+        if "dtend" in master:
+            end = when_from_ical(master.decoded("dtend"))
+        elif "duration" in master:
+            end = when_from_ical(start.value + master.decoded("duration"))
+        else:
+            end = start
         extra = [
             (when_from_ical(e.decoded("dtstart")), when_from_ical(e.decoded("dtend")))
             for e in events
             if e is not master and "dtstart" in e and "dtend" in e
         ]
         span = compute_span(start, end, _rrule_lines(master), extra)
-    except (KeyError, ValueError):
+    except (KeyError, ValueError, TypeError):
         span = None
     return Inspected(
         uid=str(master.get("uid", "")),

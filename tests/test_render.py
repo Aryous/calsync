@@ -76,3 +76,49 @@ def test_inspect_foreign_and_garbage() -> None:
     assert found is not None and found.rule is None and found.content_hash is None
     assert found.span == (datetime(2026, 10, 25, 1, tzinfo=UTC), datetime(2026, 10, 25, 2, tzinfo=UTC))
     assert inspect(b"not ical") is None
+
+
+def _body(*lines: str) -> bytes:
+    head = (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:x\r\nBEGIN:VEVENT\r\nUID:f1\r\nDTSTAMP:20261024T000000Z\r\n"
+    )
+    return (head + "".join(f"{line}\r\n" for line in lines) + "END:VEVENT\r\nEND:VCALENDAR\r\n").encode()
+
+
+def test_inspect_malformed_dates_give_no_span() -> None:
+    bad = [
+        ("DTSTART:garbage", "DTEND:20261025T020000Z"),
+        ("DTSTART:20261025T010000Z", "DTEND:xx"),
+        ("DTSTART;VALUE=PERIOD:20261025T010000Z/PT1H", "DTEND:20261025T020000Z"),
+    ]
+    for lines in bad:
+        found = inspect(_body(*lines))
+        assert found is not None, lines
+        assert found.uid == "f1" and found.span is None, lines
+
+
+def test_inspect_duplicate_markers_use_first() -> None:
+    found = inspect(
+        _body(
+            "DTSTART:20261025T010000Z",
+            "DTEND:20261025T020000Z",
+            "X-CALSYNC-HASH:first",
+            "X-CALSYNC-HASH:second",
+            "X-CALSYNC-RULE:r1",
+            "X-CALSYNC-RULE:r2",
+        )
+    )
+    assert found is not None
+    assert (found.content_hash, found.rule) == ("first", "r1")
+
+
+def test_inspect_duration_without_dtend() -> None:
+    found = inspect(_body("DTSTART:20261025T010000Z", "DURATION:PT2H"))
+    assert found is not None
+    assert found.span == (datetime(2026, 10, 25, 1, tzinfo=UTC), datetime(2026, 10, 25, 3, tzinfo=UTC))
+
+
+def test_render_rdate() -> None:
+    s = series(recurrence=("RRULE:FREQ=DAILY;COUNT=2", "RDATE;TZID=Asia/Shanghai:20261201T093000"))
+    ics = render(s, uid="r@calsync", rule_name="r", content_hash="h", now=NOW).decode()
+    assert "RDATE;TZID=Asia/Shanghai:20261201T093000" in ics

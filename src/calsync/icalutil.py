@@ -8,8 +8,10 @@ from icalendar import Event
 from calsync.model import When
 
 
-def when_from_ical(value: datetime | date, default_tz: str = "UTC") -> When:
+def when_from_ical(value: object, default_tz: str = "UTC") -> When:
     """Convert a decoded iCalendar value into a When, keeping its IANA zone."""
+    if not isinstance(value, date):  # datetime is a date subclass
+        raise ValueError(f"unsupported date value: {value!r}")
     if isinstance(value, datetime):
         if value.tzinfo is None:
             value = value.replace(tzinfo=ZoneInfo(default_tz))
