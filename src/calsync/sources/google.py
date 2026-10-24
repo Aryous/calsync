@@ -13,7 +13,14 @@ from urllib.parse import quote
 
 import httpx
 
-from calsync.errors import AuthError, CalsyncError, ConfigError, CursorExpired, NotFoundError
+from calsync.errors import (
+    AuthError,
+    CalsyncError,
+    ConfigError,
+    CursorExpired,
+    NotFoundError,
+    TransientError,
+)
 from calsync.http import request_with_retry
 from calsync.model import Alarm, Series
 from calsync.sources.base import (
@@ -45,8 +52,24 @@ CALENDAR_LIST_PARAMS: Mapping[str, str] = {
     "showDeleted": "true",
     "showHidden": "true",
     "maxResults": "250",
-    "fields": "nextPageToken,nextSyncToken,items(id,summary,timeZone,defaultReminders,deleted)",
+    "fields": "nextPageToken,nextSyncToken,items(id,summary,summaryOverride,timeZone,defaultReminders,deleted)",
 }
+
+
+RATE_LIMIT_REASONS = frozenset(
+    {"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded", "dailyLimitExceeded"}
+)
+
+
+def _is_rate_limited(response: httpx.Response) -> bool:
+    """403 bodies carry the real cause: quota exhaustion is retryable, the rest is not."""
+    try:
+        error = response.json()["error"]
+        reasons = {error["errors"][0]["reason"]} if error.get("errors") else set()
+        reasons.add(error.get("status"))
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return False
+    return bool(reasons & RATE_LIMIT_REASONS)
 
 
 def _is_removal(event: Mapping[str, Any]) -> bool:
@@ -69,8 +92,35 @@ class GoogleSource:
         self._base = base_url.rstrip("/")
 
     async def _get(self, path: str, params: Mapping[str, str], kind: str) -> dict[str, Any]:
+        response = await self._send(path, params, kind)
+        if response.status_code == 401:
+            # The cached access token may have died (sleep, revocation): refresh once.
+            invalidate = getattr(self._token, "invalidate", None)
+            if invalidate is not None:
+                invalidate()
+            response = await self._send(path, params, kind)
+        status = response.status_code
+        if status == 410:
+            raise CursorExpired(path)
+        if status == 403 and _is_rate_limited(response):
+            raise TransientError(f"Google API rate limit for {path}: {response.text[:200]}")
+        if status in (401, 403):
+            raise AuthError(f"Google API {status}: {response.text[:200]}")
+        if status == 404:
+            raise NotFoundError(path)
+        if status >= 400:
+            raise CalsyncError(f"Google API {status} for {path}: {response.text[:200]}")
+        try:
+            data = response.json()
+        except ValueError:
+            raise TransientError(f"Google API returned a non-JSON body for {path}") from None
+        if not isinstance(data, dict):
+            raise TransientError(f"Google API returned an unexpected body for {path}")
+        return data
+
+    async def _send(self, path: str, params: Mapping[str, str], kind: str) -> httpx.Response:
         token = await self._token()
-        response = await request_with_retry(
+        return await request_with_retry(
             self._client,
             "GET",
             f"{self._base}{path}",
@@ -78,16 +128,6 @@ class GoogleSource:
             params=params,
             headers={"Authorization": f"Bearer {token}"},
         )
-        status = response.status_code
-        if status == 410:
-            raise CursorExpired(path)
-        if status in (401, 403):
-            raise AuthError(f"Google API {status}: {response.text[:200]}")
-        if status == 404:
-            raise NotFoundError(path)
-        if status >= 400:
-            raise CalsyncError(f"Google API {status} for {path}: {response.text[:200]}")
-        return response.json()
 
     async def _list_all(
         self, path: str, base: Mapping[str, str], sync_token: str | None, kind: str
@@ -115,7 +155,7 @@ class GoogleSource:
             "/users/me/calendarList", CALENDAR_LIST_PARAMS, None, "google-calendarlist"
         )
         return [
-            CalendarInfo(item["id"], item.get("summary", item["id"]))
+            CalendarInfo(item["id"], item.get("summaryOverride") or item.get("summary", item["id"]))
             for item in items
             if not item.get("deleted")
         ]
@@ -136,6 +176,7 @@ class GoogleSource:
             alarms = alarms_from_reminders(item.get("defaultReminders") or [])
             meta[item["id"]] = {
                 "summary": item.get("summary", ""),
+                "summary_override": item.get("summaryOverride") or "",
                 "timezone": item.get("timeZone") or "UTC",
                 "default_alarms": [int(a.offset.total_seconds()) for a in alarms],
             }
@@ -145,7 +186,10 @@ class GoogleSource:
     def _resolve(ref: str, meta: Mapping[str, Any]) -> str:
         if ref in meta:
             return ref
-        matches = [cid for cid, entry in meta.items() if entry.get("summary") == ref]
+        for field in ("summary_override", "summary"):  # the name the user sees comes first
+            matches = [cid for cid, entry in meta.items() if entry.get(field) == ref]
+            if matches:
+                break
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:

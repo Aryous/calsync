@@ -29,6 +29,9 @@ class StaticToken:
     async def __call__(self) -> str:
         return self._token
 
+    def invalidate(self) -> None:
+        """A static token cannot be refreshed; nothing to drop."""
+
 
 class RefreshTokenProvider:
     def __init__(
@@ -39,7 +42,7 @@ class RefreshTokenProvider:
         client_secret: str,
         refresh_token: str,
         token_url: str = TOKEN_URL,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         self._client = client
         self._form = {
@@ -57,6 +60,11 @@ class RefreshTokenProvider:
     def _fresh(self) -> bool:
         return self._token is not None and self._clock() < self._expires_at - REFRESH_MARGIN
 
+    def invalidate(self) -> None:
+        """Drop the cached token (e.g. after a 401) so the next call refreshes."""
+        self._token = None
+        self._expires_at = 0.0
+
     async def __call__(self) -> str:
         if self._fresh():
             assert self._token is not None
@@ -72,8 +80,13 @@ class RefreshTokenProvider:
                 raise AuthError(f"Google refused the refresh token: {response.text[:200]}")
             if response.status_code >= 400:
                 raise TransientError(f"Google token endpoint: HTTP {response.status_code}")
-            data = response.json()
-            token: str = data["access_token"]
+            try:
+                data = response.json()
+                token = data["access_token"]
+            except (ValueError, KeyError, TypeError):
+                raise AuthError("Google token response has no usable access_token") from None
+            if not isinstance(token, str) or not token:
+                raise AuthError("Google token response has an empty access_token")
             self._token = token
             self._expires_at = self._clock() + float(data.get("expires_in", 3600))
             return token
