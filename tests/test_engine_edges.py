@@ -905,3 +905,71 @@ async def test_edit_read_before_a_crash_is_reverted_by_a_fresh_process(tmp_path:
     assert (res.status, res.updated, res.reverted) == ("ok", 1, 1)
     assert MOVE_FROM in target.objects[href][1]
     assert (await h2.engine.cycle()).rules["family"].updated == 0
+
+
+# ----- untrusted source text never breaks a series or reaches the logs -----
+
+
+async def test_conference_link_with_line_break_syncs_without_the_link(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake = simple()
+    secret = "meet.example.com/abc-secret"
+    fake.put_event(
+        GCAL,
+        google_event(
+            "call",
+            "Call",
+            "2026-10-27T09:00:00+08:00",
+            "2026-10-27T10:00:00+08:00",
+            hangoutLink=f"https://{secret}\r\nX-INJECT:1",
+        ),
+    )
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    with caplog.at_level(logging.DEBUG):
+        res = (await h.engine.cycle()).rules["family"]
+        again = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.created, res.failed, res.error) == ("ok", 3, 0, None)
+    assert (again.status, again.updated, again.error) == ("ok", 0, None)
+    body = h.target.objects[copy_href(h, "call")][1]
+    assert b"abc-secret" not in body and b"X-INJECT" not in body
+    assert "abc-secret" not in caplog.text
+    assert not [r for r in h.store.latest_runs() if r.error]
+
+
+async def test_classify_failure_is_not_an_edit_and_logs_no_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If the version calsync would write cannot be rendered while classifying a read, the copy is
+    left as it is and only the rule name is logged."""
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = move_stretch_on_target(h)
+
+    def explode(*_: Any, **__: Any) -> bytes:
+        raise ValueError("secret-content-in-message")
+
+    monkeypatch.setattr("calsync.engine.render", explode)
+    with caplog.at_level(logging.DEBUG):
+        res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.updated, res.reverted, res.error) == ("ok", 0, 0, None)
+    assert MOVE_TO in target.objects[href][1]
+    assert "secret-content-in-message" not in caplog.text
+    cached = h.store.load_target_cache("dav", target.calendars["Family"].href).objects[href]
+    assert cached.verify_digest is None and not cached.reverting
+
+
+async def test_render_failure_on_write_reports_no_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def explode(*_: Any, **__: Any) -> bytes:
+        raise ValueError("secret-content-in-message")
+
+    monkeypatch.setattr("calsync.engine.render", explode)
+    h = build_fake(tmp_path, simple(), config_for([rule()]))
+    with caplog.at_level(logging.DEBUG):
+        res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.created, res.failed) == ("failed", 0, 2)
+    assert res.error is not None and "secret" not in res.error
+    assert "secret-content-in-message" not in caplog.text

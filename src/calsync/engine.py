@@ -319,7 +319,7 @@ class Engine:
         it is current was edited on the target: it is marked ``reverting`` (cleared only by a
         successful write). Returns whether any cached object changed.
         """
-        changed = foreign = 0
+        changed = foreign = unrenderable = 0
         now = self._clock()
         for oid, have in actual.items():
             obj = cache.objects[have.href]
@@ -333,15 +333,19 @@ class Engine:
             # Gone or out of window (the planner decides), source changed too (a normal update
             # follows), or unreadable to us (never start rewriting on a parser limitation).
             if want is not None and have.content_hash == want.content_hash and window.intersects(want.span):
-                expected = content_digest(
-                    render(
-                        want.series,
-                        uid=uid_for(oid),
-                        rule_name=rule.name,
-                        content_hash=want.content_hash,
-                        now=now,
+                try:
+                    expected = content_digest(
+                        render(
+                            want.series,
+                            uid=uid_for(oid),
+                            rule_name=rule.name,
+                            content_hash=want.content_hash,
+                            now=now,
+                        )
                     )
-                )
+                except Exception:  # its message may quote event content: count it, never log it
+                    expected = None
+                    unrenderable += 1
                 edited = expected is not None and seen != expected
             if edited:  # the planner sees an unknown hash and plans an update (PUT with If-Match)
                 cache.objects[have.href] = replace(obj, verify_digest=None, content_hash=None, reverting=True)
@@ -349,6 +353,12 @@ class Engine:
                 cache.objects[have.href] = replace(obj, verify_digest=None)
             changed += 1
             foreign += edited
+        if unrenderable:
+            log.warning(
+                "rule %s: %d copy(ies) could not be compared with the source version; left as they are",
+                rule.name,
+                unrenderable,
+            )
         if foreign:
             log.info(
                 "rule %s: %d copy(ies) edited on the target; the source version will be written back",
@@ -386,13 +396,17 @@ class Engine:
         now = self._clock()
 
         def body(want: Desired) -> bytes:
-            return render(
-                want.series,
-                uid=uid_for(want.object_id),
-                rule_name=rule.name,
-                content_hash=want.content_hash,
-                now=now,
-            )
+            try:
+                return render(
+                    want.series,
+                    uid=uid_for(want.object_id),
+                    rule_name=rule.name,
+                    content_hash=want.content_hash,
+                    now=now,
+                )
+            except Exception:
+                # The message may quote event content, and it would reach the log and run history.
+                raise CalsyncError(f"could not render object {want.object_id}") from None
 
         async def current(href: str) -> FetchedObject | None:
             """The resource as it is now; None if it no longer exists."""

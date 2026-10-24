@@ -2,6 +2,7 @@
 
 import logging
 import re
+import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime, timedelta
@@ -97,15 +98,30 @@ def event_attendees(event: RawEvent) -> tuple[Attendee, ...]:
     return tuple(result)
 
 
+def _clean_url(value: object) -> str:
+    """The link, or "" if it holds whitespace or a control character.
+
+    A URL has neither; one that does cannot be written as an iCalendar URI, and the
+    error raised for it would carry the link into logs and run history."""
+    url = str(value or "")
+    if any(c.isspace() or unicodedata.category(c)[0] in "CZ" for c in url):
+        return ""
+    return url
+
+
 def event_conference(event: RawEvent) -> str:
-    """The video meeting link: the conference video entry point, else ``hangoutLink``."""
+    """The video meeting link: the conference video entry point, else ``hangoutLink``.
+
+    Links that are not well-formed (see ``_clean_url``) are skipped."""
     data = event.get("conferenceData")
     entries = data.get("entryPoints") if isinstance(data, Mapping) else None
     if isinstance(entries, (list, tuple)):
         for entry in entries:
-            if isinstance(entry, Mapping) and entry.get("entryPointType") == "video" and entry.get("uri"):
-                return str(entry["uri"])
-    return str(event.get("hangoutLink") or "")
+            if isinstance(entry, Mapping) and entry.get("entryPointType") == "video":
+                url = _clean_url(entry.get("uri"))
+                if url:
+                    return url
+    return _clean_url(event.get("hangoutLink"))
 
 
 def split_recurrence(lines: Iterable[str], tz: str) -> tuple[tuple[str, ...], tuple[When, ...]]:

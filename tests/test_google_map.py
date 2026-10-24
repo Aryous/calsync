@@ -344,3 +344,21 @@ def test_malformed_conference_data_falls_back_to_hangout_link() -> None:
     assert event_conference(linked) == "https://meet.example.com/h"
     bad_entries = google_event("e3", "Call", start, end, conferenceData={"entryPoints": "junk"})
     assert event_conference(bad_entries) == ""
+
+
+@pytest.mark.parametrize("bad", ["\r\nX-INJECT:1", "\n", "\t", " x", "\x00", "\x7f", " "])
+def test_conference_url_with_control_characters_or_spaces_is_dropped(bad: str) -> None:
+    start, end = "2026-10-25T09:00:00+08:00", "2026-10-25T10:00:00+08:00"
+    link = google_event("e1", "Call", start, end, hangoutLink=f"https://meet.example.com/abc{bad}")
+    assert event_conference(link) == ""
+    video = google_event(
+        "e2",
+        "Call",
+        start,
+        end,
+        hangoutLink="https://meet.example.com/ok",
+        conferenceData={
+            "entryPoints": [{"entryPointType": "video", "uri": f"https://meet.example.com/v{bad}"}]
+        },
+    )
+    assert event_conference(video) == "https://meet.example.com/ok"  # the clean link still counts
