@@ -1,6 +1,7 @@
 """Engine edge cases against FakeGoogle + an in-memory FakeTarget (no Radicale)."""
 
 import logging
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 import pytest
 
 import calsync.engine
+import calsync.model
 import calsync.store as store_mod
 from calsync.errors import ConflictError, ForbiddenError, TransientError
 from calsync.http import RequestLog, make_client
@@ -973,3 +975,108 @@ async def test_render_failure_on_write_reports_no_content(
     assert (res.status, res.created, res.failed) == ("failed", 0, 2)
     assert res.error is not None and "secret" not in res.error
     assert "secret-content-in-message" not in caplog.text
+
+
+# ----- equal visible content wins over the marker ---------------------------
+
+MARKER = re.compile(rb"X-CALSYNC-HASH:[0-9a-f]+\r\n")
+SNOOZE = b"BEGIN:VALARM\r\nACKNOWLEDGED:20261025T000500Z\r\n"
+
+
+def writes_since(target: FakeTarget, mark: int) -> list[tuple[str, str]]:
+    return [(op, href) for op, href in target.calls[mark:] if op in {"create", "update", "delete"}]
+
+
+def edit_copy(h: FakeHarness, edit: Callable[[bytes], bytes], source_id: str = "stretch") -> str:
+    href = copy_href(h, source_id)
+    data = h.target.objects[href][1]
+    edited = edit(data)
+    assert edited != data
+    h.target.put(href, edited)
+    return href
+
+
+def strip_marker(data: bytes) -> bytes:
+    return MARKER.sub(b"", data)
+
+
+def snooze(data: bytes) -> bytes:
+    return data.replace(b"BEGIN:VALARM\r\n", SNOOZE)
+
+
+def want_hash(h: FakeHarness, source_id: str = "stretch") -> str:
+    cached = h.store.load_target_cache("dav", h.target.calendars["Family"].href)
+    oid = object_id("family", GCAL, source_id)
+    return next(o.content_hash for o in cached.objects.values() if o.object_id == oid) or ""
+
+
+async def test_snooze_that_strips_the_marker_is_not_rewritten(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A phone that snoozes an alert and drops X-CALSYNC-HASH changes nothing a person sees: the
+    copy is adopted as current, never rewritten (a rewrite would undo the snooze)."""
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    expected = want_hash(h)
+    href = edit_copy(h, lambda d: strip_marker(snooze(d)))
+    mark = len(target.calls)
+    with caplog.at_level(logging.INFO, logger="calsync.engine"):
+        res = (await h.engine.cycle()).rules["family"]
+    assert fetched_since(target, mark) == [href]
+    assert (res.updated, res.reverted) == (0, 0) and writes_since(target, mark) == []
+    assert SNOOZE in target.objects[href][1]
+    cached = h.store.load_target_cache("dav", target.calendars["Family"].href).objects[href]
+    assert (cached.content_hash, cached.verify_digest, cached.reverting) == (expected, None, False)
+    [line] = [r.getMessage() for r in caplog.records if "marker" in r.getMessage()]
+    assert "1" in line and href not in line and "Stretch" not in line
+    mark = len(target.calls)
+    idle = (await h.engine.cycle()).rules["family"]
+    assert idle.updated == 0 and fetched_since(target, mark) == [] and writes_since(target, mark) == []
+
+
+async def test_stripped_marker_with_a_visible_change_is_an_ordinary_update(tmp_path: Path) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = edit_copy(h, lambda d: strip_marker(d.replace(MOVE_FROM, MOVE_TO)))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.updated, res.reverted) == (1, 0)
+    assert MOVE_FROM in target.objects[href][1]
+    assert (await h.engine.cycle()).rules["family"].updated == 0
+
+
+async def test_outdated_marker_on_unchanged_content_is_adopted(tmp_path: Path) -> None:
+    """A copy whose marker names another hash (e.g. an older RENDER_VERSION) but whose visible
+    content equals the source version is adopted, not rewritten."""
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    expected = want_hash(h)
+    href = edit_copy(h, lambda d: MARKER.sub(b"X-CALSYNC-HASH:" + b"0" * 32 + b"\r\n", d))
+    mark = len(target.calls)
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.updated, res.reverted) == (0, 0) and writes_since(target, mark) == []
+    cached = h.store.load_target_cache("dav", target.calendars["Family"].href).objects[href]
+    assert cached.content_hash == expected and cached.verify_digest is None
+    mark = len(target.calls)
+    assert (await h.engine.cycle()).rules["family"].updated == 0
+    assert writes_since(target, mark) == []
+
+
+async def test_render_version_bump_on_a_cold_start_rewrites_nothing_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    forget_state(h, tmp_path)
+    monkeypatch.setattr("calsync.model.RENDER_VERSION", calsync.model.RENDER_VERSION + 1)
+    h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    mark = len(target.calls)
+    res = (await h2.engine.cycle()).rules["family"]
+    assert (res.created, res.updated, res.deleted) == (0, 0, 0)
+    assert writes_since(target, mark) == []
+    mark = len(target.calls)
+    assert (await h2.engine.cycle()).rules["family"].updated == 0
+    assert writes_since(target, mark) == [] and fetched_since(target, mark) == []

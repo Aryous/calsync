@@ -90,9 +90,10 @@ directly in the other person's account.
   recurrence, free/busy, alerts — with the version it would write. If they
   differ, the source version is written back. Bookkeeping that servers and
   phones add on their own (stamps, sequence numbers, private `X-` properties,
-  a dismissed or snoozed alert) is not an edit and is never undone, provided
-  the phone keeps calsync's hidden marker; this is being verified on a real
-  iPhone.
+  a dismissed or snoozed alert) is not an edit and is never undone. A copy
+  that still shows exactly the source version is never rewritten, even if
+  the phone dropped or changed calsync's hidden marker; a check on a real
+  iPhone is pending.
 - All local state (mirror, cursors, target cache, run history) is a
   **rebuildable cache**. Delete the state directory and the next run
   reconciles from both ends without creating duplicates.
@@ -265,12 +266,16 @@ cycles after it are back to the idle cost.
 
 - **Every managed event is read once.** The local state format changed, so
   the state database is rebuilt from both ends (no duplicates, as after any
-  state loss).
+  state loss). The rebuild also clears the local run history.
 - **Every source calendar is pulled from Google in full once.** calsync now
   asks Google for attendees and conference links, and a change of request
   fields always starts a fresh full pull.
-- **Every managed event is rewritten once.** The written format changed (for
-  example the new `URL` and the attendee and conference lines in the notes).
+- **Only events whose visible content changed are rewritten.** The written
+  format changed (for example the new `URL` and the attendee and conference
+  lines in the notes). Each copy read during the rebuild is compared with what
+  calsync would write now; a copy that already shows exactly that is kept as
+  it is, so its snoozed or dismissed alerts stay. Events with attendees or a
+  conference link are rewritten once.
 - **Rules without `window` now sync everything.** A rule from an older
   configuration that had no `window` used to keep the last 7 days and the
   next 180 days; it now creates the older and later events too. To keep the

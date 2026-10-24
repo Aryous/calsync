@@ -55,7 +55,7 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
 | `naming.py` | `rule_tag`, `object_id`, resource name `calsync-<8hex>-<24hex>.ics`, UID `<id>@calsync` |
 | `render.py` | Series → iCalendar bytes (VTIMEZONE, RRULE/EXDATE/RDATE, RECURRENCE-ID overrides each with own VALARMs, `URL`, `X-CALSYNC-RULE` / `X-CALSYNC-HASH`); `inspect()` reads them back and never raises; `content_digest()` hashes only what a person sees (ignores DTSTAMP, SEQUENCE, X- properties, property/event order, VTIMEZONE text, zone labels on RECURRENCE-ID/EXDATE/RDATE, alarm ACTION/DESCRIPTION and phone alarm bookkeeping); `None` for unreadable bodies, never raises |
 | `planner.py` | pure `plan(desired, actual, window, protected)` (counts `out_of_window`); `check_delete_guard` (ratio only from 3 deletions on) |
-| `engine.py` | one cycle; per-calendar/per-rule isolation; protected/degraded handling; cursor hold; delete-guard titles; full sync when `rule.window is None`; `_classify_reads` compares a read body's digest with the digest of what we would write and marks edited copies `reverting` (the update that follows counts as `reverted`) |
+| `engine.py` | one cycle; per-calendar/per-rule isolation; protected/degraded handling; cursor hold; delete-guard titles; full sync when `rule.window is None`; `_classify_reads` compares a read body's digest with the digest of what we would write: equal → adopted as current whatever the marker says (no write); different with a current marker → `reverting` (the update that follows counts as `reverted`); different with no or another marker → ordinary update |
 | `store.py` | SQLite (WAL, 0600): `source_state`, `source_event`, `target_calendar` (keyed by account+ref), `target_object` (incl. `verify_digest`, `reverting`), `run` (500 per rule), `alert`; `SCHEMA_VERSION` 2; schema mismatch → rebuild; corrupt DB → quarantined |
 | `sources/google.py` | REST client: calendarList + events.list with `syncToken`, 410 → full resync, request-params fingerprint (`events_params` state key) → full resync when `EVENTS_LIST_PARAMS` change, attendees and conference data requested, per-calendar `SourcePull.errors`, 403 rate limit → transient, 401 → one refresh + retry |
 | `targets/dav.py` | PROPFIND/REPORT/PUT/DELETE/MKCALENDAR, manual redirects, absolute hrefs, error mapping (401 auth, 403 `ForbiddenError`, `valid-sync-token` → `CursorExpired`, 412 conflict) |
@@ -155,10 +155,18 @@ uv run ruff check src tests && uv run ruff format --check src tests && uv run py
   stop. Hence `CachedObject.verify_digest` / `reverting` are persisted and
   classification is saved before planning, also in a dry run. Never classify
   from in-memory state only.
+- Digest equality wins over the marker. iOS may drop or keep a stale
+  `X-CALSYNC-HASH` when it saves a snooze; a read copy whose visible content
+  equals what we would write is adopted (desired hash and span cached), never
+  rewritten. The marker only decides between "edited on the target" (revert)
+  and "source changed" (ordinary update) once the digests differ.
 - Changing `EVENTS_LIST_PARAMS` (e.g. `EVENT_FIELDS`) changes the
   `events_params` fingerprint and forces a full pull of every source calendar
-  once; changing rendered bytes needs a `RENDER_VERSION` bump (every copy is
-  rewritten once).
+  once; changing rendered bytes needs a `RENDER_VERSION` bump. A bump rewrites
+  only copies whose visible content differs when their body is read; bodies
+  are read on a cold start (state lost or `SCHEMA_VERSION` bumped). With a warm
+  state no body is read, so a bump alone rewrites every copy once — pair it
+  with a `SCHEMA_VERSION` bump if that matters.
 
 ## 7. Real-world status
 

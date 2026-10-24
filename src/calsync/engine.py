@@ -285,9 +285,14 @@ class Engine:
             # dry run or a failed write must not forget the edit.
             self._store.save_target_cache(rule.target.account, cal.href, cache)
             # A copy edited on the target has an unknown hash now: planned as an update until
-            # a write succeeds (remember() then clears ``reverting``).
+            # a write succeeds (remember() then clears ``reverting``). An adopted copy carries
+            # the desired hash and span: nothing to write.
             actual = {
-                oid: replace(have, content_hash=cache.objects[have.href].content_hash)
+                oid: replace(
+                    have,
+                    content_hash=cache.objects[have.href].content_hash,
+                    span=cache.objects[have.href].span,
+                )
                 for oid, have in actual.items()
             }
         result.plan = plan(desired, actual, window, frozenset(protected))
@@ -315,11 +320,15 @@ class Engine:
     ) -> bool:
         """Classify this rule's copies whose body detection read but no run has judged yet.
 
-        A copy whose visible content differs from what we would write although its marker says
-        it is current was edited on the target: it is marked ``reverting`` (cleared only by a
-        successful write). Returns whether any cached object changed.
+        What a person sees decides, not the marker: a copy whose visible content equals the
+        version we would write is adopted as current (whatever its X-CALSYNC-HASH says, so a
+        phone that drops or keeps an old marker is never rewritten). A copy that differs
+        although its marker says it is current was edited on the target: it is marked
+        ``reverting`` (cleared only by a successful write). A copy that differs and carries no
+        or another marker is left to the planner (an ordinary update). Returns whether any
+        cached object changed.
         """
-        changed = foreign = unrenderable = 0
+        changed = foreign = adopted = unrenderable = 0
         now = self._clock()
         for oid, have in actual.items():
             obj = cache.objects[have.href]
@@ -328,11 +337,11 @@ class Engine:
                 continue
             if oid in protected:
                 continue  # no trustworthy source version now: judge it once it is readable again
+            changed += 1
             want = desired.get(oid)
-            edited = False
-            # Gone or out of window (the planner decides), source changed too (a normal update
-            # follows), or unreadable to us (never start rewriting on a parser limitation).
-            if want is not None and have.content_hash == want.content_hash and window.intersects(want.span):
+            # Gone or out of window: the planner decides.
+            expected = None
+            if want is not None and window.intersects(want.span):
                 try:
                     expected = content_digest(
                         render(
@@ -344,20 +353,32 @@ class Engine:
                         )
                     )
                 except Exception:  # its message may quote event content: count it, never log it
-                    expected = None
                     unrenderable += 1
-                edited = expected is not None and seen != expected
-            if edited:  # the planner sees an unknown hash and plans an update (PUT with If-Match)
-                cache.objects[have.href] = replace(obj, verify_digest=None, content_hash=None, reverting=True)
-            else:
+            if want is None or expected is None:
+                # Unreadable to us: never start rewriting on a parser limitation.
                 cache.objects[have.href] = replace(obj, verify_digest=None)
-            changed += 1
-            foreign += edited
+            elif seen == expected:
+                adopted += have.content_hash != want.content_hash
+                cache.objects[have.href] = replace(
+                    obj, content_hash=want.content_hash, span=want.span, verify_digest=None, reverting=False
+                )
+            elif have.content_hash == want.content_hash:
+                # Edited on the target: the planner sees an unknown hash and plans an update.
+                cache.objects[have.href] = replace(obj, verify_digest=None, content_hash=None, reverting=True)
+                foreign += 1
+            else:
+                cache.objects[have.href] = replace(obj, verify_digest=None)  # the source changed too
         if unrenderable:
             log.warning(
-                "rule %s: %d copy(ies) could not be compared with the source version; left as they are",
+                "rule %s: %d copy(ies) could not be compared with the source version", rule.name, unrenderable
+            )
+        if adopted:
+            # Counts only: tells whether the target keeps the marker (the real-device check).
+            log.info(
+                "rule %s: %d copy(ies) already show the source version but carry no or an outdated "
+                "marker; recorded as current without rewriting",
                 rule.name,
-                unrenderable,
+                adopted,
             )
         if foreign:
             log.info(
