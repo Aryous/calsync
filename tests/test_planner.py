@@ -69,3 +69,15 @@ def test_protected_actuals_are_never_deleted() -> None:
     p = plan({}, {"p": have("p"), "q": have("q", span=None), "x": have("x")}, WINDOW, frozenset({"p", "q"}))
     assert [a.object_id for a in p.delete] == ["x"]
     assert p.create == [] and p.update == []
+
+
+def test_protected_desired_copy_is_left_untouched_but_may_be_created() -> None:
+    far = (NOW + timedelta(days=200), NOW + timedelta(days=201))
+    p = plan(
+        {"held": want("held", "new"), "moved": want("moved", span=far), "fresh": want("fresh")},
+        {"held": have("held", "old"), "moved": have("moved")},
+        WINDOW,
+        frozenset({"held", "moved", "fresh"}),
+    )
+    assert p.update == [] and p.delete == []
+    assert [d.object_id for d in p.create] == ["fresh"]

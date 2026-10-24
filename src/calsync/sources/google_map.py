@@ -103,10 +103,15 @@ def _series(master: RawEvent, exceptions: list[RawEvent], meta: CalendarMeta) ->
     rules, exdates = split_recurrence(master.get("recurrence") or (), tz)
     excluded = list(exdates)
     overrides: list[Occurrence] = []
+    complete = True
     if rules:
         for ex in exceptions:
             original = ex.get("originalStartTime")
             if not original:
+                log.warning(
+                    "skipping instance %s of series %s: no originalStartTime", ex.get("id"), master.get("id")
+                )
+                complete = False
                 continue
             try:
                 original_start = parse_when(original, tz)
@@ -125,6 +130,7 @@ def _series(master: RawEvent, exceptions: list[RawEvent], meta: CalendarMeta) ->
                     )
                 )
             except (KeyError, ValueError) as exc:
+                complete = False
                 log.warning(
                     "skipping malformed instance %s of series %s: %s", ex.get("id"), master.get("id"), exc
                 )
@@ -141,6 +147,7 @@ def _series(master: RawEvent, exceptions: list[RawEvent], meta: CalendarMeta) ->
             overrides=tuple(overrides),
             alarms=event_alarms(master, meta.default_alarms),
             transparent=master.get("transparency") == "transparent",
+            complete=complete,
         )
     )
 

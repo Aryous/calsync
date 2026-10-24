@@ -89,6 +89,9 @@ class Series:
     overrides: tuple[Occurrence, ...] = ()
     alarms: tuple[Alarm, ...] = ()
     transparent: bool = False
+    # False: some instance failed to parse and was left out ("degraded"). An existing
+    # target copy of a degraded series is kept as is; a missing one is created anyway.
+    complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)

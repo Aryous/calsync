@@ -144,6 +144,9 @@ def test_malformed_instance_does_not_drop_series(caplog: pytest.LogCaptureFixtur
     with caplog.at_level(logging.DEBUG):
         (s,) = build_series([master, good, bad], META)
     assert len(s.overrides) == 1
+    assert s.complete is False  # degraded: one instance was skipped
+    (whole,) = build_series([master, good], META)
+    assert whole.complete is True
     assert any(
         r.levelno == logging.WARNING and "malformed instance" in r.getMessage() for r in caplog.records
     )
@@ -218,3 +221,16 @@ def test_master_ids_covers_parseable_and_malformed_masters() -> None:
     ]
     assert master_ids(raw) == {"good", "broken"}
     assert {s.source_id for s in build_series(raw, META)} == {"good"}
+
+
+def test_instance_without_original_start_degrades_series() -> None:
+    master = google_event(
+        "m1",
+        "Standup",
+        "2026-10-23T09:30:00+08:00",
+        "2026-10-23T09:35:00+08:00",
+        recurrence=["RRULE:FREQ=DAILY;COUNT=3"],
+    )
+    stray = {"id": "m1_x", "status": "cancelled", "recurringEventId": "m1"}
+    (s,) = build_series([master, stray], META)
+    assert s.complete is False and s.exdates == ()

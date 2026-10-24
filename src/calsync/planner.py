@@ -46,7 +46,12 @@ def plan(
     window: Window,
     protected: frozenset[str] = frozenset(),
 ) -> Plan:
-    """``protected`` object ids exist at the source but could not be parsed: never delete them."""
+    """Plan creates, updates and deletes.
+
+    ``protected`` object ids are source series the engine cannot read in full
+    (unparseable, or degraded): an existing copy is never updated or deleted;
+    a missing one may still be created from whatever is in ``desired``.
+    """
     result = Plan()
     for oid, want in desired.items():
         if not window.intersects(want.span):
@@ -54,7 +59,7 @@ def plan(
         have = actual.get(oid)
         if have is None:
             result.create.append(want)
-        elif have.content_hash != want.content_hash:
+        elif have.content_hash != want.content_hash and oid not in protected:
             result.update.append((want, have))
     for oid, have in actual.items():
         want = desired.get(oid)

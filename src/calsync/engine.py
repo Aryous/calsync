@@ -224,13 +224,15 @@ class Engine:
             desired[oid] = Desired(oid, shaped, series_hash(shaped), series_span(shaped))
         unparsed = source.series_ids(raw) - {item.source_id for item in series}
         for sid in sorted(unparsed):
-            if (rule.name, sid) in self._warned_protected:
-                continue
-            self._warned_protected.add((rule.name, sid))
-            log.warning(
-                "rule %s: source series %s could not be parsed; protecting its target copy", rule.name, sid
-            )
+            self._warn_protected(rule, sid, "could not be parsed")
         return desired, frozenset(object_id(rule.name, cal_id, sid) for sid in unparsed)
+
+    def _warn_protected(self, rule: Rule, source_id: str, why: str) -> None:
+        """Once per process per (rule, series); names the source id only, never event content."""
+        if (rule.name, source_id) in self._warned_protected:
+            return
+        self._warned_protected.add((rule.name, source_id))
+        log.warning("rule %s: source series %s %s; protecting its target copy", rule.name, source_id, why)
 
     def _cache_for(self, rule: Rule) -> tuple[TargetCalendar, TargetCache]:
         key = (rule.target.account, rule.target.calendar)
@@ -246,10 +248,18 @@ class Engine:
             if obj.rule_tag == tag
         }
         window = Window.around(self._clock(), rule.window.past, rule.window.future)
-        desired, protected = self._desired(rule)
-        result.protected = len(protected)
-        result.plan = plan(desired, actual, window, protected)
-        deletable = len(actual.keys() - protected)
+        desired, unparsed = self._desired(rule)
+        # Degraded series (some instance failed to parse) keep an existing copy untouched;
+        # without a copy they are still created from their parseable part.
+        degraded = {oid for oid, want in desired.items() if not want.series.complete and oid in actual}
+        for oid in sorted(degraded):
+            self._warn_protected(
+                rule, desired[oid].series.source_id, "has instances that could not be parsed"
+            )
+        result.protected = len(unparsed) + len(degraded)
+        result.plan = plan(desired, actual, window, unparsed | degraded)
+        # The guard denominator excludes only copies whose series cannot be read at all.
+        deletable = len(actual.keys() - unparsed)
         reason = None if allow_deletes else check_delete_guard(result.plan, deletable, rule.delete_guard)
         if reason:
             result.status, result.error, result.error_kind = "blocked", reason, "guard"
