@@ -2,7 +2,9 @@
 simply drops and recreates everything instead of migrating."""
 
 import json
+import os
 import sqlite3
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,6 +16,7 @@ from calsync.sources.base import CalendarPull
 from calsync.targets.base import CachedObject, TargetCache, TargetCalendar
 
 SCHEMA_VERSION = 1
+RUN_RETENTION = 500  # newest runs kept per rule
 
 _SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -59,17 +62,44 @@ class RunRecord:
     error: str | None
 
 
-def _dt(value: str | None) -> datetime | None:
-    return datetime.fromisoformat(value) if value else None
-
-
 class Store:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._db = sqlite3.connect(path, isolation_level=None)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=NORMAL")
-        self._ensure_schema()
+        self._path = path
+        try:
+            self._db = self._open()
+        except sqlite3.DatabaseError as exc:
+            if isinstance(exc, sqlite3.OperationalError) and "not a database" not in str(exc):
+                raise
+            self._quarantine()
+            self._db = self._open()
+        self._restrict_permissions()
+
+    def _open(self) -> sqlite3.Connection:
+        # Create the file as 0600 ourselves so it is never briefly world-readable.
+        os.close(os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600))
+        db = sqlite3.connect(self._path, isolation_level=None)
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=NORMAL")
+            self._ensure_schema(db)
+        except BaseException:
+            db.close()
+            raise
+        return db
+
+    def _quarantine(self) -> None:
+        stamp = time.strftime("%Y%m%dT%H%M%S")
+        for suffix in ("", "-wal", "-shm"):
+            src = Path(str(self._path) + suffix)
+            if src.exists():
+                src.rename(Path(f"{self._path}.corrupt-{stamp}{suffix}"))
+
+    def _restrict_permissions(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(str(self._path) + suffix)
+            if path.exists():
+                path.chmod(0o600)
 
     def close(self) -> None:
         self._db.close()
@@ -80,23 +110,27 @@ class Store:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def _ensure_schema(self) -> None:
+    @staticmethod
+    def _ensure_schema(db: sqlite3.Connection) -> None:
         try:
-            row = self._db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        except sqlite3.OperationalError:
+            row = db.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc):
+                raise
             row = None
-        if row and int(row[0]) == SCHEMA_VERSION:
-            return
-        with self._tx():
+        try:
+            if row and int(row[0]) == SCHEMA_VERSION:
+                return
+        except (TypeError, ValueError):
+            pass  # unreadable version: rebuild
+        with _Transaction(db):
             for table in _TABLES:
-                self._db.execute(f"DROP TABLE IF EXISTS {table}")
+                db.execute(f"DROP TABLE IF EXISTS {table}")
             # executescript() would commit our open transaction, so run statements one by one.
             for statement in _SCHEMA.split(";"):
                 if statement.strip():
-                    self._db.execute(statement)
-            self._db.execute(
-                "INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),)
-            )
+                    db.execute(statement)
+            db.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
 
     def _tx(self) -> "_Transaction":
         return _Transaction(self._db)
@@ -145,16 +179,33 @@ class Store:
         return TargetCalendar(row[0], row[1], row[2]) if row else None
 
     def save_target_calendar(self, account: str, ref: str, cal: TargetCalendar) -> None:
-        self._db.execute(
-            "INSERT INTO target_calendar (account, ref, href, name, mode) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT (account, ref) DO UPDATE SET href = excluded.href, name = excluded.name, "
-            "mode = excluded.mode, cursor = CASE WHEN target_calendar.href = excluded.href "
-            "THEN target_calendar.cursor ELSE NULL END",
-            (account, ref, cal.href, cal.name, cal.mode),
-        )
+        with self._tx():
+            old = self._db.execute(
+                "SELECT href FROM target_calendar WHERE account = ? AND ref = ?", (account, ref)
+            ).fetchone()
+            if old and old[0] != cal.href:
+                self._drop_objects(account, old[0])
+            self._db.execute(
+                "INSERT INTO target_calendar (account, ref, href, name, mode) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT (account, ref) DO UPDATE SET href = excluded.href, name = excluded.name, "
+                "mode = excluded.mode, cursor = CASE WHEN target_calendar.href = excluded.href "
+                "THEN target_calendar.cursor ELSE NULL END",
+                (account, ref, cal.href, cal.name, cal.mode),
+            )
 
     def forget_target_calendar(self, account: str, ref: str) -> None:
-        self._db.execute("DELETE FROM target_calendar WHERE account = ? AND ref = ?", (account, ref))
+        with self._tx():
+            old = self._db.execute(
+                "SELECT href FROM target_calendar WHERE account = ? AND ref = ?", (account, ref)
+            ).fetchone()
+            if old:
+                self._drop_objects(account, old[0])
+            self._db.execute("DELETE FROM target_calendar WHERE account = ? AND ref = ?", (account, ref))
+
+    def _drop_objects(self, account: str, calendar_href: str) -> None:
+        self._db.execute(
+            "DELETE FROM target_object WHERE account = ? AND calendar_href = ?", (account, calendar_href)
+        )
 
     def load_target_cache(self, account: str, calendar_href: str) -> TargetCache:
         row = self._db.execute(
@@ -167,8 +218,8 @@ class Store:
             "FROM target_object WHERE account = ? AND calendar_href = ?",
             (account, calendar_href),
         ):
-            span = (_dt(lo), _dt(hi)) if lo and hi else None
-            cache.objects[href] = CachedObject(etag, tag, oid, content_hash, span)  # type: ignore[arg-type]
+            span = (datetime.fromisoformat(lo), datetime.fromisoformat(hi)) if lo and hi else None
+            cache.objects[href] = CachedObject(etag, tag, oid, content_hash, span)
         return cache
 
     def save_target_cache(self, account: str, calendar_href: str, cache: TargetCache) -> None:
@@ -218,6 +269,12 @@ class Store:
                     for r in runs
                 ],
             )
+            for rule in {r.rule for r in runs}:
+                self._db.execute(
+                    "DELETE FROM run WHERE rule = ? AND id NOT IN "
+                    "(SELECT id FROM run WHERE rule = ? ORDER BY id DESC LIMIT ?)",
+                    (rule, rule, RUN_RETENTION),
+                )
 
     def latest_runs(self) -> list[RunRecord]:
         rows = self._db.execute(
@@ -237,4 +294,16 @@ class _Transaction:
         self._db.execute("BEGIN IMMEDIATE")
 
     def __exit__(self, exc_type: object, *_: object) -> None:
-        self._db.execute("ROLLBACK" if exc_type else "COMMIT")
+        if exc_type is None:
+            try:
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._rollback()
+                raise
+        else:
+            self._rollback()  # never mask the original error
+
+    def _rollback(self) -> None:
+        # SQLite may already have rolled back on its own (e.g. disk full).
+        if self._db.in_transaction:
+            self._db.execute("ROLLBACK")
