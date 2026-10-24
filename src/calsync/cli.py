@@ -7,9 +7,14 @@ import getpass
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TextIO
+from typing import TYPE_CHECKING, TextIO
 
 from calsync import __version__
+
+if TYPE_CHECKING:  # type-only: importing these at runtime would load httpx/icalendar
+    from calsync.config import Config
+    from calsync.engine import CycleResult
+    from calsync.errors import CalsyncError
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_AUTH, EXIT_RUNNING = 0, 1, 2, 3, 4
 
@@ -47,7 +52,7 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _load(args: argparse.Namespace):  # type: ignore[no-untyped-def]
+def _load(args: argparse.Namespace) -> "Config":
     from calsync.config import default_config_path, load_config
 
     return load_config(args.config or default_config_path())
@@ -57,6 +62,19 @@ def _state_dir(args: argparse.Namespace) -> Path:
     from calsync.wiring import default_state_dir
 
     return args.state_dir or default_state_dir()
+
+
+def exit_code_for(exc: "CalsyncError") -> int:
+    from calsync.errors import AuthError, ConfigError
+    from calsync.lock import AlreadyRunning
+
+    if isinstance(exc, ConfigError):
+        return EXIT_CONFIG
+    if isinstance(exc, AuthError):
+        return EXIT_AUTH
+    if isinstance(exc, AlreadyRunning):
+        return EXIT_RUNNING
+    return EXIT_FAILED
 
 
 def cmd_config_check(args: argparse.Namespace, out: TextIO) -> int:
@@ -72,8 +90,9 @@ async def _calendars(args: argparse.Namespace, out: TextIO) -> int:
     if args.account not in config.accounts:
         out.write(f"unknown account {args.account!r}\n")
         return EXIT_CONFIG
-    adapters = build_adapters(config, {args.account})
+    adapters = await build_adapters(config, {args.account})
     try:
+        adapters.adapter(args.account)  # raises the account's setup error, if any
         if args.account in adapters.sources:
             for cal in await adapters.sources[args.account].list_calendars():
                 out.write(f"{cal.id}\t{cal.name}\n")
@@ -95,50 +114,82 @@ async def _auth(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
     import json
 
     from calsync.credentials import write_secret
-    from calsync.wiring import build_adapters
+    from calsync.errors import CalsyncError
+    from calsync.wiring import adapters_with_secret
 
     config = _load(args)
     account = config.accounts.get(args.account)
     if account is None:
         out.write(f"unknown account {args.account!r}\n")
         return EXIT_CONFIG
-    if account.provider == "google":
-        if not args.refresh_token_stdin:
-            out.write("google browser sign-in is not available yet; pass --refresh-token-stdin\n")
-            return EXIT_CONFIG
-        secret = json.dumps({"refresh_token": _read_stdin_secret("Refresh token: ", stdin)})
-    else:
-        secret = _read_stdin_secret("App-specific password: ", stdin)
-    write_secret(account.credential, secret)
-    adapters = build_adapters(config, {args.account})
+    google = account.provider == "google"
+    if args.refresh_token_stdin and not google:
+        out.write(f"--refresh-token-stdin applies only to google accounts; {args.account!r} is caldav\n")
+        return EXIT_CONFIG
+    if google and not args.refresh_token_stdin:
+        out.write("google browser sign-in is not available yet; pass --refresh-token-stdin\n")
+        return EXIT_CONFIG
+    raw = _read_stdin_secret("Refresh token: " if google else "App-specific password: ", stdin)
+    if not raw:
+        out.write("empty input: nothing stored, the existing credential is unchanged\n")
+        return EXIT_CONFIG
+    secret = json.dumps({"refresh_token": raw}) if google else raw
+    # Verify the candidate in memory first; store it only once it works.
     try:
-        adapter = adapters.sources.get(args.account) or adapters.targets[args.account]
-        found = await adapter.list_calendars()
-    finally:
-        await adapters.aclose()
+        adapters = await adapters_with_secret(config, args.account, secret)
+        try:
+            found = await adapters.adapter(args.account).list_calendars()
+        finally:
+            await adapters.aclose()
+    except CalsyncError as exc:
+        out.write(f"verification failed, credentials not stored (existing ones unchanged): {exc}\n")
+        return exit_code_for(exc)
+    write_secret(account.credential, secret)
     out.write(f"ok: credentials stored, {len(found)} calendars visible\n")
     return EXIT_OK
 
 
-def _print_cycle(result, out: TextIO, verbose: bool) -> None:  # type: ignore[no-untyped-def]
+def _flat(text: str) -> str:
+    """One line of user text: newlines and other whitespace runs become single spaces."""
+    return " ".join(text.split())
+
+
+def _print_cycle(result: "CycleResult", out: TextIO, verbose: bool) -> None:
     for name, r in result.rules.items():
-        out.write(
+        line = (
             f"rule={name} status={r.status} created={r.created} updated={r.updated} "
-            f"deleted={r.deleted} failed={r.failed}" + (f" error={r.error!r}" if r.error else "") + "\n"
+            f"deleted={r.deleted} failed={r.failed}"
         )
+        if r.protected:
+            line += f" protected={r.protected}"
+        if r.degraded:
+            line += f" degraded={r.degraded}"
+        if r.error:
+            line += f" error={r.error!r}"
+        out.write(line + "\n")
+        # Titles are listed in plan.delete order only when every one was read.
+        titled = r.status == "blocked" and r.blocked_titles_complete
+        if r.status == "blocked":
+            for title in r.blocked_titles:
+                out.write(f"  - {_flat(title)}\n")
+            if not r.blocked_titles_complete:
+                out.write("  (titles incomplete)\n")
+            out.write("  re-run with --allow-deletes if this is intended\n")
         if verbose and r.plan is not None:
             for want in r.plan.create:
-                out.write(f"  + {want.series.title} @ {want.series.start.value.isoformat()}\n")
+                out.write(f"  + {_flat(want.series.title)} @ {want.series.start.value.isoformat()}\n")
             for want, _ in r.plan.update:
-                out.write(f"  ~ {want.series.title} @ {want.series.start.value.isoformat()}\n")
-            for have in r.plan.delete:
-                out.write(f"  - {have.href}\n")
+                out.write(f"  ~ {_flat(want.series.title)} @ {want.series.start.value.isoformat()}\n")
+            if not (titled and len(r.blocked_titles) == len(r.plan.delete)):
+                for have in r.plan.delete:  # no title known: the href is all we have
+                    out.write(f"  - {have.href}\n")
     out.write(f"requests={result.requests}\n")
 
 
 async def _run(args: argparse.Namespace, out: TextIO) -> int:
+    from calsync.engine import RuleResult
     from calsync.lock import RunLock
-    from calsync.store import Store
+    from calsync.store import RunRecord, Store
     from calsync.wiring import accounts_in_use, build_adapters, build_engine, state_paths
 
     config = _load(args)
@@ -146,18 +197,40 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
     if unknown:
         out.write(f"unknown rule(s): {', '.join(unknown)}\n")
         return EXIT_CONFIG
+    selected = [r for r in config.rules if not args.rules or r.name in args.rules]
     db_path, lock_path = state_paths(_state_dir(args))
     with RunLock(lock_path):
-        adapters = build_adapters(config, accounts_in_use(config, args.rules))
-        store = Store(db_path)
+        adapters = await build_adapters(config, accounts_in_use(config, args.rules))
         try:
-            engine = build_engine(config, adapters, store)
-            result = await engine.cycle(
-                rules=args.rules, dry_run=args.dry_run, allow_deletes=args.allow_deletes
-            )
+            # A rule whose source or target account could not be set up fails on its own;
+            # the other rules run normally.
+            skipped: dict[str, RuleResult] = {}
+            for rule in selected:
+                broken = [a for a in (rule.source.account, rule.target.account) if a in adapters.errors]
+                if broken:
+                    skipped[rule.name] = RuleResult(rule.name)
+                    skipped[rule.name].fail(adapters.errors[broken[0]])
+            store = Store(db_path)
+            try:
+                engine = build_engine(config, adapters, store)
+                result = await engine.cycle(
+                    rules=[r.name for r in selected if r.name not in skipped],
+                    dry_run=args.dry_run,
+                    allow_deletes=args.allow_deletes,
+                )
+                if skipped and not args.dry_run:  # keep run history complete
+                    start, end = result.started_at, result.finished_at
+                    store.record_runs(
+                        [
+                            RunRecord(r.rule, start, end, r.status, 0, 0, 0, 0, 0, r.error)
+                            for r in skipped.values()
+                        ]
+                    )
+            finally:
+                store.close()
         finally:
-            store.close()
             await adapters.aclose()
+    result.rules = {r.name: result.rules.get(r.name) or skipped[r.name] for r in selected}
     _print_cycle(result, out, verbose=args.dry_run)
     if any(r.error_kind == "auth" for r in result.rules.values()):
         return EXIT_AUTH
@@ -169,7 +242,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
     if args.version:
         out.write(f"calsync {__version__}\n")
         return EXIT_OK
-    from calsync.errors import AuthError, ConfigError
+    from calsync.errors import AuthError, CalsyncError, ConfigError
     from calsync.lock import AlreadyRunning
 
     try:
@@ -188,7 +261,10 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
         out.write(f"authentication error: {exc}\n")
         return EXIT_AUTH
     except AlreadyRunning as exc:
-        out.write(f"{exc}\n")
+        out.write(f"{exc} (a later version will support `calsync trigger`)\n")
         return EXIT_RUNNING
+    except CalsyncError as exc:  # network and other expected failures: a message, not a traceback
+        out.write(f"error: {exc}\n")
+        return EXIT_FAILED
     _parser().print_help(out)
     return EXIT_CONFIG

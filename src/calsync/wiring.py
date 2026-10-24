@@ -1,6 +1,7 @@
 """Build adapters and the engine from configuration. The only place that
 turns account definitions into live clients."""
 
+import contextlib
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -11,7 +12,7 @@ import httpx
 from calsync.config import Account, Config
 from calsync.credentials import read_secret
 from calsync.engine import Engine
-from calsync.errors import ConfigError
+from calsync.errors import CalsyncError, ConfigError
 from calsync.http import RequestLog, make_client
 from calsync.sources.base import Source
 from calsync.sources.google import GoogleSource
@@ -34,43 +35,82 @@ class Adapters:
     sources: dict[str, Source] = field(default_factory=dict)
     targets: dict[str, Target] = field(default_factory=dict)
     clients: list[httpx.AsyncClient] = field(default_factory=list)
+    # Accounts whose setup failed (e.g. unreadable secret); they have no adapter.
+    errors: dict[str, CalsyncError] = field(default_factory=dict)
+
+    def adapter(self, name: str) -> Source | Target:
+        """The account's adapter, or its setup error raised."""
+        if name in self.errors:
+            raise self.errors[name]
+        return self.sources.get(name) or self.targets[name]
 
     async def aclose(self) -> None:
+        """Close every client, even if one close fails; re-raise the first failure."""
+        first: Exception | None = None
         for client in self.clients:
-            await client.aclose()
+            try:
+                await client.aclose()
+            except Exception as exc:
+                first = first or exc
+        if first is not None:
+            raise first
 
 
-def _google_source(
-    config: Config, account: Account, client: httpx.AsyncClient, environ: Mapping[str, str]
-) -> GoogleSource:
-    if config.google_client_secret_file is None:
-        raise ConfigError(["google.client_secret_file: required for google accounts"])
-    client_id, client_secret = load_client_secret(config.google_client_secret_file)
-    refresh = parse_refresh_token(read_secret(account.credential, environ=environ))
-    token = RefreshTokenProvider(
-        client, client_id=client_id, client_secret=client_secret, refresh_token=refresh
+async def _discard(adapters: Adapters) -> None:
+    """Close a half-built set of adapters without masking the error that stopped it."""
+    with contextlib.suppress(Exception):
+        await adapters.aclose()
+
+
+def _add_account(config: Config, account: Account, secret: str, adapters: Adapters) -> None:
+    """Build one account's adapter from an explicit secret; never reads stored credentials."""
+    if account.provider == "google":
+        if config.google_client_secret_file is None:
+            raise ConfigError(["google.client_secret_file: required for google accounts"])
+        client_id, client_secret = load_client_secret(config.google_client_secret_file)
+        refresh = parse_refresh_token(secret)
+        client = make_client(adapters.log)
+        adapters.clients.append(client)
+        token = RefreshTokenProvider(
+            client, client_id=client_id, client_secret=client_secret, refresh_token=refresh
+        )
+        adapters.sources[account.name] = GoogleSource(client, token)
+        return
+    assert account.server_url is not None and account.username is not None
+    client = make_client(adapters.log, auth=httpx.BasicAuth(account.username, secret))
+    adapters.clients.append(client)
+    adapters.targets[account.name] = CalDavTarget(
+        client, account.server_url, max_concurrency=account.max_concurrency
     )
-    return GoogleSource(client, token)
 
 
-def build_adapters(config: Config, names: set[str], *, environ: Mapping[str, str] = os.environ) -> Adapters:
+async def build_adapters(
+    config: Config, names: set[str], *, environ: Mapping[str, str] = os.environ
+) -> Adapters:
+    """Adapters for ``names``. An account whose setup fails is recorded in ``errors`` and
+    skipped, so one unreadable secret cannot stop the other accounts."""
     adapters = Adapters(RequestLog())
-    google_client: httpx.AsyncClient | None = None
-    for name in sorted(names):
-        account = config.accounts[name]
-        if account.provider == "google":
-            if google_client is None:
-                google_client = make_client(adapters.log)
-                adapters.clients.append(google_client)
-            adapters.sources[name] = _google_source(config, account, google_client, environ)
-        else:
-            assert account.server_url is not None and account.username is not None
-            password = read_secret(account.credential, environ=environ)
-            client = make_client(adapters.log, auth=httpx.BasicAuth(account.username, password))
-            adapters.clients.append(client)
-            adapters.targets[name] = CalDavTarget(
-                client, account.server_url, max_concurrency=account.max_concurrency
-            )
+    try:
+        for name in sorted(names):
+            account = config.accounts[name]
+            try:
+                _add_account(config, account, read_secret(account.credential, environ=environ), adapters)
+            except CalsyncError as exc:
+                adapters.errors[name] = exc
+    except BaseException:
+        await _discard(adapters)
+        raise
+    return adapters
+
+
+async def adapters_with_secret(config: Config, name: str, secret: str) -> Adapters:
+    """Adapters for one account built from a candidate secret (not yet stored); raises on failure."""
+    adapters = Adapters(RequestLog())
+    try:
+        _add_account(config, config.accounts[name], secret, adapters)
+    except BaseException:
+        await _discard(adapters)
+        raise
     return adapters
 
 
