@@ -864,7 +864,7 @@ def test_on_target_edit_default_and_rejects_others(tmp_path: Path) -> None:
     assert 'rules[family].on_target_edit: only "revert" is supported' in err.value.problems
 ```
 
-`tests/test_engine_edges.py`: remove the `@pytest.mark.xfail(...)` decorator and the "known limitation" header from `test_manual_target_edit_is_repaired`, update its docstring to "Someone moves a reminder on the phone; the client keeps X-CALSYNC-HASH. The next cycle writes the source version back.", and add after the existing asserts:
+`tests/test_engine_edges.py`: remove the `@pytest.mark.xfail(...)` decorator and the "known limitation" header from `test_manual_target_edit_is_repaired`, update its docstring to "Someone moves an event on the phone; the client keeps X-CALSYNC-HASH. The next cycle writes the source version back.", and add after the existing asserts:
 
 ```python
     assert res.reverted == 1

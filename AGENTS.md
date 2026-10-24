@@ -15,7 +15,7 @@ AI assistant writing events) that must appear, **with working alerts**, on a
 relative's iPhone. That use case sets the priorities:
 
 1. Never delete or overwrite an event wrongly. A stale copy is acceptable; a
-   missing reminder reminder is not.
+   missing reminder is not.
 2. Alerts are first-class data.
 3. Cheap enough to poll every minute.
 4. Generic: nothing in code refers to a specific account or calendar.

@@ -95,9 +95,9 @@ on_target_edit = "revert"            # 第一版唯一取值
 
 | 字段 | 取值 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `attendees` | `"none"` / `"notes"` | `"notes"` | `notes`：在备注末尾追加"参与人：名字 <邮箱>, …"。不写 `ATTENDEE` / `ORGANIZER`，因此不会触发目标服务器发送邀请 |
-| `conference` | `"copy"` / `"none"` | `"copy"` | 把会议链接写入 `URL` 属性，并追加到备注 |
-| `content` | `"full"` / `"busy"` | `"full"` | `busy`：标题写"忙"，不写备注和地点，时间和提醒照常。用于把工作日历同步到个人日历 |
+| `attendees` | `"none"` / `"notes"` | `"notes"` | `notes`：在备注末尾追加 `Attendees: 名字 <邮箱>, …`（标签用英文，作为开源默认值）。不写 `ATTENDEE` / `ORGANIZER`，因此不会触发目标服务器发送邀请 |
+| `conference` | `"copy"` / `"none"` | `"copy"` | 把会议链接写入 `URL` 属性，并以 `Conference: <链接>` 追加到备注 |
+| `content` | `"full"` / `"busy"` | `"full"` | `busy`：标题写 `Busy`，不写备注、地点和会议链接（`URL`），时间和提醒照常。用于把工作日历同步到个人日历 |
 
 - 这些设置参与内容哈希：修改设置后，线路下的对象会被重写一次。
 - "作为真正的参与人复制"（`ATTENDEE` 加 `SCHEDULE-AGENT=CLIENT`）不在第一版。要先验证 iCloud 是否遵守这个参数、不发邀请，见 §9 的 E4。
@@ -105,7 +105,7 @@ on_target_edit = "revert"            # 第一版唯一取值
 
 ### 3.3 目标端被改动时：按来源改回
 
-**现状**：内容指纹 `X-CALSYNC-HASH` 写在正文里。iPhone 修改事件时通常原样保留这个字段，calsync 因此发现不了改动（v3 §2；严格 xfail 测试 `test_manual_target_edit_is_repaired`）。
+**现状**（块①已实现，以下为当时状态；实现见本节"做法"）：内容指纹 `X-CALSYNC-HASH` 写在正文里。iPhone 修改事件时通常原样保留这个字段，calsync 因此发现不了改动（v3 §2；严格 xfail 测试 `test_manual_target_edit_is_repaired`）。
 
 **目标**：`on_target_edit = "revert"` 时，目标端对托管事件的任何修改，都会在下一轮被改回来源的版本；目标端删除的托管事件会被重新创建。
 

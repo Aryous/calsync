@@ -90,7 +90,9 @@ directly in the other person's account.
   recurrence, free/busy, alerts — with the version it would write. If they
   differ, the source version is written back. Bookkeeping that servers and
   phones add on their own (stamps, sequence numbers, private `X-` properties,
-  a dismissed or snoozed alert) is not an edit and is never undone.
+  a dismissed or snoozed alert) is not an edit and is never undone, provided
+  the phone keeps calsync's hidden marker; this is being verified on a real
+  iPhone.
 - All local state (mirror, cursors, target cache, run history) is a
   **rebuildable cache**. Delete the state directory and the next run
   reconciles from both ends without creating duplicates.
@@ -435,7 +437,9 @@ stale one.
   normally shows: times, title, notes, location, link, recurrence, free/busy
   and alerts. A change only to properties outside that set (for example
   `STATUS`, `CLASS` or `CATEGORIES`) is not detected and stays until the
-  event is rewritten for another reason.
+  event is rewritten for another reason. Alerts added on the phone that use an
+  absolute time, are snoozes (`RELATED-TO`) or are the app's default alerts
+  are treated as the person's own and are never reverted.
 - **Edits to a protected series wait.** An edit made on the target to a
   series calsync currently cannot fully parse (reported as `protected`) is
   reverted only after the series parses again.
