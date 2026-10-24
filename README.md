@@ -485,7 +485,7 @@ stale one.
 | exit code 4 | another `calsync run` holds the lock; wait for it |
 | an event changed on the iPhone snaps back (`reverted=1`) | expected: sync is one way, the Google version wins. Make the change in Google |
 | log says an object "was reverted 3 times within 6:00:00 … not reverting it until …; the source version will be written back then" | something on the target rewrites that event after every write (the loop breaker stepped in). calsync leaves it alone for 24 hours (changes made in Google still sync), then writes the Google version back once ("the hold on 1 copy(ies) ended"). If it keeps happening, look for another app or sync service editing that calendar |
-| log says "copy(ies) read back with no or another marker than calsync wrote" | information only: the target (e.g. iOS) dropped or replaced calsync's hidden `X-CALSYNC-HASH`. Edits are still judged by visible content and reverted as usual |
+| log says "copy(ies) read back with no calsync marker" | information only: the target (e.g. iOS) dropped calsync's hidden `X-CALSYNC-HASH` from those copies (a copy that keeps an older marker is not reported). Edits are still judged by visible content and reverted as usual |
 | events arrive on a family member's iPhone but no alert fires | check, in order: notifications for the Calendar app are on (Settings → Notifications → Calendar); the calendar's own Event Alerts switch is on; the calendar is shared rather than in their account, in which case only their Default Alert Time applies (see Known limitations) |
 | no alert while the Calendar app is open | expected: iOS shows the alert inside the app instead of as a notification |
 | behind a proxy | set `HTTPS_PROXY`; calsync honours the standard proxy variables |

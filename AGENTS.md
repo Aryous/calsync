@@ -167,7 +167,8 @@ uv run ruff check src tests && uv run ruff format --check src tests && uv run py
   counts toward the breaker) and "source changed" (ordinary update).
   Overwriting it from the body would let a target that strips the marker
   turn every edit into an uncounted update. Detection logs (counts only) how
-  many known copies came back with no or another marker — the iOS check.
+  many copies came back with no marker at all — the iOS check. Another marker
+  is not reported: a copy adopted on a cold start keeps its old one.
 - Rewrite-loop breaker: a server or phone that rewrites visible content after
   every write would otherwise be reverted every cycle. The breaker uses the
   engine's injected clock, is persisted on `CachedObject`, and must be carried
