@@ -18,6 +18,12 @@ def _keyring() -> ModuleType:
     return keyring
 
 
+def _keyring_error() -> type[Exception]:
+    from keyring.errors import KeyringError  # lazy, like _keyring()
+
+    return KeyringError
+
+
 def read_secret(ref: CredentialRef, *, environ: Mapping[str, str] = os.environ) -> str:
     if ref.backend == "env":
         value = environ.get(ref.ref)
@@ -33,7 +39,10 @@ def read_secret(ref: CredentialRef, *, environ: Mapping[str, str] = os.environ) 
         if mode & 0o077:
             raise ConfigError([f"credential file {path} must have mode 0600 (found {mode:o})"])
         return path.read_text().strip()
-    value = _keyring().get_password(ref.ref, KEYRING_USER)
+    try:
+        value = _keyring().get_password(ref.ref, KEYRING_USER)
+    except _keyring_error() as exc:
+        raise AuthError(f"keychain unavailable for {ref.ref}: {exc}") from exc
     if not value:
         raise AuthError(f"no keychain entry {ref.ref!r}; run `calsync auth <account>`")
     return value
@@ -46,8 +55,11 @@ def write_secret(ref: CredentialRef, value: str) -> None:
         path = Path(ref.ref).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)  # tighten a pre-existing file before any secret is written
         with os.fdopen(fd, "w") as fh:
             fh.write(value)
-        os.chmod(path, 0o600)
         return
-    _keyring().set_password(ref.ref, KEYRING_USER, value)
+    try:
+        _keyring().set_password(ref.ref, KEYRING_USER, value)
+    except _keyring_error() as exc:
+        raise ConfigError([f"could not store keychain entry {ref.ref!r}: {exc}"]) from exc

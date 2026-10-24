@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+import keyring.errors
 import pytest
 
 from calsync import credentials
@@ -54,3 +55,30 @@ def test_keychain_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     write_secret(ref, "pw")
     assert fake.store == {("calsync/test", "calsync"): "pw"}
     assert read_secret(ref) == "pw"
+
+
+def test_file_backend_overwrite_tightens_mode(tmp_path: Path) -> None:
+    path = tmp_path / "secret"
+    path.write_text("old")
+    os.chmod(path, 0o644)
+    ref = CredentialRef("file", str(path))
+    write_secret(ref, "new")
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    assert path.read_text() == "new"
+
+
+class BrokenKeyring:
+    def get_password(self, service: str, user: str) -> str | None:
+        raise keyring.errors.NoKeyringError("no backend")
+
+    def set_password(self, service: str, user: str, value: str) -> None:
+        raise keyring.errors.KeyringLocked("locked")
+
+
+def test_keychain_errors_are_classified(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(credentials, "_keyring", lambda: BrokenKeyring())
+    ref = CredentialRef("keychain", "calsync/test")
+    with pytest.raises(AuthError, match="keychain unavailable for calsync/test: no backend"):
+        read_secret(ref)
+    with pytest.raises(ConfigError, match=r"could not store.*calsync/test.*locked"):
+        write_secret(ref, "pw")
