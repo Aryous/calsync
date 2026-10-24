@@ -469,7 +469,7 @@ class Engine:
             )
         if restored:
             log.info(
-                "rule %s: the hold on %d copy(ies) ended; the source version will be written back",
+                "rule %s: the hold on %d copy(ies) ended; each will be brought back in line with the source",
                 rule.name,
                 restored,
             )
