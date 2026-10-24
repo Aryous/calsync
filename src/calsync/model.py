@@ -10,6 +10,7 @@ import json
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, date, datetime, timedelta
+from itertools import islice
 from typing import Any, Literal
 
 from dateutil.rrule import rrulestr
@@ -19,6 +20,8 @@ from dateutil.rrule import rrulestr
 RENDER_VERSION = 1
 
 MAX_TIME = datetime(9999, 12, 31, tzinfo=UTC)
+# Beyond this many occurrences the series is treated as unbounded (safe direction: never mistaken for finished).
+SPAN_EXPANSION_LIMIT = 10_000
 
 AlarmPolicy = Literal["copy", "strip"] | tuple[timedelta, ...]
 
@@ -205,17 +208,28 @@ def compute_span(
         if "COUNT=" not in upper and "UNTIL=" not in upper:
             unbounded = True
             continue
+        last: datetime | None = None
+        count = 0
         try:
-            occurrences = list(rrulestr(value, dtstart=_rrule_anchor(start)))
+            rule = rrulestr(value, dtstart=_rrule_anchor(start))
+            for occurrence in islice(rule, SPAN_EXPANSION_LIMIT + 1):
+                last = occurrence
+                count += 1
         except (ValueError, TypeError):
             unbounded = True
             continue
-        if occurrences:
-            last_start = max(last_start, _as_utc(occurrences[-1]))
-    hi = MAX_TIME if unbounded else last_start + duration
+        if count > SPAN_EXPANSION_LIMIT:
+            unbounded = True
+            continue
+        if last is not None:
+            last_start = max(last_start, _as_utc(last))
+    try:
+        hi = MAX_TIME if unbounded else last_start + duration
+    except OverflowError:
+        hi = MAX_TIME
     for occ_start, occ_end in extra:
         lo = min(lo, occ_start.utc())
-        if not unbounded:
+        if hi != MAX_TIME:
             hi = max(hi, occ_end.utc())
     return lo, hi
 

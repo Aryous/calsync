@@ -1,3 +1,4 @@
+import time
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
@@ -6,6 +7,7 @@ import pytest
 from calsync import model
 from calsync.model import (
     MAX_TIME,
+    SPAN_EXPANSION_LIMIT,
     Alarm,
     Occurrence,
     When,
@@ -126,3 +128,20 @@ def test_alarm_policies() -> None:
 
 def test_zone_is_preserved() -> None:
     assert at(2026, 10, 23).value.tzinfo == ZONE
+
+
+def test_span_huge_until_is_bounded_and_fast() -> None:
+    s = series(recurrence=("RRULE:FREQ=DAILY;UNTIL=99991230T000000Z",))
+    started = time.perf_counter()
+    end = series_span(s)[1]
+    elapsed = time.perf_counter() - started
+    assert end == MAX_TIME
+    assert elapsed < 1.0
+
+
+def test_span_count_over_limit_is_unbounded() -> None:
+    over = series(recurrence=(f"RRULE:FREQ=MINUTELY;COUNT={SPAN_EXPANSION_LIMIT + 1}",))
+    assert series_span(over)[1] == MAX_TIME
+    at_limit = series(recurrence=(f"RRULE:FREQ=MINUTELY;COUNT={SPAN_EXPANSION_LIMIT}",))
+    lo, hi = series_span(at_limit)
+    assert hi == lo + timedelta(minutes=SPAN_EXPANSION_LIMIT - 1) + timedelta(minutes=5)
