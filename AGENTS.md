@@ -8,7 +8,7 @@ product roadmap is in [docs/ROADMAP.md](docs/ROADMAP.md).
 
 A self-hosted, **one-way** calendar sync engine: Google Calendar → CalDAV
 (iCloud global and China mainland, Radicale, other CalDAV servers). Written in
-Python 3.12, managed with uv, about 4k lines in `src/` and 300+ tests.
+Python 3.12, managed with uv, about 4.4k lines in `src/` and 400+ tests.
 
 The motivating use case is a family calendar maintained in Google (often by an
 AI assistant writing events) that must appear, **with working alerts**, on a
@@ -27,6 +27,7 @@ relative's iPhone. That use case sets the priorities:
 | `docs/superpowers/specs/2026-10-23-calsync-design.md` | design spec (v3, in sync with the code). Wins over everything else; if code and spec disagree, report it |
 | `docs/superpowers/specs/2026-10-24-calsync-v2-product-design.md` | phase-2 design (full sync, daemon, web UI). Wins over v3 where they conflict; its §10 lists the affected v3 sections |
 | `docs/superpowers/plans/2026-10-24-calsync-core-engine.md` | plan 1, executed. Historical: the code has been hardened well beyond its verbatim listings |
+| `docs/superpowers/plans/2026-10-24-block1-sync-engine.md` | block ① plan (full sync, field policy, target-edit revert), executed. Historical in the same way |
 | `docs/ROADMAP.md` | what is done, next, later; product decisions for the web UI |
 | `README.md` | user-facing behaviour; keep it accurate when behaviour changes |
 
@@ -37,7 +38,9 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
                 │            │
                 │            ├─ 1 ingest  Source.pull() → mirror.apply_pull() → Store.save_source()
                 │            ├─ 2 detect  Target.changes() → apply_target_delta() → fetch + render.inspect()
-                │            ├─ 3 plan    Source.to_series() → model (policy, hash, span) → planner.plan()
+                │            │                + render.content_digest() → CachedObject.verify_digest
+                │            ├─ 3 plan    Source.to_series() → model (alarm + field policy, hash, span)
+                │            │            → _classify_reads() (edited → reverting) → planner.plan()
                 │            ├─ 4 guard   planner.check_delete_guard()
                 │            ├─ 5 push    render.render() → Target.create/update/delete (412 fallbacks)
                 │            └─ 6 record  Store.record_runs()
@@ -48,16 +51,17 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
 
 | Module | Responsibility |
 | --- | --- |
-| `model.py` | `When`, `Alarm`, `Occurrence`, `Series` (`complete` flag), `Window`; normalization, `series_hash` (includes `RENDER_VERSION`), `compute_span` (bounded by `SPAN_EXPANSION_LIMIT`, overflow-safe), alarm policies |
+| `model.py` | `When`, `Alarm`, `Attendee`, `Occurrence`, `Series` (`complete` flag, attendees, `conference_url`), `Window` (`everything()` for full sync); normalization (attendees deduplicated and totally ordered), `series_hash` (includes `RENDER_VERSION`), `compute_span` (bounded by `SPAN_EXPANSION_LIMIT`, overflow-safe), alarm policies, `FieldPolicy` / `apply_field_policy` (attendees into notes or dropped, conference link to `URL` + notes, busy-only; structured attendees never survive it) |
 | `naming.py` | `rule_tag`, `object_id`, resource name `calsync-<8hex>-<24hex>.ics`, UID `<id>@calsync` |
-| `render.py` | Series → iCalendar bytes (VTIMEZONE, RRULE/EXDATE/RDATE, RECURRENCE-ID overrides each with own VALARMs, `X-CALSYNC-RULE` / `X-CALSYNC-HASH`); `inspect()` reads them back and never raises |
-| `planner.py` | pure `plan(desired, actual, window, protected)`; `check_delete_guard` (ratio only from 3 deletions on) |
-| `engine.py` | one cycle; per-calendar/per-rule isolation; protected/degraded handling; cursor hold; delete-guard titles |
-| `store.py` | SQLite (WAL, 0600): `source_state`, `source_event`, `target_calendar` (keyed by account+ref), `target_object`, `run` (500 per rule), `alert`; schema mismatch → rebuild; corrupt DB → quarantined |
-| `sources/google.py` | REST client: calendarList + events.list with `syncToken`, 410 → full resync, per-calendar `SourcePull.errors`, 403 rate limit → transient, 401 → one refresh + retry |
+| `render.py` | Series → iCalendar bytes (VTIMEZONE, RRULE/EXDATE/RDATE, RECURRENCE-ID overrides each with own VALARMs, `URL`, `X-CALSYNC-RULE` / `X-CALSYNC-HASH`); `inspect()` reads them back and never raises; `content_digest()` hashes only what a person sees (ignores DTSTAMP, SEQUENCE, X- properties, property/event order, VTIMEZONE text, zone labels on RECURRENCE-ID/EXDATE/RDATE, alarm ACTION/DESCRIPTION and phone alarm bookkeeping); `None` for unreadable bodies, never raises |
+| `planner.py` | pure `plan(desired, actual, window, protected)` (counts `out_of_window`); `check_delete_guard` (ratio only from 3 deletions on) |
+| `engine.py` | one cycle; per-calendar/per-rule isolation; protected/degraded handling; cursor hold; delete-guard titles; full sync when `rule.window is None`; `_classify_reads` compares a read body's digest with the digest of what we would write and marks edited copies `reverting` (the update that follows counts as `reverted`) |
+| `store.py` | SQLite (WAL, 0600): `source_state`, `source_event`, `target_calendar` (keyed by account+ref), `target_object` (incl. `verify_digest`, `reverting`), `run` (500 per rule), `alert`; `SCHEMA_VERSION` 2; schema mismatch → rebuild; corrupt DB → quarantined |
+| `sources/google.py` | REST client: calendarList + events.list with `syncToken`, 410 → full resync, request-params fingerprint (`events_params` state key) → full resync when `EVENTS_LIST_PARAMS` change, attendees and conference data requested, per-calendar `SourcePull.errors`, 403 rate limit → transient, 401 → one refresh + retry |
 | `targets/dav.py` | PROPFIND/REPORT/PUT/DELETE/MKCALENDAR, manual redirects, absolute hrefs, error mapping (401 auth, 403 `ForbiddenError`, `valid-sync-token` → `CursorExpired`, 412 conflict) |
+| `targets/base.py` | target protocol; `TargetCache` / `CachedObject` — `verify_digest` (digest of a read body its rule has not classified yet; persisted so an edit survives a cycle the rule does not finish) and `reverting` (classified as edited; cleared by the successful write-back) |
 | `targets/caldav.py` | discovery (iCloud region detection via `server_url = "icloud"`), detection ladder sync → ctag → full, multiget, conditional writes, adaptive `Limiter` |
-| `config.py` / `credentials.py` | validated TOML (all problems at once); keychain / env / 0600-file secrets |
+| `config.py` / `credentials.py` | validated TOML (all problems at once; `Rule.window` is `None` when omitted = full sync, `window = {}` = 7d/180d; `fields` → `FieldPolicy`; `on_target_edit` accepts only `"revert"`); keychain / env / 0600-file secrets |
 | `wiring.py` | the only place account definitions become clients; one `CalDavTarget` per account; `build_adapters` is **async**; per-account setup errors in `Adapters.errors` |
 | `cli.py` | commands, exit codes, output; heavy imports are lazy |
 
@@ -74,15 +78,15 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
 5. **Protected and degraded series.** A series present in the source but
    unparseable (`Source.series_ids` minus parsed ids), or parsed with a broken
    instance (`Series.complete == False`), never has its existing target copy
-   updated or deleted; it is excluded from the delete-guard denominator. A
+   updated, reverted or deleted; it is excluded from the delete-guard denominator. A
    degraded series with no copy is created from its parseable part.
 6. **Request budget (spec §8.1).** Idle cycle = 1 calendarList per Google
    account + 1 events.list per source calendar + 1 change check per target
    calendar, and no body reads — also in the cycle right after our own writes
-   and in a fresh process. Enforced by `tests/e2e/test_request_budget.py`;
+   (including a revert) and in a fresh process. Enforced by `tests/e2e/test_request_budget.py`;
    if it fails, fix the code, not the test.
-7. **Privacy.** Never log or print event titles, descriptions, locations or
-   secrets. Delete-guard titles go to the CLI output only. Test data is
+7. **Privacy.** Never log or print event titles, descriptions, locations,
+   attendees, URLs or secrets. Delete-guard titles go to the CLI output only. Test data is
    synthetic (`example.com`, neutral titles).
 8. **Isolation.** A failure in one calendar, account or rule fails only what
    depends on it; `cycle()` always returns a `CycleResult`.
@@ -142,6 +146,19 @@ uv run ruff check src tests && uv run ruff format --check src tests && uv run py
 - The keychain backend needs a logged-in session (launchd agent, not a
   daemon at the login screen); otherwise use the `file` backend.
 - macOS `time.monotonic` stops during sleep — token expiry uses wall time.
+- `content_digest` must ignore phone bookkeeping (ACKNOWLEDGED, snoozed VALARMs
+  with RELATED-TO, X-APPLE-DEFAULT-ALARM); otherwise calsync would undo snoozes.
+  VALARMs with an absolute trigger are ignored for the same reason, and alarm
+  ACTION/DESCRIPTION are not content.
+- Detection reads a changed body once; classifying it is the job of its rule,
+  which may not run this cycle (`--rule`), may fail first, or the process may
+  stop. Hence `CachedObject.verify_digest` / `reverting` are persisted and
+  classification is saved before planning, also in a dry run. Never classify
+  from in-memory state only.
+- Changing `EVENTS_LIST_PARAMS` (e.g. `EVENT_FIELDS`) changes the
+  `events_params` fingerprint and forces a full pull of every source calendar
+  once; changing rendered bytes needs a `RENDER_VERSION` bump (every copy is
+  rewritten once).
 
 ## 7. Real-world status
 
@@ -151,14 +168,18 @@ end: discovery across hosts, region detection, sync-collection mode, all alerts
 visible in Apple Calendar, idle second cycle at budget. Measured: alerts on a
 calendar shared to another Apple ID do **not** reach the sharee (per-user
 `VALARM`); the sharee sees only their own iPhone default alert (spec §13
-item 1). Still unverified on iCloud: writing into the family member's own
-account, repair of edits made on the phone, 401 vs 403 for a bad password,
-`MKCALENDAR` (spec §13).
+item 1). Reverting edits made on the target is implemented and tested against
+Radicale and `FakeTarget`; the real-device check (an edit and a snooze on an
+iPhone against iCloud, experiment E1) is still pending. Also still unverified
+on iCloud: writing into the family member's own account, 401 vs 403 for a bad
+password, `MKCALENDAR` (spec §13).
 
 ## 8. Known limitations and debt
 
-- Target-side edits are not repaired (strict xfail
-  `test_manual_target_edit_is_repaired`).
+- Target edits that touch only properties outside `content_digest` (STATUS,
+  CLASS, CATEGORIES, …) are not detected; an edit to a protected series is
+  reverted only after the series parses again.
+- Only Google pop-up reminders are synced; attendees are never invitees.
 - Renaming or removing a rule orphans its events.
 - `RequestLog` grows forever (fine for `run`, must be reset per cycle in a
   daemon).
@@ -170,7 +191,8 @@ account, repair of edits made on the phone, 401 vs 403 for a bad password,
 
 ## 9. Next work
 
-See [docs/ROADMAP.md](docs/ROADMAP.md): plan 2 (real-service verification,
-starting with target-side edits), plan 3 (daemon, alerts, launchd/Docker,
+See [docs/ROADMAP.md](docs/ROADMAP.md): plan 2 / block ① (full sync, field
+policy, target-edit revert — implemented; the iPhone check E1 is pending),
+plan 3 (daemon, alerts, launchd/Docker,
 deployment on a home server), plan 4 (self-hosted web UI — product decisions
 recorded there, page layout still to be designed).
