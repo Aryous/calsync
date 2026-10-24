@@ -1423,6 +1423,10 @@ async def test_expired_hold_on_a_protected_series_waits(tmp_path: Path) -> None:
     res = (await h.engine.cycle()).rules["family"]
     assert res.protected == 1 and res.updated == 0
     assert MOVE_TO in target.objects[href][1]
+    # Still held, not turned into a pending revert while the series is protected.
+    cached = h.store.load_target_cache("dav", target.calendars["Family"].href).objects[href]
+    assert cached.hold_until == NOW + timedelta(hours=4) + calsync.engine.REVERT_HOLD
+    assert cached.reverting is False
     fake.put_event(GCAL, good)  # readable again: the expired hold is handled now
     res = (await h.engine.cycle()).rules["family"]
     assert (res.protected, res.updated, res.reverted) == (0, 1, 1)
