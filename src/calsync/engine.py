@@ -42,6 +42,7 @@ class RuleResult:
     error: str | None = None
     error_kind: ErrorKind | None = None
     plan: Plan | None = None
+    protected: int = 0  # source series that could not be parsed; their target copy is left alone
 
     def fail(self, exc: BaseException) -> None:
         self.status = "failed"
@@ -169,17 +170,25 @@ class Engine:
         self._store.save_target_cache(account, cal.href, cache)
 
     # ----- phase 3-5: plan, guard, push --------------------------------
-    def _desired(self, rule: Rule) -> dict[str, Desired]:
+    def _desired(self, rule: Rule) -> tuple[dict[str, Desired], frozenset[str]]:
+        """Desired objects, plus the object ids of source series that failed to parse."""
         account = rule.source.account
+        source = self._sources[account]
         cal_id = self._resolved[(account, rule.source.calendar)]
         meta = self._meta.get((account, cal_id), CalendarMeta())
-        series = self._sources[account].to_series(self._mirrors[account].get(cal_id, {}).values(), meta)
+        raw = self._mirrors[account].get(cal_id, {}).values()
+        series = source.to_series(raw, meta)
         desired: dict[str, Desired] = {}
         for item in series:
             shaped = apply_alarm_policy(item, rule.alarms)
             oid = object_id(rule.name, cal_id, item.source_id)
             desired[oid] = Desired(oid, shaped, series_hash(shaped), series_span(shaped))
-        return desired
+        unparsed = source.series_ids(raw) - {item.source_id for item in series}
+        for sid in sorted(unparsed):
+            log.warning(
+                "rule %s: source series %s could not be parsed; protecting its target copy", rule.name, sid
+            )
+        return desired, frozenset(object_id(rule.name, cal_id, sid) for sid in unparsed)
 
     def _cache_for(self, rule: Rule) -> tuple[TargetCalendar, TargetCache]:
         key = (rule.target.account, rule.target.calendar)
@@ -195,8 +204,11 @@ class Engine:
             if obj.rule_tag == tag
         }
         window = Window.around(self._clock(), rule.window.past, rule.window.future)
-        result.plan = plan(self._desired(rule), actual, window)
-        reason = None if allow_deletes else check_delete_guard(result.plan, len(actual), rule.delete_guard)
+        desired, protected = self._desired(rule)
+        result.protected = len(protected)
+        result.plan = plan(desired, actual, window, protected)
+        deletable = len(actual.keys() - protected)
+        reason = None if allow_deletes else check_delete_guard(result.plan, deletable, rule.delete_guard)
         if reason:
             result.status, result.error, result.error_kind = "blocked", reason, "guard"
             return

@@ -31,7 +31,7 @@ from calsync.sources.base import (
     SourcePull,
 )
 from calsync.sources.google_auth import TokenProvider
-from calsync.sources.google_map import alarms_from_reminders, build_series
+from calsync.sources.google_map import alarms_from_reminders, build_series, master_ids
 
 BASE_URL = "https://www.googleapis.com/calendar/v3"
 
@@ -236,3 +236,6 @@ class GoogleSource:
 
     def to_series(self, raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Series]:
         return build_series(raw_events, meta)
+
+    def series_ids(self, raw_events: Iterable[RawEvent]) -> set[str]:
+        return master_ids(raw_events)

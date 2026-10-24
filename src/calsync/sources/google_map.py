@@ -145,6 +145,15 @@ def _series(master: RawEvent, exceptions: list[RawEvent], meta: CalendarMeta) ->
     )
 
 
+def _is_master(event: RawEvent) -> bool:
+    return bool(event.get("id")) and not event.get("recurringEventId") and event.get("status") != "cancelled"
+
+
+def master_ids(raw_events: Iterable[RawEvent]) -> set[str]:
+    """IDs of every live series master, parseable or not (the masters ``build_series`` considers)."""
+    return {event["id"] for event in raw_events if _is_master(event)}
+
+
 def build_series(raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Series]:
     """Group mirror entries into series: masters plus their modified/cancelled instances.
 
@@ -160,7 +169,7 @@ def build_series(raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Ser
         parent = event.get("recurringEventId")
         if parent:
             exceptions[parent].append(event)
-        elif event.get("status") != "cancelled":
+        elif _is_master(event):
             masters[event["id"]] = event
     result: list[Series] = []
     for master_id, master in masters.items():

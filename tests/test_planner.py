@@ -63,3 +63,9 @@ def test_delete_guard() -> None:
     assert "max_ratio" in (check_delete_guard(half, 6, guard) or "")
     assert check_delete_guard(Plan(delete=[have("a"), have("b")]), 2, guard) is None
     assert check_delete_guard(Plan(), 0, guard) is None
+
+
+def test_protected_actuals_are_never_deleted() -> None:
+    p = plan({}, {"p": have("p"), "q": have("q", span=None), "x": have("x")}, WINDOW, frozenset({"p", "q"}))
+    assert [a.object_id for a in p.delete] == ["x"]
+    assert p.create == [] and p.update == []

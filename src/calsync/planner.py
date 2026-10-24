@@ -40,7 +40,13 @@ class Plan:
         return not (self.create or self.update or self.delete)
 
 
-def plan(desired: Mapping[str, Desired], actual: Mapping[str, Actual], window: Window) -> Plan:
+def plan(
+    desired: Mapping[str, Desired],
+    actual: Mapping[str, Actual],
+    window: Window,
+    protected: frozenset[str] = frozenset(),
+) -> Plan:
+    """``protected`` object ids exist at the source but could not be parsed: never delete them."""
     result = Plan()
     for oid, want in desired.items():
         if not window.intersects(want.span):
@@ -52,7 +58,7 @@ def plan(desired: Mapping[str, Desired], actual: Mapping[str, Actual], window: W
             result.update.append((want, have))
     for oid, have in actual.items():
         want = desired.get(oid)
-        if want is not None and window.intersects(want.span):
+        if oid in protected or (want is not None and window.intersects(want.span)):
             continue
         # Unknown span (unparseable body) counts as "in window": it is ours and unwanted.
         if have.span is None or window.intersects(have.span):

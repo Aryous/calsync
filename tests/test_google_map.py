@@ -6,7 +6,7 @@ import pytest
 
 from calsync.model import Alarm, When
 from calsync.sources.base import CalendarMeta
-from calsync.sources.google_map import build_series, html_to_text, parse_when
+from calsync.sources.google_map import build_series, html_to_text, master_ids, parse_when
 from tests.factories import TZ, ZONE, google_event
 
 META = CalendarMeta(timezone=TZ, default_alarms=(Alarm(timedelta(minutes=-10)),))
@@ -204,3 +204,17 @@ def test_entries_without_id_are_skipped(caplog: pytest.LogCaptureFixture) -> Non
         result = build_series([no_id, ok], META)
     assert [s.source_id for s in result] == ["e1"]
     assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+def test_master_ids_covers_parseable_and_malformed_masters() -> None:
+    good = google_event("good", "Good", "2026-10-25T09:00:00+08:00", "2026-10-25T09:05:00+08:00")
+    broken = {k: v for k, v in good.items() if k != "start"} | {"id": "broken"}
+    raw = [
+        good,
+        broken,
+        {"id": "gone", "status": "cancelled"},
+        {"id": "good_1", "recurringEventId": "good", "status": "confirmed"},
+        {"summary": "no id"},
+    ]
+    assert master_ids(raw) == {"good", "broken"}
+    assert {s.source_id for s in build_series(raw, META)} == {"good"}
