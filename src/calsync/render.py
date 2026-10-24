@@ -121,12 +121,14 @@ def _optional(component: Component, name: str) -> str | None:
 
 
 def inspect(data: bytes) -> Inspected | None:
-    """Read identity, hash and span from a resource body; None if it is not parseable."""
+    """Read identity, hash and span from a resource body; None if it is not parseable.
+
+    The body comes from the target server and may be anything, so this never raises."""
     try:
         cal = Calendar.from_ical(data)
-    except ValueError:
+        events = list(cal.walk("VEVENT"))
+    except Exception:  # untrusted bytes: any parser failure means "not ours to read"
         return None
-    events = list(cal.walk("VEVENT"))
     if not events:
         return None
     master = next((e for e in events if e.get("recurrence-id") is None), events[0])
@@ -145,7 +147,7 @@ def inspect(data: bytes) -> Inspected | None:
             if e is not master and "dtstart" in e and "dtend" in e
         ]
         span = compute_span(start, end, _rrule_lines(master), extra)
-    except (KeyError, ValueError, TypeError):
+    except Exception:  # malformed or out-of-range dates (OverflowError included)
         span = None
     return Inspected(
         uid=str(master.get("uid", "")),

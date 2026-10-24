@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from calsync.model import Alarm, Occurrence, series_hash, series_span
 from calsync.naming import object_id, parse_resource_name, resource_name, rule_tag, uid_for
 from calsync.render import inspect, render
@@ -124,3 +126,21 @@ def test_render_rdate() -> None:
     s = series(recurrence=("RRULE:FREQ=DAILY;COUNT=2", "RDATE;TZID=Asia/Shanghai:20261201T093000"))
     ics = render(s, uid="r@calsync", rule_name="r", content_hash="h", now=NOW).decode()
     assert "RDATE;TZID=Asia/Shanghai:20261201T093000" in ics
+
+
+def test_inspect_span_overflow_gives_no_span() -> None:
+    """Untrusted bytes: a DURATION past year 9999 overflows; inspect must not raise."""
+    found = inspect(_body("DTSTART:99991231T230000Z", "DURATION:PT2H"))
+    assert found is not None
+    assert found.uid == "f1" and found.span is None
+
+
+@pytest.mark.parametrize("exc", [IndexError("parser bug"), RecursionError(), OverflowError(), TypeError()])
+def test_inspect_never_raises_from_the_parser(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    from calsync import render as render_mod
+
+    def broken(_: bytes) -> object:
+        raise exc
+
+    monkeypatch.setattr(render_mod.Calendar, "from_ical", staticmethod(broken))
+    assert inspect(_body("DTSTART:20261025T010000Z")) is None
