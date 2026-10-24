@@ -203,8 +203,14 @@ class Store:
             self._db.execute("DELETE FROM target_calendar WHERE account = ? AND ref = ?", (account, ref))
 
     def _drop_objects(self, account: str, calendar_href: str) -> None:
+        """Forget a calendar's objects and, with them, every ref's cursor for that href:
+        a cursor without its objects would make the next detection skip them for good."""
         self._db.execute(
             "DELETE FROM target_object WHERE account = ? AND calendar_href = ?", (account, calendar_href)
+        )
+        self._db.execute(
+            "UPDATE target_calendar SET cursor = NULL WHERE account = ? AND href = ?",
+            (account, calendar_href),
         )
 
     def load_target_cache(self, account: str, calendar_href: str) -> TargetCache:

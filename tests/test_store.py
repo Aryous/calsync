@@ -184,3 +184,22 @@ def test_corrupt_file_is_quarantined(tmp_path: Path) -> None:
         store.save_source("g", {"x": 1}, [])
         assert store.load_source("g")[0] == {"x": 1}
     assert len(list(tmp_path.glob("s.db.corrupt-*"))) == 1
+
+
+@pytest.mark.parametrize("how", ["moved", "forgotten"])
+def test_dropping_objects_resets_every_sibling_ref_cursor(tmp_path: Path, how: str) -> None:
+    """No ref may keep a cursor for an href whose objects are gone: the next load is a cold start."""
+    db = tmp_path / "s.db"
+    a = TargetCalendar("https://x/cal/a/", "A", "sync")
+    with Store(db) as store:
+        store.save_target_calendar("dav", "A", a)  # one calendar, referenced by name...
+        store.save_target_calendar("dav", a.href, a)  # ...and by href
+        objects = {f"{a.href}calsync-x.ics": CachedObject('"e"', "t", "o", "h", None)}
+        store.save_target_cache("dav", a.href, TargetCache("tok-1", objects))
+        if how == "moved":  # ref "A" now resolves elsewhere (renamed / recreated)
+            store.save_target_calendar("dav", "A", TargetCalendar("https://x/cal/b/", "B", "sync"))
+        else:
+            store.forget_target_calendar("dav", "A")
+        assert _count(db, "SELECT COUNT(*) FROM target_calendar WHERE cursor IS NOT NULL") == 0
+        again = store.load_target_cache("dav", a.href)
+        assert again.cursor is None and again.objects == {}
