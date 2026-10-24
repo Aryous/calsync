@@ -168,8 +168,11 @@ class Engine:
             raise
         need = apply_target_delta(cache, delta)
         fetched = await target.fetch(cal, need) if need else []
-        for href in set(need) - {obj.href for obj in fetched}:
-            cache.objects.pop(href, None)  # changed but unreadable now: re-fetch and repair next time
+        unread = set(need) - {obj.href for obj in fetched}
+        for href in unread:
+            # Changed, but its body is unknown: plan as if absent (a create there 412s and
+            # becomes an update). The cursor is held below so detection reports it again.
+            cache.objects.pop(href, None)
         for obj in fetched:
             name = parse_resource_name(obj.href)
             if name is None:
@@ -182,7 +185,17 @@ class Engine:
                 content_hash=found.content_hash if found else None,
                 span=found.span if found else None,
             )
-        cache.cursor = delta.cursor
+        if unread:
+            # Keep the previous cursor: sync-collection replays (ctag re-lists) these hrefs
+            # next cycle; advancing would orphan them until they change on the target again.
+            log.warning(
+                "target %s %r: %d changed resource(s) could not be read; re-detecting next cycle",
+                account,
+                ref,
+                len(unread),
+            )
+        else:
+            cache.cursor = delta.cursor
         self._store.save_target_cache(account, cal.href, cache)
 
     # ----- phase 3-5: plan, guard, push --------------------------------

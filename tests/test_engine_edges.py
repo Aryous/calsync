@@ -9,10 +9,12 @@ import pytest
 
 from calsync.errors import ConflictError, TransientError
 from calsync.model import Series
+from calsync.naming import object_id, resource_name
 from calsync.sources.base import CalendarInfo, CalendarMeta, RawEvent, SourcePull
 from tests.factories import google_event
 from tests.fakes.google import FakeGoogle
-from tests.harness import GCAL, build_fake, config_for, rule
+from tests.fakes.target import FakeTarget
+from tests.harness import GCAL, FakeHarness, build_fake, config_for, rule
 
 pytestmark = pytest.mark.anyio
 
@@ -306,3 +308,48 @@ async def test_dry_run_against_missing_target_calendar(tmp_path: Path) -> None:
     assert res.status == "failed" and "a real run creates it" in (res.error or "")
     assert h.target.calendars == {} and h.target.objects == {}
     assert h.store.latest_runs() == []
+
+
+# ----- fix 2: unreadable hrefs in sync-collection mode ----------------------
+
+
+def copy_href(h: FakeHarness, source_id: str, rule_name: str = "family") -> str:
+    oid = object_id(rule_name, GCAL, source_id)
+    return h.target.href_for(h.target.calendars["Family"], resource_name(rule_name, oid))
+
+
+async def test_sync_mode_unreadable_href_is_repaired_and_not_orphaned(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=FakeTarget(mode="sync"))
+    assert (await h.engine.cycle()).rules["family"].created == 2
+    href = copy_href(h, "checkup")
+    h.target.put(href, b"edited elsewhere")
+    h.target.hide_once = {href}
+    with caplog.at_level(logging.WARNING):
+        res = (await h.engine.cycle()).rules["family"]
+    assert res.status == "ok"
+    warnings = [r.getMessage() for r in caplog.records if "could not be read" in r.getMessage()]
+    assert len(warnings) == 1 and "calsync-" not in warnings[0]
+    for _ in range(2):
+        assert (await h.engine.cycle()).rules["family"].plan.empty
+    managed = h.target.managed(h.target.calendars["Family"])
+    assert len(managed) == 2 and managed[href] != b"edited elsewhere"
+
+
+async def test_sync_mode_unreadable_href_of_deleted_series_is_still_deleted(tmp_path: Path) -> None:
+    fake = simple()
+    h = build_fake(tmp_path, fake, config_for([rule()]), target=FakeTarget(mode="sync"))
+    await h.engine.cycle()
+    href = copy_href(h, "checkup")
+    h.target.put(href, b"edited elsewhere")
+    h.target.hide_once = {href}
+    fake.cancel_event(GCAL, "checkup")
+    deleted = 0
+    for _ in range(3):
+        res = (await h.engine.cycle()).rules["family"]
+        assert res.status == "ok"
+        deleted += res.deleted
+    assert deleted == 1
+    assert href not in h.target.objects
+    assert len(h.target.managed(h.target.calendars["Family"])) == 1

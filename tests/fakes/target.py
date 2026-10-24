@@ -4,7 +4,12 @@ Writes are strictly conditional, like the strictest real servers: ``create``
 answers 412 if the resource exists; ``update`` and ``delete`` answer 412 if
 the resource is missing or its etag differs (including ``If-Match: *``).
 
-Two injection points drive edge cases:
+``mode="full"`` (default) lists every managed resource on each ``changes()``;
+``mode="sync"`` behaves like sync-collection: a full listing only when the
+cursor is None, otherwise just what was written or deleted since the cursor.
+Use ``put``/``remove`` (not ``objects`` directly) to change resources in sync mode.
+
+Injection points drive edge cases:
 - ``fail_changes[ref]``: exception raised by the next ``changes()`` call for a
   calendar (consumed once); ``fail_fetch`` fails every ``fetch()`` while set.
 - ``before_write(op, href)``: called at the start of every write; it may mutate
@@ -16,7 +21,7 @@ from dataclasses import dataclass, field
 
 from calsync.errors import ConflictError, NotFoundError
 from calsync.naming import parse_resource_name
-from calsync.targets.base import FetchedObject, TargetCalendar, TargetDelta
+from calsync.targets.base import DetectMode, FetchedObject, TargetCalendar, TargetDelta
 
 HOME = "/dav/home/"
 
@@ -30,11 +35,13 @@ class FakeTarget:
     hide_once: set[str] = field(default_factory=set)  # left out of the next fetch() only
     before_write: Callable[[str, str], None] | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
+    mode: DetectMode = "full"  # detection mode of calendars created from now on
     _seq: int = 0
+    _touched: dict[str, int] = field(default_factory=dict)  # href -> seq of its last write/delete
 
     # ----- test helpers -------------------------------------------------
     def add_calendar(self, name: str) -> TargetCalendar:
-        cal = TargetCalendar(f"{HOME}{name.lower()}/", name, "full")
+        cal = TargetCalendar(f"{HOME}{name.lower()}/", name, self.mode)
         self.calendars[name] = cal
         return cal
 
@@ -42,7 +49,13 @@ class FakeTarget:
         self._seq += 1
         etag = f'"e{self._seq}"'
         self.objects[href] = (etag, data)
+        self._touched[href] = self._seq
         return etag
+
+    def remove(self, href: str) -> None:
+        self._seq += 1
+        del self.objects[href]
+        self._touched[href] = self._seq
 
     def managed(self, cal: TargetCalendar) -> dict[str, bytes]:
         return {
@@ -68,12 +81,16 @@ class FakeTarget:
         failure = self.fail_changes.pop(cal.name, None)
         if failure is not None:
             raise failure
-        changed: dict[str, str | None] = {
-            h: etag
-            for h, (etag, _) in self.objects.items()
-            if h.startswith(cal.href) and parse_resource_name(h)
-        }
-        return TargetDelta(changed, (), True, None)
+        mine = [
+            h for h in {*self.objects, *self._touched} if h.startswith(cal.href) and parse_resource_name(h)
+        ]
+        if cal.mode == "sync" and cursor is not None:
+            since = [h for h in mine if self._touched.get(h, 0) > int(cursor)]
+            changed: dict[str, str | None] = {h: self.objects[h][0] for h in since if h in self.objects}
+            deleted = tuple(h for h in since if h not in self.objects)
+            return TargetDelta(changed, deleted, False, str(self._seq))
+        changed = {h: self.objects[h][0] for h in mine if h in self.objects}
+        return TargetDelta(changed, (), True, str(self._seq) if cal.mode == "sync" else None)
 
     async def fetch(self, cal: TargetCalendar, hrefs: Sequence[str]) -> list[FetchedObject]:
         self.calls.append(("fetch", ",".join(hrefs)))
@@ -108,4 +125,4 @@ class FakeTarget:
         current = self.objects.get(href)
         if current is None or (etag is not None and current[0] != etag):
             raise ConflictError(f"412 delete {href}")
-        del self.objects[href]
+        self.remove(href)
