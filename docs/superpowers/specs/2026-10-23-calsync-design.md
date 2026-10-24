@@ -571,6 +571,7 @@ calsync service install|uninstall      macOS：生成并加载/卸载 launchd pl
 8. **跨主机发现**：iCloud 的 `calendar-home-set` 通常是另一个主机上的绝对地址（`pNN-caldav.icloud.com`），并可能伴随重定向。实现已按此设计：手动跟随重定向（每一跳重新带认证，禁止改变协议），所有 href 按返回它的响应的最终 URL 转成绝对地址。需要实测确认。
 9. **iCloud 中国区**：`caldav.icloud.com.cn` 的发现和写入流程是否与国际区一致（有中国区账号时验证）。
 10. **手机端编辑托管事件**：在 iOS 上编辑一个托管事件，观察正文是否保留 `X-CALSYNC-HASH`，以及我们自己 PUT 之后服务器报告的 etag 是否变化。结论决定 §2 的"目标端修改会被覆盖"如何实现（按 etag 识别他人修改，还是读取正文比对）。
+11. **错误密码的状态码**：用错误或已作废的 App 专用密码访问 iCloud，确认返回 401 而不是 403。calsync 只把 401 当作授权失效（提示 `calsync auth`），403 按"无权限"处理（退出码 1）；若 iCloud 用 403 表示密码错误，需要调整映射。
 
 ## 14. 测试
 

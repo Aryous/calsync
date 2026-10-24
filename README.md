@@ -107,8 +107,9 @@ scope it with `--rule`.
 
 Known limitation: sync is one way, but a manual edit of a synced event on the
 target (e.g. moving it on the iPhone) is only overwritten when the edit drops
-or changes the event's `X-CALSYNC-HASH` property. Most clients keep it, so such
-an edit stays until the source event changes again. Full repair is planned
+or changes the event's `X-CALSYNC-HASH` property. Clients usually keep unknown
+properties (plan 2 verifies this for iOS), so such an edit is likely to stay
+until the source event changes again. Full repair is planned
 once plan 2 has verified how iCloud treats these edits.
 
 Exit codes:
