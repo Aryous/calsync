@@ -1,4 +1,8 @@
+import logging
 from datetime import date, datetime, timedelta
+from typing import Any
+
+import pytest
 
 from calsync.model import Alarm, When
 from calsync.sources.base import CalendarMeta
@@ -113,3 +117,90 @@ def test_all_day_event() -> None:
     (s,) = build_series([raw], META)
     assert s.start == When(date(2026, 11, 5)) and s.end == When(date(2026, 11, 6))
     assert s.alarms == META.default_alarms
+
+
+def test_malformed_instance_does_not_drop_series(caplog: pytest.LogCaptureFixture) -> None:
+    master = google_event(
+        "m1",
+        "Standup",
+        "2026-10-23T09:30:00+08:00",
+        "2026-10-23T09:35:00+08:00",
+        recurrence=["RRULE:FREQ=DAILY;COUNT=3"],
+    )
+    good = google_event(
+        "m1_20261024T013000Z",
+        "Moved",
+        "2026-10-24T21:00:00+08:00",
+        "2026-10-24T21:05:00+08:00",
+        recurringEventId="m1",
+        originalStartTime={"dateTime": "2026-10-24T09:30:00+08:00", "timeZone": TZ},
+    )
+    bad = {
+        "id": "m1_20261025T013000Z",
+        "status": "confirmed",
+        "recurringEventId": "m1",
+        "originalStartTime": {"dateTime": "2026-10-25T09:30:00+08:00", "timeZone": TZ},
+    }
+    with caplog.at_level(logging.DEBUG):
+        (s,) = build_series([master, good, bad], META)
+    assert len(s.overrides) == 1
+    assert any(
+        r.levelno == logging.WARNING and "malformed instance" in r.getMessage() for r in caplog.records
+    )
+
+
+def _orphan(event_id: str, cancelled: bool) -> dict[str, Any]:
+    if cancelled:
+        return {
+            "id": event_id,
+            "status": "cancelled",
+            "recurringEventId": "missing",
+            "originalStartTime": {"dateTime": "2026-10-24T09:00:00+08:00"},
+        }
+    return google_event(
+        event_id,
+        "Orphan",
+        "2026-10-24T09:00:00+08:00",
+        "2026-10-24T09:05:00+08:00",
+        recurringEventId="missing",
+        originalStartTime={"dateTime": "2026-10-24T09:00:00+08:00"},
+    )
+
+
+def test_orphan_log_levels(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.DEBUG):
+        assert build_series([_orphan("o_1", False)], META) == []
+    assert [r.levelno for r in caplog.records if "missing" in r.getMessage()] == [logging.WARNING]
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        assert build_series([_orphan("o_2", True)], META) == []
+    assert [r.levelno for r in caplog.records if "missing" in r.getMessage()] == [logging.DEBUG]
+
+
+def test_html_to_text_leaves_non_html_alone() -> None:
+    assert html_to_text("x<y and z") == "x<y and z"
+    assert html_to_text("a & b") == "a & b"
+
+
+def test_html_to_text_links() -> None:
+    assert html_to_text('<a href="https://example.com/x">notes</a>') == "notes (https://example.com/x)"
+    assert html_to_text('<a href="https://e.com">https://e.com</a>') == "https://e.com"
+
+
+def test_html_to_text_nbsp() -> None:
+    assert html_to_text("<p>a&nbsp;b</p>") == "a b"
+    assert "\xa0" not in html_to_text("<p>a\xa0b</p>")
+
+
+def test_entries_without_id_are_skipped(caplog: pytest.LogCaptureFixture) -> None:
+    no_id = {
+        "status": "confirmed",
+        "summary": "x",
+        "start": {"date": "2026-11-05"},
+        "end": {"date": "2026-11-06"},
+    }
+    ok = google_event("e1", "A", "2026-10-23T09:00:00+08:00", "2026-10-23T09:05:00+08:00")
+    with caplog.at_level(logging.WARNING):
+        result = build_series([no_id, ok], META)
+    assert [s.source_id for s in result] == ["e1"]
+    assert any(r.levelno == logging.WARNING for r in caplog.records)

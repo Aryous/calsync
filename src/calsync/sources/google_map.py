@@ -15,6 +15,7 @@ from calsync.sources.base import CalendarMeta, RawEvent
 
 log = logging.getLogger(__name__)
 
+_LOOKS_LIKE_HTML = re.compile(r"</?[a-zA-Z][^>]*>|&[a-zA-Z]+;|&#\d+;|&#x[0-9a-fA-F]+;")
 _BLOCK_END = {"p", "div", "li", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "tr"}
 
 
@@ -22,12 +23,24 @@ class _TextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
+        self._href: str | None = None
+        self._link_start = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag == "br":
             self.parts.append("\n")
+        elif tag == "a":
+            self._href = dict(attrs).get("href")
+            self._link_start = len(self.parts)
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._href:
+            label = "".join(self.parts[self._link_start :]).strip()
+            if not label:
+                self.parts.append(self._href)
+            elif label != self._href:
+                self.parts.append(f" ({self._href})")
+            self._href = None
         if tag in _BLOCK_END:
             self.parts.append("\n")
 
@@ -37,12 +50,12 @@ class _TextExtractor(HTMLParser):
 
 def html_to_text(text: str) -> str:
     """Google stores rich descriptions as HTML; targets want plain text."""
-    if "<" not in text and "&" not in text:
+    if not _LOOKS_LIKE_HTML.search(text):
         return text.strip()
     parser = _TextExtractor()
     parser.feed(text)
     parser.close()
-    joined = "".join(parser.parts)
+    joined = "".join(parser.parts).replace("\xa0", " ")
     lines = [line.rstrip() for line in joined.splitlines()]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
 
@@ -95,21 +108,26 @@ def _series(master: RawEvent, exceptions: list[RawEvent], meta: CalendarMeta) ->
             original = ex.get("originalStartTime")
             if not original:
                 continue
-            original_start = parse_when(original, tz)
-            if ex.get("status") == "cancelled":
-                excluded.append(original_start)
-                continue
-            overrides.append(
-                Occurrence(
-                    original_start=original_start,
-                    start=parse_when(ex["start"], tz),
-                    end=parse_when(ex["end"], tz),
-                    title=ex.get("summary", ""),
-                    description=html_to_text(ex.get("description", "")),
-                    location=ex.get("location", ""),
-                    alarms=event_alarms(ex, meta.default_alarms),
+            try:
+                original_start = parse_when(original, tz)
+                if ex.get("status") == "cancelled":
+                    excluded.append(original_start)
+                    continue
+                overrides.append(
+                    Occurrence(
+                        original_start=original_start,
+                        start=parse_when(ex["start"], tz),
+                        end=parse_when(ex["end"], tz),
+                        title=ex.get("summary", ""),
+                        description=html_to_text(ex.get("description", "")),
+                        location=ex.get("location", ""),
+                        alarms=event_alarms(ex, meta.default_alarms),
+                    )
                 )
-            )
+            except (KeyError, ValueError) as exc:
+                log.warning(
+                    "skipping malformed instance %s of series %s: %s", ex.get("id"), master.get("id"), exc
+                )
     return normalize_series(
         Series(
             source_id=master["id"],
@@ -136,6 +154,9 @@ def build_series(raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Ser
     masters: dict[str, RawEvent] = {}
     exceptions: dict[str, list[RawEvent]] = defaultdict(list)
     for event in raw_events:
+        if not event.get("id"):
+            log.warning("skipping entry without id: %r", event.get("summary", ""))
+            continue
         parent = event.get("recurringEventId")
         if parent:
             exceptions[parent].append(event)
@@ -148,5 +169,9 @@ def build_series(raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Ser
         except (KeyError, ValueError) as exc:
             log.warning("skipping malformed event %s: %s", master_id, exc)
     for master_id, orphans in exceptions.items():
-        log.debug("ignoring %d instance(s) of unknown series %s", len(orphans), master_id)
+        live = [o for o in orphans if o.get("status") != "cancelled"]
+        if live:
+            log.warning("ignoring %d instance(s) of unknown series %s", len(live), master_id)
+        else:
+            log.debug("ignoring %d cancelled instance(s) of unknown series %s", len(orphans), master_id)
     return result
