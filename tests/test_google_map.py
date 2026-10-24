@@ -332,3 +332,15 @@ def test_series_and_overrides_carry_attendees_and_conference() -> None:
     assert s.conference_url == "https://meet.example.com/w"
     assert s.overrides[0].attendees == (Attendee("", "carol@example.com"),)
     assert s.overrides[0].conference_url == ""
+
+
+def test_malformed_conference_data_falls_back_to_hangout_link() -> None:
+    start, end = "2026-10-25T09:00:00+08:00", "2026-10-25T10:00:00+08:00"
+    junk = google_event("e1", "Call", start, end, conferenceData="junk")
+    assert event_conference(junk) == ""
+    linked = google_event(
+        "e2", "Call", start, end, conferenceData="junk", hangoutLink="https://meet.example.com/h"
+    )
+    assert event_conference(linked) == "https://meet.example.com/h"
+    bad_entries = google_event("e3", "Call", start, end, conferenceData={"entryPoints": "junk"})
+    assert event_conference(bad_entries) == ""

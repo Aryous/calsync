@@ -539,3 +539,16 @@ async def test_matching_params_pull_incrementally() -> None:
     first = await source.pull(["Family"], {})
     again = await source.pull(["Family"], first.state)
     assert not again.calendars["Family"].full
+
+
+async def test_state_from_different_params_forces_a_full_pull() -> None:
+    fake, log = seeded(), RequestLog()
+    source = make_source(fake, log)
+    first = await source.pull(["Family"], {})
+    old = copy.deepcopy(first.state)
+    old["events_params"] = "0123456789abcdef"  # saved by a version with other fields
+    assert old["events_params"] != EVENTS_PARAMS_ID
+    again = await source.pull(["Family"], old)
+    pull = again.calendars["Family"]
+    assert pull.full and sorted(e["id"] for e in pull.upserts) == ["e1", "e2"]
+    assert again.state["events_params"] == EVENTS_PARAMS_ID

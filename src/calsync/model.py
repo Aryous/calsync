@@ -127,9 +127,30 @@ def _alarm_key(alarm: Alarm) -> timedelta:
     return alarm.offset
 
 
+def _attendee_preference(a: Attendee) -> tuple[bool, str, str]:
+    # Lower is better: a named entry first, then the smallest (name, email).
+    return (not a.name, a.name, a.email)
+
+
 def _normalize_attendees(attendees: tuple[Attendee, ...]) -> tuple[Attendee, ...]:
-    cleaned = {Attendee(a.name.strip(), a.email.strip()) for a in attendees}
-    return tuple(sorted(cleaned, key=lambda a: (a.email.lower(), a.name)))
+    """Trimmed, blank-free, deduplicated (emails case-insensitively) and totally ordered.
+
+    The result must not depend on input order or on ``PYTHONHASHSEED``: it feeds ``series_hash``.
+    """
+    by_email: dict[str, Attendee] = {}
+    by_name: dict[str, Attendee] = {}
+    for a in attendees:
+        cleaned = Attendee(a.name.strip(), a.email.strip())
+        if cleaned.email:
+            key = cleaned.email.lower()
+            kept = by_email.get(key)
+            if kept is None or _attendee_preference(cleaned) < _attendee_preference(kept):
+                by_email[key] = cleaned
+        elif cleaned.name:
+            by_name.setdefault(cleaned.name, cleaned)
+    return tuple(
+        sorted([*by_email.values(), *by_name.values()], key=lambda a: (a.email.lower(), a.email, a.name))
+    )
 
 
 def _normalize_occurrence(occ: Occurrence) -> Occurrence:

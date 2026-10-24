@@ -99,10 +99,12 @@ def event_attendees(event: RawEvent) -> tuple[Attendee, ...]:
 
 def event_conference(event: RawEvent) -> str:
     """The video meeting link: the conference video entry point, else ``hangoutLink``."""
-    data = event.get("conferenceData") or {}
-    for entry in data.get("entryPoints") or ():
-        if isinstance(entry, Mapping) and entry.get("entryPointType") == "video" and entry.get("uri"):
-            return str(entry["uri"])
+    data = event.get("conferenceData")
+    entries = data.get("entryPoints") if isinstance(data, Mapping) else None
+    if isinstance(entries, (list, tuple)):
+        for entry in entries:
+            if isinstance(entry, Mapping) and entry.get("entryPointType") == "video" and entry.get("uri"):
+                return str(entry["uri"])
     return str(event.get("hangoutLink") or "")
 
 
