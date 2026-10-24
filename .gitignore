@@ -1,0 +1,60 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+
+# ---- 虚拟环境（uv.lock 和 .python-version 要提交）----
+.venv/
+venv/
+
+# ---- 测试 / 检查工具缓存 ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+
+# ---- 本地配置与凭证：绝不提交 ----
+.env
+.env.*
+!.env.example
+/config.toml
+*client_secret*.json
+google-client*.json
+*token*.json
+!tests/fixtures/**/*.json
+secrets/
+*.pem
+*.key
+*.p12
+
+# ---- 运行时状态与日志 ----
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+run.lock
+logs/
+*.log
+
+# ---- 端到端测试临时数据（Radicale 存储）----
+tests/e2e/.radicale-data/
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# ---- Claude Code 本地设置 ----
+.claude/settings.local.json
