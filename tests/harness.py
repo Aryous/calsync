@@ -15,6 +15,7 @@ from calsync.sources.google_auth import StaticToken
 from calsync.store import Store
 from calsync.targets.caldav import CalDavTarget
 from tests.fakes.google import BASE_URL, FakeGoogle
+from tests.fakes.target import FakeTarget
 
 GCAL = "family@group.calendar.google.com"
 NOW = datetime(2026, 10, 24, 8, 0, tzinfo=UTC)
@@ -81,3 +82,30 @@ def build(
     store = Store(tmp_path / "state.db")
     engine = Engine(config, store, sources, {"dav": target}, request_log=log, clock=clock)
     return Harness(fake, log, engine, target, store)
+
+
+@dataclass
+class FakeHarness:
+    fake: FakeGoogle
+    log: RequestLog
+    engine: Engine
+    target: FakeTarget
+    store: Store
+
+
+def build_fake(
+    tmp_path: Path,
+    fake: FakeGoogle,
+    config: Config,
+    *,
+    target: FakeTarget | None = None,
+    clock: Any = lambda: NOW,
+) -> FakeHarness:
+    """Like ``build`` but with an in-memory FakeTarget instead of Radicale."""
+    log = RequestLog()
+    google_client = make_client(log, transport=fake.transport())
+    sources: dict[str, Any] = {"me": GoogleSource(google_client, StaticToken("t"), base_url=BASE_URL)}
+    target = target or FakeTarget()
+    store = Store(tmp_path / "state.db")
+    engine = Engine(config, store, sources, {"dav": target}, request_log=log, clock=clock)
+    return FakeHarness(fake, log, engine, target, store)

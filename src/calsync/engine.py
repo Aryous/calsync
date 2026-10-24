@@ -142,12 +142,15 @@ class Engine:
         self._calendars[key] = cal
         cache_key = (account, cal.href)
         cache = self._caches.get(cache_key) or self._store.load_target_cache(account, cal.href)
+        # Registered before any network call: it is unchanged until apply_target_delta.
+        self._caches[cache_key] = cache
         try:
             delta = await target.changes(cal, cache.cursor)
         except NotFoundError:
             # Calendar deleted or moved: rediscover on the next cycle.
             self._store.forget_target_calendar(account, ref)
             self._calendars.pop(key, None)
+            self._caches.pop(cache_key, None)
             raise
         need = apply_target_delta(cache, delta)
         for obj in await target.fetch(cal, need) if need else []:
@@ -163,7 +166,6 @@ class Engine:
                 span=found.span if found else None,
             )
         cache.cursor = delta.cursor
-        self._caches[cache_key] = cache
         self._store.save_target_cache(account, cal.href, cache)
 
     # ----- phase 3-5: plan, guard, push --------------------------------
@@ -323,7 +325,9 @@ class Engine:
                 if (r.target.account, r.target.calendar) in self._calendars
             }
             for account, href in touched:
-                self._store.save_target_cache(account, href, self._caches[(account, href)])
+                cache = self._caches.get((account, href))
+                if cache is not None:  # detection may have failed before the cache existed
+                    self._store.save_target_cache(account, href, cache)
 
         finished = self._clock()
         requests = (self._log.mark() - mark) if self._log else 0
