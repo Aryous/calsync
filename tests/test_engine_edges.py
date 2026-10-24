@@ -1393,3 +1393,21 @@ async def test_target_that_drops_the_marker_on_every_rewrite_is_held(
             assert (res.updated, res.reverted) == expected
     assert MOVE_TO in target.objects[href][1]
     assert len(breaker_warnings(caplog)) == 1
+
+
+async def test_held_copy_that_shows_the_source_version_again_ends_its_hold(tmp_path: Path) -> None:
+    clock = Clock()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target, clock=clock)
+    await h.engine.cycle()
+    href = await hold_stretch(h, clock)
+    clock.now = NOW + timedelta(hours=5)
+    edit_copy(h, lambda d: d.replace(MOVE_TO, MOVE_FROM))  # the target shows the source version again
+    mark = len(target.calls)
+    assert (await h.engine.cycle()).rules["family"].updated == 0
+    assert writes_since(target, mark) == []
+    cached = h.store.load_target_cache("dav", target.calendars["Family"].href).objects[href]
+    assert cached.hold_until is None
+    res = await edit_and_cycle(h, clock, timedelta(hours=6))  # a new edit is reverted at once
+    assert (res.updated, res.reverted) == (1, 1)
+    assert MOVE_FROM in target.objects[href][1]
