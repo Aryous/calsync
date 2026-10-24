@@ -1,0 +1,49 @@
+"""Source adapter interface.
+
+A source owns its own incremental-sync cursors inside an opaque, JSON
+serializable ``state`` dict. The engine persists that dict together with the
+mirror in one transaction and hands it back on the next pull.
+"""
+
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+from calsync.model import Alarm, Series
+
+RawEvent = Mapping[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarInfo:
+    id: str
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarMeta:
+    timezone: str = "UTC"
+    default_alarms: tuple[Alarm, ...] = ()
+
+
+@dataclass(slots=True)
+class CalendarPull:
+    calendar_id: str  # resolved ID, even if the rule referenced the calendar by name
+    full: bool  # True: ``upserts`` is the complete calendar, replace the mirror
+    upserts: list[dict[str, Any]] = field(default_factory=list)
+    deletes: list[str] = field(default_factory=list)
+    meta: CalendarMeta = CalendarMeta()
+
+
+@dataclass(slots=True)
+class SourcePull:
+    calendars: dict[str, CalendarPull]  # keyed by the calendar reference passed in
+    state: dict[str, Any]
+
+
+class Source(Protocol):
+    async def list_calendars(self) -> list[CalendarInfo]: ...
+
+    async def pull(self, calendar_refs: Sequence[str], state: Mapping[str, Any]) -> SourcePull: ...
+
+    def to_series(self, raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Series]: ...
