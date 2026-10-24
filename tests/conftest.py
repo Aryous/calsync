@@ -52,13 +52,21 @@ def radicale_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
             break
         except httpx.TransportError:
             if proc.poll() is not None or time.monotonic() > deadline:
-                stderr = proc.stderr.read().decode() if proc.stderr else ""
                 proc.kill()
-                pytest.fail(f"radicale did not start: {stderr}")
+                _, stderr = proc.communicate()  # reaps the process and closes the pipe
+                pytest.fail(f"radicale did not start: {stderr.decode()}")
             time.sleep(0.1)
-    yield url
-    proc.terminate()
-    proc.wait(timeout=5)
+    try:
+        yield url
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        if proc.stderr:
+            proc.stderr.close()
 
 
 @pytest.fixture
