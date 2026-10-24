@@ -235,15 +235,15 @@ class DavClient:
         headers = {"Content-Type": "text/calendar; charset=utf-8"}
         if create_only:
             headers["If-None-Match"] = "*"
-        elif if_match is not None:
-            headers["If-Match"] = if_match
+        else:
+            headers["If-Match"] = if_match if if_match is not None else "*"  # "*": must still exist
         response = await self._send(
             "PUT", href, kind="put", ok=(200, 201, 204), content=data, headers=headers
         )
         return response.headers.get("etag")
 
     async def delete(self, href: str, *, if_match: str | None = None) -> None:
-        headers = {"If-Match": if_match} if if_match else None
+        headers = {"If-Match": if_match or "*"}
         await self._send("DELETE", href, kind="delete", ok=(200, 204), headers=headers)
 
     async def mkcalendar(self, href: str, display_name: str) -> None:

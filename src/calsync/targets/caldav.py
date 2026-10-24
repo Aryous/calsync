@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from calsync.errors import ConfigError, CursorExpired, NotFoundError
+from calsync.errors import CalsyncError, ConfigError, CursorExpired, NotFoundError
 from calsync.http import Sleep
 from calsync.naming import parse_resource_name
 from calsync.targets.base import DetectMode, FetchedObject, TargetCalendar, TargetDelta
@@ -28,7 +28,6 @@ CALENDAR_PROPS = (
     q(DAV, "resourcetype"),
     q(DAV, "displayname"),
     q(CS, "getctag"),
-    q(DAV, "sync-token"),
     q(DAV, "supported-report-set"),
 )
 
@@ -37,9 +36,12 @@ class Limiter:
     """Concurrency limit that can drop to 1 when the server starts throttling."""
 
     def __init__(self, limit: int) -> None:
+        if limit < 1:
+            raise ValueError(f"concurrency limit must be >= 1, got {limit}")
         self._configured = limit
         self._limit = limit
         self._active = 0
+        self._wake: asyncio.Task[None] | None = None
         self._cond = asyncio.Condition()
 
     @property
@@ -51,6 +53,15 @@ class Limiter:
 
     def reset(self) -> None:
         self._limit = self._configured
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop: nobody can be waiting
+        self._wake = loop.create_task(self._notify())  # keep a reference until done
+
+    async def _notify(self) -> None:
+        async with self._cond:
+            self._cond.notify_all()
 
     async def __aenter__(self) -> None:
         async with self._cond:
@@ -99,13 +110,19 @@ class CalDavTarget:
     def reset(self) -> None:
         self._limiter.reset()
 
+    async def _propfind_one(self, href: str, props: Sequence[str]) -> DavResponse:
+        items = await self._dav.propfind(href, props, depth=0)
+        if len(items) != 1:
+            raise CalsyncError(f"unexpected PROPFIND response for {href}: {len(items)} entries")
+        return items[0]
+
     async def _calendar_home(self) -> str:
         if self._home is None:
-            (root,) = await self._dav.propfind("", [q(DAV, "current-user-principal")], depth=0)
+            root = await self._propfind_one("", [q(DAV, "current-user-principal")])
             principal = root.href_prop(q(DAV, "current-user-principal"))
             if principal is None:
                 raise NotFoundError("server did not report current-user-principal")
-            (pr,) = await self._dav.propfind(principal, [q(CALDAV, "calendar-home-set")], depth=0)
+            pr = await self._propfind_one(principal, [q(CALDAV, "calendar-home-set")])
             home = pr.href_prop(q(CALDAV, "calendar-home-set"))
             if home is None:
                 raise NotFoundError("server did not report calendar-home-set")
@@ -152,6 +169,8 @@ class CalDavTarget:
         responses, new_token = await self._dav.report(
             cal.href, sync_collection_body(token), kind="sync-collection"
         )
+        # RFC 6578 section 3.6: 507 on the collection itself means the listing was truncated.
+        truncated = any(_same_href(r.href, cal.href) and r.status == 507 for r in responses)
         changed: dict[str, str | None] = {}
         deleted: list[str] = []
         for r in self._managed(cal, responses):
@@ -159,7 +178,7 @@ class CalDavTarget:
                 deleted.append(r.href)
             else:
                 changed[r.href] = r.text(q(DAV, "getetag"))
-        return TargetDelta(changed, tuple(deleted), token is None, new_token)
+        return TargetDelta(changed, tuple(deleted), token is None and not truncated, new_token)
 
     async def changes(self, cal: TargetCalendar, cursor: str | None) -> TargetDelta:
         if cal.mode == "sync":
@@ -168,7 +187,7 @@ class CalDavTarget:
             except CursorExpired:
                 return await self._sync(cal, None)
         if cal.mode == "ctag":
-            (item,) = await self._dav.propfind(cal.href, [q(CS, "getctag")], depth=0)
+            item = await self._propfind_one(cal.href, [q(CS, "getctag")])
             ctag = item.text(q(CS, "getctag"))
             if cursor is not None and ctag == cursor:
                 return TargetDelta({}, (), False, cursor)
