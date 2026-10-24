@@ -154,7 +154,8 @@ delete_guard = { max_ratio = 0.5, max_count = 10 }
   - `"strip"`：不写任何提醒。
   - 偏移数组，例如 `["-5m", "0m"]`：所有事件统一使用这组提醒。
 - `rules[].name` 在配置内唯一。它参与生成资源名和 UID，**修改规则名等于重建该规则的全部托管资源**。
-- 配置加载时校验：账号引用存在、规则名唯一、时长格式合法、同一目标日历不被两条规则以不同账号写入（见 §6.3）。校验失败时不运行任何规则。
+- 配置加载时校验：账号引用存在、源账号类型为 `google`、目标账号类型为 `caldav`、规则名唯一、时长格式合法。校验失败时不运行任何规则。
+- "同一个共享日历被不同账号的规则写入"无法在配置层静态识别（不同账号下的同名日历未必是同一个），只在文档中警告，见 §6.3。
 
 ## 5. 统一事件模型
 
@@ -168,10 +169,10 @@ class Occurrence:              # 单次改动的实例
     original_start: When       # 对应 RECURRENCE-ID
     start: When
     end: When
-    title: str | None          # None 表示沿用主事件
-    description: str | None
-    location: str | None
-    alarms: tuple[Alarm, ...] | None
+    title: str                 # 字段完整：按 RFC 5545，带 RECURRENCE-ID 的组件整体替换该实例，
+    description: str           # 不继承主事件的标题、描述、地点和提醒
+    location: str
+    alarms: tuple[Alarm, ...]
 
 @dataclass(frozen=True, slots=True)
 class Series:
@@ -313,7 +314,7 @@ XML 用标准库 `xml.etree` 解析，命名空间常量集中定义。
   - `X-CALSYNC-RULE:<规则名>`
   - `X-CALSYNC-HASH:<内容哈希>`
 - 若实验证明服务器不保留客户端指定的资源名（§13），退回到读取正文中的 `UID` 和 `X-CALSYNC-RULE` 判断归属。
-- CalendarServer 默认把 `X-` 属性视为每个用户自己的数据：托管标记只对写入它的账号可见。因此一条规则的写入和读取必须使用同一个目标账号；配置校验会拒绝"同一个目标日历被不同账号的规则写入"。
+- CalendarServer 默认把 `X-` 属性视为每个用户自己的数据：托管标记只对写入它的账号可见。因此一条规则的写入和读取必须使用同一个目标账号；不要让不同账号的规则写入同一个共享日历。
 
 **资源内容**
 
