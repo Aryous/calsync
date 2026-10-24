@@ -1,3 +1,4 @@
+import copy
 from datetime import timedelta
 from pathlib import Path
 
@@ -125,3 +126,64 @@ def test_load_config_reads_toml(tmp_path: Path) -> None:
 def test_default_config_path_env_override() -> None:
     assert default_config_path({"CALSYNC_CONFIG": "/etc/calsync.toml"}) == Path("/etc/calsync.toml")
     assert default_config_path({}).name == "config.toml"
+
+
+def _mutated(**changes: object) -> dict[str, object]:
+    data = copy.deepcopy(VALID)
+    for dotted, value in changes.items():
+        parts = dotted.split("__")
+        node: object = data
+        for part in parts[:-1]:
+            node = node[int(part)] if isinstance(node, list) else node[part]  # type: ignore[index]
+        node[parts[-1]] = value  # type: ignore[index]
+    return data
+
+
+BAD_VALUES = [
+    ({"runtime__interval": "0s"}, "runtime.interval: must be positive"),
+    ({"runtime__interval": "-30s"}, "runtime.interval: must be positive"),
+    ({"runtime__jitter": "x"}, "runtime.jitter"),
+    ({"runtime": "60s"}, "runtime: must be a table"),
+    ({"notify": 5}, "notify: must be a table"),
+    ({"google": 5}, "google: must be a table"),
+    ({"notify__failure_threshold": "three"}, "notify.failure_threshold"),
+    ({"accounts__family-icloud__max_concurrency": True}, "accounts.family-icloud.max_concurrency"),
+    ({"rules__0__delete_guard": {"max_count": 3.7}}, "rules[family].delete_guard.max_count"),
+    ({"rules__0__delete_guard": {"max_count": -1}}, "rules[family].delete_guard.max_count"),
+    ({"rules__0__delete_guard": {"max_ratio": 0}}, "rules[family].delete_guard.max_ratio"),
+    ({"rules__0__delete_guard": 5}, "rules[family].delete_guard: must be a table"),
+    ({"rules__0__window": "7d"}, "rules[family].window: must be a table"),
+    (
+        {"rules__0__target__create_if_missing": "false"},
+        "rules[family].target.create_if_missing: must be true or false",
+    ),
+    ({"accounts": "x"}, "accounts: must be a table"),
+]
+
+
+@pytest.mark.parametrize(("changes", "expected"), BAD_VALUES)
+def test_wrong_types_become_problems(tmp_path: Path, changes: dict[str, object], expected: str) -> None:
+    with pytest.raises(ConfigError) as info:
+        parse_config(_mutated(**changes), base_dir=tmp_path)
+    assert expected in "\n".join(info.value.problems)
+
+
+def test_wrong_types_reported_together(tmp_path: Path) -> None:
+    data = _mutated(
+        runtime__jitter="x",
+        notify__failure_threshold="three",
+        rules__0__delete_guard={"max_count": -1},
+    )
+    with pytest.raises(ConfigError) as info:
+        parse_config(data, base_dir=tmp_path)
+    text = "\n".join(info.value.problems)
+    assert "runtime.jitter" in text
+    assert "notify.failure_threshold" in text
+    assert "delete_guard.max_count" in text
+
+
+def test_float_accepted_for_ratio_and_int_for_jitter(tmp_path: Path) -> None:
+    data = _mutated(runtime__jitter=0, rules__0__delete_guard={"max_ratio": 1, "max_count": 5.0})
+    cfg = parse_config(data, base_dir=tmp_path)
+    assert cfg.runtime.jitter == 0.0
+    assert cfg.rules[0].delete_guard.max_count == 5

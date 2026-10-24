@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 from calsync.durations import parse_duration
 from calsync.errors import ConfigError
@@ -124,6 +124,78 @@ def _duration(raw: Any, where: str, problems: list[str]) -> timedelta | None:
         return None
 
 
+def _table(raw: Any, where: str, problems: list[str]) -> Mapping[str, Any]:
+    if raw is None:
+        return {}
+    if isinstance(raw, Mapping):
+        return raw
+    problems.append(f"{where}: must be a table")
+    return {}
+
+
+@overload
+def _number(
+    raw: Any,
+    where: str,
+    problems: list[str],
+    *,
+    kind: type[int],
+    default: int,
+    minimum: float | None = ...,
+    maximum: float | None = ...,
+    exclusive_min: bool = ...,
+    exclusive_max: bool = ...,
+    expect: str = ...,
+) -> int: ...
+@overload
+def _number(
+    raw: Any,
+    where: str,
+    problems: list[str],
+    *,
+    kind: type[float],
+    default: float,
+    minimum: float | None = ...,
+    maximum: float | None = ...,
+    exclusive_min: bool = ...,
+    exclusive_max: bool = ...,
+    expect: str = ...,
+) -> float: ...
+def _number(
+    raw: Any,
+    where: str,
+    problems: list[str],
+    *,
+    kind: type[int] | type[float],
+    default: Any,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    exclusive_min: bool = False,
+    exclusive_max: bool = False,
+    expect: str = "",
+) -> Any:
+    """Validate a numeric value; record a problem and return ``default`` on failure."""
+    if raw is None:
+        return default
+    label = expect or ("an integer" if kind is int else "a number")
+    if isinstance(raw, bool) or not isinstance(raw, int | float):
+        problems.append(f"{where}: must be {label}")
+        return default
+    if kind is int:
+        if isinstance(raw, float) and not raw.is_integer():
+            problems.append(f"{where}: must be {label}")
+            return default
+        value: Any = int(raw)
+    else:
+        value = float(raw)
+    too_low = minimum is not None and (value <= minimum if exclusive_min else value < minimum)
+    too_high = maximum is not None and (value >= maximum if exclusive_max else value > maximum)
+    if too_low or too_high:
+        problems.append(f"{where}: must be {label}")
+        return default
+    return value
+
+
 def _account(name: str, raw: Any, problems: list[str]) -> Account | None:
     where = f"accounts.{name}"
     if not isinstance(raw, Mapping):
@@ -149,10 +221,15 @@ def _account(name: str, raw: Any, problems: list[str]) -> Account | None:
             problems.append(f"{where}.server_url: required http(s) URL for caldav accounts")
         if not isinstance(username, str) or not username:
             problems.append(f"{where}.username: required for caldav accounts")
-    concurrency = raw.get("max_concurrency", 2)
-    if not isinstance(concurrency, int) or concurrency < 1:
-        problems.append(f"{where}.max_concurrency: must be an integer >= 1")
-        concurrency = 1
+    concurrency = _number(
+        raw.get("max_concurrency"),
+        f"{where}.max_concurrency",
+        problems,
+        kind=int,
+        default=2,
+        minimum=1,
+        expect="an integer >= 1",
+    )
     return Account(
         name=name,
         provider=provider,
@@ -185,7 +262,11 @@ def _selection(
         problems.append(f"{where}.account: {account!r} must be a {provider} account")
     if not ok or not isinstance(calendar, str):
         return None
-    return CalendarSel(account, calendar, bool(raw.get("create_if_missing", False)))
+    create = raw.get("create_if_missing", False)
+    if not isinstance(create, bool):
+        problems.append(f"{where}.create_if_missing: must be true or false")
+        return None
+    return CalendarSel(account, calendar, create)
 
 
 def _alarms(raw: Any, where: str, problems: list[str]) -> AlarmPolicy:
@@ -210,20 +291,36 @@ def _rule(index: int, raw: Any, accounts: Mapping[str, Account], problems: list[
     where = f"rules[{name}]"
     source = _selection(raw.get("source"), f"{where}.source", accounts, "google", problems)
     target = _selection(raw.get("target"), f"{where}.target", accounts, "caldav", problems)
-    window_raw = raw.get("window", {})
+    window_raw = _table(raw.get("window"), f"{where}.window", problems)
     past = _duration(window_raw.get("past", "7d"), f"{where}.window.past", problems)
     future = _duration(window_raw.get("future", "180d"), f"{where}.window.future", problems)
     for label, value in (("past", past), ("future", future)):
         if value is not None and value < timedelta(0):
             problems.append(f"{where}.window.{label}: must not be negative")
     alarms = _alarms(raw.get("alarms", "copy"), f"{where}.alarms", problems)
-    guard_raw = raw.get("delete_guard", {})
+    guard_raw = _table(raw.get("delete_guard"), f"{where}.delete_guard", problems)
     guard = DeleteGuard(
-        max_ratio=float(guard_raw.get("max_ratio", 0.5)),
-        max_count=int(guard_raw.get("max_count", 10)),
+        max_ratio=_number(
+            guard_raw.get("max_ratio"),
+            f"{where}.delete_guard.max_ratio",
+            problems,
+            kind=float,
+            default=0.5,
+            minimum=0,
+            maximum=1,
+            exclusive_min=True,
+            expect="a number in (0, 1]",
+        ),
+        max_count=_number(
+            guard_raw.get("max_count"),
+            f"{where}.delete_guard.max_count",
+            problems,
+            kind=int,
+            default=10,
+            minimum=0,
+            expect="an integer >= 0",
+        ),
     )
-    if not 0 < guard.max_ratio <= 1:
-        problems.append(f"{where}.delete_guard.max_ratio: must be in (0, 1]")
     if source is None or target is None or past is None or future is None:
         return None
     return Rule(name, source, target, WindowSpec(past, future), alarms, guard)
@@ -232,25 +329,44 @@ def _rule(index: int, raw: Any, accounts: Mapping[str, Account], problems: list[
 def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:
     problems: list[str] = []
 
-    google = data.get("google", {})
+    google = _table(data.get("google"), "google", problems)
     secret_file = google.get("client_secret_file")
     client_secret_file = _resolve(secret_file, base_dir) if isinstance(secret_file, str) else None
 
-    notify_raw = data.get("notify", {})
+    notify_raw = _table(data.get("notify"), "notify", problems)
     notify = NotifyConfig(
         bark_url=notify_raw.get("bark_url"),
         webhook_url=notify_raw.get("webhook_url"),
-        failure_threshold=int(notify_raw.get("failure_threshold", 3)),
+        failure_threshold=_number(
+            notify_raw.get("failure_threshold"),
+            "notify.failure_threshold",
+            problems,
+            kind=int,
+            default=3,
+            minimum=1,
+            expect="an integer >= 1",
+        ),
     )
 
-    runtime_raw = data.get("runtime", {})
+    runtime_raw = _table(data.get("runtime"), "runtime", problems)
     interval = _duration(runtime_raw.get("interval", "60s"), "runtime.interval", problems)
-    jitter = float(runtime_raw.get("jitter", 0.1))
-    if not 0 <= jitter < 1:
-        problems.append("runtime.jitter: must be in [0, 1)")
+    if interval is not None and interval <= timedelta(0):
+        problems.append("runtime.interval: must be positive")
+        interval = None
+    jitter = _number(
+        runtime_raw.get("jitter"),
+        "runtime.jitter",
+        problems,
+        kind=float,
+        default=0.1,
+        minimum=0,
+        maximum=1,
+        exclusive_max=True,
+        expect="a number in [0, 1)",
+    )
 
     accounts: dict[str, Account] = {}
-    for name, raw in (data.get("accounts") or {}).items():
+    for name, raw in _table(data.get("accounts"), "accounts", problems).items():
         account = _account(name, raw, problems)
         if account is not None:
             accounts[name] = account
@@ -276,5 +392,7 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:
         rules=tuple(rules),
         google_client_secret_file=client_secret_file,
         notify=notify,
-        runtime=RuntimeConfig(interval=interval or timedelta(seconds=60), jitter=jitter),
+        runtime=RuntimeConfig(
+            interval=interval if interval is not None else timedelta(seconds=60), jitter=jitter
+        ),
     )
