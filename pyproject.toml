@@ -1,0 +1,52 @@
+[project]
+name = "calsync"
+version = "0.1.0"
+description = "One-way calendar sync engine: Google Calendar to CalDAV (iCloud and more)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx[http2]>=0.28,<1",
+    "icalendar>=7.3,<8",
+    "python-dateutil>=2.9",
+    "keyring>=25",
+]
+
+[project.scripts]
+calsync = "calsync.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9",
+    "anyio>=4.6",
+    "radicale>=3.8",
+    "ruff>=0.8",
+    "pyright>=1.1.390",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/calsync"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["e2e: end-to-end tests against a local Radicale server"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF", "ASYNC"]
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
