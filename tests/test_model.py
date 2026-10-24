@@ -145,3 +145,33 @@ def test_span_count_over_limit_is_unbounded() -> None:
     at_limit = series(recurrence=(f"RRULE:FREQ=MINUTELY;COUNT={SPAN_EXPANSION_LIMIT}",))
     lo, hi = series_span(at_limit)
     assert hi == lo + timedelta(minutes=SPAN_EXPANSION_LIMIT - 1) + timedelta(minutes=5)
+
+
+def test_span_duration_overflow_is_unbounded() -> None:
+    s = series(
+        start=at(2026, 12, 31, 23, tz="UTC"),
+        minutes=120,
+        recurrence=("RRULE:FREQ=YEARLY;UNTIL=99991231T235959Z",),
+    )
+    assert series_span(s)[1] == MAX_TIME
+
+
+def test_span_override_conversion_overflow_is_guarded() -> None:
+    tz = "America/New_York"
+    late = Occurrence(
+        original_start=at(2026, 10, 24, 9, 30, tz=tz),
+        start=at(9999, 12, 31, 23, tz=tz),
+        end=at(9999, 12, 31, 23, 30, tz=tz),
+        title="late",
+        description="",
+        location="",
+        alarms=(),
+    )
+    s = series(
+        start=at(2026, 10, 23, 9, 30, tz=tz),
+        recurrence=("RRULE:FREQ=DAILY;COUNT=2",),
+        overrides=(late,),
+    )
+    lo, hi = series_span(s)
+    assert hi == MAX_TIME
+    assert lo == datetime(2026, 10, 23, 13, 30, tzinfo=UTC)

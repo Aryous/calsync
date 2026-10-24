@@ -8,6 +8,7 @@ individually modified instance (``Occurrence``).
 import hashlib
 import json
 from collections.abc import Iterable, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from itertools import islice
@@ -223,14 +224,21 @@ def compute_span(
             continue
         if last is not None:
             last_start = max(last_start, _as_utc(last))
-    try:
-        hi = MAX_TIME if unbounded else last_start + duration
-    except OverflowError:
-        hi = MAX_TIME
+    hi = MAX_TIME
+    if not unbounded:
+        try:
+            hi = last_start + duration
+        except OverflowError:
+            unbounded = True
     for occ_start, occ_end in extra:
-        lo = min(lo, occ_start.utc())
-        if hi != MAX_TIME:
-            hi = max(hi, occ_end.utc())
+        with suppress(OverflowError):  # unrepresentable start: leave lo as is
+            lo = min(lo, occ_start.utc())
+        if not unbounded:
+            try:
+                hi = max(hi, occ_end.utc())
+            except OverflowError:
+                unbounded = True
+                hi = MAX_TIME
     return lo, hi
 
 
