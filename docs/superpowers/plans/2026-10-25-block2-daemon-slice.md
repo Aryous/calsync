@@ -91,7 +91,7 @@ The README's command list must not advertise them.
   - `RunRecord` gains, appended with defaults so existing positional constructions keep working: `reverted: int = 0`, `protected: int = 0`, `out_of_window: int = 0`, `error_kind: str | None = None`.
   - New frozen dataclass `ChangeRecord(rule: str, object_id: str, action: str, at: datetime, title: str | None)`.
   - `Store.record_runs(runs, changes: Sequence[ChangeRecord] = ())` writes both in one transaction. Each change row gets `run_id` = the id of the run row of the same rule inserted in that call.
-  - Retention runs in the same transaction: delete `change` rows with `at < now - CHANGE_RETENTION`, where `now` is the newest `finished_at` in the call. Delete changes whose `run_id` was pruned by `RUN_RETENTION`.
+  - Retention runs in the same transaction: delete `change` rows with `at < now - CHANGE_RETENTION`, where `now` is the newest `finished_at` in the call. Change rows are pruned by age only, never together with run rows: at a 60 s interval `RUN_RETENTION` keeps about 8 hours of runs, while changes are kept 90 days, so a change's `run_id` may point at a pruned run.
   - `RuleResult.changes: list[ChangeRecord]`.
 - **Schema (version 4, the usual drop-and-rebuild):**
   ```sql
