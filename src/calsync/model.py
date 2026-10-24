@@ -131,6 +131,18 @@ def _alarm_key(alarm: Alarm) -> timedelta:
     return alarm.offset
 
 
+def _when_order(when: When) -> tuple[datetime, str, bool, str]:
+    """Total order on ``When``: the instant first, then what tells equal instants apart.
+
+    Sorting a ``set`` by the instant alone would leave ties in hash-seed order, and the
+    result feeds ``series_hash``."""
+    return (when.utc(), when.tzid or "", when.all_day, when.value.isoformat())
+
+
+def _occurrence_order(occ: Occurrence) -> tuple[tuple[datetime, str, bool, str], str]:
+    return (_when_order(occ.original_start), json.dumps(_canon(occ), ensure_ascii=False, sort_keys=True))
+
+
 def _attendee_preference(a: Attendee) -> tuple[bool, str, str]:
     # Lower is better: a named entry first, then the smallest (name, email).
     return (not a.name, a.name, a.email)
@@ -177,13 +189,8 @@ def normalize_series(series: Series) -> Series:
         description=series.description.strip(),
         location=series.location.strip(),
         recurrence=tuple(line.strip() for line in series.recurrence),
-        exdates=tuple(sorted(set(series.exdates), key=When.utc)),
-        overrides=tuple(
-            sorted(
-                (_normalize_occurrence(o) for o in series.overrides),
-                key=lambda o: o.original_start.utc(),
-            )
-        ),
+        exdates=tuple(sorted(set(series.exdates), key=_when_order)),
+        overrides=tuple(sorted((_normalize_occurrence(o) for o in series.overrides), key=_occurrence_order)),
         alarms=tuple(sorted(set(series.alarms), key=_alarm_key)),
         attendees=_normalize_attendees(series.attendees),
         conference_url=series.conference_url.strip(),

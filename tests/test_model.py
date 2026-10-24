@@ -278,6 +278,43 @@ def test_attendee_normalization_does_not_depend_on_hash_seed() -> None:
     assert len(outputs) == 1
 
 
+def test_exdate_order_does_not_depend_on_hash_seed() -> None:
+    """Two EXDATEs for the same instant in different zones tie on the instant; the hash must
+    still be the same in every process."""
+    script = (
+        "from datetime import UTC, datetime\n"
+        "from zoneinfo import ZoneInfo\n"
+        "from calsync.model import When, series_hash\n"
+        "from tests.factories import series\n"
+        "a = When(datetime(2026, 10, 30, 9, 30, tzinfo=ZoneInfo('Asia/Shanghai')), 'Asia/Shanghai')\n"
+        "b = When(datetime(2026, 10, 30, 1, 30, tzinfo=UTC), 'UTC')\n"
+        "c = When(datetime(2026, 10, 30, 1, 30, tzinfo=ZoneInfo('Europe/London')), 'Europe/London')\n"
+        "print(series_hash(series(recurrence=('RRULE:FREQ=DAILY;COUNT=10',), exdates=(a, b, c))))\n"
+    )
+    outputs = {
+        subprocess.run(
+            [sys.executable, "-c", script],
+            env={**os.environ, "PYTHONHASHSEED": str(seed)},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for seed in range(8)
+    }
+    assert len(outputs) == 1
+
+
+def test_override_order_with_tied_instants_does_not_change_the_hash() -> None:
+    def occ(original: When) -> Occurrence:
+        return Occurrence(original, at(2026, 10, 30, 10, 0), at(2026, 10, 30, 10, 5), "Moved", "", "", ())
+
+    local = at(2026, 10, 30, 9, 30)
+    utc = When(local.value.astimezone(UTC), "UTC")
+    one = series(recurrence=("RRULE:FREQ=DAILY;COUNT=10",), overrides=(occ(local), occ(utc)))
+    two = replace(one, overrides=(occ(utc), occ(local)))
+    assert series_hash(one) == series_hash(two)
+
+
 ALICE = Attendee("Alice", "alice@example.com")
 BOB = Attendee("", "bob@example.com")
 
