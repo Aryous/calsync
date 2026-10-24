@@ -200,23 +200,44 @@ class Engine:
             # Changed, but its body is unknown: plan as if absent (a create there 412s and
             # becomes an update). The cursor is held below so detection reports it again.
             cache.objects.pop(href, None)
+        marker_lost = 0
         for obj in fetched:
             name = parse_resource_name(obj.href)
             if name is None:
                 continue
             found = inspect(obj.data)
             known = cache.objects.get(obj.href)
+            # The recorded hash is what we last wrote or adopted, whatever marker the target kept
+            # in the body: only a copy unknown to us (cold start, lost state) is judged by its
+            # marker. An unparseable body has no usable hash: the planner rewrites it.
+            if found is None:
+                content_hash = None
+            elif known is not None:
+                content_hash = known.content_hash
+                marker_lost += known.content_hash is not None and found.content_hash != known.content_hash
+            else:
+                content_hash = found.content_hash
             # Changed by someone else (or unknown to us): its rule compares it with the source
             # version when it next runs, which need not be this cycle (see _classify_reads).
             cache.objects[obj.href] = CachedObject(
                 etag=obj.etag,
                 rule_tag=name[0],
                 object_id=name[1],
-                content_hash=found.content_hash if found else None,
+                content_hash=content_hash,
                 span=found.span if found else None,
                 verify_digest=content_digest(obj.data),
+                reverting=known.reverting if known else False,
                 revert_times=known.revert_times if known else (),
                 hold_until=known.hold_until if known else None,
+            )
+        if marker_lost:
+            # Counts only: tells whether the target keeps the marker (the real-device check).
+            log.info(
+                "target %s %r: %d copy(ies) read back with no or another marker than calsync wrote; "
+                "judged by visible content",
+                account,
+                ref,
+                marker_lost,
             )
         if unread:
             # Keep the previous cursor: sync-collection replays (ctag re-lists) these hrefs
@@ -330,13 +351,15 @@ class Engine:
     ) -> bool:
         """Classify this rule's copies whose body detection read but no run has judged yet.
 
-        What a person sees decides, not the marker: a copy whose visible content equals the
-        version we would write is adopted as current (whatever its X-CALSYNC-HASH says, so a
-        phone that drops or keeps an old marker is never rewritten). A copy that differs
-        although its marker says it is current was edited on the target: it is marked
-        ``reverting`` (cleared only by a successful write). A copy that differs and carries no
-        or another marker is left to the planner (an ordinary update). Returns whether any
-        cached object changed.
+        What a person sees decides, never the marker in the body: a copy whose visible content
+        equals the version we would write is adopted as current (so a phone that drops or keeps
+        an old X-CALSYNC-HASH is never rewritten). A copy that differs although its recorded
+        hash (what we last wrote or adopted, see _detect) is current was edited on the target:
+        it is marked ``reverting`` (cleared only by a successful write) and counts toward the
+        loop breaker. A copy that differs while its recorded hash is outdated or unknown (the
+        source changed too, or a cold start read it without our marker) is left to the planner
+        (an ordinary update). A hold that has ended turns the copy into one to revert, without
+        reading it. Returns whether any cached object changed.
         """
         changed = foreign = adopted = unrenderable = restored = 0
         now = self._clock()
@@ -387,9 +410,11 @@ class Engine:
                     reverting=False,
                     hold_until=None,
                 )
-            elif have.content_hash == want.content_hash:
-                # Edited on the target, again: the planner sees an unknown hash and plans an update,
-                # unless this copy keeps changing after our writes (then it is held as it is).
+            elif obj.reverting or obj.content_hash == want.content_hash:
+                # We wrote (or adopted) the source version and the copy shows something else:
+                # edited on the target, whatever its marker says. The planner sees an unknown hash
+                # and plans an update, unless this copy keeps changing after our writes (then it
+                # is held as it is). ``reverting``: edited again before the revert was written.
                 held = obj.hold_until is not None and now < obj.hold_until
                 recent = [t for t in obj.revert_times if t > now - REVERT_WINDOW]
                 if not held and len(recent) >= REVERT_LIMIT:
@@ -418,16 +443,18 @@ class Engine:
                     )
                     foreign += 1
             else:
-                cache.objects[have.href] = replace(obj, verify_digest=None)  # the source changed too
+                # The source changed since we wrote it (or nothing tells what we wrote): an
+                # ordinary update.
+                cache.objects[have.href] = replace(obj, verify_digest=None)
         if unrenderable:
             log.warning(
                 "rule %s: %d copy(ies) could not be compared with the source version", rule.name, unrenderable
             )
         if adopted:
-            # Counts only: tells whether the target keeps the marker (the real-device check).
+            # Counts only. Whether the target keeps the marker is logged by _detect.
             log.info(
-                "rule %s: %d copy(ies) already show the source version but carry no or an outdated "
-                "marker; recorded as current without rewriting",
+                "rule %s: %d copy(ies) already show the source version but were recorded with no or "
+                "an outdated hash; recorded as current without rewriting",
                 rule.name,
                 adopted,
             )

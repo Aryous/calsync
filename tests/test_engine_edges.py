@@ -1036,13 +1036,81 @@ async def test_snooze_that_strips_the_marker_is_not_rewritten(
     assert idle.updated == 0 and fetched_since(target, mark) == [] and writes_since(target, mark) == []
 
 
-async def test_stripped_marker_with_a_visible_change_is_an_ordinary_update(tmp_path: Path) -> None:
+def other_marker(data: bytes) -> bytes:
+    return MARKER.sub(b"X-CALSYNC-HASH:" + b"0" * 32 + b"\r\n", data)
+
+
+@pytest.mark.parametrize("marker", [strip_marker, other_marker], ids=["stripped", "other"])
+async def test_target_edit_that_drops_the_marker_is_reverted(
+    tmp_path: Path, marker: Callable[[bytes], bytes]
+) -> None:
+    """Whether an edit is reverted does not depend on the target keeping X-CALSYNC-HASH: the hash
+    calsync recorded for the copy (what it wrote) is compared with the source version."""
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = edit_copy(h, lambda d: marker(d.replace(MOVE_FROM, MOVE_TO)))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.updated, res.reverted) == (1, 1)
+    assert MOVE_FROM in target.objects[href][1]
+    assert (await h.engine.cycle()).rules["family"].updated == 0
+
+
+async def test_stripped_marker_without_a_visible_change_is_not_rewritten(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    expected = want_hash(h)
+    href = edit_copy(h, strip_marker)
+    mark = len(target.calls)
+    with caplog.at_level(logging.INFO, logger="calsync.engine"):
+        res = (await h.engine.cycle()).rules["family"]
+    assert (res.updated, res.reverted) == (0, 0) and writes_since(target, mark) == []
+    cached = h.store.load_target_cache("dav", target.calendars["Family"].href).objects[href]
+    assert (cached.content_hash, cached.verify_digest) == (expected, None)
+    # The diagnostic for the real-device check: counts only.
+    [line] = [r.getMessage() for r in caplog.records if "marker" in r.getMessage()]
+    assert "1 copy" in line and href not in line and "Stretch" not in line
+
+
+async def test_cold_start_with_a_stripped_marker_and_a_visible_change_is_an_ordinary_update(
+    tmp_path: Path,
+) -> None:
+    """Without local state nothing tells what calsync wrote: a copy without the marker that
+    differs is simply updated (not counted as a revert)."""
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
     href = edit_copy(h, lambda d: strip_marker(d.replace(MOVE_FROM, MOVE_TO)))
+    forget_state(h, tmp_path)
+    h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    res = (await h2.engine.cycle()).rules["family"]
+    assert (res.created, res.updated, res.reverted) == (0, 1, 0)
+    assert MOVE_FROM in target.objects[href][1]
+
+
+async def test_second_target_edit_before_the_revert_is_written_is_still_a_revert(tmp_path: Path) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = move_stretch_on_target(h)
+    await h.engine.cycle(dry_run=True)  # classified as edited, nothing written
+    edit_copy(h, lambda d: strip_marker(d.replace(MOVE_TO, start_at(b"084500"))))
     res = (await h.engine.cycle()).rules["family"]
-    assert (res.updated, res.reverted) == (1, 0)
+    assert (res.updated, res.reverted) == (1, 1)
+    assert MOVE_FROM in target.objects[href][1]
+
+
+async def test_unparseable_body_of_a_known_copy_is_rewritten(tmp_path: Path) -> None:
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
+    await h.engine.cycle()
+    href = copy_href(h, "stretch")
+    target.put(href, b"not icalendar")
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.updated == 1
     assert MOVE_FROM in target.objects[href][1]
     assert (await h.engine.cycle()).rules["family"].updated == 0
 
@@ -1304,3 +1372,24 @@ async def test_expired_hold_on_a_protected_series_waits(tmp_path: Path) -> None:
     res = (await h.engine.cycle()).rules["family"]
     assert (res.protected, res.updated, res.reverted) == (0, 1, 1)
     assert MOVE_FROM in target.objects[href][1]
+
+
+async def test_target_that_drops_the_marker_on_every_rewrite_is_held(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A server or phone that rewrites the copy and drops the marker each time is caught by the
+    loop breaker like one that keeps it."""
+    clock = Clock()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target, clock=clock)
+    await h.engine.cycle()
+    href = copy_href(h, "stretch")
+    with caplog.at_level(logging.INFO, logger="calsync.engine"):
+        for hour in (1, 2, 3, 4):
+            clock.now = NOW + timedelta(hours=hour)
+            edit_copy(h, lambda d: strip_marker(d.replace(MOVE_FROM, MOVE_TO)))
+            res = (await h.engine.cycle()).rules["family"]
+            expected = (1, 1) if hour < 4 else (0, 0)
+            assert (res.updated, res.reverted) == expected
+    assert MOVE_TO in target.objects[href][1]
+    assert len(breaker_warnings(caplog)) == 1
