@@ -209,3 +209,20 @@ def test_more_malformed_values(tmp_path: Path, changes: dict[str, object], expec
     with pytest.raises(ConfigError) as info:
         parse_config(_mutated(**changes), base_dir=tmp_path)
     assert expected in "\n".join(info.value.problems)
+
+
+def test_icloud_server_alias_is_accepted(tmp_path: Path) -> None:
+    data = {
+        "accounts": {
+            "i": {
+                "provider": "caldav",
+                "server_url": "icloud",
+                "username": "u@icloud.com",
+                "credential": {"backend": "env", "ref": "PW"},
+            }
+        }
+    }
+    assert parse_config(data, base_dir=tmp_path).accounts["i"].server_url == "icloud"
+    data["accounts"]["i"]["server_url"] = "icloud.com"
+    with pytest.raises(ConfigError, match="server_url"):
+        parse_config(data, base_dir=tmp_path)

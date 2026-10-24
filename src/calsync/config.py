@@ -228,8 +228,13 @@ def _account(name: str, raw: Any, problems: list[str]) -> Account | None:
     server_url = raw.get("server_url")
     username = raw.get("username")
     if provider == "caldav":
-        if not isinstance(server_url, str) or not server_url.startswith(("https://", "http://")):
-            problems.append(f"{where}.server_url: required http(s) URL for caldav accounts")
+        if not isinstance(server_url, str) or not (
+            server_url == "icloud" or server_url.startswith(("https://", "http://"))
+        ):
+            problems.append(
+                f'{where}.server_url: required for caldav accounts: "icloud" (detects the global or '
+                "China mainland region) or an http(s) URL"
+            )
         if not isinstance(username, str) or not username:
             problems.append(f"{where}.username: required for caldav accounts")
     concurrency = _number(

@@ -52,7 +52,7 @@ credential = { backend = "keychain", ref = "calsync/me-google" }
 
 [accounts.family-icloud]
 provider = "caldav"
-server_url = "https://caldav.icloud.com/"   # China mainland: https://caldav.icloud.com.cn/
+server_url = "icloud"   # detects the global or China mainland region; any CalDAV URL also works
 username = "family@example.com"
 credential = { backend = "keychain", ref = "calsync/family-icloud" }
 

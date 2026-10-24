@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from calsync.errors import CalsyncError, ConfigError, CursorExpired, NotFoundError
+from calsync.errors import AuthError, CalsyncError, ConfigError, CursorExpired, NotFoundError
 from calsync.http import Sleep
 from calsync.naming import parse_resource_name
 from calsync.targets.base import DetectMode, FetchedObject, TargetCalendar, TargetDelta
@@ -90,6 +90,16 @@ def _detect_mode(response: DavResponse) -> DetectMode:
     return "full"
 
 
+ICLOUD = "icloud"
+# Tried in order: an Apple ID lives in exactly one region, the other rejects it with 401.
+ICLOUD_SERVERS = ("https://caldav.icloud.com/", "https://caldav.icloud.com.cn/")
+
+
+def server_candidates(server_url: str) -> tuple[str, ...]:
+    """`"icloud"` means "detect the region"; anything else is a single explicit URL."""
+    return ICLOUD_SERVERS if server_url == ICLOUD else (server_url,)
+
+
 class CalDavTarget:
     def __init__(
         self,
@@ -100,8 +110,39 @@ class CalDavTarget:
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         self._limiter = Limiter(max_concurrency)
-        self._dav = DavClient(client, server_url, sleep=sleep, on_throttle=self._limiter.throttle)
+        self._client = client
+        self._sleep = sleep
+        self._candidates = server_candidates(server_url)
+        self._dav = self._dav_for(self._candidates[0])
         self._home: str | None = None
+
+    def _dav_for(self, base_url: str) -> DavClient:
+        return DavClient(self._client, base_url, sleep=self._sleep, on_throttle=self._limiter.throttle)
+
+    async def _principal_root(self) -> DavResponse:
+        """First discovery request; with several candidate servers, the first that accepts us wins.
+
+        Only an authentication rejection moves on to the next candidate, so a
+        network failure is never mistaken for "wrong region".
+        """
+        rejected: list[str] = []
+        for base in self._candidates:
+            dav = self._dav_for(base)
+            try:
+                items = await dav.propfind("", [q(DAV, "current-user-principal")], depth=0)
+            except AuthError:
+                rejected.append(urlsplit(base).netloc)
+                continue
+            if len(items) != 1:
+                raise CalsyncError(f"unexpected PROPFIND response for {base}: {len(items)} entries")
+            self._dav = dav
+            return items[0]
+        if len(rejected) == 1:
+            raise AuthError(f"{rejected[0]} rejected the username or app-specific password (HTTP 401)")
+        raise AuthError(
+            f"rejected by every iCloud region ({', '.join(rejected)}): "
+            "check the Apple ID and app-specific password"
+        )
 
     @property
     def limiter(self) -> Limiter:
@@ -118,7 +159,7 @@ class CalDavTarget:
 
     async def _calendar_home(self) -> str:
         if self._home is None:
-            root = await self._propfind_one("", [q(DAV, "current-user-principal")])
+            root = await self._principal_root()
             principal = root.href_prop(q(DAV, "current-user-principal"))
             if principal is None:
                 raise NotFoundError("server did not report current-user-principal")
