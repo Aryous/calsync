@@ -6,6 +6,8 @@ plus one ``events.list`` request per source calendar when nothing changed.
 
 import asyncio
 import copy
+import hashlib
+import json
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import timedelta
 from typing import Any
@@ -38,7 +40,8 @@ BASE_URL = "https://www.googleapis.com/calendar/v3"
 
 EVENT_FIELDS = (
     "id,status,updated,summary,description,location,start,end,"
-    "originalStartTime,recurringEventId,recurrence,reminders,transparency"
+    "originalStartTime,recurringEventId,recurrence,reminders,transparency,"
+    "attendees(email,displayName,resource),hangoutLink,conferenceData(entryPoints(entryPointType,uri))"
 )
 # Identical for the initial full sync and every incremental call, as Google
 # requires. ``fields`` MUST keep nextSyncToken/nextPageToken or incremental
@@ -49,6 +52,10 @@ EVENTS_LIST_PARAMS: Mapping[str, str] = {
     "maxResults": "2500",
     "fields": f"nextPageToken,nextSyncToken,items({EVENT_FIELDS})",
 }
+# Sync tokens are only valid for the parameters they were issued with, and a mirror
+# filled with fewer fields lacks data. When the parameters change, pull everything again.
+_EVENTS_PARAMS_JSON = json.dumps(dict(EVENTS_LIST_PARAMS), sort_keys=True)
+EVENTS_PARAMS_ID = hashlib.sha256(_EVENTS_PARAMS_JSON.encode()).hexdigest()[:16]
 CALENDAR_LIST_PARAMS: Mapping[str, str] = {
     "showDeleted": "true",
     "showHidden": "true",
@@ -233,6 +240,9 @@ class GoogleSource:
         events token is left untouched, so the next pull retries it.
         """
         new_state: dict[str, Any] = copy.deepcopy(dict(state))
+        if new_state.get("events_params") != EVENTS_PARAMS_ID:
+            new_state["events_tokens"] = {}
+            new_state["events_params"] = EVENTS_PARAMS_ID
         await self._refresh_calendar_meta(new_state)
         meta = new_state["meta"]
         tokens: dict[str, str] = new_state.setdefault("events_tokens", {})

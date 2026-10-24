@@ -9,14 +9,14 @@ import math
 import os
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal, overload
 
 from calsync.durations import parse_duration
 from calsync.errors import ConfigError
-from calsync.model import AlarmPolicy
+from calsync.model import AlarmPolicy, FieldPolicy
 
 Backend = Literal["keychain", "env", "file"]
 Provider = Literal["google", "caldav"]
@@ -64,9 +64,11 @@ class Rule:
     name: str
     source: CalendarSel
     target: CalendarSel
-    window: WindowSpec
+    window: WindowSpec | None  # None: all of time (full sync)
     alarms: AlarmPolicy
     delete_guard: DeleteGuard
+    fields: FieldPolicy = field(default_factory=FieldPolicy)
+    on_target_edit: Literal["revert"] = "revert"  # a copy edited on the target is written back
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +297,28 @@ def _alarms(raw: Any, where: str, problems: list[str]) -> AlarmPolicy:
     return "copy"
 
 
+_FIELD_CHOICES: dict[str, tuple[str, ...]] = {
+    "attendees": ("none", "notes"),
+    "conference": ("copy", "none"),
+    "content": ("full", "busy"),
+}
+
+
+def _fields(raw: Any, where: str, problems: list[str]) -> FieldPolicy:
+    table = _table(raw, where, problems)
+    values: dict[str, Any] = {}  # each value checked against _FIELD_CHOICES
+    for key, value in table.items():
+        choices = _FIELD_CHOICES.get(key)
+        if choices is None:
+            problems.append(f"{where}.{key}: unknown setting")
+        elif value not in choices:
+            allowed = ", ".join(f'"{c}"' for c in choices)
+            problems.append(f"{where}.{key}: expected one of {allowed}")
+        else:
+            values[key] = value
+    return FieldPolicy(**values)
+
+
 def _rule(index: int, raw: Any, accounts: Mapping[str, Account], problems: list[str]) -> Rule | None:
     where = f"rules[{index}]"
     if not isinstance(raw, Mapping):
@@ -307,12 +331,19 @@ def _rule(index: int, raw: Any, accounts: Mapping[str, Account], problems: list[
     where = f"rules[{name}]"
     source = _selection(raw.get("source"), f"{where}.source", accounts, "google", problems)
     target = _selection(raw.get("target"), f"{where}.target", accounts, "caldav", problems)
-    window_raw = _table(raw.get("window"), f"{where}.window", problems)
-    past = _duration(window_raw.get("past", "7d"), f"{where}.window.past", problems)
-    future = _duration(window_raw.get("future", "180d"), f"{where}.window.future", problems)
-    for label, value in (("past", past), ("future", future)):
-        if value is not None and value < timedelta(0):
-            problems.append(f"{where}.window.{label}: must not be negative")
+    window: WindowSpec | None = None  # omitted: all of time
+    window_ok = True
+    if "window" in raw:
+        window_raw = _table(raw.get("window"), f"{where}.window", problems)
+        past = _duration(window_raw.get("past", "7d"), f"{where}.window.past", problems)
+        future = _duration(window_raw.get("future", "180d"), f"{where}.window.future", problems)
+        for label, value in (("past", past), ("future", future)):
+            if value is not None and value < timedelta(0):
+                problems.append(f"{where}.window.{label}: must not be negative")
+        if past is None or future is None:
+            window_ok = False  # keep collecting this rule's other problems
+        else:
+            window = WindowSpec(past, future)
     alarms = _alarms(raw.get("alarms", "copy"), f"{where}.alarms", problems)
     guard_raw = _table(raw.get("delete_guard"), f"{where}.delete_guard", problems)
     guard = DeleteGuard(
@@ -337,9 +368,12 @@ def _rule(index: int, raw: Any, accounts: Mapping[str, Account], problems: list[
             expect="an integer >= 0",
         ),
     )
-    if source is None or target is None or past is None or future is None:
+    fields = _fields(raw.get("fields"), f"{where}.fields", problems)
+    if raw.get("on_target_edit", "revert") != "revert":
+        problems.append(f'{where}.on_target_edit: only "revert" is supported')
+    if source is None or target is None or not window_ok:
         return None
-    return Rule(name, source, target, WindowSpec(past, future), alarms, guard)
+    return Rule(name, source, target, window, alarms, guard, fields)
 
 
 def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:

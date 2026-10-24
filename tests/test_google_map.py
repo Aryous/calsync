@@ -4,9 +4,16 @@ from typing import Any
 
 import pytest
 
-from calsync.model import Alarm, When
+from calsync.model import Alarm, Attendee, When
 from calsync.sources.base import CalendarMeta
-from calsync.sources.google_map import build_series, html_to_text, master_ids, parse_when
+from calsync.sources.google_map import (
+    build_series,
+    event_attendees,
+    event_conference,
+    html_to_text,
+    master_ids,
+    parse_when,
+)
 from tests.factories import TZ, ZONE, google_event
 
 META = CalendarMeta(timezone=TZ, default_alarms=(Alarm(timedelta(minutes=-10)),))
@@ -110,7 +117,7 @@ def test_all_day_event() -> None:
     raw = {
         "id": "d1",
         "status": "confirmed",
-        "summary": "Checkup",
+        "summary": "Planning",
         "start": {"date": "2026-11-05"},
         "end": {"date": "2026-11-06"},
     }
@@ -238,12 +245,120 @@ def test_instance_without_original_start_degrades_series() -> None:
 
 def test_entry_without_id_logs_no_event_content(caplog: pytest.LogCaptureFixture) -> None:
     raw = [
-        {"summary": "Secret Reminders Title", "description": "Private reminder notes", "location": "Home"},
+        {"summary": "Secret Stretch Title", "description": "Private lantern notes", "location": "Home"},
         {"summary": "Other Secret", "recurringEventId": "master1", "status": "confirmed"},
     ]
     with caplog.at_level(logging.DEBUG, logger="calsync"):
         assert build_series(raw, CalendarMeta()) == []
     assert "without id" in caplog.text
     assert "master1" in caplog.text  # the series it belongs to, if any, is the only detail
-    for secret in ("Secret", "Reminders", "Private", "reminder", "Home"):
+    for secret in ("Secret", "Stretch", "Private", "lantern", "Home"):
         assert secret not in caplog.text
+
+
+def test_attendees_are_read_and_rooms_skipped() -> None:
+    event = google_event(
+        "e1",
+        "Meeting",
+        "2026-10-25T09:00:00+08:00",
+        "2026-10-25T10:00:00+08:00",
+        attendees=[
+            {"email": "alice@example.com", "displayName": "Alice"},
+            {"email": "bob@example.com"},
+            {"email": "room-1@resource.example.com", "displayName": "Room 1", "resource": True},
+        ],
+    )
+    assert event_attendees(event) == (
+        Attendee("Alice", "alice@example.com"),
+        Attendee("", "bob@example.com"),
+    )
+
+
+def test_conference_prefers_video_entry_point() -> None:
+    event = google_event(
+        "e1",
+        "Call",
+        "2026-10-25T09:00:00+08:00",
+        "2026-10-25T10:00:00+08:00",
+        hangoutLink="https://meet.example.com/old",
+        conferenceData={
+            "entryPoints": [
+                {"entryPointType": "phone", "uri": "tel:+1-555-0100"},
+                {"entryPointType": "video", "uri": "https://meet.example.com/abc"},
+            ]
+        },
+    )
+    assert event_conference(event) == "https://meet.example.com/abc"
+
+
+def test_conference_falls_back_to_hangout_link() -> None:
+    event = google_event(
+        "e1",
+        "Call",
+        "2026-10-25T09:00:00+08:00",
+        "2026-10-25T10:00:00+08:00",
+        hangoutLink="https://meet.example.com/xyz",
+    )
+    assert event_conference(event) == "https://meet.example.com/xyz"
+    assert (
+        event_conference(
+            google_event("e2", "No call", "2026-10-25T09:00:00+08:00", "2026-10-25T10:00:00+08:00")
+        )
+        == ""
+    )
+
+
+def test_series_and_overrides_carry_attendees_and_conference() -> None:
+    master = google_event(
+        "s1",
+        "Weekly",
+        "2026-10-26T09:00:00+08:00",
+        "2026-10-26T10:00:00+08:00",
+        recurrence=["RRULE:FREQ=WEEKLY;COUNT=3"],
+        attendees=[{"email": "alice@example.com", "displayName": "Alice"}],
+        hangoutLink="https://meet.example.com/w",
+    )
+    moved = google_event(
+        "s1_20261102T010000Z",
+        "Weekly",
+        "2026-11-02T10:00:00+08:00",
+        "2026-11-02T11:00:00+08:00",
+        recurringEventId="s1",
+        originalStartTime={"dateTime": "2026-11-02T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        attendees=[{"email": "carol@example.com"}],
+    )
+    [s] = build_series([master, moved], CalendarMeta("Asia/Shanghai"))
+    assert s.attendees == (Attendee("Alice", "alice@example.com"),)
+    assert s.conference_url == "https://meet.example.com/w"
+    assert s.overrides[0].attendees == (Attendee("", "carol@example.com"),)
+    assert s.overrides[0].conference_url == ""
+
+
+def test_malformed_conference_data_falls_back_to_hangout_link() -> None:
+    start, end = "2026-10-25T09:00:00+08:00", "2026-10-25T10:00:00+08:00"
+    junk = google_event("e1", "Call", start, end, conferenceData="junk")
+    assert event_conference(junk) == ""
+    linked = google_event(
+        "e2", "Call", start, end, conferenceData="junk", hangoutLink="https://meet.example.com/h"
+    )
+    assert event_conference(linked) == "https://meet.example.com/h"
+    bad_entries = google_event("e3", "Call", start, end, conferenceData={"entryPoints": "junk"})
+    assert event_conference(bad_entries) == ""
+
+
+@pytest.mark.parametrize("bad", ["\r\nX-INJECT:1", "\n", "\t", " x", "\x00", "\x7f", " "])
+def test_conference_url_with_control_characters_or_spaces_is_dropped(bad: str) -> None:
+    start, end = "2026-10-25T09:00:00+08:00", "2026-10-25T10:00:00+08:00"
+    link = google_event("e1", "Call", start, end, hangoutLink=f"https://meet.example.com/abc{bad}")
+    assert event_conference(link) == ""
+    video = google_event(
+        "e2",
+        "Call",
+        start,
+        end,
+        hangoutLink="https://meet.example.com/ok",
+        conferenceData={
+            "entryPoints": [{"entryPointType": "video", "uri": f"https://meet.example.com/v{bad}"}]
+        },
+    )
+    assert event_conference(video) == "https://meet.example.com/ok"  # the clean link still counts

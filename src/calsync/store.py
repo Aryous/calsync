@@ -15,7 +15,7 @@ from calsync.mirror import Mirror
 from calsync.sources.base import CalendarPull
 from calsync.targets.base import CachedObject, TargetCache, TargetCalendar
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 RUN_RETENTION = 500  # newest runs kept per rule
 
 _SCHEMA = """
@@ -33,7 +33,8 @@ CREATE TABLE target_calendar (
 CREATE TABLE target_object (
     account TEXT NOT NULL, calendar_href TEXT NOT NULL, href TEXT NOT NULL, etag TEXT,
     rule_tag TEXT NOT NULL, object_id TEXT NOT NULL, content_hash TEXT,
-    span_start TEXT, span_end TEXT,
+    span_start TEXT, span_end TEXT, verify_digest TEXT, reverting INTEGER NOT NULL,
+    revert_times TEXT NOT NULL, hold_until TEXT,
     PRIMARY KEY (account, calendar_href, href)
 );
 CREATE TABLE run (
@@ -219,13 +220,35 @@ class Store:
             (account, calendar_href),
         ).fetchone()
         cache = TargetCache(cursor=row[0] if row else None)
-        for href, etag, tag, oid, content_hash, lo, hi in self._db.execute(
-            "SELECT href, etag, rule_tag, object_id, content_hash, span_start, span_end "
-            "FROM target_object WHERE account = ? AND calendar_href = ?",
+        for (
+            href,
+            etag,
+            tag,
+            oid,
+            content_hash,
+            lo,
+            hi,
+            verify_digest,
+            reverting,
+            times,
+            hold,
+        ) in self._db.execute(
+            "SELECT href, etag, rule_tag, object_id, content_hash, span_start, span_end, verify_digest, "
+            "reverting, revert_times, hold_until FROM target_object WHERE account = ? AND calendar_href = ?",
             (account, calendar_href),
         ):
             span = (datetime.fromisoformat(lo), datetime.fromisoformat(hi)) if lo and hi else None
-            cache.objects[href] = CachedObject(etag, tag, oid, content_hash, span)
+            cache.objects[href] = CachedObject(
+                etag,
+                tag,
+                oid,
+                content_hash,
+                span,
+                verify_digest,
+                bool(reverting),
+                revert_times=tuple(datetime.fromisoformat(t) for t in json.loads(times)),
+                hold_until=datetime.fromisoformat(hold) if hold else None,
+            )
         return cache
 
     def save_target_cache(self, account: str, calendar_href: str, cache: TargetCache) -> None:
@@ -240,6 +263,10 @@ class Store:
                 obj.content_hash,
                 obj.span[0].isoformat() if obj.span else None,
                 obj.span[1].isoformat() if obj.span else None,
+                obj.verify_digest,
+                int(obj.reverting),
+                json.dumps([t.isoformat() for t in obj.revert_times]),
+                obj.hold_until.isoformat() if obj.hold_until else None,
             )
             for href, obj in cache.objects.items()
         ]
@@ -247,7 +274,9 @@ class Store:
             self._db.execute(
                 "DELETE FROM target_object WHERE account = ? AND calendar_href = ?", (account, calendar_href)
             )
-            self._db.executemany("INSERT INTO target_object VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            self._db.executemany(
+                "INSERT INTO target_object VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+            )
             self._db.execute(
                 "UPDATE target_calendar SET cursor = ? WHERE account = ? AND href = ?",
                 (cache.cursor, account, calendar_href),

@@ -8,19 +8,19 @@ up exactly where the last one stopped.
 import asyncio
 import logging
 from collections import defaultdict
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from calsync.config import Config, Rule
 from calsync.errors import AuthError, CalsyncError, ConfigError, ConflictError, NotFoundError
 from calsync.http import RequestLog
 from calsync.mirror import Mirror, apply_pull
-from calsync.model import Window, apply_alarm_policy, series_hash, series_span
+from calsync.model import Window, apply_alarm_policy, apply_field_policy, series_hash, series_span
 from calsync.naming import object_id, parse_resource_name, resource_name, rule_tag, uid_for
 from calsync.planner import Actual, Desired, Plan, check_delete_guard, plan
-from calsync.render import inspect, render
+from calsync.render import content_digest, inspect, render
 from calsync.sources.base import CalendarMeta, Source
 from calsync.store import RunRecord, Store
 from calsync.targets.base import (
@@ -33,6 +33,13 @@ from calsync.targets.base import (
 )
 
 log = logging.getLogger(__name__)
+
+# Rewrite-loop breaker: a copy reverted REVERT_LIMIT times within REVERT_WINDOW that differs
+# again is not reverted for REVERT_HOLD (a server or phone that rewrites what calsync writes
+# would otherwise be rewritten every cycle). Source changes are still written meanwhile.
+REVERT_LIMIT = 3
+REVERT_WINDOW = timedelta(hours=6)
+REVERT_HOLD = timedelta(hours=24)
 
 Status = Literal["ok", "partial", "failed", "blocked"]
 ErrorKind = Literal["auth", "config", "guard", "other"]
@@ -52,6 +59,7 @@ class RuleResult:
     status: Status = "ok"
     created: int = 0
     updated: int = 0
+    reverted: int = 0  # copies edited on the target and written back (counted in updated)
     deleted: int = 0
     failed: int = 0
     error: str | None = None
@@ -59,6 +67,7 @@ class RuleResult:
     plan: Plan | None = None
     protected: int = 0  # existing target copies held untouched this cycle (series unparsed or degraded)
     degraded: int = 0  # series in the source calendar that are unparsed or degraded, copy or not
+    out_of_window: int = 0  # desired series skipped by the rule's time window
     blocked_titles: list[str] = field(default_factory=list)  # planned deletes, for the guard alert
     blocked_titles_complete: bool = True  # False: the lookup failed or some bodies were unreadable
 
@@ -191,17 +200,47 @@ class Engine:
             # Changed, but its body is unknown: plan as if absent (a create there 412s and
             # becomes an update). The cursor is held below so detection reports it again.
             cache.objects.pop(href, None)
+        marker_lost = 0
         for obj in fetched:
             name = parse_resource_name(obj.href)
             if name is None:
                 continue
             found = inspect(obj.data)
+            known = cache.objects.get(obj.href)
+            if found is not None:
+                # Every body calsync writes carries the marker: without one, the target dropped it.
+                # Another marker is not counted: a copy adopted on a cold start keeps the marker of
+                # the version it was written with (adoption does not rewrite it).
+                marker_lost += found.content_hash is None
+            # The recorded hash is what we last wrote or adopted, whatever marker the target kept
+            # in the body: only a copy unknown to us (cold start, lost state) is judged by its
+            # marker. An unparseable body has no usable hash: the planner rewrites it.
+            if found is None:
+                content_hash = None
+            elif known is not None:
+                content_hash = known.content_hash
+            else:
+                content_hash = found.content_hash
+            # Changed by someone else (or unknown to us): its rule compares it with the source
+            # version when it next runs, which need not be this cycle (see _classify_reads).
             cache.objects[obj.href] = CachedObject(
                 etag=obj.etag,
                 rule_tag=name[0],
                 object_id=name[1],
-                content_hash=found.content_hash if found else None,
+                content_hash=content_hash,
                 span=found.span if found else None,
+                verify_digest=content_digest(obj.data),
+                reverting=known.reverting if known else False,
+                revert_times=known.revert_times if known else (),
+                hold_until=known.hold_until if known else None,
+            )
+        if marker_lost:
+            # Counts only: tells whether the target keeps the marker (the real-device check).
+            log.info(
+                "target %s %r: %d copy(ies) read back with no calsync marker; judged by visible content",
+                account,
+                ref,
+                marker_lost,
             )
         if unread:
             # Keep the previous cursor: sync-collection replays (ctag re-lists) these hrefs
@@ -228,7 +267,7 @@ class Engine:
         series = source.to_series(raw, meta)
         desired: dict[str, Desired] = {}
         for item in series:
-            shaped = apply_alarm_policy(item, rule.alarms)
+            shaped = apply_field_policy(apply_alarm_policy(item, rule.alarms), rule.fields)
             oid = object_id(rule.name, cal_id, item.source_id)
             desired[oid] = Desired(oid, shaped, series_hash(shaped), series_span(shaped))
         unparsed = source.series_ids(raw) - {item.source_id for item in series}
@@ -263,7 +302,11 @@ class Engine:
             for href, obj in cache.objects.items()
             if obj.rule_tag == tag
         }
-        window = Window.around(self._clock(), rule.window.past, rule.window.future)
+        window = (
+            Window.everything()
+            if rule.window is None
+            else Window.around(self._clock(), rule.window.past, rule.window.future)
+        )
         desired, unparsed = self._desired(rule)
         incomplete = {oid for oid, want in desired.items() if not want.series.complete}
         result.degraded = len(unparsed) + len(incomplete)
@@ -271,7 +314,23 @@ class Engine:
         # delete); a degraded one without a copy is still created from its parseable part.
         protected = (unparsed | incomplete) & actual.keys()
         result.protected = len(protected)
+        if self._classify_reads(rule, cache, actual, desired, protected, window):
+            # Saved now (also in a dry run): detection has already consumed the change, so a
+            # dry run or a failed write must not forget the edit.
+            self._store.save_target_cache(rule.target.account, cal.href, cache)
+            # A copy edited on the target has an unknown hash now: planned as an update until
+            # a write succeeds (remember() then clears ``reverting``). An adopted copy carries
+            # the desired hash and span: nothing to write.
+            actual = {
+                oid: replace(
+                    have,
+                    content_hash=cache.objects[have.href].content_hash,
+                    span=cache.objects[have.href].span,
+                )
+                for oid, have in actual.items()
+            }
         result.plan = plan(desired, actual, window, frozenset(protected))
+        result.out_of_window = result.plan.out_of_window
         # The guard counts only non-protected actuals.
         deletable = len(actual.keys() - protected)
         reason = None if allow_deletes else check_delete_guard(result.plan, deletable, rule.delete_guard)
@@ -283,6 +342,138 @@ class Engine:
             return
         if not dry_run and not result.plan.empty:
             await self._push(rule, cal, cache, result.plan, result)
+
+    def _classify_reads(
+        self,
+        rule: Rule,
+        cache: TargetCache,
+        actual: Mapping[str, Actual],
+        desired: Mapping[str, Desired],
+        protected: Set[str],
+        window: Window,
+    ) -> bool:
+        """Classify this rule's copies whose body detection read but no run has judged yet.
+
+        What a person sees decides, never the marker in the body: a copy whose visible content
+        equals the version we would write is adopted as current (so a phone that drops or keeps
+        an old X-CALSYNC-HASH is never rewritten). A copy that differs although its recorded
+        hash (what we last wrote or adopted, see _detect) is current was edited on the target:
+        it is marked ``reverting`` (cleared only by a successful write) and counts toward the
+        loop breaker. A copy that differs while its recorded hash is outdated or unknown (the
+        source changed too, or a cold start read it without our marker) is left to the planner
+        (an ordinary update). A hold that has ended turns the copy into one to revert, without
+        reading it. Returns whether any cached object changed.
+        """
+        changed = foreign = adopted = unrenderable = restored = 0
+        now = self._clock()
+        for oid, have in actual.items():
+            obj = cache.objects[have.href]
+            if oid in protected:
+                continue  # no trustworthy source version now: judge it once it is readable again
+            if obj.hold_until is not None and now >= obj.hold_until:
+                # The hold ended. The copy was recorded as current while the target kept its own
+                # version: treat it as an edit to revert, so the source version is written back
+                # (counted as one revert; revert_times was emptied when the hold started).
+                obj = replace(obj, content_hash=None, hold_until=None, reverting=True)
+                cache.objects[have.href] = obj
+                changed += 1
+                if obj.verify_digest is None:
+                    restored += 1  # with a pending read, the read decides below
+            seen = obj.verify_digest
+            if seen is None:
+                continue
+            changed += 1
+            want = desired.get(oid)
+            # Gone or out of window: the planner decides.
+            expected = None
+            if want is not None and window.intersects(want.span):
+                try:
+                    expected = content_digest(
+                        render(
+                            want.series,
+                            uid=uid_for(oid),
+                            rule_name=rule.name,
+                            content_hash=want.content_hash,
+                            now=now,
+                        )
+                    )
+                except Exception:  # its message may quote event content: count it, never log it
+                    unrenderable += 1
+            if want is None or expected is None:
+                # Unreadable to us: never start rewriting on a parser limitation.
+                cache.objects[have.href] = replace(obj, verify_digest=None)
+            elif seen == expected:
+                adopted += obj.content_hash != want.content_hash
+                # It shows the source version: nothing to revert, and nothing left to hold.
+                cache.objects[have.href] = replace(
+                    obj,
+                    content_hash=want.content_hash,
+                    span=want.span,
+                    verify_digest=None,
+                    reverting=False,
+                    hold_until=None,
+                )
+            elif obj.reverting or obj.content_hash == want.content_hash:
+                # We wrote (or adopted) the source version and the copy shows something else:
+                # edited on the target, whatever its marker says. The planner sees an unknown hash
+                # and plans an update, unless this copy keeps changing after our writes (then it
+                # is held as it is). ``reverting``: edited again before the revert was written.
+                held = obj.hold_until is not None and now < obj.hold_until
+                recent = [t for t in obj.revert_times if t > now - REVERT_WINDOW]
+                if not held and len(recent) >= REVERT_LIMIT:
+                    held = True
+                    obj = replace(obj, revert_times=(), hold_until=now + REVERT_HOLD)
+                    log.warning(
+                        "rule %s: object %s was reverted %d times within %s and changed on the target "
+                        "again; not reverting it until %s; the source version will be written back then",
+                        rule.name,
+                        obj.object_id,
+                        len(recent),
+                        REVERT_WINDOW,
+                        obj.hold_until,
+                    )
+                if held:
+                    cache.objects[have.href] = replace(
+                        obj,
+                        content_hash=want.content_hash,
+                        span=want.span,
+                        verify_digest=None,
+                        reverting=False,
+                    )
+                else:
+                    cache.objects[have.href] = replace(
+                        obj, verify_digest=None, content_hash=None, reverting=True
+                    )
+                    foreign += 1
+            else:
+                # The source changed since we wrote it (or nothing tells what we wrote): an
+                # ordinary update.
+                cache.objects[have.href] = replace(obj, verify_digest=None)
+        if unrenderable:
+            log.warning(
+                "rule %s: %d copy(ies) could not be compared with the source version", rule.name, unrenderable
+            )
+        if adopted:
+            # Counts only. Whether the target keeps the marker is logged by _detect.
+            log.info(
+                "rule %s: %d copy(ies) already show the source version but were recorded with no or "
+                "an outdated hash; recorded as current without rewriting",
+                rule.name,
+                adopted,
+            )
+        if foreign:
+            log.info(
+                "rule %s: %d copy(ies) edited on the target; the source version will be written back",
+                rule.name,
+                foreign,
+            )
+        if restored:
+            log.info(
+                "rule %s: the hold on %d copy(ies) ended; each will be brought back in line with the source",
+                rule.name,
+                restored,
+            )
+        return changed > 0
 
     async def _titles(self, rule: Rule, cal: TargetCalendar, deletes: list[Actual]) -> tuple[list[str], bool]:
         """SUMMARY of each planned delete and whether every one was read; only blocked rules pay."""
@@ -301,28 +492,51 @@ class Engine:
         return listed, len(listed) == len(deletes) and not unreadable
 
     async def _push(
-        self, rule: Rule, cal: TargetCalendar, cache: TargetCache, p: Plan, result: RuleResult
+        self,
+        rule: Rule,
+        cal: TargetCalendar,
+        cache: TargetCache,
+        p: Plan,
+        result: RuleResult,
     ) -> None:
         target = self._targets[rule.target.account]
         tag = rule_tag(rule.name)
         now = self._clock()
 
         def body(want: Desired) -> bytes:
-            return render(
-                want.series,
-                uid=uid_for(want.object_id),
-                rule_name=rule.name,
-                content_hash=want.content_hash,
-                now=now,
-            )
+            try:
+                return render(
+                    want.series,
+                    uid=uid_for(want.object_id),
+                    rule_name=rule.name,
+                    content_hash=want.content_hash,
+                    now=now,
+                )
+            except Exception:
+                # The message may quote event content, and it would reach the log and run history.
+                raise CalsyncError(f"could not render object {want.object_id}") from None
 
         async def current(href: str) -> FetchedObject | None:
             """The resource as it is now; None if it no longer exists."""
             fetched = await target.fetch(cal, [href])
             return fetched[0] if fetched else None
 
-        def remember(href: str, etag: str | None, want: Desired) -> None:
-            cache.objects[href] = CachedObject(etag, tag, want.object_id, want.content_hash, want.span)
+        def remember(href: str, etag: str | None, want: Desired, *, reverted: bool = False) -> None:
+            """After a successful write: nothing pending, nothing left to revert. The loop
+            breaker's record is kept, plus this write if it was a revert."""
+            prior = cache.objects.get(href)
+            times = prior.revert_times if prior else ()
+            if reverted:
+                times = (*(t for t in times if t > now - REVERT_WINDOW), now)
+            cache.objects[href] = CachedObject(
+                etag,
+                tag,
+                want.object_id,
+                want.content_hash,
+                want.span,
+                revert_times=times,
+                hold_until=prior.hold_until if prior else None,
+            )
 
         # Strict servers answer 412 to If-Match (even "*") for a missing resource, so
         # every conflict re-reads the resource before deciding how to retry once.
@@ -347,6 +561,8 @@ class Engine:
             result.created += 1
 
         async def update(want: Desired, have: Actual) -> None:
+            prior = cache.objects.get(have.href)
+            reverting = prior is not None and prior.reverting  # may be from an earlier cycle
             data = body(want)
             try:
                 etag = await target.update(have.href, have.etag, data)
@@ -356,8 +572,9 @@ class Engine:
                     etag = await target.create(have.href, data)
                 else:
                     etag = await target.update(have.href, found.etag, data)
-            remember(have.href, etag, want)
+            remember(have.href, etag, want, reverted=reverting)
             result.updated += 1
+            result.reverted += reverting
 
         async def delete(have: Actual) -> None:
             try:

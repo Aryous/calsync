@@ -212,6 +212,24 @@ def test_print_cycle_shows_protected_and_degraded_only_when_nonzero() -> None:
     assert lines[2] == "requests=3"
 
 
+def test_print_cycle_shows_out_of_window_only_when_nonzero() -> None:
+    from calsync.engine import RuleResult
+
+    text = _printed(_cycle(RuleResult("a", created=1), RuleResult("b", created=1, out_of_window=1)))
+    lines = text.splitlines()
+    assert lines[0] == "rule=a status=ok created=1 updated=0 deleted=0 failed=0"
+    assert lines[1] == "rule=b status=ok created=1 updated=0 deleted=0 failed=0 out_of_window=1"
+
+
+def test_print_cycle_shows_reverted_only_when_nonzero() -> None:
+    from calsync.engine import RuleResult
+
+    text = _printed(_cycle(RuleResult("a", updated=1), RuleResult("b", updated=2, reverted=1)))
+    lines = text.splitlines()
+    assert lines[0] == "rule=a status=ok created=0 updated=1 deleted=0 failed=0"
+    assert lines[1] == "rule=b status=ok created=0 updated=2 deleted=0 failed=0 reverted=1"
+
+
 def test_print_cycle_blocked_lists_titles_and_hint() -> None:
     from calsync.engine import RuleResult
 

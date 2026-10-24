@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from icalendar import Calendar
 
 from calsync.engine import apply_target_delta
 from calsync.naming import parse_resource_name
@@ -8,7 +9,7 @@ from calsync.render import inspect
 from calsync.targets.base import CachedObject, TargetCache, TargetDelta
 from tests.factories import google_event
 from tests.fakes.google import FakeGoogle
-from tests.harness import GCAL, Harness, build, config_for, rule
+from tests.harness import GCAL, Harness, build, build_fake, config_for, rule
 
 pytestmark = pytest.mark.anyio
 
@@ -38,7 +39,7 @@ def seeded() -> FakeGoogle:
         ),
     )
     fake.put_event(
-        GCAL, google_event("checkup", "Checkup", "2026-10-28T10:00:00+08:00", "2026-10-28T11:00:00+08:00")
+        GCAL, google_event("planning", "Planning", "2026-10-28T10:00:00+08:00", "2026-10-28T11:00:00+08:00")
     )
     return fake
 
@@ -63,6 +64,27 @@ def test_apply_target_delta() -> None:
     assert cache.objects["/b"].etag == '"e2"' and "/d" not in cache.objects
     full = apply_target_delta(cache, TargetDelta({"/a": '"e1"'}, (), True, "c2"))
     assert full == [] and list(cache.objects) == ["/a"]
+
+
+def far_past() -> FakeGoogle:
+    fake = FakeGoogle()
+    fake.add_calendar(GCAL, "Family")
+    fake.put_event(GCAL, google_event("old", "Old", "2026-01-05T09:00:00+08:00", "2026-01-05T09:30:00+08:00"))
+    fake.put_event(GCAL, google_event("new", "New", "2026-10-25T09:00:00+08:00", "2026-10-25T09:30:00+08:00"))
+    return fake
+
+
+async def test_no_window_syncs_everything(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, far_past(), config_for([rule()]))
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.created == 2 and res.out_of_window == 0
+
+
+async def test_window_skips_and_counts(tmp_path: Path) -> None:
+    cfg = config_for([rule(window={"past": "7d", "future": "180d"})])
+    h = build_fake(tmp_path, far_past(), cfg)
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.created == 1 and res.out_of_window == 1
 
 
 # ----- against Radicale -----------------------------------------------------
@@ -112,13 +134,15 @@ async def test_update_delete_and_foreign_untouched(tmp_path: Path, radicale_url:
 
     fake.put_event(
         GCAL,
-        google_event("checkup", "Checkup (moved)", "2026-10-29T10:00:00+08:00", "2026-10-29T11:00:00+08:00"),
+        google_event(
+            "planning", "Planning (moved)", "2026-10-29T10:00:00+08:00", "2026-10-29T11:00:00+08:00"
+        ),
     )
     res = (await h.engine.cycle()).rules["family"]
     assert (res.created, res.updated, res.deleted) == (0, 1, 0)
-    assert any(b"Checkup (moved)" in b for b in (await managed(h)).values())
+    assert any(b"Planning (moved)" in b for b in (await managed(h)).values())
 
-    fake.cancel_event(GCAL, "checkup")
+    fake.cancel_event(GCAL, "planning")
     res = (await h.engine.cycle()).rules["family"]
     assert (res.created, res.updated, res.deleted) == (0, 0, 1)
     listing = await h.target.changes(cal, None)
@@ -211,3 +235,42 @@ async def test_two_rules_share_one_target_calendar(tmp_path: Path, radicale_url:
     assert result.rules["work"].deleted == 1 and result.rules["family"].plan.empty
     titles = [inspect(b) for b in (await managed(h)).values()]
     assert len(titles) == 2 and {t.rule for t in titles if t} == {"family"}
+
+
+def with_attendees() -> FakeGoogle:
+    fake = FakeGoogle()
+    fake.add_calendar(GCAL, "Family")
+    fake.put_event(
+        GCAL,
+        google_event(
+            "m1",
+            "Visit",
+            "2026-10-28T10:00:00+08:00",
+            "2026-10-28T10:30:00+08:00",
+            attendees=[{"email": "alice@example.com", "displayName": "Alice"}],
+            hangoutLink="https://meet.example.com/abc",
+        ),
+    )
+    return fake
+
+
+async def test_default_fields_write_notes_not_invitations(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, with_attendees(), config_for([rule()]))
+    await h.engine.cycle()
+    [body] = h.target.managed(h.target.calendars["Family"]).values()
+    text = body.decode()
+    assert "Attendees: Alice <alice@example.com>" in text.replace("\r\n ", "")
+    assert "URL:https://meet.example.com/abc" in text
+    assert "ATTENDEE" not in text
+
+
+async def test_busy_rule_hides_content(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, with_attendees(), config_for([rule(fields={"content": "busy"})]))
+    await h.engine.cycle()
+    [body] = h.target.managed(h.target.calendars["Family"]).values()
+    [event] = Calendar.from_ical(body).walk("VEVENT")
+    assert event["summary"] == "Busy"
+    # The alarm stays (its own DESCRIPTION is the title, "Busy"); the event carries no content.
+    assert event.walk("VALARM")
+    assert "description" not in event and "location" not in event and "url" not in event
+    assert b"Visit" not in body and b"alice@example.com" not in body and b"meet.example.com" not in body

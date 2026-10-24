@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
-from calsync.config import CredentialRef, default_config_path, load_config, parse_config
+from calsync.config import CredentialRef, WindowSpec, default_config_path, load_config, parse_config
 from calsync.durations import parse_duration
 from calsync.errors import ConfigError
+from calsync.model import FieldPolicy
 
 VALID = {
     "google": {"client_secret_file": "google-client.json"},
@@ -57,8 +58,32 @@ def test_parse_valid_config(tmp_path: Path) -> None:
     (rule,) = cfg.rules
     assert rule.target.create_if_missing is True
     assert rule.alarms == (timedelta(minutes=-5), timedelta(0))
+    assert rule.window is not None
     assert rule.window.future == timedelta(days=180)
     assert rule.delete_guard.max_count == 10
+
+
+def test_window_is_optional(tmp_path: Path) -> None:
+    data = copy.deepcopy(VALID)
+    del data["rules"][0]["window"]
+    cfg = parse_config(data, tmp_path)
+    assert cfg.rules[0].window is None
+
+
+def test_window_given_is_kept(tmp_path: Path) -> None:
+    cfg = parse_config(copy.deepcopy(VALID), tmp_path)
+    assert cfg.rules[0].window == WindowSpec(timedelta(days=7), timedelta(days=180))
+
+
+def test_bad_window_still_reports_later_rule_problems(tmp_path: Path) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["window"] = {"past": "soon"}
+    data["rules"][0]["alarms"] = 5
+    with pytest.raises(ConfigError) as info:
+        parse_config(data, tmp_path)
+    text = "\n".join(info.value.problems)
+    assert "rules[family].window.past" in text
+    assert "rules[family].alarms" in text
 
 
 def test_collects_all_problems(tmp_path: Path) -> None:
@@ -226,3 +251,61 @@ def test_icloud_server_alias_is_accepted(tmp_path: Path) -> None:
     data["accounts"]["i"]["server_url"] = "icloud.com"
     with pytest.raises(ConfigError, match="server_url"):
         parse_config(data, base_dir=tmp_path)
+
+
+def test_fields_default(tmp_path: Path) -> None:
+    assert parse_config(copy.deepcopy(VALID), tmp_path).rules[0].fields == FieldPolicy()
+
+
+def test_fields_parsed(tmp_path: Path) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["fields"] = {"attendees": "none", "conference": "none", "content": "busy"}
+    assert parse_config(data, tmp_path).rules[0].fields == FieldPolicy("none", "none", "busy")
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected"),
+    [
+        ({"attendees": "invite"}, 'rules[family].fields.attendees: expected one of "none", "notes"'),
+        ({"conference": True}, 'rules[family].fields.conference: expected one of "copy", "none"'),
+        ({"content": "hidden"}, 'rules[family].fields.content: expected one of "full", "busy"'),
+        ({"colour": "red"}, "rules[family].fields.colour: unknown setting"),
+        ("busy", "rules[family].fields: must be a table"),
+    ],
+)
+def test_fields_rejected(tmp_path: Path, fields: object, expected: str) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["fields"] = fields
+    with pytest.raises(ConfigError) as info:
+        parse_config(data, tmp_path)
+    assert expected in info.value.problems
+
+
+def test_bad_fields_reported_with_other_problems_of_the_rule(tmp_path: Path) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["fields"] = {"content": "hidden"}
+    data["rules"][0]["delete_guard"] = {"max_count": -1}
+    with pytest.raises(ConfigError) as info:
+        parse_config(data, tmp_path)
+    text = "\n".join(info.value.problems)
+    assert "rules[family].fields.content" in text
+    assert "rules[family].delete_guard.max_count" in text
+
+
+def test_on_target_edit_default_and_rejects_others(tmp_path: Path) -> None:
+    assert parse_config(copy.deepcopy(VALID), tmp_path).rules[0].on_target_edit == "revert"
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["on_target_edit"] = "keep"
+    with pytest.raises(ConfigError) as err:
+        parse_config(data, tmp_path)
+    assert 'rules[family].on_target_edit: only "revert" is supported' in err.value.problems
+
+
+def test_bad_on_target_edit_reported_with_other_problems_of_the_rule(tmp_path: Path) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["on_target_edit"] = "keep"
+    data["rules"][0]["fields"] = {"content": "hidden"}
+    with pytest.raises(ConfigError) as err:
+        parse_config(data, tmp_path)
+    text = "\n".join(err.value.problems)
+    assert "rules[family].on_target_edit" in text and "rules[family].fields.content" in text

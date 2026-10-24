@@ -18,13 +18,17 @@ from dateutil.rrule import rrulestr
 
 # Bump whenever render.py changes the bytes it produces: every managed
 # resource is then rewritten once on the next cycle.
-RENDER_VERSION = 1
+RENDER_VERSION = 2
 
 MAX_TIME = datetime(9999, 12, 31, tzinfo=UTC)
 # Beyond this many occurrences the series is treated as unbounded (safe direction: never mistaken for finished).
 SPAN_EXPANSION_LIMIT = 10_000
 
 AlarmPolicy = Literal["copy", "strip"] | tuple[timedelta, ...]
+AttendeeMode = Literal["none", "notes"]
+ConferenceMode = Literal["copy", "none"]
+ContentMode = Literal["full", "busy"]
+BUSY_TITLE = "Busy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +64,12 @@ class Alarm:
 
 
 @dataclass(frozen=True, slots=True)
+class Attendee:
+    name: str
+    email: str
+
+
+@dataclass(frozen=True, slots=True)
 class Occurrence:
     """One modified instance of a recurring series.
 
@@ -74,6 +84,8 @@ class Occurrence:
     description: str
     location: str
     alarms: tuple[Alarm, ...]
+    attendees: tuple[Attendee, ...] = ()
+    conference_url: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +100,8 @@ class Series:
     exdates: tuple[When, ...] = ()
     overrides: tuple[Occurrence, ...] = ()
     alarms: tuple[Alarm, ...] = ()
+    attendees: tuple[Attendee, ...] = ()
+    conference_url: str = ""
     transparent: bool = False
     # False: some instance failed to parse and was left out ("degraded"). An existing
     # target copy of a degraded series is kept as is; a missing one is created anyway.
@@ -103,6 +117,11 @@ class Window:
     def around(cls, now: datetime, past: timedelta, future: timedelta) -> "Window":
         return cls(now - past, now + future)
 
+    @classmethod
+    def everything(cls) -> "Window":
+        """All of time: every span intersects it (full sync)."""
+        return cls(datetime(1, 1, 1, tzinfo=UTC), MAX_TIME)
+
     def intersects(self, span: tuple[datetime, datetime]) -> bool:
         lo, hi = span
         return lo < self.end and hi > self.start
@@ -112,6 +131,44 @@ def _alarm_key(alarm: Alarm) -> timedelta:
     return alarm.offset
 
 
+def _when_order(when: When) -> tuple[datetime, str, bool, str]:
+    """Total order on ``When``: the instant first, then what tells equal instants apart.
+
+    Sorting a ``set`` by the instant alone would leave ties in hash-seed order, and the
+    result feeds ``series_hash``."""
+    return (when.utc(), when.tzid or "", when.all_day, when.value.isoformat())
+
+
+def _occurrence_order(occ: Occurrence) -> tuple[tuple[datetime, str, bool, str], str]:
+    return (_when_order(occ.original_start), json.dumps(_canon(occ), ensure_ascii=False, sort_keys=True))
+
+
+def _attendee_preference(a: Attendee) -> tuple[bool, str, str]:
+    # Lower is better: a named entry first, then the smallest (name, email).
+    return (not a.name, a.name, a.email)
+
+
+def _normalize_attendees(attendees: tuple[Attendee, ...]) -> tuple[Attendee, ...]:
+    """Trimmed, blank-free, deduplicated (emails case-insensitively) and totally ordered.
+
+    The result must not depend on input order or on ``PYTHONHASHSEED``: it feeds ``series_hash``.
+    """
+    by_email: dict[str, Attendee] = {}
+    by_name: dict[str, Attendee] = {}
+    for a in attendees:
+        cleaned = Attendee(a.name.strip(), a.email.strip())
+        if cleaned.email:
+            key = cleaned.email.lower()
+            kept = by_email.get(key)
+            if kept is None or _attendee_preference(cleaned) < _attendee_preference(kept):
+                by_email[key] = cleaned
+        elif cleaned.name:
+            by_name.setdefault(cleaned.name, cleaned)
+    return tuple(
+        sorted([*by_email.values(), *by_name.values()], key=lambda a: (a.email.lower(), a.email, a.name))
+    )
+
+
 def _normalize_occurrence(occ: Occurrence) -> Occurrence:
     return replace(
         occ,
@@ -119,6 +176,8 @@ def _normalize_occurrence(occ: Occurrence) -> Occurrence:
         description=occ.description.strip(),
         location=occ.location.strip(),
         alarms=tuple(sorted(set(occ.alarms), key=_alarm_key)),
+        attendees=_normalize_attendees(occ.attendees),
+        conference_url=occ.conference_url.strip(),
     )
 
 
@@ -130,14 +189,11 @@ def normalize_series(series: Series) -> Series:
         description=series.description.strip(),
         location=series.location.strip(),
         recurrence=tuple(line.strip() for line in series.recurrence),
-        exdates=tuple(sorted(set(series.exdates), key=When.utc)),
-        overrides=tuple(
-            sorted(
-                (_normalize_occurrence(o) for o in series.overrides),
-                key=lambda o: o.original_start.utc(),
-            )
-        ),
+        exdates=tuple(sorted(set(series.exdates), key=_when_order)),
+        overrides=tuple(sorted((_normalize_occurrence(o) for o in series.overrides), key=_occurrence_order)),
         alarms=tuple(sorted(set(series.alarms), key=_alarm_key)),
+        attendees=_normalize_attendees(series.attendees),
+        conference_url=series.conference_url.strip(),
     )
 
 
@@ -174,6 +230,60 @@ def apply_alarm_policy(series: Series, policy: AlarmPolicy) -> Series:
         series,
         alarms=alarms,
         overrides=tuple(replace(o, alarms=alarms) for o in series.overrides),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FieldPolicy:
+    attendees: AttendeeMode = "notes"
+    conference: ConferenceMode = "copy"
+    content: ContentMode = "full"
+
+
+def _attendee_label(a: Attendee) -> str:
+    return f"{a.name} <{a.email}>" if a.name and a.email else a.name or a.email
+
+
+def _notes(description: str, attendees: tuple[Attendee, ...], url: str, policy: FieldPolicy) -> str:
+    blocks = [description.strip()] if description.strip() else []
+    if policy.attendees == "notes" and attendees:
+        blocks.append("Attendees: " + ", ".join(_attendee_label(a) for a in attendees))
+    if policy.conference == "copy" and url:
+        blocks.append("Conference: " + url)
+    return "\n\n".join(blocks)
+
+
+def apply_field_policy(series: Series, policy: FieldPolicy) -> Series:
+    """Shape what reaches the target. Attendees never stay structured: they are
+    either written into the notes or dropped, so no server can invite anyone."""
+    if policy.content == "busy":
+        return replace(
+            series,
+            title=BUSY_TITLE,
+            description="",
+            location="",
+            attendees=(),
+            conference_url="",
+            overrides=tuple(
+                replace(o, title=BUSY_TITLE, description="", location="", attendees=(), conference_url="")
+                for o in series.overrides
+            ),
+        )
+    keep_url = policy.conference == "copy"
+    return replace(
+        series,
+        description=_notes(series.description, series.attendees, series.conference_url, policy),
+        attendees=(),
+        conference_url=series.conference_url if keep_url else "",
+        overrides=tuple(
+            replace(
+                o,
+                description=_notes(o.description, o.attendees, o.conference_url, policy),
+                attendees=(),
+                conference_url=o.conference_url if keep_url else "",
+            )
+            for o in series.overrides
+        ),
     )
 
 

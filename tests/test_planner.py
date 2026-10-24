@@ -55,6 +55,15 @@ def test_desired_outside_window_is_ignored_or_removed() -> None:
     assert [a.object_id for a in moved.delete] == ["f"]
 
 
+def test_out_of_window_desired_are_counted() -> None:
+    window = Window(datetime(2026, 10, 1, tzinfo=UTC), datetime(2026, 11, 1, tzinfo=UTC))
+    inside = want("in", span=(datetime(2026, 10, 5, tzinfo=UTC), datetime(2026, 10, 6, tzinfo=UTC)))
+    outside = want("old", span=(datetime(2026, 1, 5, tzinfo=UTC), datetime(2026, 1, 6, tzinfo=UTC)))
+    p = plan({d.object_id: d for d in (inside, outside)}, {}, window)
+    assert [d.object_id for d in p.create] == ["in"]
+    assert p.out_of_window == 1
+
+
 def test_delete_guard() -> None:
     guard = DeleteGuard(max_ratio=0.5, max_count=10)
     many = Plan(delete=[have(str(i)) for i in range(11)])

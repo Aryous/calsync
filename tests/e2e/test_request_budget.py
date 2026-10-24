@@ -120,3 +120,19 @@ async def test_k_changes_cost_k_writes(tmp_path: Path, radicale_url: str, dav_us
     assert result.rules["family"].updated == 3
     kinds = Counter(e.kind for e in h.log.since(mark))
     assert kinds == Counter({"google-calendarlist": 1, "google-events": 1, "sync-collection": 1, "put": 3})
+
+
+async def test_cycle_after_revert_is_idle(tmp_path: Path, radicale_url: str, dav_user: str) -> None:
+    h = build(tmp_path, radicale_url, dav_user, fake_with_two_calendars(), config_for([rule("family")]))
+    await h.engine.cycle()
+    cal = await h.target.ensure_calendar("Family", create=False)
+    hrefs = sorted(h.store.load_target_cache("dav", cal.href).objects)
+    [obj] = await h.target.fetch(cal, hrefs[:1])
+    await h.target.update(obj.href, obj.etag, obj.data.replace(b"SUMMARY:F", b"SUMMARY:Edited F"))
+    revert = (await h.engine.cycle()).rules["family"]
+    assert revert.reverted == 1
+    mark = h.log.mark()
+    await h.engine.cycle()
+    assert Counter(e.kind for e in h.log.since(mark)) == Counter(
+        {"google-calendarlist": 1, "google-events": 1, "sync-collection": 1}
+    )

@@ -37,6 +37,16 @@ class CachedObject:
     object_id: str
     content_hash: str | None
     span: tuple[datetime, datetime] | None
+    # content_digest of a body read from the target that its rule has not classified yet
+    # (None: nothing pending, or the body could not be digested). Persisted, so an edit read by
+    # detection survives a cycle in which its rule does not run, fails, or the process stops.
+    verify_digest: str | None = None
+    # Classified as edited on the target; the source version has not been written back yet.
+    reverting: bool = False
+    # Rewrite-loop breaker (see engine.REVERT_LIMIT): when recent reverts of this copy were
+    # written, and until when further target edits to it are adopted instead of reverted.
+    revert_times: tuple[datetime, ...] = ()
+    hold_until: datetime | None = None
 
 
 @dataclass(slots=True)

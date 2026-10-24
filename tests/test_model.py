@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 import time
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -9,10 +12,14 @@ from calsync.model import (
     MAX_TIME,
     SPAN_EXPANSION_LIMIT,
     Alarm,
+    Attendee,
+    FieldPolicy,
     Occurrence,
+    Series,
     When,
     Window,
     apply_alarm_policy,
+    apply_field_policy,
     compute_span,
     series_hash,
     series_span,
@@ -89,6 +96,12 @@ def test_window_intersects() -> None:
     assert w.intersects((now - timedelta(days=30), now - timedelta(days=1)))
     assert not w.intersects((now - timedelta(days=30), now - timedelta(days=8)))
     assert not w.intersects((now + timedelta(days=181), now + timedelta(days=182)))
+
+
+def test_window_everything_intersects_any_span() -> None:
+    w = Window.everything()
+    assert w.intersects((datetime(1970, 1, 1, tzinfo=UTC), datetime(1970, 1, 2, tzinfo=UTC)))
+    assert w.intersects((datetime(2026, 10, 1, tzinfo=UTC), MAX_TIME))
 
 
 def test_hash_is_stable_under_normalization() -> None:
@@ -183,3 +196,178 @@ def test_span_count_reaching_year_9999_is_unbounded() -> None:
         recurrence=("RRULE:FREQ=YEARLY;COUNT=9000",),
     )
     assert series_span(s)[1] == MAX_TIME
+
+
+def test_attendees_are_normalized_and_hashed() -> None:
+    a = replace(
+        series(), attendees=(Attendee("Bob", "bob@example.com"), Attendee("Alice", "alice@example.com"))
+    )
+    b = replace(
+        series(), attendees=(Attendee("Alice", "alice@example.com"), Attendee("Bob", "bob@example.com"))
+    )
+    assert series_hash(a) == series_hash(b)
+    assert series_hash(a) != series_hash(series())
+    assert series_hash(replace(series(), conference_url="https://meet.example.com/a")) != series_hash(
+        series()
+    )
+
+
+def test_attendee_order_and_case_do_not_change_the_hash() -> None:
+    a = replace(
+        series(),
+        attendees=(
+            Attendee("A", "Bob@example.com"),
+            Attendee("Alice", "alice@example.com"),
+            Attendee("A", "bob@example.com"),
+        ),
+    )
+    b = replace(
+        series(),
+        attendees=(
+            Attendee("A", "bob@example.com"),
+            Attendee("Alice", "alice@example.com"),
+            Attendee("A", "Bob@example.com"),
+        ),
+    )
+    # Case-insensitive duplicates collapse to one entry, chosen deterministically.
+    assert model.normalize_series(a).attendees == (
+        Attendee("Alice", "alice@example.com"),
+        Attendee("A", "Bob@example.com"),
+    )
+    assert model.normalize_series(b).attendees == model.normalize_series(a).attendees
+    assert series_hash(a) == series_hash(b)
+
+
+def test_named_attendee_wins_over_unnamed_with_same_email() -> None:
+    s = replace(
+        series(),
+        attendees=(
+            Attendee("", "carol@example.com"),
+            Attendee(" Carol ", "Carol@example.com "),
+            Attendee("Dan", ""),
+            Attendee(" Dan", ""),
+        ),
+    )
+    assert model.normalize_series(s).attendees == (
+        Attendee("Dan", ""),
+        Attendee("Carol", "Carol@example.com"),
+    )
+
+
+def test_blank_attendees_are_dropped() -> None:
+    s = replace(series(), attendees=(Attendee("   ", ""), Attendee("", " "), Attendee("Eve", "")))
+    assert model.normalize_series(s).attendees == (Attendee("Eve", ""),)
+
+
+def test_attendee_normalization_does_not_depend_on_hash_seed() -> None:
+    script = (
+        "from calsync.model import Attendee, _normalize_attendees as n\n"
+        "print(n((Attendee('A', 'Bob@example.com'), Attendee('A', 'bob@example.com'),"
+        " Attendee('B', 'x@example.com'), Attendee('B', 'X@example.com'))))\n"
+    )
+    outputs = {
+        subprocess.run(
+            [sys.executable, "-c", script],
+            env={**os.environ, "PYTHONHASHSEED": str(seed)},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for seed in range(6)
+    }
+    assert len(outputs) == 1
+
+
+def test_exdate_order_does_not_depend_on_hash_seed() -> None:
+    """Two EXDATEs for the same instant in different zones tie on the instant; the hash must
+    still be the same in every process."""
+    script = (
+        "from datetime import UTC, datetime\n"
+        "from zoneinfo import ZoneInfo\n"
+        "from calsync.model import When, series_hash\n"
+        "from tests.factories import series\n"
+        "a = When(datetime(2026, 10, 30, 9, 30, tzinfo=ZoneInfo('Asia/Shanghai')), 'Asia/Shanghai')\n"
+        "b = When(datetime(2026, 10, 30, 1, 30, tzinfo=UTC), 'UTC')\n"
+        "c = When(datetime(2026, 10, 30, 1, 30, tzinfo=ZoneInfo('Europe/London')), 'Europe/London')\n"
+        "print(series_hash(series(recurrence=('RRULE:FREQ=DAILY;COUNT=10',), exdates=(a, b, c))))\n"
+    )
+    outputs = {
+        subprocess.run(
+            [sys.executable, "-c", script],
+            env={**os.environ, "PYTHONHASHSEED": str(seed)},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for seed in range(8)
+    }
+    assert len(outputs) == 1
+
+
+def test_override_order_with_tied_instants_does_not_change_the_hash() -> None:
+    def occ(original: When) -> Occurrence:
+        return Occurrence(original, at(2026, 10, 30, 10, 0), at(2026, 10, 30, 10, 5), "Moved", "", "", ())
+
+    local = at(2026, 10, 30, 9, 30)
+    utc = When(local.value.astimezone(UTC), "UTC")
+    one = series(recurrence=("RRULE:FREQ=DAILY;COUNT=10",), overrides=(occ(local), occ(utc)))
+    two = replace(one, overrides=(occ(utc), occ(local)))
+    assert series_hash(one) == series_hash(two)
+
+
+ALICE = Attendee("Alice", "alice@example.com")
+BOB = Attendee("", "bob@example.com")
+
+
+def rich() -> Series:
+    occ = Occurrence(
+        original_start=at(2026, 10, 30, 9, 30),
+        start=at(2026, 10, 30, 10, 0),
+        end=at(2026, 10, 30, 10, 5),
+        title="Standup moved",
+        description="",
+        location="Room B",
+        alarms=(),
+        attendees=(BOB,),
+        conference_url="",
+    )
+    return replace(
+        series(recurrence=("RRULE:FREQ=DAILY;COUNT=10",), overrides=(occ,)),
+        description="Agenda",
+        location="Room A",
+        attendees=(ALICE, BOB),
+        conference_url="https://meet.example.com/abc",
+    )
+
+
+def test_notes_and_copy_by_default() -> None:
+    s = apply_field_policy(rich(), FieldPolicy())
+    assert s.description == (
+        "Agenda\n\nAttendees: Alice <alice@example.com>, bob@example.com\n\n"
+        "Conference: https://meet.example.com/abc"
+    )
+    assert s.attendees == () and s.conference_url == "https://meet.example.com/abc"
+    assert s.overrides[0].description == "Attendees: bob@example.com"
+    assert s.overrides[0].attendees == ()
+
+
+def test_none_drops_attendees_and_conference() -> None:
+    s = apply_field_policy(rich(), FieldPolicy(attendees="none", conference="none"))
+    assert s.description == "Agenda"
+    assert s.attendees == () and s.conference_url == ""
+
+
+def test_busy_hides_content_but_keeps_time_and_alarms() -> None:
+    original = rich()
+    s = apply_field_policy(original, FieldPolicy(content="busy"))
+    assert (s.title, s.description, s.location, s.conference_url) == ("Busy", "", "", "")
+    assert s.start == original.start and s.alarms == original.alarms
+    occ = s.overrides[0]
+    assert (occ.title, occ.description, occ.location) == ("Busy", "", "")
+    assert occ.start == original.overrides[0].start
+
+
+def test_policy_changes_the_hash() -> None:
+    assert series_hash(apply_field_policy(rich(), FieldPolicy())) != series_hash(
+        apply_field_policy(rich(), FieldPolicy(attendees="none"))
+    )

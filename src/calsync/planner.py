@@ -34,6 +34,7 @@ class Plan:
     create: list[Desired] = field(default_factory=list)
     update: list[tuple[Desired, Actual]] = field(default_factory=list)
     delete: list[Actual] = field(default_factory=list)
+    out_of_window: int = 0  # desired series skipped because they fall outside the window
 
     @property
     def empty(self) -> bool:
@@ -55,6 +56,7 @@ def plan(
     result = Plan()
     for oid, want in desired.items():
         if not window.intersects(want.span):
+            result.out_of_window += 1
             continue
         have = actual.get(oid)
         if have is None:

@@ -1,10 +1,13 @@
+import re
+from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from calsync.model import Alarm, Occurrence, series_hash, series_span
+from calsync.model import Alarm, Attendee, Occurrence, Series, series_hash, series_span
 from calsync.naming import object_id, parse_resource_name, resource_name, rule_tag, uid_for
-from calsync.render import inspect, render
+from calsync.render import content_digest, inspect, render
 from tests.factories import at, day, series
 
 NOW = datetime(2026, 10, 24, tzinfo=UTC)
@@ -144,3 +147,174 @@ def test_inspect_never_raises_from_the_parser(monkeypatch: pytest.MonkeyPatch, e
 
     monkeypatch.setattr(render_mod.Calendar, "from_ical", staticmethod(broken))
     assert inspect(_body("DTSTART:20261025T010000Z")) is None
+
+
+def test_url_is_rendered_and_attendees_never_are() -> None:
+    s = replace(
+        series(),
+        conference_url="https://meet.example.com/abc",
+        attendees=(Attendee("Alice", "alice@example.com"),),
+    )
+    data = render(s, uid="u@calsync", rule_name="r", content_hash="h", now=NOW)
+    assert b"URL:https://meet.example.com/abc" in data
+    assert b"ATTENDEE" not in data and b"ORGANIZER" not in data
+
+
+def body(s: Series, *, now: datetime = NOW, content_hash: str = "h") -> bytes:
+    return render(s, uid="u@calsync", rule_name="r", content_hash=content_hash, now=now)
+
+
+def daily() -> Series:
+    occ = Occurrence(
+        original_start=at(2026, 10, 25, 9, 30),
+        start=at(2026, 10, 25, 8, 0),
+        end=at(2026, 10, 25, 8, 5),
+        title="Item 1/4",
+        description="",
+        location="",
+        alarms=(Alarm(timedelta(0)),),
+    )
+    return replace(series(recurrence=("RRULE:FREQ=DAILY;COUNT=21",), overrides=(occ,)), description="Note")
+
+
+def test_digest_ignores_stamp_marker_and_property_order() -> None:
+    a = body(daily())
+    b = body(daily(), now=NOW + timedelta(days=3), content_hash="other")
+    assert content_digest(a) == content_digest(b) is not None
+
+
+def test_digest_ignores_server_and_phone_additions() -> None:
+    original = body(daily())
+    noisy = original.replace(
+        b"BEGIN:VALARM\r\n",
+        b"BEGIN:VALARM\r\nACKNOWLEDGED:20261025T000500Z\r\nX-WR-ALARMUID:abc\r\nUID:abc\r\n",
+    ).replace(
+        b"END:VEVENT\r\n",
+        b"SEQUENCE:3\r\nCREATED:20261024T000000Z\r\nLAST-MODIFIED:20261024T000000Z\r\n"
+        b"X-APPLE-TRAVEL-ADVISORY-BEHAVIOR:AUTOMATIC\r\n"
+        b"BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:Reminder\r\n"
+        b"TRIGGER;VALUE=DATE-TIME:20261025T001500Z\r\nRELATED-TO:abc\r\nEND:VALARM\r\n"
+        b"BEGIN:VALARM\r\nACTION:NONE\r\nTRIGGER;VALUE=DATE-TIME:19760401T005545Z\r\n"
+        b"X-APPLE-DEFAULT-ALARM:TRUE\r\nEND:VALARM\r\n"
+        b"END:VEVENT\r\n",
+    )
+    assert noisy != original
+    assert content_digest(noisy) == content_digest(original) is not None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda s: replace(s, title="Other"),
+        lambda s: replace(s, start=at(2026, 10, 23, 10, 0), end=at(2026, 10, 23, 10, 5)),
+        lambda s: replace(s, alarms=(Alarm(timedelta(minutes=-5)),)),
+        lambda s: replace(s, alarms=()),
+        lambda s: replace(s, exdates=(at(2026, 10, 27, 9, 30),)),
+        lambda s: replace(s, overrides=(replace(s.overrides[0], start=at(2026, 10, 25, 7, 0)),)),
+        lambda s: replace(s, conference_url="https://meet.example.com/x"),
+        lambda s: replace(s, description="Changed"),
+        lambda s: replace(s, location="Room 2"),
+        lambda s: replace(s, overrides=(replace(s.overrides[0], title="Item 2/4"),)),
+        lambda s: replace(s, overrides=(replace(s.overrides[0], alarms=(Alarm(timedelta(minutes=-10)),)),)),
+        lambda s: replace(s, recurrence=("RRULE:FREQ=DAILY;COUNT=14",)),
+    ],
+)
+def test_digest_sees_what_people_see(change: Callable[[Series], Series]) -> None:
+    changed = content_digest(body(change(daily())))
+    assert changed is not None
+    assert changed != content_digest(body(daily()))
+
+
+def test_digest_sees_alarm_relative_to_end() -> None:
+    original = body(daily())
+    to_end = original.replace(b"TRIGGER:P0D\r\n", b"TRIGGER;RELATED=END:P0D\r\n", 1)
+    assert to_end != original
+    changed = content_digest(to_end)
+    assert changed is not None
+    assert changed != content_digest(original)
+
+
+def test_digest_of_garbage_is_none() -> None:
+    assert content_digest(b"not a calendar") is None
+    assert content_digest(b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n") is None
+
+
+def test_digest_all_day() -> None:
+    a = body(series(start=day(2026, 11, 5)))
+    assert content_digest(a) is not None
+    assert content_digest(a) == content_digest(
+        body(series(start=day(2026, 11, 5)), now=NOW + timedelta(days=1))
+    )
+    assert content_digest(a) != content_digest(body(series(start=day(2026, 11, 6))))
+    midnight = series(start=at(2026, 11, 5, tz="UTC"), minutes=0)
+    assert content_digest(a) != content_digest(body(midnight))
+
+
+def test_digest_duration_equals_dtend() -> None:
+    original = body(series())
+    assert b"DTEND;TZID=Asia/Shanghai:20261023T093500\r\n" in original
+    with_duration = original.replace(b"DTEND;TZID=Asia/Shanghai:20261023T093500\r\n", b"DURATION:PT5M\r\n")
+    assert content_digest(with_duration) == content_digest(original)
+    longer = original.replace(b"DTEND;TZID=Asia/Shanghai:20261023T093500\r\n", b"DURATION:PT10M\r\n")
+    assert content_digest(longer) != content_digest(original)
+
+
+def test_digest_ignores_missing_vtimezone_for_iana_tzid() -> None:
+    original = body(daily())
+    stripped = re.sub(rb"BEGIN:VTIMEZONE\r\n.*?END:VTIMEZONE\r\n", b"", original, flags=re.DOTALL)
+    assert b"VTIMEZONE" not in stripped and b"TZID=Asia/Shanghai" in stripped
+    assert content_digest(stripped) == content_digest(original)
+
+
+@pytest.mark.parametrize("exc", [IndexError("parser bug"), RecursionError(), OverflowError(), TypeError()])
+def test_digest_never_raises_from_the_parser(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
+    from calsync import render as render_mod
+
+    def broken(_: bytes) -> object:
+        raise exc
+
+    monkeypatch.setattr(render_mod.Calendar, "from_ical", staticmethod(broken))
+    assert content_digest(body(daily())) is None
+
+
+def test_digest_of_malformed_event_is_none() -> None:
+    assert content_digest(_body("DTSTART:garbage")) is None
+    assert content_digest(_body("SUMMARY:no start")) is None
+    assert content_digest(_body("DTSTART:99991231T230000Z", "DURATION:PT2H")) is None
+
+
+def test_digest_ignores_zone_label_on_exdate() -> None:
+    original = body(replace(daily(), exdates=(at(2026, 10, 27, 9, 30),)))
+    rewritten = original.replace(b"EXDATE;TZID=Asia/Shanghai:20261027T093000", b"EXDATE:20261027T013000Z")
+    assert rewritten != original
+    assert content_digest(rewritten) == content_digest(original) is not None
+
+
+def test_digest_ignores_zone_label_on_recurrence_id() -> None:
+    original = body(daily())
+    rewritten = original.replace(
+        b"RECURRENCE-ID;TZID=Asia/Shanghai:20261025T093000", b"RECURRENCE-ID:20261025T013000Z"
+    )
+    assert rewritten != original
+    assert content_digest(rewritten) == content_digest(original) is not None
+
+
+def test_digest_ignores_zone_label_on_rdate() -> None:
+    s = series(recurrence=("RRULE:FREQ=DAILY;COUNT=2", "RDATE;TZID=Asia/Shanghai:20261201T093000"))
+    original = body(s)
+    rewritten = original.replace(b"RDATE;TZID=Asia/Shanghai:20261201T093000", b"RDATE:20261201T013000Z")
+    assert rewritten != original
+    assert content_digest(rewritten) == content_digest(original) is not None
+
+
+def test_digest_ignores_event_order_even_with_duplicate_recurrence_ids() -> None:
+    s = daily()
+    a = s.overrides[0]
+    b = replace(a, title="Item 2/4")
+    other = replace(
+        a, original_start=at(2026, 10, 26, 9, 30), start=at(2026, 10, 26, 8, 0), end=at(2026, 10, 26, 8, 5)
+    )
+    first = body(replace(s, overrides=(a, other, b)))
+    second = body(replace(s, overrides=(b, other, a)))
+    assert first != second
+    assert content_digest(first) == content_digest(second) is not None
