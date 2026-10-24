@@ -1190,3 +1190,117 @@ async def test_spaced_phone_edits_are_always_reverted(
             res = await edit_and_cycle(h, clock, timedelta(hours=2.5 * step))
             assert (res.updated, res.reverted) == (1, 1)
     assert breaker_warnings(caplog) == []
+
+
+async def hold_stretch(h: FakeHarness, clock: Clock) -> str:
+    """Three reverts at +1/+2/+3 h, then a fourth differing read at +4 h is held."""
+    href = copy_href(h, "stretch")
+    for hour in (1, 2, 3, 4):
+        await edit_and_cycle(h, clock, timedelta(hours=hour))
+    assert MOVE_TO in h.target.objects[href][1]
+    cached = h.store.load_target_cache("dav", h.target.calendars["Family"].href).objects[href]
+    assert cached.hold_until == NOW + timedelta(hours=4) + calsync.engine.REVERT_HOLD
+    return href
+
+
+async def test_expired_hold_writes_the_source_version_back_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When the hold ends, the copy the target kept is replaced by the source version without
+    another edit on the target and without reading its body again."""
+    clock = Clock()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target, clock=clock)
+    await h.engine.cycle()
+    with caplog.at_level(logging.INFO, logger="calsync.engine"):
+        href = await hold_stretch(h, clock)
+    [line] = breaker_warnings(caplog)
+    assert "written back then" in line
+    clock.now = NOW + timedelta(hours=27)  # still held
+    assert (await h.engine.cycle()).rules["family"].updated == 0
+    assert MOVE_TO in target.objects[href][1]
+    clock.now = NOW + timedelta(hours=30)
+    mark = len(target.calls)
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.updated, res.reverted) == (1, 1)
+    assert writes_since(target, mark) == [("update", href)] and fetched_since(target, mark) == []
+    assert MOVE_FROM in target.objects[href][1]
+    cached = h.store.load_target_cache("dav", target.calendars["Family"].href).objects[href]
+    assert cached.hold_until is None and not cached.reverting and cached.content_hash == want_hash(h)
+    mark = len(target.calls)
+    clock.now = NOW + timedelta(hours=31)
+    assert (await h.engine.cycle()).rules["family"].updated == 0
+    assert writes_since(target, mark) == [] and fetched_since(target, mark) == []
+
+
+async def test_expired_hold_is_written_back_by_a_fresh_process(tmp_path: Path) -> None:
+    clock = Clock()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target, clock=clock)
+    await h.engine.cycle()
+    href = await hold_stretch(h, clock)
+    h.store.close()
+    h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target, clock=clock)
+    clock.now = NOW + timedelta(hours=30)
+    res = (await h2.engine.cycle()).rules["family"]
+    assert (res.updated, res.reverted) == (1, 1)
+    assert MOVE_FROM in target.objects[href][1]
+
+
+async def test_expired_hold_restored_in_a_dry_run_is_written_by_the_next_run(tmp_path: Path) -> None:
+    clock = Clock()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target, clock=clock)
+    await h.engine.cycle()
+    href = await hold_stretch(h, clock)
+    clock.now = NOW + timedelta(hours=30)
+    dry = (await h.engine.cycle(dry_run=True)).rules["family"]
+    assert dry.plan is not None and len(dry.plan.update) == 1
+    assert MOVE_TO in target.objects[href][1]
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.updated, res.reverted) == (1, 1)
+    assert MOVE_FROM in target.objects[href][1]
+
+
+async def test_target_that_keeps_rewriting_after_a_hold_is_held_again(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The write at the end of a hold counts as one revert: it does not start a new hold by
+    itself, and a target that keeps rewriting is held again after the usual three reverts."""
+    clock = Clock()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, simple(), config_for([rule()]), target=target, clock=clock)
+    await h.engine.cycle()
+    with caplog.at_level(logging.INFO, logger="calsync.engine"):
+        href = await hold_stretch(h, clock)
+        clock.now = NOW + timedelta(hours=30)
+        assert (await h.engine.cycle()).rules["family"].reverted == 1  # the hold ends: one revert
+        for hour in (31, 32):
+            res = await edit_and_cycle(h, clock, timedelta(hours=hour))
+            assert (res.updated, res.reverted) == (1, 1)
+        assert len(breaker_warnings(caplog)) == 1
+        res = await edit_and_cycle(h, clock, timedelta(hours=33))
+        assert (res.updated, res.reverted) == (0, 0)
+        assert MOVE_TO in target.objects[href][1]
+        assert len(breaker_warnings(caplog)) == 2
+
+
+async def test_expired_hold_on_a_protected_series_waits(tmp_path: Path) -> None:
+    clock = Clock()
+    fake = simple()
+    target = FakeTarget(mode="sync")
+    h = build_fake(tmp_path, fake, config_for([rule()]), target=target, clock=clock)
+    await h.engine.cycle()
+    href = await hold_stretch(h, clock)
+    good = google_event("stretch", "Stretch", "2026-10-25T08:00:00+08:00", "2026-10-25T08:05:00+08:00")
+    broken = dict(good)
+    del broken["start"]
+    fake.put_event(GCAL, broken)
+    clock.now = NOW + timedelta(hours=30)
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.protected == 1 and res.updated == 0
+    assert MOVE_TO in target.objects[href][1]
+    fake.put_event(GCAL, good)  # readable again: the expired hold is handled now
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.protected, res.updated, res.reverted) == (0, 1, 1)
+    assert MOVE_FROM in target.objects[href][1]

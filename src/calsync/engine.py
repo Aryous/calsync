@@ -338,15 +338,24 @@ class Engine:
         or another marker is left to the planner (an ordinary update). Returns whether any
         cached object changed.
         """
-        changed = foreign = adopted = unrenderable = 0
+        changed = foreign = adopted = unrenderable = restored = 0
         now = self._clock()
         for oid, have in actual.items():
             obj = cache.objects[have.href]
+            if oid in protected:
+                continue  # no trustworthy source version now: judge it once it is readable again
+            if obj.hold_until is not None and now >= obj.hold_until:
+                # The hold ended. The copy was recorded as current while the target kept its own
+                # version: treat it as an edit to revert, so the source version is written back
+                # (counted as one revert; revert_times was emptied when the hold started).
+                obj = replace(obj, content_hash=None, hold_until=None, reverting=True)
+                cache.objects[have.href] = obj
+                changed += 1
+                if obj.verify_digest is None:
+                    restored += 1  # with a pending read, the read decides below
             seen = obj.verify_digest
             if seen is None:
                 continue
-            if oid in protected:
-                continue  # no trustworthy source version now: judge it once it is readable again
             changed += 1
             want = desired.get(oid)
             # Gone or out of window: the planner decides.
@@ -368,9 +377,15 @@ class Engine:
                 # Unreadable to us: never start rewriting on a parser limitation.
                 cache.objects[have.href] = replace(obj, verify_digest=None)
             elif seen == expected:
-                adopted += have.content_hash != want.content_hash
+                adopted += obj.content_hash != want.content_hash
+                # It shows the source version: nothing to revert, and nothing left to hold.
                 cache.objects[have.href] = replace(
-                    obj, content_hash=want.content_hash, span=want.span, verify_digest=None, reverting=False
+                    obj,
+                    content_hash=want.content_hash,
+                    span=want.span,
+                    verify_digest=None,
+                    reverting=False,
+                    hold_until=None,
                 )
             elif have.content_hash == want.content_hash:
                 # Edited on the target, again: the planner sees an unknown hash and plans an update,
@@ -382,7 +397,7 @@ class Engine:
                     obj = replace(obj, revert_times=(), hold_until=now + REVERT_HOLD)
                     log.warning(
                         "rule %s: object %s was reverted %d times within %s and changed on the target "
-                        "again; not reverting it until %s",
+                        "again; not reverting it until %s; the source version will be written back then",
                         rule.name,
                         obj.object_id,
                         len(recent),
@@ -421,6 +436,12 @@ class Engine:
                 "rule %s: %d copy(ies) edited on the target; the source version will be written back",
                 rule.name,
                 foreign,
+            )
+        if restored:
+            log.info(
+                "rule %s: the hold on %d copy(ies) ended; the source version will be written back",
+                rule.name,
+                restored,
             )
         return changed > 0
 
