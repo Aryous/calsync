@@ -117,7 +117,7 @@ def test_all_day_event() -> None:
     raw = {
         "id": "d1",
         "status": "confirmed",
-        "summary": "Checkup",
+        "summary": "Planning",
         "start": {"date": "2026-11-05"},
         "end": {"date": "2026-11-06"},
     }
@@ -245,14 +245,14 @@ def test_instance_without_original_start_degrades_series() -> None:
 
 def test_entry_without_id_logs_no_event_content(caplog: pytest.LogCaptureFixture) -> None:
     raw = [
-        {"summary": "Secret Reminders Title", "description": "Private reminder notes", "location": "Home"},
+        {"summary": "Secret Stretch Title", "description": "Private lantern notes", "location": "Home"},
         {"summary": "Other Secret", "recurringEventId": "master1", "status": "confirmed"},
     ]
     with caplog.at_level(logging.DEBUG, logger="calsync"):
         assert build_series(raw, CalendarMeta()) == []
     assert "without id" in caplog.text
     assert "master1" in caplog.text  # the series it belongs to, if any, is the only detail
-    for secret in ("Secret", "Reminders", "Private", "reminder", "Home"):
+    for secret in ("Secret", "Stretch", "Private", "lantern", "Home"):
         assert secret not in caplog.text
 
 

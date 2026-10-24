@@ -28,10 +28,10 @@ def simple() -> FakeGoogle:
     fake = FakeGoogle()
     fake.add_calendar(GCAL, "Family")
     fake.put_event(
-        GCAL, google_event("checkup", "Checkup", "2026-10-28T10:00:00+08:00", "2026-10-28T11:00:00+08:00")
+        GCAL, google_event("planning", "Planning", "2026-10-28T10:00:00+08:00", "2026-10-28T11:00:00+08:00")
     )
     fake.put_event(
-        GCAL, google_event("pills", "Reminders", "2026-10-25T08:00:00+08:00", "2026-10-25T08:05:00+08:00")
+        GCAL, google_event("stretch", "Stretch", "2026-10-25T08:00:00+08:00", "2026-10-25T08:05:00+08:00")
     )
     return fake
 
@@ -65,7 +65,7 @@ async def test_unparseable_series_keeps_its_target_copy(
     cal = h.target.calendars["Family"]
     before = h.target.managed(cal)
 
-    broken = google_event("pills", "Reminders", "2026-10-25T08:00:00+08:00", "2026-10-25T08:05:00+08:00")
+    broken = google_event("stretch", "Stretch", "2026-10-25T08:00:00+08:00", "2026-10-25T08:05:00+08:00")
     del broken["start"]
     fake.put_event(GCAL, broken)
     with caplog.at_level(logging.WARNING):
@@ -74,7 +74,7 @@ async def test_unparseable_series_keeps_its_target_copy(
     assert res.plan is not None and res.plan.empty
     assert h.target.managed(cal) == before
     warnings = [r.getMessage() for r in caplog.records if "protect" in r.getMessage()]
-    assert len(warnings) == 1 and "pills" in warnings[0] and "Reminders" not in warnings[0]
+    assert len(warnings) == 1 and "stretch" in warnings[0] and "Stretch" not in warnings[0]
     caplog.clear()
     with caplog.at_level(logging.WARNING):
         again = (await h.engine.cycle()).rules["family"]
@@ -161,7 +161,7 @@ async def test_delete_conflict_on_vanished_resource_counts_as_deleted(tmp_path: 
     fake = simple()
     h = build_fake(tmp_path, fake, config_for([rule()]))
     await h.engine.cycle()
-    fake.cancel_event(GCAL, "checkup")
+    fake.cancel_event(GCAL, "planning")
     h.target.before_write = once("delete", lambda href: h.target.objects.pop(href))
     res = (await h.engine.cycle()).rules["family"]
     assert (res.status, res.deleted, res.failed) == ("ok", 1, 0)
@@ -175,13 +175,15 @@ async def test_update_conflict_on_vanished_resource_recreates_it(tmp_path: Path)
     await h.engine.cycle()
     fake.put_event(
         GCAL,
-        google_event("checkup", "Checkup (moved)", "2026-10-29T10:00:00+08:00", "2026-10-29T11:00:00+08:00"),
+        google_event(
+            "planning", "Planning (moved)", "2026-10-29T10:00:00+08:00", "2026-10-29T11:00:00+08:00"
+        ),
     )
     h.target.before_write = once("update", lambda href: h.target.objects.pop(href))
     res = (await h.engine.cycle()).rules["family"]
     assert (res.status, res.updated, res.failed) == ("ok", 1, 0)
     bodies = h.target.managed(h.target.calendars["Family"]).values()
-    assert any(b"Checkup (moved)" in b for b in bodies)
+    assert any(b"Planning (moved)" in b for b in bodies)
     assert (await h.engine.cycle()).rules["family"].plan.empty
 
 
@@ -294,8 +296,8 @@ async def test_source_omitting_a_calendar_fails_the_rule_instead_of_reusing_data
     )
     h = build_fake(tmp_path, fake, config_for([rule()]), sources={"me": source})
     assert (await h.engine.cycle()).rules["family"].created == 2
-    fake.cancel_event(GCAL, "checkup")
-    fake.cancel_event(GCAL, "pills")
+    fake.cancel_event(GCAL, "planning")
+    fake.cancel_event(GCAL, "stretch")
     source.forgetful = True  # neither in calendars nor in errors: a contract violation
     res = (await h.engine.cycle()).rules["family"]
     assert res.status == "failed" and "contract" in (res.error or "")
@@ -352,7 +354,7 @@ async def test_sync_mode_unreadable_href_is_repaired_and_not_orphaned(
 ) -> None:
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=FakeTarget(mode="sync"))
     assert (await h.engine.cycle()).rules["family"].created == 2
-    href = copy_href(h, "checkup")
+    href = copy_href(h, "planning")
     h.target.put(href, b"edited elsewhere")
     h.target.hide_once = {href}
     with caplog.at_level(logging.WARNING):
@@ -370,10 +372,10 @@ async def test_sync_mode_unreadable_href_of_deleted_series_is_still_deleted(tmp_
     fake = simple()
     h = build_fake(tmp_path, fake, config_for([rule()]), target=FakeTarget(mode="sync"))
     await h.engine.cycle()
-    href = copy_href(h, "checkup")
+    href = copy_href(h, "planning")
     h.target.put(href, b"edited elsewhere")
     h.target.hide_once = {href}
-    fake.cancel_event(GCAL, "checkup")
+    fake.cancel_event(GCAL, "planning")
     deleted = 0
     for _ in range(3):
         res = (await h.engine.cycle()).rules["family"]
@@ -387,11 +389,11 @@ async def test_sync_mode_unreadable_href_of_deleted_series_is_still_deleted(tmp_
 # ----- fix 3: degraded series (an instance failed to parse) -----------------
 
 
-def recurring(fake: FakeGoogle, *, broken: bool, title: str = "Reminders") -> None:
+def recurring(fake: FakeGoogle, *, broken: bool, title: str = "Stretch") -> None:
     fake.put_event(
         GCAL,
         google_event(
-            "pills",
+            "stretch",
             title,
             "2026-10-24T08:00:00+08:00",
             "2026-10-24T08:05:00+08:00",
@@ -399,11 +401,11 @@ def recurring(fake: FakeGoogle, *, broken: bool, title: str = "Reminders") -> No
         ),
     )
     late = google_event(
-        "pills_20261026T000000Z",
-        "Reminders (late)",
+        "stretch_20261026T000000Z",
+        "Stretch (late)",
         "2026-10-26T10:00:00+08:00",
         "2026-10-26T10:05:00+08:00",
-        recurringEventId="pills",
+        recurringEventId="stretch",
         originalStartTime={"dateTime": "2026-10-26T08:00:00+08:00", "timeZone": "Asia/Shanghai"},
     )
     if broken:
@@ -411,7 +413,7 @@ def recurring(fake: FakeGoogle, *, broken: bool, title: str = "Reminders") -> No
     fake.put_event(GCAL, late)
 
 
-def calendar_with_pills(*, broken: bool) -> FakeGoogle:
+def calendar_with_stretch(*, broken: bool) -> FakeGoogle:
     fake = FakeGoogle()
     fake.add_calendar(GCAL, "Family")
     recurring(fake, broken=broken)
@@ -419,11 +421,11 @@ def calendar_with_pills(*, broken: bool) -> FakeGoogle:
 
 
 async def test_degraded_series_keeps_existing_copy(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    fake = calendar_with_pills(broken=False)
+    fake = calendar_with_stretch(broken=False)
     h = build_fake(tmp_path, fake, config_for([rule()]))
     assert (await h.engine.cycle()).rules["family"].created == 1
     before = dict(h.target.objects)
-    recurring(fake, broken=True, title="Reminders (new reminder)")  # a real change, but one instance is bad
+    recurring(fake, broken=True, title="Stretch (new time)")  # a real change, but one instance is bad
     with caplog.at_level(logging.WARNING):
         res = (await h.engine.cycle()).rules["family"]
         again = (await h.engine.cycle()).rules["family"]
@@ -432,25 +434,25 @@ async def test_degraded_series_keeps_existing_copy(tmp_path: Path, caplog: pytes
     assert res.degraded == 1 and again.degraded == 1
     assert h.target.objects == before
     warnings = [r.getMessage() for r in caplog.records if "protecting" in r.getMessage()]
-    assert len(warnings) == 1 and "pills" in warnings[0] and "Reminders" not in warnings[0]
+    assert len(warnings) == 1 and "stretch" in warnings[0] and "Stretch" not in warnings[0]
 
 
 async def test_degraded_series_without_copy_is_created_then_completed(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    fake = calendar_with_pills(broken=True)
+    fake = calendar_with_stretch(broken=True)
     h = build_fake(tmp_path, fake, config_for([rule()]))
     with caplog.at_level(logging.WARNING):
         first = (await h.engine.cycle()).rules["family"]
     assert (first.status, first.created, first.protected, first.degraded) == ("ok", 1, 0, 1)
-    assert len([r for r in caplog.records if "pills" in r.getMessage()]) == 1  # engine only, once
+    assert len([r for r in caplog.records if "stretch" in r.getMessage()]) == 1  # engine only, once
     (body,) = h.target.managed(h.target.calendars["Family"]).values()
-    assert b"Reminders (late)" not in body
+    assert b"Stretch (late)" not in body
     recurring(fake, broken=False)
     fixed = (await h.engine.cycle()).rules["family"]
     assert (fixed.status, fixed.updated, fixed.protected, fixed.degraded) == ("ok", 1, 0, 0)
     (body,) = h.target.managed(h.target.calendars["Family"]).values()
-    assert b"Reminders (late)" in body
+    assert b"Stretch (late)" in body
 
 
 async def test_degraded_copy_is_excluded_from_the_delete_guard(tmp_path: Path) -> None:
@@ -472,12 +474,12 @@ async def test_degraded_copy_is_excluded_from_the_delete_guard(tmp_path: Path) -
 
 
 async def test_create_fallback_never_overwrites_a_copy_with_a_degraded_series(tmp_path: Path) -> None:
-    fake = calendar_with_pills(broken=False)
+    fake = calendar_with_stretch(broken=False)
     h = build_fake(tmp_path, fake, config_for([rule()]), target=FakeTarget(mode="sync"))
     await h.engine.cycle()
     (href,) = h.target.managed(h.target.calendars["Family"])
     good = h.target.objects[href][1]
-    assert b"Reminders (late)" in good
+    assert b"Stretch (late)" in good
     recurring(fake, broken=True)  # one instance now malformed: degraded
     h.target.put(href, good)  # touched on the target (new etag), same body
     h.target.hide_once = {href}  # multiget omits it once: not in actual, so the plan creates
@@ -487,10 +489,10 @@ async def test_create_fallback_never_overwrites_a_copy_with_a_degraded_series(tm
     again = (await h.engine.cycle()).rules["family"]
     assert again.protected == 1 and again.plan is not None and again.plan.empty
     assert h.target.objects[href][1] == good
-    recurring(fake, broken=False, title="Reminders (new reminder)")
+    recurring(fake, broken=False, title="Stretch (new time)")
     fixed = (await h.engine.cycle()).rules["family"]
     assert (fixed.status, fixed.updated, fixed.protected, fixed.degraded) == ("ok", 1, 0, 0)
-    assert b"Reminders (new reminder)" in h.target.objects[href][1]
+    assert b"Stretch (new time)" in h.target.objects[href][1]
 
 
 async def test_unparsed_series_without_copy_is_degraded_not_protected(
@@ -511,13 +513,13 @@ async def test_unparsed_series_without_copy_is_degraded_not_protected(
 async def test_degraded_warning_rearms_after_the_series_parses_again(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    fake = calendar_with_pills(broken=False)
+    fake = calendar_with_stretch(broken=False)
     h = build_fake(tmp_path, fake, config_for([rule()]))
     with caplog.at_level(logging.WARNING):
         for broken in (True, True, False, True):
             recurring(fake, broken=broken)
             await h.engine.cycle()
-    assert len([r for r in caplog.records if "pills" in r.getMessage()]) == 2
+    assert len([r for r in caplog.records if "stretch" in r.getMessage()]) == 2
 
 
 # ----- 403 is not an authentication failure --------------------------------
@@ -551,7 +553,7 @@ async def test_forbidden_detection_is_not_an_auth_failure(tmp_path: Path) -> Non
 
 
 async def test_manual_target_edit_is_repaired(tmp_path: Path) -> None:
-    """Someone moves a reminder on the phone; the client keeps X-CALSYNC-HASH. The next cycle writes
+    """Someone moves an event on the phone; the client keeps X-CALSYNC-HASH. The next cycle writes
     the source version back."""
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
@@ -559,8 +561,8 @@ async def test_manual_target_edit_is_repaired(tmp_path: Path) -> None:
     await h.engine.cycle()
     cal = target.calendars["Family"]
     href, data = next(iter(target.managed(cal).items()))
-    edited = data.replace(b"SUMMARY:Reminders", b"SUMMARY:Reminders MOVED").replace(
-        b"SUMMARY:Checkup", b"SUMMARY:Checkup MOVED"
+    edited = data.replace(b"SUMMARY:Stretch", b"SUMMARY:Stretch MOVED").replace(
+        b"SUMMARY:Planning", b"SUMMARY:Planning MOVED"
     )
     assert edited != data and b"X-CALSYNC-HASH" in edited
     target.put(href, edited)
@@ -577,8 +579,8 @@ MOVE_FROM, MOVE_TO = (
 )
 
 
-def move_pills_on_target(h: FakeHarness, rule_name: str = "family", source_id: str = "pills") -> str:
-    """Move the start of the "pills" copy by 30 minutes, keeping our marker (like a phone)."""
+def move_stretch_on_target(h: FakeHarness, rule_name: str = "family", source_id: str = "stretch") -> str:
+    """Move the start of the "stretch" copy by 30 minutes, keeping our marker (like a phone)."""
     href = copy_href(h, source_id, rule_name)
     data = h.target.objects[href][1]
     edited = data.replace(MOVE_FROM, MOVE_TO)
@@ -663,7 +665,7 @@ async def test_lost_state_reverts_a_copy_edited_meanwhile(tmp_path: Path) -> Non
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
-    href = move_pills_on_target(h)
+    href = move_stretch_on_target(h)
     forget_state(h, tmp_path)
     h2 = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     res = (await h2.engine.cycle()).rules["family"]
@@ -680,7 +682,7 @@ async def test_unreadable_digest_is_not_treated_as_an_edit(
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
-    href = move_pills_on_target(h)
+    href = move_stretch_on_target(h)
     real = calsync.engine.content_digest
     # The edited body read from the target carries MOVE_TO, the rendered source version MOVE_FROM.
     blind = MOVE_TO if unreadable == "fetched" else MOVE_FROM
@@ -708,8 +710,8 @@ async def test_edit_on_a_protected_series_is_not_reverted(tmp_path: Path) -> Non
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, fake, config_for([rule()]), target=target)
     await h.engine.cycle()
-    href = move_pills_on_target(h)
-    broken = google_event("pills", "Reminders", "2026-10-25T08:00:00+08:00", "2026-10-25T08:05:00+08:00")
+    href = move_stretch_on_target(h)
+    broken = google_event("stretch", "Stretch", "2026-10-25T08:00:00+08:00", "2026-10-25T08:05:00+08:00")
     del broken["start"]
     fake.put_event(GCAL, broken)
     res = (await h.engine.cycle()).rules["family"]
@@ -720,7 +722,7 @@ async def test_edit_on_a_protected_series_is_not_reverted(tmp_path: Path) -> Non
     assert MOVE_TO in target.objects[href][1]
     # The series parses again, unchanged: the edit read while it was protected is now reverted.
     fake.put_event(
-        GCAL, google_event("pills", "Reminders", "2026-10-25T08:00:00+08:00", "2026-10-25T08:05:00+08:00")
+        GCAL, google_event("stretch", "Stretch", "2026-10-25T08:00:00+08:00", "2026-10-25T08:05:00+08:00")
     )
     mark = len(target.calls)
     fixed = (await h.engine.cycle()).rules["family"]
@@ -734,9 +736,9 @@ async def test_source_change_wins_over_a_target_edit(tmp_path: Path) -> None:
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, fake, config_for([rule()]), target=target)
     await h.engine.cycle()
-    href = move_pills_on_target(h)
+    href = move_stretch_on_target(h)
     fake.put_event(
-        GCAL, google_event("pills", "Reminders", "2026-10-25T09:00:00+08:00", "2026-10-25T09:05:00+08:00")
+        GCAL, google_event("stretch", "Stretch", "2026-10-25T09:00:00+08:00", "2026-10-25T09:05:00+08:00")
     )
     res = (await h.engine.cycle()).rules["family"]
     assert (res.updated, res.reverted) == (1, 0)  # an ordinary update, not a revert
@@ -749,7 +751,7 @@ async def test_dry_run_plans_the_revert_and_the_next_run_writes_it(
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
-    href = move_pills_on_target(h)
+    href = move_stretch_on_target(h)
     with caplog.at_level(logging.INFO, logger="calsync.engine"):
         dry = (await h.engine.cycle(dry_run=True)).rules["family"]
     assert dry.plan is not None and len(dry.plan.update) == 1
@@ -771,7 +773,7 @@ async def test_failed_revert_counts_as_failed_and_is_retried(tmp_path: Path) -> 
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
-    href = move_pills_on_target(h)
+    href = move_stretch_on_target(h)
 
     def refuse(op: str, path: str) -> None:
         raise TransientError("PUT timed out")
@@ -810,7 +812,7 @@ async def test_edit_read_by_a_subset_cycle_is_reverted_by_its_own_rule(tmp_path:
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule("a"), rule("b")]), target=target)
     await h.engine.cycle()
-    href = move_pills_on_target(h, "b")
+    href = move_stretch_on_target(h, "b")
     mark = len(target.calls)
     only_a = (await h.engine.cycle(rules=["a"])).rules
     assert set(only_a) == {"a"} and only_a["a"].updated == 0
@@ -826,7 +828,7 @@ async def test_edit_survives_a_failure_of_the_owning_rule(tmp_path: Path) -> Non
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
-    href = move_pills_on_target(h)
+    href = move_stretch_on_target(h)
     fail_desired(h, "family")
     failed = (await h.engine.cycle()).rules["family"]
     assert failed.status == "failed" and "TransientError" in (failed.error or "")
@@ -874,7 +876,7 @@ async def test_edit_survives_a_source_failure_of_the_owning_rule(tmp_path: Path)
     h = build_fake(tmp_path, fake, config_for(rules), target=target, sources={"me": source})
     first = await h.engine.cycle()
     assert first.ok and first.rules["b"].created == 2
-    href = move_pills_on_target(h, "b")
+    href = move_stretch_on_target(h, "b")
     source.failing = {GCAL}
     mark = len(target.calls)
     broken = (await h.engine.cycle()).rules
@@ -892,7 +894,7 @@ async def test_edit_read_before_a_crash_is_reverted_by_a_fresh_process(tmp_path:
     target = FakeTarget(mode="sync")
     h = build_fake(tmp_path, simple(), config_for([rule()]), target=target)
     await h.engine.cycle()
-    href = move_pills_on_target(h)
+    href = move_stretch_on_target(h)
     fail_desired(h, "family")
     assert (await h.engine.cycle()).rules["family"].status == "failed"
     h.store.close()

@@ -674,7 +674,7 @@ git add -A && git commit -m "feat(engine): configurable field policy (attendees,
 **Interfaces:**
 - Produces: `content_digest(data: bytes) -> str | None` (32 hex chars; None when the body is not a calendar with at least one VEVENT; never raises).
 
-Background for the implementer: the engine (Task 5) compares the digest of a body fetched from the target with the digest of the body it would render. Equal digests mean "nothing a person sees differs". It must ignore anything servers and phones add on their own, or calsync would rewrite events forever. It must especially ignore alarm bookkeeping: when someone dismisses or snoozes an alert on an iPhone, the phone writes `ACKNOWLEDGED` into the VALARM, or adds a VALARM with `RELATED-TO` and an absolute `TRIGGER;VALUE=DATE-TIME`. Rewriting those away would break snooze for the person taking the medicine.
+Background for the implementer: the engine (Task 5) compares the digest of a body fetched from the target with the digest of the body it would render. Equal digests mean "nothing a person sees differs". It must ignore anything servers and phones add on their own, or calsync would rewrite events forever. It must especially ignore alarm bookkeeping: when someone dismisses or snoozes an alert on an iPhone, the phone writes `ACKNOWLEDGED` into the VALARM, or adds a VALARM with `RELATED-TO` and an absolute `TRIGGER;VALUE=DATE-TIME`. Rewriting those away would break snooze for the person relying on the reminder.
 
 - [ ] **Step 1: Write failing tests**
 

@@ -39,7 +39,7 @@ def seeded() -> FakeGoogle:
         ),
     )
     fake.put_event(
-        GCAL, google_event("checkup", "Checkup", "2026-10-28T10:00:00+08:00", "2026-10-28T11:00:00+08:00")
+        GCAL, google_event("planning", "Planning", "2026-10-28T10:00:00+08:00", "2026-10-28T11:00:00+08:00")
     )
     return fake
 
@@ -134,13 +134,15 @@ async def test_update_delete_and_foreign_untouched(tmp_path: Path, radicale_url:
 
     fake.put_event(
         GCAL,
-        google_event("checkup", "Checkup (moved)", "2026-10-29T10:00:00+08:00", "2026-10-29T11:00:00+08:00"),
+        google_event(
+            "planning", "Planning (moved)", "2026-10-29T10:00:00+08:00", "2026-10-29T11:00:00+08:00"
+        ),
     )
     res = (await h.engine.cycle()).rules["family"]
     assert (res.created, res.updated, res.deleted) == (0, 1, 0)
-    assert any(b"Checkup (moved)" in b for b in (await managed(h)).values())
+    assert any(b"Planning (moved)" in b for b in (await managed(h)).values())
 
-    fake.cancel_event(GCAL, "checkup")
+    fake.cancel_event(GCAL, "planning")
     res = (await h.engine.cycle()).rules["family"]
     assert (res.created, res.updated, res.deleted) == (0, 0, 1)
     listing = await h.target.changes(cal, None)
