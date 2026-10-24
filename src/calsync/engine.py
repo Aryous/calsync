@@ -23,7 +23,14 @@ from calsync.planner import Actual, Desired, Plan, check_delete_guard, plan
 from calsync.render import inspect, render
 from calsync.sources.base import CalendarMeta, Source
 from calsync.store import RunRecord, Store
-from calsync.targets.base import CachedObject, Target, TargetCache, TargetCalendar, TargetDelta
+from calsync.targets.base import (
+    CachedObject,
+    FetchedObject,
+    Target,
+    TargetCache,
+    TargetCalendar,
+    TargetDelta,
+)
 
 log = logging.getLogger(__name__)
 
@@ -236,20 +243,27 @@ class Engine:
                 now=now,
             )
 
-        async def current_etag(href: str) -> str | None:
+        async def current(href: str) -> FetchedObject | None:
+            """The resource as it is now; None if it no longer exists."""
             fetched = await target.fetch(cal, [href])
-            return fetched[0].etag if fetched else None
+            return fetched[0] if fetched else None
 
         def remember(href: str, etag: str | None, want: Desired) -> None:
             cache.objects[href] = CachedObject(etag, tag, want.object_id, want.content_hash, want.span)
 
+        # Strict servers answer 412 to If-Match (even "*") for a missing resource, so
+        # every conflict re-reads the resource before deciding how to retry once.
         async def create(want: Desired) -> None:
             href = target.href_for(cal, resource_name(rule.name, want.object_id))
             data = body(want)
             try:
                 etag = await target.create(href, data)
             except ConflictError:  # exists already (e.g. local state was lost)
-                etag = await target.update(href, await current_etag(href), data)
+                found = await current(href)
+                if found is None:
+                    etag = await target.create(href, data)
+                else:
+                    etag = await target.update(href, found.etag, data)
             remember(href, etag, want)
             result.created += 1
 
@@ -258,7 +272,11 @@ class Engine:
             try:
                 etag = await target.update(have.href, have.etag, data)
             except ConflictError:
-                etag = await target.update(have.href, await current_etag(have.href), data)
+                found = await current(have.href)
+                if found is None:  # deleted behind our back: put it back
+                    etag = await target.create(have.href, data)
+                else:
+                    etag = await target.update(have.href, found.etag, data)
             remember(have.href, etag, want)
             result.updated += 1
 
@@ -266,7 +284,9 @@ class Engine:
             try:
                 await target.delete(have.href, have.etag)
             except ConflictError:
-                await target.delete(have.href, await current_etag(have.href))
+                found = await current(have.href)
+                if found is not None:
+                    await target.delete(have.href, found.etag)
             cache.objects.pop(have.href, None)
             result.deleted += 1
 

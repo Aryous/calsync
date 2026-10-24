@@ -1,11 +1,12 @@
 """Engine edge cases against FakeGoogle + an in-memory FakeTarget (no Radicale)."""
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from calsync.errors import TransientError
+from calsync.errors import ConflictError, TransientError
 from tests.factories import google_event
 from tests.fakes.google import FakeGoogle
 from tests.harness import GCAL, build_fake, config_for, rule
@@ -124,3 +125,70 @@ async def test_missing_source_calendar_404_fails_only_its_rule(tmp_path: Path) -
     _, mirrors = h.store.load_source("me")
     assert set(mirrors["gone@group.calendar.google.com"]) == {"nap"}  # failed pull persisted nothing
     assert "walk" in mirrors[GCAL]
+
+
+# ----- 4. conflict fallbacks when the resource is gone ----------------------
+
+
+def once(op: str, action: Callable[[str], None]) -> Callable[[str, str], None]:
+    """A before_write hook that runs ``action(href)`` on the first ``op`` only."""
+    fired: list[str] = []
+
+    def hook(kind: str, href: str) -> None:
+        if kind == op and not fired:
+            fired.append(href)
+            action(href)
+
+    return hook
+
+
+async def test_delete_conflict_on_vanished_resource_counts_as_deleted(tmp_path: Path) -> None:
+    fake = simple()
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    fake.cancel_event(GCAL, "checkup")
+    h.target.before_write = once("delete", lambda href: h.target.objects.pop(href))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.deleted, res.failed) == ("ok", 1, 0)
+    assert len(h.target.managed(h.target.calendars["Family"])) == 1
+    assert (await h.engine.cycle()).rules["family"].plan.empty
+
+
+async def test_update_conflict_on_vanished_resource_recreates_it(tmp_path: Path) -> None:
+    fake = simple()
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    fake.put_event(
+        GCAL,
+        google_event("checkup", "Checkup (moved)", "2026-10-29T10:00:00+08:00", "2026-10-29T11:00:00+08:00"),
+    )
+    h.target.before_write = once("update", lambda href: h.target.objects.pop(href))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.updated, res.failed) == ("ok", 1, 0)
+    bodies = h.target.managed(h.target.calendars["Family"]).values()
+    assert any(b"Checkup (moved)" in b for b in bodies)
+    assert (await h.engine.cycle()).rules["family"].plan.empty
+
+
+async def test_create_conflict_on_missing_resource_retries_create(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, simple(), config_for([rule()]))
+
+    def spurious(href: str) -> None:
+        raise ConflictError(f"412 create {href}")
+
+    h.target.before_write = once("create", spurious)
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.created, res.failed) == ("ok", 2, 0)
+    assert len(h.target.managed(h.target.calendars["Family"])) == 2
+    assert [op for op, _ in h.target.calls].count("create") == 3
+
+
+async def test_create_conflict_on_existing_resource_updates_it(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, simple(), config_for([rule()]))
+    h.target.before_write = once("create", lambda href: h.target.put(href, b"stale copy"))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.created, res.failed) == ("ok", 2, 0)
+    bodies = h.target.managed(h.target.calendars["Family"]).values()
+    assert len(bodies) == 2 and b"stale copy" not in b"".join(bodies)
+    assert "update" in [op for op, _ in h.target.calls]
+    assert (await h.engine.cycle()).rules["family"].plan.empty
