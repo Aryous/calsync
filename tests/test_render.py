@@ -64,6 +64,7 @@ def test_inspect_roundtrip() -> None:
     assert found is not None
     assert (found.uid, found.rule, found.content_hash) == ("abc@calsync", "family", h)
     assert found.span == series_span(s)
+    assert found.summary == "Standup"  # the master's, not the override's "Standup (late)"
 
 
 def test_inspect_foreign_and_garbage() -> None:
@@ -74,6 +75,7 @@ def test_inspect_foreign_and_garbage() -> None:
     )
     found = inspect(foreign)
     assert found is not None and found.rule is None and found.content_hash is None
+    assert found.summary is None
     assert found.span == (datetime(2026, 10, 25, 1, tzinfo=UTC), datetime(2026, 10, 25, 2, tzinfo=UTC))
     assert inspect(b"not ical") is None
 

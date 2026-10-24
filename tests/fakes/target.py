@@ -6,7 +6,7 @@ the resource is missing or its etag differs (including ``If-Match: *``).
 
 Two injection points drive edge cases:
 - ``fail_changes[ref]``: exception raised by the next ``changes()`` call for a
-  calendar (consumed once).
+  calendar (consumed once); ``fail_fetch`` fails every ``fetch()`` while set.
 - ``before_write(op, href)``: called at the start of every write; it may mutate
   ``objects`` (to stage a race) or raise (to fail that one write).
 """
@@ -26,6 +26,7 @@ class FakeTarget:
     calendars: dict[str, TargetCalendar] = field(default_factory=dict)  # name -> calendar
     objects: dict[str, tuple[str, bytes]] = field(default_factory=dict)  # href -> (etag, data)
     fail_changes: dict[str, Exception] = field(default_factory=dict)
+    fail_fetch: Exception | None = None  # raised by every fetch() while set
     before_write: Callable[[str, str], None] | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
     _seq: int = 0
@@ -75,6 +76,8 @@ class FakeTarget:
 
     async def fetch(self, cal: TargetCalendar, hrefs: Sequence[str]) -> list[FetchedObject]:
         self.calls.append(("fetch", ",".join(hrefs)))
+        if self.fail_fetch is not None:
+            raise self.fail_fetch
         return [FetchedObject(h, *self.objects[h]) for h in hrefs if h in self.objects]
 
     def href_for(self, cal: TargetCalendar, name: str) -> str:

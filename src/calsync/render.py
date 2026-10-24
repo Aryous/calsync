@@ -102,6 +102,7 @@ class Inspected:
     rule: str | None
     content_hash: str | None
     span: tuple[datetime, datetime] | None
+    summary: str | None = None  # the master VEVENT's SUMMARY
 
 
 def _rrule_lines(component: Component) -> list[str]:
@@ -151,4 +152,5 @@ def inspect(data: bytes) -> Inspected | None:
         rule=_optional(master, "x-calsync-rule"),
         content_hash=_optional(master, "x-calsync-hash"),
         span=span,
+        summary=_optional(master, "summary"),
     )

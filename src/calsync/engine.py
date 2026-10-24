@@ -50,6 +50,7 @@ class RuleResult:
     error_kind: ErrorKind | None = None
     plan: Plan | None = None
     protected: int = 0  # source series that could not be parsed; their target copy is left alone
+    blocked_titles: list[str] = field(default_factory=list)  # planned deletes, for the guard alert
 
     def fail(self, exc: BaseException) -> None:
         self.status = "failed"
@@ -223,9 +224,23 @@ class Engine:
         reason = None if allow_deletes else check_delete_guard(result.plan, deletable, rule.delete_guard)
         if reason:
             result.status, result.error, result.error_kind = "blocked", reason, "guard"
+            result.blocked_titles = await self._titles(rule, cal, result.plan.delete)
             return
         if not dry_run and not result.plan.empty:
             await self._push(rule, cal, cache, result.plan, result)
+
+    async def _titles(self, rule: Rule, cal: TargetCalendar, deletes: list[Actual]) -> list[str]:
+        """SUMMARY of each planned delete, for the guard alert; only blocked rules pay for this."""
+        try:
+            fetched = await self._targets[rule.target.account].fetch(cal, [a.href for a in deletes])
+        except Exception as exc:  # the alert loses detail, but the rule stays blocked
+            log.warning("rule %s: could not read the titles of planned deletes: %s", rule.name, exc)
+            return []
+        titles: dict[str, str] = {}
+        for obj in fetched:
+            found = inspect(obj.data)
+            titles[obj.href] = (found.summary if found else None) or "(untitled)"
+        return [titles[a.href] for a in deletes if a.href in titles]
 
     async def _push(
         self, rule: Rule, cal: TargetCalendar, cache: TargetCache, p: Plan, result: RuleResult

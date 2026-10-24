@@ -192,3 +192,41 @@ async def test_create_conflict_on_existing_resource_updates_it(tmp_path: Path) -
     assert len(bodies) == 2 and b"stale copy" not in b"".join(bodies)
     assert "update" in [op for op, _ in h.target.calls]
     assert (await h.engine.cycle()).rules["family"].plan.empty
+
+
+# ----- 5. delete-guard alert titles -----------------------------------------
+
+
+def many(n: int) -> FakeGoogle:
+    fake = FakeGoogle()
+    fake.add_calendar(GCAL, "Family")
+    for i in range(n):
+        fake.put_event(
+            GCAL, google_event(f"e{i}", f"E{i}", "2026-10-25T09:00:00+08:00", "2026-10-25T09:05:00+08:00")
+        )
+    return fake
+
+
+async def test_blocked_rule_lists_titles_with_one_fetch(tmp_path: Path) -> None:
+    fake = many(4)
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    for i in range(4):
+        fake.cancel_event(GCAL, f"e{i}")
+    h.target.calls.clear()
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.status == "blocked"
+    assert sorted(res.blocked_titles) == ["E0", "E1", "E2", "E3"]
+    assert [op for op, _ in h.target.calls] == ["changes", "fetch"]
+
+
+async def test_title_lookup_failure_keeps_the_rule_blocked(tmp_path: Path) -> None:
+    fake = many(4)
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    for i in range(4):
+        fake.cancel_event(GCAL, f"e{i}")
+    h.target.fail_fetch = TransientError("multiget timed out")
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.status == "blocked" and res.error_kind == "guard" and res.blocked_titles == []
+    assert len(h.target.objects) == 4

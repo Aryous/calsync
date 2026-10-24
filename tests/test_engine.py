@@ -157,6 +157,7 @@ async def test_delete_guard_blocks_mass_delete(tmp_path: Path, radicale_url: str
         fake.cancel_event(GCAL, f"e{i}")
     blocked = (await h.engine.cycle()).rules["family"]
     assert blocked.status == "blocked" and blocked.error_kind == "guard"
+    assert sorted(blocked.blocked_titles) == sorted(f"E{i}" for i in range(12))
     assert len(await managed(h)) == 12
     forced = (await h.engine.cycle(allow_deletes=True)).rules["family"]
     assert forced.deleted == 12 and await managed(h) == {}
