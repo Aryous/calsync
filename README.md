@@ -462,8 +462,8 @@ the daemon.
   names are refused (protection against DNS rebinding).
 - It is plain HTTP: use it on networks you trust, or put it behind a TLS
   proxy or a VPN such as Tailscale.
-- After 10 wrong keys in 10 minutes from one address, pairing from it is
-  refused for a while.
+- After 10 wrong keys in 10 minutes from one address, further wrong keys from
+  it are refused for a while (HTTP 429); the right key always pairs.
 - The page loads nothing from the internet, and the daemon keeps no access
   log (a URL can carry the key).
 

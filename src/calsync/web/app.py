@@ -7,15 +7,15 @@ on every request against DNS rebinding and cross-site requests.
 - The ``Host`` header must name this machine: ``localhost``, a loopback address, the listen
   host, an ``allowed_hosts`` entry, or (when listening on every address) any IP literal.
 - A request other than GET or HEAD that carries ``Origin`` must come from this same origin.
-- 10 wrong keys within 10 minutes from one client address: every attempt from it is 429 until
-  the oldest of them is 10 minutes old.
+- 10 wrong keys within 10 minutes from one client address: every further wrong key from it
+  is 429 until the oldest of them is 10 minutes old. The right key always pairs.
 
 The unix-socket app (``calsync.api.create_app``) has none of this: the socket's file mode is
 its access control.
 """
 
 import ipaddress
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -45,6 +45,7 @@ LIMIT_NOTICE = '<p class="notice" role="alert">Too many attempts. Try again in a
 UNPAIRED = "This browser is not paired."
 MAX_FAILURES = 10
 FAILURE_WINDOW = timedelta(minutes=10)
+MAX_CLIENTS = 1024  # addresses whose failures are kept
 MAX_FORM = 4096  # bytes: the pair form holds one key
 LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
 NO_CACHE = {"Cache-Control": "no-cache"}
@@ -75,35 +76,36 @@ def _same_origin(origin: str, host: str) -> bool:
     return parts.scheme in {"http", "https"} and parts.netloc == host.strip().lower()
 
 
-class _Attempts:
-    """Wrong keys per client address within ``FAILURE_WINDOW``."""
+class Attempts:
+    """Wrong keys per client address: the latest ``MAX_FAILURES`` of each, for at most
+    ``MAX_CLIENTS`` addresses. The table is ordered by each address's latest failure, so the
+    quiet ones are forgotten from the front (amortized O(1) per failure), and past
+    ``MAX_CLIENTS`` the least recent goes first."""
 
     def __init__(self, clock: Clock) -> None:
         self._clock = clock
-        self._failures: dict[str, deque[datetime]] = {}
-
-    def _recent(self, client: str, now: datetime) -> deque[datetime]:
-        times = self._failures.get(client, deque())
-        while times and times[0] <= now - FAILURE_WINDOW:
-            times.popleft()
-        return times
+        self._failures: OrderedDict[str, deque[datetime]] = OrderedDict()
 
     def retry_after(self, client: str) -> int | None:
         """Seconds until ``client`` may try again, or None if it may now."""
         now = self._clock()
-        times = self._recent(client, now)
-        if len(times) < MAX_FAILURES:
+        times = self._failures.get(client)
+        if times is None or len(times) < MAX_FAILURES or times[0] <= now - FAILURE_WINDOW:
             return None
         return max(1, int((times[0] + FAILURE_WINDOW - now).total_seconds() + 0.999))
 
     def fail(self, client: str) -> None:
         now = self._clock()
-        if len(self._failures) > 1000:  # forget the addresses that are quiet again
-            for quiet in [c for c in self._failures if not self._recent(c, now)]:
-                del self._failures[quiet]
-        times = self._recent(client, now)
+        cutoff = now - FAILURE_WINDOW
+        while self._failures and next(iter(self._failures.values()))[-1] <= cutoff:
+            self._failures.popitem(last=False)  # quiet for the whole window
+        times = self._failures.pop(client, None)
+        if times is None:
+            times = deque(maxlen=MAX_FAILURES)
         times.append(now)
-        self._failures[client] = times
+        self._failures[client] = times  # at the end: the latest failure
+        while len(self._failures) > MAX_CLIENTS:
+            self._failures.popitem(last=False)
 
 
 class _Guard:
@@ -187,7 +189,7 @@ def _pasted_key(text: str) -> str:
 
 
 class _Pages:
-    def __init__(self, keys: Keys, attempts: _Attempts) -> None:
+    def __init__(self, keys: Keys, attempts: Attempts) -> None:
         self._keys = keys
         self._attempts = attempts
 
@@ -195,11 +197,14 @@ class _Pages:
         return self._keys.valid_cookie(request.cookies.get(COOKIE))
 
     def _attempt(self, request: Request, key: str) -> Response:
-        client = request.client.host if request.client else ""
-        wait = self._attempts.retry_after(client)
-        if wait is not None:
-            return _page("pair.html", status=429, notice=LIMIT_NOTICE, headers={"Retry-After": str(wait)})
+        """The right key always pairs (a cross-site page can spend a browser's failures on
+        ``/?k=wrong`` loads); only a wrong one meets the limit, and one that is already over
+        it is not counted again."""
         if not self._keys.matches(key):
+            client = request.client.host if request.client else ""
+            wait = self._attempts.retry_after(client)
+            if wait is not None:
+                return _page("pair.html", status=429, notice=LIMIT_NOTICE, headers={"Retry-After": str(wait)})
             self._attempts.fail(client)
             return _page("pair.html", status=403, notice=INVALID_NOTICE)
         token = self._keys.token()
@@ -237,7 +242,7 @@ def create_web_app(
 ) -> Starlette:
     """The web UI app: the pages, ``/static`` and the ``/api`` routes, behind the checks."""
     keys = Keys(state_dir)
-    pages = _Pages(keys, _Attempts(clock))
+    pages = _Pages(keys, Attempts(clock))
     routes = [
         Route("/", api.guarded(pages.home), methods=["GET"]),
         Route("/pair", api.guarded(pages.pair), methods=["POST"]),

@@ -35,6 +35,7 @@ INVALID = (
 )
 TOO_MANY = '<p class="notice" role="alert">Too many attempts. Try again in a few minutes.</p>'
 MARKER = "<!-- calsync:notice -->"
+MAX_FAILURES = 10
 pytestmark = pytest.mark.anyio
 
 UNPAIRED = {"error": {"kind": "unpaired", "message": "This browser is not paired."}}
@@ -238,19 +239,63 @@ async def test_reset_key_unpairs_every_browser(state: Path) -> None:
 
 
 async def test_too_many_wrong_keys_are_429(state: Path) -> None:
-    key = auth.load_or_create_key(state)
     clock = Clock()
     c = client(state, clock=clock)
+    auth.load_or_create_key(state)
     for _ in range(5):
         assert (await c.post("/pair", data={"key": "wrong"})).status_code == 403
     for _ in range(5):  # a wrong link counts too
         assert (await c.get("/", params={"k": "wrong"})).status_code == 403
-    limited = await c.post("/pair", data={"key": key})  # even the right key, until the window passes
+    limited = await c.post("/pair", data={"key": "wrong"})
     assert limited.status_code == 429 and TOO_MANY in limited.text
     assert int(limited.headers["retry-after"]) == 600
-    assert (await c.get("/", params={"k": key})).status_code == 429
-    clock.now += timedelta(minutes=10, seconds=1)
+    clock.now += timedelta(minutes=5)
+    limited = await c.get("/", params={"k": "wrong"})
+    assert limited.status_code == 429 and int(limited.headers["retry-after"]) == 300  # not extended
+    clock.now += timedelta(minutes=5, seconds=1)
+    assert (await c.post("/pair", data={"key": "wrong"})).status_code == 403  # the window passed
+
+
+async def test_the_right_key_pairs_whatever_the_rate_limit(state: Path) -> None:
+    """A cross-site page can make a browser load ``/?k=wrong`` ten times (an image needs no
+    Origin): that must not lock its owner out of pairing with the real key."""
+    key = auth.load_or_create_key(state)
+    c = client(state, clock=Clock())
+    for _ in range(10):
+        response = await c.get(
+            "/",
+            params={"k": "x"},
+            headers={"sec-fetch-site": "cross-site", "referer": "https://evil.example/"},
+        )
+        assert response.status_code == 403
+    assert (await c.get("/", params={"k": "x"})).status_code == 429
+    paired = await c.get("/", params={"k": key})
+    assert paired.status_code == 303 and paired.headers["set-cookie"].startswith("calsync_session=")
     assert (await c.post("/pair", data={"key": key})).status_code == 303
+
+
+async def test_the_failure_table_is_bounded_and_cheap() -> None:
+    import time
+
+    from calsync.web.app import MAX_CLIENTS, Attempts
+
+    clock = Clock()
+    attempts = Attempts(clock)
+    started = time.perf_counter()
+    for i in range(5000):
+        attempts.fail(f"10.0.{i // 256}.{i % 256}")
+    elapsed = time.perf_counter() - started
+    table = attempts._failures  # pyright: ignore[reportPrivateUsage]
+    assert MAX_CLIENTS == 1024 and len(table) == 1024
+    assert "10.0.0.0" not in table and "10.0.19.135" in table  # the oldest went first
+    assert elapsed < 1.0, elapsed
+    for _ in range(MAX_FAILURES):
+        attempts.fail("10.9.9.9")
+    assert attempts.retry_after("10.9.9.9") == 600
+    assert len(table["10.9.9.9"]) == MAX_FAILURES
+    clock.now += timedelta(minutes=11)
+    attempts.fail("10.8.8.8")  # every other address is quiet again: pruned
+    assert list(table) == ["10.8.8.8"]
 
 
 # ----- the API -----------------------------------------------------------------------
