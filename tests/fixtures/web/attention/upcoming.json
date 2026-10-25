@@ -9,6 +9,18 @@
   "events": [
     {
       "rule": "family",
+      "start": "@-1D",
+      "end": "@+0D",
+      "all_day": true,
+      "title": "整理书架",
+      "location": "",
+      "alarms_minutes_before": [],
+      "recurring": false,
+      "target_calendar": "家庭日程",
+      "delivery": "delivered"
+    },
+    {
+      "rule": "family",
       "start": "@q+45m",
       "end": "@q+90m",
       "all_day": false,

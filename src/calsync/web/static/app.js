@@ -560,8 +560,18 @@ function SkeletonCoupons({ n = 4 }) {
   </ul>`;
 }
 
+// The server compares all-day events in UTC, so east of UTC it can still send yesterday's.
+// Hide an all-day event whose (exclusive) end date is on or before the viewer's local today.
+function visibleEvents(upcoming) {
+  return ((upcoming && upcoming.events) || []).filter((ev) => {
+    if (!ev.all_day || typeof ev.end !== "string") return true;
+    const [y, m, d] = ev.end.slice(0, 10).split("-").map(Number);
+    return dayIndex(new Date(y, m - 1, d)) > 0;
+  });
+}
+
 function Upcoming({ upcoming, fresh, loading }) {
-  const events = (upcoming && upcoming.events) || [];
+  const events = visibleEvents(upcoming);
   return html`<section class="block block--coupons" aria-labelledby="h-upcoming">
     <h2 id="h-upcoming">${t("Next 24 hours")} ${!loading && html`<span class="cap">${t("Coupons")} · <span class="num">${events.length}</span></span>`}</h2>
     ${loading
