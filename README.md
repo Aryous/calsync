@@ -462,6 +462,9 @@ the daemon.
   names are refused (protection against DNS rebinding).
 - It is plain HTTP: use it on networks you trust, or put it behind a TLS
   proxy or a VPN such as Tailscale.
+- A reverse proxy must pass the original `Host` header through (nginx:
+  `proxy_set_header Host $http_host;`, with that name in `allowed_hosts`);
+  otherwise pairing and "sync now" get 403.
 - After 10 wrong keys in 10 minutes from one address, further wrong keys from
   it are refused for a while (HTTP 429); the right key always pairs.
 - The page loads nothing from the internet, and the daemon keeps no access
