@@ -178,17 +178,92 @@ async def test_blocked_deletes_are_recorded_once(tmp_path: Path) -> None:
     assert change_run_ids_match(tmp_path)
 
 
-async def test_blocked_deletes_with_unreadable_titles_are_recorded_untitled(tmp_path: Path) -> None:
+async def test_blocked_delete_with_an_unreadable_body_is_recorded_untitled(tmp_path: Path) -> None:
     fake = four()
     h = build_fake(tmp_path, fake, config_for([rule()]))
     await h.engine.cycle()
     mark = last_id(tmp_path)
     garbled = sorted(h.target.managed(h.target.calendars["Family"]))[0]
+    lost = next(i for i in range(4) if f"SUMMARY:Standup {i}".encode() in h.target.objects[garbled][1])
     h.target.put(garbled, b"not icalendar")
     for i in range(4):
         fake.cancel_event(GCAL, f"e{i}")
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.status == "blocked" and not res.blocked_titles_complete
+    # Each row carries the summary as read; only the unreadable body has no title.
+    assert changes(tmp_path, mark) == sorted(
+        (oid(f"e{i}"), "blocked", None if i == lost else f"Standup {i}") for i in range(4)
+    )
+
+
+async def test_empty_titles_are_recorded_as_none(tmp_path: Path) -> None:
+    fake = four()
+    fake.put_event(GCAL, google_event("e0", "", "2026-10-26T09:00:00+08:00", "2026-10-26T09:15:00+08:00"))
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    created = {r[0]: r[2] for r in changes(tmp_path) if r[1] == "created"}
+    assert created[oid("e0")] is None  # neither "" nor a placeholder
+    mark = last_id(tmp_path)
+    for i in range(4):
+        fake.cancel_event(GCAL, f"e{i}")
+    res = (await h.engine.cycle()).rules["family"]
+    assert res.status == "blocked" and "(untitled)" in res.blocked_titles  # the alert keeps its placeholder
+    assert changes(tmp_path, mark) == sorted(
+        (oid(f"e{i}"), "blocked", None if i == 0 else f"Standup {i}") for i in range(4)
+    )
+
+
+async def test_only_newly_protected_ids_are_recorded(tmp_path: Path) -> None:
+    fake = standup_and_lunch()
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    mark = last_id(tmp_path)
+    for source_id, title, start, end in (
+        ("lunch", "Lunch", "2026-10-26T12:00:00+08:00", "2026-10-26T13:00:00+08:00"),
+        ("standup", "Standup", "2026-10-26T09:00:00+08:00", "2026-10-26T09:15:00+08:00"),
+    ):
+        broken = google_event(source_id, title, start, end)
+        del broken["start"]
+        fake.put_event(GCAL, broken)
+        await h.engine.cycle()
+        await h.engine.cycle()
+    # The set grew from {lunch} to {lunch, standup}: standup is new, lunch is not recorded again.
+    assert changes(tmp_path, mark) == [(oid("lunch"), "protected", None), (oid("standup"), "protected", None)]
+    assert (await h.engine.cycle()).rules["family"].protected == 2
+
+
+async def test_a_failed_history_write_records_the_rows_next_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = four()
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    mark = last_id(tmp_path)
+    runs = h.store.latest_runs()
+    broken = google_event("e0", "Standup 0", "2026-10-26T09:00:00+08:00", "2026-10-26T09:15:00+08:00")
+    del broken["start"]
+    fake.put_event(GCAL, broken)
+    for i in range(1, 4):
+        fake.cancel_event(GCAL, f"e{i}")  # 3 of 3 deletable copies: the guard blocks
+
+    real = h.store.record_runs
+    calls = 0
+
+    def fail_once(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(h.store, "record_runs", fail_once)
+    with pytest.raises(sqlite3.OperationalError):
+        await h.engine.cycle()
+    assert changes(tmp_path, mark) == [] and h.store.latest_runs() == runs
     assert (await h.engine.cycle()).rules["family"].status == "blocked"
-    assert changes(tmp_path, mark) == sorted((oid(f"e{i}"), "blocked", None) for i in range(4))
+    assert changes(tmp_path, mark) == sorted(
+        [(oid("e0"), "protected", None)] + [(oid(f"e{i}"), "blocked", f"Standup {i}") for i in range(1, 4)]
+    )
 
 
 async def test_out_of_window_count_is_recorded(tmp_path: Path) -> None:
