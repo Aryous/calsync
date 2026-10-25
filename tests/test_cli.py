@@ -771,15 +771,41 @@ def test_view_commands_without_state_exit_1(tmp_path: Path) -> None:
 
 
 def test_view_commands_reject_unknown_rules_and_bad_config(synced: list[str], tmp_path: Path) -> None:
-    for command in (
-        ["upcoming", "--rule", "nope"],
-        ["runs", "--rule", "nope"],
-        ["changes", "--rule", "nope"],
-    ):
-        code, text = run([*synced, *command])
-        assert code == EXIT_CONFIG and "unknown rule" in text
+    code, text = run([*synced, "upcoming", "--rule", "nope"])
+    assert code == EXIT_CONFIG and "unknown rule" in text
     code, text = run(["--config", str(tmp_path / "missing.toml"), "status"])
     assert code == EXIT_CONFIG and "config file not found" in text
+
+
+def test_history_commands_accept_a_removed_rule(synced: list[str], tmp_path: Path) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from calsync.store import ChangeRecord, RunRecord, Store
+
+    at = datetime(2026, 10, 24, 8, 1, tzinfo=UTC)
+    with Store(tmp_path / "state" / "state.db") as store:
+        store.record_runs(
+            [RunRecord("retired", at, at, "ok", 1, 0, 0, 0, 1, None)],
+            [ChangeRecord("retired", "o1", "created", at, "Standup")],
+        )
+    code, text = run([*synced, "runs", "--rule", "retired", "--json"])
+    assert code == EXIT_OK and [r["rule"] for r in json.loads(text)["runs"]] == ["retired"]
+    code, text = run([*synced, "changes", "--rule", "retired", "--json"])
+    assert code == EXIT_OK and [c["object_id"] for c in json.loads(text)["changes"]] == ["o1"]
+    code, text = run([*synced, "runs", "--rule", "nope"])
+    assert (code, text) == (EXIT_OK, "")
+
+
+def test_view_commands_report_an_unreadable_database(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "state.db").write_bytes(b"not a database, just some text " * 64)
+    for command in (["status"], ["upcoming"], ["runs"], ["changes", "--json"]):
+        code, text = run(["--config", str(cfg), "--state-dir", str(state), *command])
+        assert (code, text) == (EXIT_FAILED, "error: the state database could not be read: DatabaseError\n")
 
 
 def test_light_commands_import_no_heavy_modules(tmp_path: Path) -> None:

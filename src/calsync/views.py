@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from calsync.config import Account, Config, Rule
 from calsync.errors import ConfigError
@@ -147,7 +147,8 @@ class StateReader:
     def __init__(self, db_path: Path) -> None:
         if not db_path.is_file():
             raise StateUnavailable(str(db_path))
-        uri = f"file:{db_path}?mode=ro"
+        # Quoted: a path with % ? or # would otherwise be read as URI syntax.
+        uri = f"file:{quote(str(db_path), safe='/')}?mode=ro"
         if not Path(f"{db_path}-wal").exists():
             # Everything committed is in the main file. A plain read-only open of a WAL database
             # would create -wal and -shm files next to it; immutable reads it without touching
@@ -233,12 +234,15 @@ class StateReader:
         rows = self._run_rows("WHERE rule = ? AND status = 'ok'", (rule,), 1)
         return rows[0] if rows else None
 
-    def statuses(self, rule: str) -> Iterator[str]:
-        """The rule's run statuses, newest first."""
-        if not {"rule", "status", "id"} <= self.columns("run"):
+    def statuses(self, rule: str) -> Iterator[tuple[str, int]]:
+        """The rule's run (status, failed) pairs, newest first."""
+        if not {"rule", "status", "failed", "id"} <= self.columns("run"):
             return iter(())
         return (
-            r[0] for r in self._db.execute("SELECT status FROM run WHERE rule = ? ORDER BY id DESC", (rule,))
+            (r[0], r[1])
+            for r in self._db.execute(
+                "SELECT status, failed FROM run WHERE rule = ? ORDER BY id DESC", (rule,)
+            )
         )
 
     def changes(self, rule: str | None = None) -> Iterator[ChangeView]:
@@ -473,7 +477,7 @@ class StatusView:
 def _health(run: RunView | None) -> Health:
     if run is None:
         return "never_run"
-    if run.status == "ok" or (run.status == "partial" and run.failed == 0):
+    if _is_ok(run.status, run.failed):
         return "ok"
     if run.error_kind == "auth" or (run.error_kind is None and (run.error or "").startswith("AuthError")):
         return "auth"
@@ -489,10 +493,16 @@ def _worst(present: set[Health]) -> Health:
     return "ok"
 
 
+def _is_ok(status: str, failed: int) -> bool:
+    """A run whose health is ``ok``: ok, or partial without failed items."""
+    return status == "ok" or (status == "partial" and failed == 0)
+
+
 def _consecutive_failures(reader: StateReader, rule: str) -> int:
+    """The newest runs in a row whose health is not ``ok``."""
     count = 0
-    for status in reader.statuses(rule):
-        if status == "ok":
+    for status, failed in reader.statuses(rule):
+        if _is_ok(status, failed):
             break
         count += 1
     return count

@@ -354,24 +354,30 @@ def _now() -> datetime:
 ViewBuilder = Callable[["Config", "StateReader"], "StatusView | UpcomingView | RunsView | ChangesView"]
 
 
-def _show(args: argparse.Namespace, out: TextIO, build: ViewBuilder) -> int:
+def _show(args: argparse.Namespace, out: TextIO, build: ViewBuilder, *, check_rule: bool = True) -> int:
     """Build a read-only view from the state database and print it (as JSON with ``--json``)."""
+    import sqlite3
+
     from calsync.views import NO_STATE_MESSAGE, StateReader, StateUnavailable
     from calsync.wiring import state_paths
 
     config = _load(args)
     rule = getattr(args, "rule", None)
-    if rule is not None and rule not in {r.name for r in config.rules}:
+    # History outlives the config: `runs` and `changes` also show rules removed since.
+    if check_rule and rule is not None and rule not in {r.name for r in config.rules}:
         out.write(f"unknown rule(s): {rule}\n")
         return EXIT_CONFIG
     db_path, _ = state_paths(_state_dir(args))
     try:
         reader = StateReader(db_path)
+        with reader:
+            view = build(config, reader)
     except StateUnavailable:
         out.write(NO_STATE_MESSAGE + "\n")
         return EXIT_FAILED
-    with reader:
-        view = build(config, reader)
+    except sqlite3.DatabaseError as exc:  # not a database, corrupt, or locked
+        out.write(f"error: the state database could not be read: {type(exc).__name__}\n")
+        return EXIT_FAILED
     if args.json:
         out.write(json.dumps(view.to_json(), ensure_ascii=False, indent=2) + "\n")
     else:
@@ -446,7 +452,10 @@ def cmd_runs(args: argparse.Namespace, out: TextIO) -> int:
     from calsync.views import build_runs
 
     return _show(
-        args, out, lambda config, reader: build_runs(config, reader, rule=args.rule, limit=args.limit)
+        args,
+        out,
+        lambda config, reader: build_runs(config, reader, rule=args.rule, limit=args.limit),
+        check_rule=False,
     )
 
 
@@ -459,6 +468,7 @@ def cmd_changes(args: argparse.Namespace, out: TextIO) -> int:
         lambda config, reader: build_changes(
             config, reader, rule=args.rule, since=args.since, limit=args.limit
         ),
+        check_rule=False,
     )
 
 

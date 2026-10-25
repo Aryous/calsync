@@ -96,6 +96,15 @@ def test_missing_database_is_state_unavailable(tmp_path: Path) -> None:
     assert not (tmp_path / "state.db").exists()
 
 
+def test_reader_opens_a_path_with_uri_characters(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state %41 #1 ?x"
+    state_dir.mkdir()
+    with Store(state_dir / "state.db") as store:
+        store.record_runs([_run("ok")])
+    with StateReader(state_dir / "state.db") as r:
+        assert [run.status for run in r.runs()] == ["ok"]
+
+
 @pytest.mark.parametrize(
     ("url", "host"),
     [
@@ -358,6 +367,13 @@ def test_failing_attention_counts_consecutive_failures(tmp_path: Path) -> None:
             "command": None,
         }
     ]
+
+
+def test_consecutive_failures_count_only_runs_that_are_not_ok(tmp_path: Path) -> None:
+    # A partial run without failures is healthy (as health says), so it ends the streak.
+    runs = [_run("failed", error="x"), _run("partial"), _run("partial", failed=1), _run("failed", error="y")]
+    view = _status(tmp_path, runs)
+    assert view["rules"][0]["consecutive_failures"] == 2
 
 
 def test_blocked_attention_counts_the_blocked_deletions(tmp_path: Path) -> None:
