@@ -228,7 +228,7 @@ The README's command list must not advertise them.
   - **`consecutive_failures`:** the number of newest runs in a row with status other than `ok`.
   - **`attention`:** one entry per rule with health `auth` / `blocked` / `failing`, with these messages (exact):
     - **`auth`:** `"The {account} account needs to be connected again."`, command `calsync auth {account}`. For `account`, use the rule's source account if the error mentions Google or the source fails, else the target. Simplest rule: the source account if `error` contains "google" (case-insensitive) or "oauth", else the target account.
-    - **`blocked`:** `"Sync paused: {n} deletions are waiting for your confirmation."`, command `calsync run --rule {rule} --allow-deletes`. Here `n` is the number of `blocked` change rows of the latest run, or 0 when unknown; with 0, the message is `"Sync paused: deletions are waiting for your confirmation."`.
+    - **`blocked`:** `"Sync paused: {n} deletions are waiting for your confirmation."`, command `calsync run --rule {rule} --allow-deletes`. Here `n` is the number of `blocked` change rows sharing the greatest `run_id` among the rule's blocked rows (the latest recorded blocked set), or 0 when unknown; with 0, the message is `"Sync paused: deletions are waiting for your confirmation."`.
     - **`failing`:** `"Sync has failed {k} times in a row."`, command `null`.
   - **`changes_24h`:** the sum of `created + updated + deleted` over runs that finished within 24 h.
   - **`copies`:** the number of `target_object` rows with this rule's `rule_tag` (`naming.rule_tag`).
