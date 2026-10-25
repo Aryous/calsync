@@ -1126,6 +1126,23 @@ def test_web_reset_key(tmp_path: Path) -> None:
     assert stat.S_IMODE((state / "web.key").stat().st_mode) == 0o600
 
 
+def test_web_pair_refuses_a_key_file_others_can_read(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "s"
+    run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"])
+    key_file = state / "web.key"
+    key_file.chmod(0o644)
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"])
+    assert code == EXIT_FAILED
+    assert text == (
+        f"error: other users can access {key_file} (mode 0644); run `chmod 600 {key_file}`, "
+        "or replace the key with `calsync web reset-key`\n"
+    )
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "web", "reset-key"])
+    assert code == EXIT_OK and stat.S_IMODE(key_file.stat().st_mode) == 0o600
+
+
 def test_daemon_listen_is_validated(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
     cfg.write_text(VIEWS_CONFIG)

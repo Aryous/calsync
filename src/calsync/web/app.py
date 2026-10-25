@@ -245,4 +245,5 @@ def create_web_app(
         Mount("/static", app=_Static(directory=STATIC_DIR), name="static"),
     ]
     guard = Middleware(_Guard, keys=keys, config_provider=config_provider, listen_host=listen_host)
-    return Starlette(routes=routes, middleware=[guard], exception_handlers=api.exception_handlers)
+    middleware = [Middleware(api.ContainErrors), guard]  # errors in the checks are contained too
+    return Starlette(routes=routes, middleware=middleware, exception_handlers=api.exception_handlers)

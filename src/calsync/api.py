@@ -28,9 +28,11 @@ import anyio.to_thread
 import uvicorn
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from calsync import __version__, views
 from calsync.config import Config
@@ -239,6 +241,35 @@ def guarded(endpoint: Endpoint) -> Endpoint:
     return wrapper
 
 
+class ContainErrors:
+    """Pure ASGI middleware, outermost of an app's own: an error that escapes everything inside
+    it (the checks around the routes, a mount, the router) becomes the fixed JSON 500, logged by
+    type only. It is not raised on: Starlette's ``ServerErrorMiddleware`` would log it with its
+    traceback after answering. Once a response has started, the error is only logged."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        started = False
+
+        async def tracking(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self._app(scope, receive, tracking)
+        except Exception as exc:
+            error = _internal(exc)
+            if not started:
+                await error_response(error.status, error.kind, error.message)(scope, receive, send)
+
+
 def api_routes(
     *,
     config_provider: Callable[[], Config],
@@ -287,7 +318,9 @@ def create_app(
     clock: Clock = _now,
 ) -> Starlette:
     routes = api_routes(config_provider=config_provider, state_dir=state_dir, daemon=daemon, clock=clock)
-    return Starlette(routes=routes, exception_handlers=exception_handlers)
+    return Starlette(
+        routes=routes, middleware=[Middleware(ContainErrors)], exception_handlers=exception_handlers
+    )
 
 
 # ----- serving on a unix socket ---------------------------------------------------------

@@ -7,6 +7,7 @@ Requests go through ``httpx.ASGITransport`` (from 127.0.0.1); the client's ``bas
 import asyncio
 import hashlib
 import hmac
+import logging
 import stat
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -120,6 +121,39 @@ async def test_key_file_is_private_and_stable(tmp_path: Path) -> None:
     new = auth.reset_key(state_dir)
     assert new != key and auth.load_or_create_key(state_dir) == new
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o604, 0o620, 0o602, 0o644])
+async def test_a_key_file_other_users_can_reach_is_refused(tmp_path: Path, mode: int) -> None:
+    state_dir = tmp_path / "state"
+    key = auth.load_or_create_key(state_dir)
+    path = state_dir / "web.key"
+    path.chmod(mode)
+    with pytest.raises(auth.InsecureKeyFile) as info:
+        auth.load_or_create_key(state_dir)
+    assert str(info.value) == (
+        f"other users can access {path} (mode {mode:04o}); run `chmod 600 {path}`, "
+        "or replace the key with `calsync web reset-key`"
+    )
+    with pytest.raises(auth.InsecureKeyFile):
+        auth.Keys(state_dir).matches(key)
+    assert path.read_text().strip() == key  # left alone
+    new = auth.reset_key(state_dir)  # recovers without reading it
+    assert new != key and stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert auth.load_or_create_key(state_dir) == new
+
+
+async def test_the_server_refuses_a_key_file_others_can_read(
+    state: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    key = auth.load_or_create_key(state)
+    (state / "web.key").chmod(0o644)
+    caplog.set_level(logging.DEBUG)
+    c = client(state)
+    response = await c.get("/", params={"k": key})
+    assert response.status_code == 500 and "set-cookie" not in response.headers
+    ours = [r.getMessage() for r in caplog.records if r.name.startswith("calsync")]
+    assert ours == ["an API request failed (InsecureKeyFile)"]  # the client's own httpx log aside
 
 
 async def test_session_token() -> None:
@@ -302,6 +336,51 @@ async def test_a_cross_origin_post_is_403(state: Path) -> None:
     assert (await c.post("/api/trigger", headers={"origin": "http://127.0.0.1:8766"})).status_code == 202
     assert (await c.post("/api/trigger")).status_code == 202  # no Origin: not a browser's cross-site request
     assert (await c.get("/api/status", headers={"origin": "http://evil.example"})).status_code == 200
+
+
+# ----- errors outside the endpoints ----------------------------------------------------
+
+INTERNAL = {"error": {"kind": "internal", "message": "Internal error."}}
+
+
+def assert_type_only(caplog: pytest.LogCaptureFixture, kind: str, *secrets: str) -> None:
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert [r.getMessage() for r in errors] == [f"an API request failed ({kind})"]
+    assert all(r.exc_info is None for r in caplog.records)
+    assert "Traceback" not in caplog.text
+    for text in secrets:
+        assert text not in caplog.text
+
+
+async def test_an_unreadable_key_file_in_the_cookie_check_is_a_plain_500(
+    state: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    key = auth.load_or_create_key(state)
+    c = client(state)  # ASGITransport re-raises whatever escapes the app
+    c.cookies.set("calsync_session", auth.session_token(key))
+    caplog.set_level(logging.DEBUG)
+    (state / "web.key").chmod(0)
+    try:
+        response = await c.get("/api/status")
+    finally:
+        (state / "web.key").chmod(0o600)
+    assert response.status_code == 500 and response.json() == INTERNAL
+    assert_type_only(caplog, "PermissionError", "web.key", str(state))
+
+
+async def test_a_failing_config_in_the_host_check_is_a_plain_500(
+    state: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    def broken() -> Config:
+        raise RuntimeError("和朋友吃午饭 at https://calendar.example.invalid/e/123")
+
+    app = create_web_app(config_provider=broken, state_dir=state, daemon=None, listen_host="127.0.0.1")
+    caplog.set_level(logging.DEBUG)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://nas.lan") as c:
+        response = await c.get("/static/favicon.svg")  # nas.lan: not loopback, so the config is read
+    assert response.status_code == 500 and response.json() == INTERNAL
+    assert "和朋友吃午饭" not in response.text
+    assert_type_only(caplog, "RuntimeError", "和朋友吃午饭", "example.invalid")
 
 
 # ----- the daemon's TCP listener ----------------------------------------------------------

@@ -13,8 +13,11 @@ import hmac
 import ipaddress
 import os
 import secrets
+import stat
 from collections.abc import Iterable
 from pathlib import Path
+
+from calsync.errors import CalsyncError
 
 KEY_FILE = "web.key"
 COOKIE = "calsync_session"
@@ -31,12 +34,29 @@ def session_token(key: str) -> str:
     return hmac.new(key.encode(), b"calsync-session-v1", hashlib.sha256).hexdigest()
 
 
+class InsecureKeyFile(CalsyncError):
+    """``web.key`` is open to other users (any group or other permission bit): not used."""
+
+    def __init__(self, path: Path, mode: int) -> None:
+        super().__init__(
+            f"other users can access {path} (mode {mode:04o}); run `chmod 600 {path}`, "
+            "or replace the key with `calsync web reset-key`"
+        )
+
+
 def read_key(state_dir: Path) -> str | None:
-    """The key, or None if there is none (no file, or an empty one)."""
+    """The key, or None if there is none (no file, or an empty one). ``InsecureKeyFile`` if
+    other users could read or replace it."""
+    path = key_path(state_dir)
     try:
-        text = key_path(state_dir).read_text(encoding="utf-8").strip()
+        fd = os.open(path, os.O_RDONLY)
     except FileNotFoundError:
         return None
+    with os.fdopen(fd, encoding="utf-8") as fh:  # the mode checked is the file's that is read
+        mode = stat.S_IMODE(os.fstat(fd).st_mode)
+        if mode & 0o077:
+            raise InsecureKeyFile(path, mode)
+        text = fh.read().strip()
     return text or None
 
 
