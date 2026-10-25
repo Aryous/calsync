@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#0D1B3D">
+<title>calsync</title>
+<script>
+  // Theme and language before first paint: ?theme= / ?lang=, then localStorage, then the system.
+  (function () {
+    var d = document.documentElement, q = new URLSearchParams(location.search), s = null, l = null;
+    try { s = localStorage.getItem("calsync.theme"); l = localStorage.getItem("calsync.lang"); } catch (e) {}
+    var p = q.get("theme");
+    if (p !== "light" && p !== "dark") p = s;
+    var dark = p === "dark" || (p !== "light" && window.matchMedia && matchMedia("(prefers-color-scheme: dark)").matches);
+    d.setAttribute("data-theme", dark ? "dark" : "light");
+    var ql = q.get("lang");
+    if (ql !== "zh" && ql !== "en") ql = l === "zh" || l === "en" ? l : ((navigator.language || "").toLowerCase().indexOf("zh") === 0 ? "zh" : "en");
+    d.setAttribute("lang", ql === "zh" ? "zh-CN" : "en");
+  })();
+</script>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/static/vendor/fonts/barlow-condensed-latin-600-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="modulepreload" href="/static/vendor/htm-preact-standalone.mjs">
+<script type="module" src="/static/app.js"></script>
+</head>
+<body>
+<div id="app">
+  <header class="bar"><div class="bar__in"><span class="wordmark">calsync</span></div></header>
+  <noscript><p class="noscript">calsync needs JavaScript to show the sync status. · 需要启用 JavaScript 才能显示同步状态。</p></noscript>
+</div>
+</body>
+</html>
