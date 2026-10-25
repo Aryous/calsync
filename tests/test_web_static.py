@@ -114,3 +114,40 @@ def test_t_is_only_called_with_literal_keys() -> None:
     app = (STATIC / "app.js").read_text(encoding="utf-8")
     dynamic = re.findall(r'\bt\(\s*[^"\s)]', app)
     assert not dynamic, f"t() called with a non-literal key: {dynamic}"
+
+
+class _Inline(HTMLParser):
+    """Inline scripts and styles, which the pages' CSP (``default-src 'self'``) would block."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.found: list[str] = []
+        self.head: list[str] = []
+        self._in_head = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "head":
+            self._in_head = True
+        if self._in_head and tag in {"script", "link"}:
+            self.head.append(values.get("src") or values.get("href") or "")
+        if tag == "script" and not values.get("src"):
+            self.found.append("<script> without src")
+        if tag == "style":
+            self.found.append("<style>")
+        if "style" in values:
+            self.found.append(f"style= on <{tag}>")
+        self.found += [f"{name}= on <{tag}>" for name in values if name.startswith("on")]
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "head":
+            self._in_head = False
+
+
+@pytest.mark.parametrize("page", PAGES)
+def test_pages_have_no_inline_script_or_style(page: str) -> None:
+    parser = _Inline()
+    parser.feed((STATIC / page).read_text(encoding="utf-8"))
+    assert parser.found == []
+    # The theme before first paint: a classic script, first in <head>, before any stylesheet.
+    assert parser.head[0] == "/static/theme.js"

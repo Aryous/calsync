@@ -3,7 +3,8 @@ on every request against DNS rebinding and cross-site requests.
 
 - ``GET /``: ``?k=<key>`` pairs this browser (cookie, then 303 to ``/``); otherwise the app
   when paired, else the pair page. ``POST /pair`` (form field ``key``) pairs too.
-- ``/api/*`` needs the cookie (401 ``unpaired`` without it). ``/static/*`` is public.
+- ``/api/*`` needs the cookie (401 ``unpaired`` without it). ``/static/*`` is public, except
+  the pages (``*.html``), which only ``/`` serves, with a CSP and ``X-Frame-Options: DENY``.
 - The ``Host`` header must name this machine: ``localhost``, a loopback address, the listen
   host, an ``allowed_hosts`` entry, or (when listening on every address) any IP literal.
 - A request other than GET or HEAD that carries ``Origin`` must come from this same origin.
@@ -15,6 +16,7 @@ its access control.
 """
 
 import ipaddress
+import os
 from collections import OrderedDict, deque
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -49,6 +51,17 @@ MAX_CLIENTS = 1024  # addresses whose failures are kept
 MAX_FORM = 4096  # bytes: the pair form holds one key
 LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
 NO_CACHE = {"Cache-Control": "no-cache"}
+# Every HTML page: no framing (clickjacking), and nothing but this origin's own files.
+CSP = "; ".join(
+    (
+        "default-src 'self'",
+        "object-src 'none'",
+        "base-uri 'none'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+    )
+)
+PAGE_HEADERS = {**NO_CACHE, "X-Frame-Options": "DENY", "Content-Security-Policy": CSP}
 
 Clock = Callable[[], datetime]
 
@@ -161,7 +174,15 @@ class _Guard:
 
 
 class _Static(StaticFiles):
-    """Static files, revalidated on every use (``no-cache``): an upgrade never mixes versions."""
+    """Static files, revalidated on every use (``no-cache``): an upgrade never mixes versions.
+    The pages (``*.html``) are not among them: they are served by ``/``, which decides between
+    the app and the pair page."""
+
+    def lookup_path(self, path: str) -> tuple[str, os.stat_result | None]:
+        full_path, found = super().lookup_path(path)
+        if full_path.lower().endswith(".html"):  # any case: APFS ignores it
+            return "", None
+        return full_path, found
 
     def file_response(self, *args: Any, **kwargs: Any) -> Response:
         response = super().file_response(*args, **kwargs)
@@ -175,7 +196,7 @@ def _page(
     text = (STATIC_DIR / name).read_text(encoding="utf-8")
     if notice:
         text = text.replace(NOTICE_MARKER, notice, 1)
-    return HTMLResponse(text, status_code=status, headers={**NO_CACHE, **(headers or {})})
+    return HTMLResponse(text, status_code=status, headers={**PAGE_HEADERS, **(headers or {})})
 
 
 def _pasted_key(text: str) -> str:

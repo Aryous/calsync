@@ -332,9 +332,48 @@ async def test_static_files_are_public(state: Path) -> None:
     for path in ("/static/app.js", "/static/styles.css", "/static/vendor/htm-preact-standalone.mjs"):
         response = await c.get(path)
         assert response.status_code == 200, path
-    page = await c.get("/static/pair.html")
-    assert page.status_code == 200 and page.headers["cache-control"] == "no-cache"
+    for path in ("/static/theme.js", "/static/pair.css", "/static/favicon.svg"):  # the pair page's
+        response = await c.get(path)
+        assert response.status_code == 200 and response.headers["cache-control"] == "no-cache", path
     assert (await c.get("/static/nope.js")).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/static/index.html",
+        "/static/pair.html",
+        "/static/INDEX.HTML",  # APFS: any case names the same file
+        "/static/Index.Html",
+        "/static/./index.html",
+        "/static/vendor/../index.html",
+        "/static/%69ndex.html",
+    ],
+)
+async def test_pages_are_not_served_from_static(state: Path, path: str) -> None:
+    c = await paired(state)  # not even to a paired browser: the app page is served at /
+    response = await c.get(path)
+    assert response.status_code == 404, path
+    assert "<html" not in response.text.lower()
+
+
+async def test_html_responses_refuse_frames_and_set_a_csp(state: Path) -> None:
+    key = auth.load_or_create_key(state)
+    c = client(state, clock=Clock())
+    pages = [await c.get("/"), await c.get("/", params={"k": "wrong"})]
+    for _ in range(9):
+        await c.post("/pair", data={"key": "wrong"})
+    pages.append(await c.post("/pair", data={"key": "wrong"}))  # 429
+    assert [p.status_code for p in pages] == [200, 403, 429]
+    await c.get("/", params={"k": key})
+    pages.append(await c.get("/"))  # the app page, paired
+    assert '<div id="app">' in pages[-1].text
+    for page in pages:
+        assert page.headers["x-frame-options"] == "DENY"
+        csp = [d.strip() for d in page.headers["content-security-policy"].split(";")]
+        assert "frame-ancestors 'none'" in csp and "default-src 'self'" in csp
+        assert "form-action 'self'" in csp and "base-uri 'none'" in csp and "object-src 'none'" in csp
+        assert not any("unsafe" in d for d in csp)
 
 
 # ----- Host and Origin ------------------------------------------------------------------
