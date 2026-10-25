@@ -1,0 +1,84 @@
+{
+  "generated_at": "@+0m",
+  "schema": {
+    "version": 4,
+    "current": true
+  },
+  "summary": {
+    "health": "ok",
+    "rules": 1,
+    "attention": 0,
+    "last_sync_at": "@-60s",
+    "changes_24h": 9
+  },
+  "accounts": [
+    {
+      "name": "me-google",
+      "provider": "google",
+      "host": "Google Calendar"
+    },
+    {
+      "name": "me-icloud",
+      "provider": "caldav",
+      "host": "iCloud"
+    }
+  ],
+  "rules": [
+    {
+      "name": "family",
+      "source": {
+        "account": "me-google",
+        "calendar": "c_family01@group.calendar.google.com",
+        "calendar_name": "家庭日程"
+      },
+      "target": {
+        "account": "me-icloud",
+        "calendar": "/12345678/calendars/home-family/",
+        "calendar_name": "家庭日程"
+      },
+      "scope": {
+        "kind": "all"
+      },
+      "alarms": "copy",
+      "fields": {
+        "attendees": "notes",
+        "conference": "copy",
+        "content": "full"
+      },
+      "health": "ok",
+      "last_run": {
+        "id": 40,
+        "rule": "family",
+        "started_at": "@-60s",
+        "finished_at": "@-59s",
+        "duration_ms": 702,
+        "status": "ok",
+        "created": 0,
+        "updated": 0,
+        "deleted": 0,
+        "failed": 0,
+        "reverted": 0,
+        "protected": 0,
+        "out_of_window": 0,
+        "requests": 3,
+        "error": null,
+        "error_kind": null
+      },
+      "last_ok_at": "@-60s",
+      "consecutive_failures": 0,
+      "copies": 17,
+      "out_of_window": 0,
+      "protected": 0
+    }
+  ],
+  "attention": [],
+  "daemon": {
+    "running": true,
+    "sync": false,
+    "pid": 48213,
+    "started_at": "@-3h",
+    "last_cycle_at": "@-60s",
+    "next_cycle_at": null,
+    "cycles": 181
+  }
+}
