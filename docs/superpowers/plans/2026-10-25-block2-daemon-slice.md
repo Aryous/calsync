@@ -367,7 +367,7 @@ The README's command list must not advertise them.
   - `GET /api/status` → status view plus `"daemon": DaemonInfo.to_json() | null`
   - `GET /api/upcoming?hours=24&rule=R` (`hours` clamped to 1..168)
   - `GET /api/runs?rule=R&limit=50` (limit 1..500)
-  - `GET /api/changes?rule=R&since=ISO&limit=100` (limit 1..1000)
+  - `GET /api/changes?rule=R&since=ISO&run_id=N&limit=100` (limit 1..1000; `run_id` returns only that run's changes, so the run history page can expand one run). Add the matching optional `run_id` parameter to `views.build_changes`.
   - `POST /api/trigger` with an optional JSON body `{"rule": "R"}` → `202 {"accepted": true, "rule": "R" | null}`
     - 409 `{"error": {"kind": "read_only", ...}}` in `--no-sync`;
     - 404 for an unknown rule.
@@ -402,6 +402,6 @@ The README's command list must not advertise them.
   - Check the stale-socket cleanup: create a dangling socket file first.
   - Check that `calsync trigger` against the running read-only daemon prints the `--no-sync` message.
   - Note: macOS limits AF_UNIX paths to 104 bytes. If `tmp_path` is too long, use `tempfile.mkdtemp(dir="/tmp")` in that test.
-- [ ] **Step 4: Implement the socket serving and `trigger`.**
+- [ ] **Step 4: Implement the socket serving and `trigger`.** Also add `calsync daemon --listen HOST:PORT` as a no-op placeholder? No: the TCP listener belongs to block ③; do not add it here.
 - [ ] **Step 5: Docs.** Run the full checks.
 - [ ] **Step 6: Commit** `feat(api): local control API over a unix socket and calsync trigger`, plus `docs: daemon, trigger and read commands`.
