@@ -13,6 +13,11 @@ cycle), and runs a cycle at start, then after every wait of ``interval × (1 ± 
 - A rule that failed for authentication gets its accounts' adapters rebuilt before its next
   attempt, which picks up a credential stored meanwhile by ``calsync auth``.
 
+Beside the scheduler, the daemon serves the local API (``calsync.api``) on
+``<state_dir>/calsync.sock``. Each service catches its own failure, logs it and sets ``stop``:
+a failing server never cancels a cycle in progress. Once every service has ended (the cycle
+finished), ``run`` raises the first failure.
+
 Without sync (``--no-sync``) the daemon takes no lock, reads no credential, opens no store and
 runs no cycle: it only serves the API beside a daemon (or ``calsync run``) that does.
 """
@@ -22,13 +27,14 @@ import contextlib
 import logging
 import os
 import random
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+import socket
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
-from calsync import wiring
+from calsync import api, wiring
 from calsync.config import Config
 from calsync.cycle import counts_line, run_cycle
 from calsync.engine import CycleResult, Engine, RuleResult
@@ -99,14 +105,17 @@ class Daemon:
         state_dir: Path,
         *,
         sync: bool = True,
+        serve: bool = True,
         clock: Callable[[], datetime] = _now,
         sleep: Sleep = asyncio.sleep,
         rng: Callable[[], float] = random.random,
         adapters_factory: AdaptersFactory | None = None,
     ) -> None:
         self._config = config
+        self._state_dir = state_dir
         self._db_path, self._lock_path = wiring.state_paths(state_dir)
         self._sync = sync
+        self._serve_api = serve  # False: no socket (tests of the schedule)
         self._clock = clock
         self._sleep = sleep
         self._rng = rng
@@ -135,21 +144,41 @@ class Daemon:
     async def run(self, stop: asyncio.Event) -> None:
         """Run until ``stop`` is set; a cycle in progress finishes first.
 
-        Every service runs as a task of one group and ends when ``stop`` is set: the scheduler
-        (with sync) and the API server beside it.
+        The services, the scheduler (with sync) and the API server beside it, run as tasks of
+        one group and end when ``stop`` is set. A failing service sets ``stop`` instead of
+        cancelling the others; its error is raised once they have all ended.
         """
         self._running = True
+        failures: list[Exception] = []
         try:
-            async with self._resources(), asyncio.TaskGroup() as group:
+            async with self._resources() as sock, asyncio.TaskGroup() as group:
                 if self._sync:
-                    group.create_task(self._scheduler(stop))
+                    group.create_task(self._service("scheduler", self._scheduler(stop), stop, failures))
+                if sock is not None:
+                    group.create_task(self._service("api server", self._serve(sock, stop), stop, failures))
                 group.create_task(stop.wait())
-        except ExceptionGroup as failed:  # one service failed: raise its error as is
-            if len(failed.exceptions) == 1:
-                raise failed.exceptions[0] from None
-            raise
         finally:
             self._running = False
+        if failures:
+            raise failures[0]
+
+    @staticmethod
+    async def _service(
+        name: str, work: Coroutine[Any, Any, None], stop: asyncio.Event, failures: list[Exception]
+    ) -> None:
+        try:
+            await work
+        except Exception as exc:
+            # The type only: an error's text can carry a request URL.
+            log.error("the %s failed (%s); stopping", name, type(exc).__name__)
+            failures.append(exc)
+            stop.set()
+
+    async def _serve(self, sock: socket.socket, stop: asyncio.Event) -> None:
+        app = api.create_app(
+            config_provider=lambda: self._config, state_dir=self._state_dir, daemon=self, clock=self._clock
+        )
+        await api.serve(app, sock, stop)
 
     def request_cycle(self, rule: str | None = None) -> bool:
         """Run a cycle now (after the current one, if one is running): ``rule`` only, or every
@@ -181,24 +210,28 @@ class Daemon:
 
     # ----- resources ----------------------------------------------------------
     @contextlib.asynccontextmanager
-    async def _resources(self) -> AsyncIterator[None]:
-        """With sync: the lock, the store, the adapters and the engine, closed in reverse."""
-        if not self._sync:
-            yield
-            return
-        with RunLock(self._lock_path):
-            store = Store(self._db_path)
-            try:
-                try:
-                    await self._build(sorted(wiring.accounts_in_use(self._config)))
-                    self._store = store
-                    self._engine = wiring.build_engine(self._config, self._adapters, store, clock=self._clock)
-                    yield
-                finally:
-                    self._engine = self._store = None
-                    await self._close_adapters()
-            finally:
-                store.close()
+    async def _resources(self) -> AsyncIterator[socket.socket | None]:
+        """The lock (with sync), the API socket (when serving; yielded), then the store, the
+        adapters and the engine (with sync), closed in reverse."""
+        async with contextlib.AsyncExitStack() as stack:
+            if self._sync:
+                stack.enter_context(RunLock(self._lock_path))
+            sock: socket.socket | None = None
+            if self._serve_api:
+                self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                sock = stack.enter_context(api.unix_socket(wiring.socket_path(self._state_dir)))
+            if self._sync:
+                store = Store(self._db_path)
+                stack.callback(store.close)
+                stack.push_async_callback(self._release)
+                await self._build(sorted(wiring.accounts_in_use(self._config)))
+                self._store = store
+                self._engine = wiring.build_engine(self._config, self._adapters, store, clock=self._clock)
+            yield sock
+
+    async def _release(self) -> None:
+        self._engine = self._store = None
+        await self._close_adapters()
 
     async def _build(self, names: Iterable[str]) -> None:
         """Build (or rebuild) each account's adapters; a replaced build's clients are closed."""

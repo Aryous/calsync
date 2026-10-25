@@ -857,7 +857,9 @@ def test_daemon_refuses_a_held_lock(tmp_path: Path) -> None:
 DAEMON_SCRIPT = "import sys\nfrom calsync.cli import main\nsys.exit(main(sys.argv[1:]))\n"
 
 
-def _daemon_process(tmp_path: Path, *extra: str) -> "subprocess.Popen[str]":
+def _daemon_process(tmp_path: Path, state: Path, *extra: str) -> "subprocess.Popen[str]":
+    """``calsync daemon`` with a config in ``tmp_path`` and the state (and its socket) in
+    ``state``, which must be short: a unix socket path is limited to 104 bytes on macOS."""
     cfg = tmp_path / "config.toml"
     cfg.write_text(VIEWS_CONFIG)  # env credentials that are never set: no network, no secret read
     env = {k: v for k, v in os.environ.items() if not k.startswith("CALSYNC_")}
@@ -869,7 +871,7 @@ def _daemon_process(tmp_path: Path, *extra: str) -> "subprocess.Popen[str]":
             "--config",
             str(cfg),
             "--state-dir",
-            str(tmp_path / "s"),
+            str(state),
             "daemon",
             *extra,
         ],
@@ -899,13 +901,38 @@ def _run_count(db: Path) -> int:
         return len(reader.runs())
 
 
-def test_daemon_signals(tmp_path: Path) -> None:
-    db = tmp_path / "s" / "state.db"
-    proc = _daemon_process(tmp_path)
+def _serving(state: Path) -> bool:
+    """The daemon's socket accepts connections."""
+    import socket
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        try:
+            probe.connect(str(state / "calsync.sock"))
+        except OSError:
+            return False
+    return True
+
+
+def test_daemon_signals_and_trigger(tmp_path: Path, short_dir: Path) -> None:
+    state = short_dir / "s"
+    db = state / "state.db"
+    proc = _daemon_process(tmp_path, state)
     try:
         _wait_for(lambda: _run_count(db) >= 1, proc)  # the first cycle starts at once
         proc.send_signal(signal.SIGUSR1)  # a cycle now, despite the backoff of the failed rule
         _wait_for(lambda: _run_count(db) >= 2, proc)
+        _wait_for(lambda: _serving(state), proc)
+        assert run(["--state-dir", str(state), "trigger"]) == (EXIT_OK, "ok: cycle requested\n")
+        _wait_for(lambda: _run_count(db) >= 3, proc)
+        assert run(["--state-dir", str(state), "trigger", "--rule", "family"]) == (
+            EXIT_OK,
+            "ok: cycle requested\n",
+        )
+        _wait_for(lambda: _run_count(db) >= 4, proc)
+        assert run(["--state-dir", str(state), "trigger", "--rule", "nope"]) == (
+            EXIT_CONFIG,
+            "unknown rule(s): nope\n",
+        )
         proc.send_signal(signal.SIGTERM)
         out, err = proc.communicate(timeout=20)
     finally:
@@ -913,24 +940,43 @@ def test_daemon_signals(tmp_path: Path) -> None:
             proc.kill()
             proc.communicate()
     assert proc.returncode == EXIT_OK and out == ""
-    assert err.count("INFO calsync.daemon: rule=family status=failed ") == 2
+    assert err.count("INFO calsync.daemon: rule=family status=failed ") == 4
     assert "error_kind=auth" in err and "Traceback" not in err
-    with RunLock(tmp_path / "s" / "run.lock"):  # released
+    assert "http" not in err.replace("httpx", "")  # no request URL in the log
+    with RunLock(state / "run.lock"):  # released
         pass
+    assert not (state / "calsync.sock").exists()
 
 
-def test_daemon_no_sync_stops_on_sigint(tmp_path: Path) -> None:
-    proc = _daemon_process(tmp_path, "--no-sync")
+def test_daemon_no_sync_serves_and_stops_on_sigint(tmp_path: Path, short_dir: Path) -> None:
+    state = short_dir / "s"
+    proc = _daemon_process(tmp_path, state, "--no-sync")
     try:
-        _wait_for(lambda: "daemon started" in (proc.stderr.readline() if proc.stderr else ""), proc)
-        proc.send_signal(signal.SIGINT)
+        _wait_for(lambda: _serving(state), proc)
+        assert run(["--state-dir", str(state), "trigger"]) == (
+            EXIT_FAILED,
+            "the daemon runs with --no-sync\n",
+        )
+        proc.send_signal(signal.SIGINT)  # reaches the daemon's own handler, not uvicorn's
         _, err = proc.communicate(timeout=20)
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.communicate()
-    assert proc.returncode == EXIT_OK and "Traceback" not in err
-    assert not (tmp_path / "s").exists()  # no lock, no state database
+    assert proc.returncode == EXIT_OK and "Traceback" not in err and "daemon stopped" in err
+    assert sorted(p.name for p in state.iterdir()) == []  # no lock, no state database; socket removed
+
+
+def test_trigger_without_a_daemon(short_dir: Path) -> None:
+    import socket
+
+    not_running = (EXIT_FAILED, "the daemon is not running; use calsync run\n")
+    assert run(["--state-dir", str(short_dir / "none"), "trigger"]) == not_running  # no socket
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dead.bind(str(short_dir / "calsync.sock"))  # a socket file nobody listens on: refused
+    dead.close()
+    assert run(["--state-dir", str(short_dir), "trigger"]) == not_running
+    assert not (short_dir / "none").exists()
 
 
 def test_daemon_logging_keeps_request_urls_out(caplog: pytest.LogCaptureFixture) -> None:

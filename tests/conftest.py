@@ -1,6 +1,8 @@
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from collections.abc import Iterator
@@ -13,6 +15,17 @@ import pytest
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture
+def short_dir() -> Iterator[Path]:
+    """A scratch directory under /tmp: macOS limits a unix socket path to 104 bytes, and
+    ``tmp_path`` alone is longer than that there."""
+    path = Path(tempfile.mkdtemp(prefix="calsync-", dir="/tmp"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def _free_port() -> int:

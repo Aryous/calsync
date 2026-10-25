@@ -622,3 +622,18 @@ def test_change_since_filters_by_instant(tmp_path: Path) -> None:
         changes = build_changes(family(), r, since=since).to_json()["changes"]
         assert build_changes(family(), r, rule="other").to_json()["changes"] == []
     assert [(c["object_id"], c["title"]) for c in changes] == [("b", None)]
+
+
+def test_changes_of_one_run(tmp_path: Path) -> None:
+    with Store(tmp_path / "state.db") as store:
+        for i, oid in enumerate(("a", "b", "c")):
+            at = NOW + timedelta(minutes=i)
+            store.record_runs(
+                [RunRecord("family", at, at, "ok", 1, 0, 0, 0, 1, None)],
+                [ChangeRecord("family", oid, "created", at, "Standup")],
+            )
+    with reader(tmp_path) as r:
+        second = build_changes(family(), r, run_id=2).to_json()["changes"]
+        assert build_changes(family(), r, rule="other", run_id=2).to_json()["changes"] == []
+        assert build_changes(family(), r, run_id=99).to_json()["changes"] == []
+    assert [(c["run_id"], c["object_id"]) for c in second] == [(2, "b")]

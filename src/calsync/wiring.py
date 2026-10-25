@@ -136,3 +136,8 @@ def build_engine(
 
 def state_paths(state_dir: Path) -> tuple[Path, Path]:
     return state_dir / "state.db", state_dir / "run.lock"
+
+
+def socket_path(state_dir: Path) -> Path:
+    """The daemon's API socket."""
+    return state_dir / "calsync.sock"

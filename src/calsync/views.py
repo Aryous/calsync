@@ -245,16 +245,24 @@ class StateReader:
             )
         )
 
-    def changes(self, rule: str | None = None) -> Iterator[ChangeView]:
-        """Changes, newest first (a missing ``change`` table: none)."""
+    def changes(self, rule: str | None = None, run_id: int | None = None) -> Iterator[ChangeView]:
+        """Changes, newest first: of ``rule`` and of the run ``run_id`` when given (a missing
+        ``change`` table: none)."""
         if not {"id", "run_id", "rule", "object_id", "action", "at", "title"} <= self.columns("change"):
             return
-        sql = "SELECT id, run_id, rule, object_id, action, at, title FROM change"
-        params: tuple[Any, ...] = ()
+        where: list[str] = []
+        params: list[Any] = []
         if rule is not None:
-            sql, params = sql + " WHERE rule = ?", (rule,)
-        for cid, run_id, name, oid, action, at, title in self._db.execute(sql + " ORDER BY id DESC", params):
-            yield ChangeView(cid, run_id, name, oid, action, _parse_time(at), title)
+            where.append("rule = ?")
+            params.append(rule)
+        if run_id is not None:
+            where.append("run_id = ?")
+            params.append(run_id)
+        sql = "SELECT id, run_id, rule, object_id, action, at, title FROM change"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        for cid, rid, name, oid, action, at, title in self._db.execute(sql + " ORDER BY id DESC", params):
+            yield ChangeView(cid, rid, name, oid, action, _parse_time(at), title)
 
     def blocked_count(self, rule: str) -> int:
         """Deletions in the most recently recorded blocked set (0: none recorded).
@@ -724,10 +732,12 @@ def build_changes(
     rule: str | None = None,
     since: datetime | None = None,
     limit: int = 100,
+    run_id: int | None = None,
 ) -> ChangesView:
-    """Recorded changes, newest first; ``since`` keeps those at or after that instant."""
+    """Recorded changes, newest first; ``since`` keeps those at or after that instant, ``run_id``
+    those of that run only."""
     found: list[ChangeView] = []
-    for change in reader.changes(rule):
+    for change in reader.changes(rule, run_id):
         if len(found) >= limit:
             break
         if since is None or change.at >= since:

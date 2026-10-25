@@ -62,6 +62,9 @@ def _parser() -> argparse.ArgumentParser:
         "--no-sync", action="store_true", help="run no sync cycles (no lock, no credentials): serve only"
     )
 
+    trigger = sub.add_parser("trigger", help="ask the running daemon to sync now")
+    trigger.add_argument("--rule", help="only this rule")
+
     status = sub.add_parser("status", help="sync health per rule (read-only)")
     status.add_argument("--json", action="store_true", help="print JSON")
 
@@ -361,6 +364,33 @@ async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
     return EXIT_OK
 
 
+async def _trigger(args: argparse.Namespace, out: TextIO) -> int:
+    """Ask the daemon, over its socket, for a cycle now."""
+    import httpx
+
+    from calsync.wiring import socket_path
+
+    transport = httpx.AsyncHTTPTransport(uds=str(socket_path(_state_dir(args))))
+    body = {"rule": args.rule} if args.rule else {}
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://calsync", timeout=10) as client:
+            response = await client.post("/api/trigger", json=body)
+    except httpx.ConnectError:  # no socket file, or nobody listening on it
+        out.write("the daemon is not running; use calsync run\n")
+        return EXIT_FAILED
+    if response.status_code == 202:
+        out.write("ok: cycle requested\n")
+        return EXIT_OK
+    if response.status_code == 409:
+        out.write("the daemon runs with --no-sync\n")
+        return EXIT_FAILED
+    if response.status_code == 404:
+        out.write(f"unknown rule(s): {args.rule}\n")
+        return EXIT_CONFIG
+    out.write(f"error: the daemon answered HTTP {response.status_code}\n")
+    return EXIT_FAILED
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -504,6 +534,8 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
             return asyncio.run(_run(args, out))
         if args.command == "daemon":
             return asyncio.run(_daemon(args, out))
+        if args.command == "trigger":
+            return asyncio.run(_trigger(args, out))
         if args.command == "status":
             return cmd_status(args, out)
         if args.command == "upcoming":

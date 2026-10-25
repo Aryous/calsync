@@ -114,6 +114,7 @@ class World:
             "sleep": self.sleep,
             "rng": lambda: 0.5,
             "adapters_factory": self.factory,
+            "serve": False,  # the socket tests below turn it on, in a short directory
         }
         return Daemon(config, state_dir, **{**options, **kwargs})
 
@@ -123,6 +124,20 @@ def runs_by_time(state_dir: Path) -> list[tuple[int, str]]:
     with StateReader(state_dir / "state.db") as reader:
         runs = reader.runs()  # newest first
     return [(int((r.started_at - NOW).total_seconds()), r.rule) for r in reversed(runs)]
+
+
+async def eventually(condition: Callable[[], bool]) -> None:
+    """Like ``until``, for conditions that need real time (threads, sockets)."""
+    for _ in range(500):
+        if condition():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition never became true")
+
+
+def uds_client(state_dir: Path) -> httpx.AsyncClient:
+    transport = httpx.AsyncHTTPTransport(uds=str(state_dir / "calsync.sock"))
+    return httpx.AsyncClient(transport=transport, base_url="http://calsync")
 
 
 async def until(condition: Callable[[], bool]) -> None:
@@ -435,33 +450,34 @@ async def test_snapshot_json(tmp_path: Path) -> None:
 
 
 async def test_no_sync_builds_no_adapters_and_takes_no_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async def refuse(*args: Any, **kwargs: Any) -> Adapters:
         raise AssertionError("build_adapters called")
 
     monkeypatch.setattr(wiring, "build_adapters", refuse)
     stop = asyncio.Event()
-    state_dir = tmp_path / "state"
+    state_dir = short_dir / "state"
     daemon = Daemon(two_rules(), state_dir, sync=False)
     task = asyncio.create_task(daemon.run(stop))
     await until(lambda: daemon.snapshot().running)
-    daemon.request_cycle()  # nothing to run: ignored
+    assert daemon.request_cycle() is False  # nothing runs cycles
     info = daemon.snapshot()
     assert (info.sync, info.next_cycle_at, info.cycles) == (False, None, 0)
     stop.set()
     await asyncio.wait_for(task, 5)
     assert not (state_dir / "run.lock").exists() and not (state_dir / "state.db").exists()
+    assert not (state_dir / "calsync.sock").exists()
 
 
-async def test_no_sync_runs_beside_a_running_sync_daemon(tmp_path: Path) -> None:
-    world = World(block=True)
-    task = asyncio.create_task(world.daemon(two_rules(), tmp_path).run(world.stop))
+async def test_no_sync_runs_beside_a_running_sync_daemon(short_dir: Path) -> None:
+    world = World(block=True)  # syncs without serving, as `calsync run` would
+    task = asyncio.create_task(world.daemon(two_rules(), short_dir).run(world.stop))
     await until(lambda: len(world.delays) == 1)
     stop = asyncio.Event()
-    viewer = Daemon(two_rules(), tmp_path, sync=False)
+    viewer = Daemon(two_rules(), short_dir, sync=False)
     viewer_task = asyncio.create_task(viewer.run(stop))
-    await until(lambda: viewer.snapshot().running)
+    await eventually(lambda: (short_dir / "calsync.sock").is_socket())
     stop.set()
     world.stop.set()
     await asyncio.wait_for(asyncio.gather(task, viewer_task), 5)
@@ -577,3 +593,136 @@ async def test_request_cycle_reports_whether_it_was_accepted(tmp_path: Path) -> 
     assert viewer.request_cycle() is False and viewer.request_cycle("work") is False
     with pytest.raises(ValueError, match="unknown rule"):
         viewer.request_cycle("nope")
+
+
+# ----- the API socket ---------------------------------------------------------------
+
+
+async def run_viewer(state_dir: Path) -> tuple[Daemon, asyncio.Event, "asyncio.Task[None]"]:
+    """A ``--no-sync`` daemon serving the socket in ``state_dir``, once it is listening."""
+    stop = asyncio.Event()
+    viewer = Daemon(two_rules(), state_dir, sync=False, clock=lambda: NOW)
+    task = asyncio.create_task(viewer.run(stop))
+    await eventually(lambda: (state_dir / "calsync.sock").is_socket() or task.done())
+    if task.done():
+        task.result()
+    return viewer, stop, task
+
+
+async def test_serves_the_api_on_a_private_socket(short_dir: Path) -> None:
+    import signal
+    import stat
+
+    world = World(stop_after=1)  # one cycle, for a state to show
+    await world.daemon(two_rules(), short_dir).run(world.stop)
+    before = signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)
+    viewer, stop, task = await run_viewer(short_dir)
+    sock = short_dir / "calsync.sock"
+    assert stat.S_IMODE(sock.stat().st_mode) == 0o600
+    async with uds_client(short_dir) as client:
+        status = await client.get("/api/status")
+        runs = await client.get("/api/runs")
+        trigger = await client.post("/api/trigger")
+    assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before  # uvicorn left them
+    assert status.status_code == 200
+    body = status.json()
+    assert body["daemon"] == viewer.snapshot().to_json() and body["daemon"]["sync"] is False
+    assert [r["name"] for r in body["rules"]] == ["family", "work"]
+    assert len(runs.json()["runs"]) == 2
+    assert trigger.status_code == 409 and trigger.json()["error"]["kind"] == "read_only"
+    stop.set()
+    await asyncio.wait_for(task, 5)
+    assert not sock.exists()  # removed on exit
+    assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before
+
+
+async def test_a_stale_socket_file_is_replaced(short_dir: Path) -> None:
+    import socket
+
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dead.bind(str(short_dir / "calsync.sock"))  # bound, never listened on, closed: nobody answers
+    dead.close()
+    assert (short_dir / "calsync.sock").is_socket()
+    _, stop, task = await run_viewer(short_dir)
+    async with uds_client(short_dir) as client:
+        response = await client.get("/api/status")
+    assert response.status_code == 503 and response.json()["error"]["kind"] == "no_state"
+    stop.set()
+    await asyncio.wait_for(task, 5)
+
+
+async def test_a_live_socket_means_another_daemon(short_dir: Path) -> None:
+    _, stop, task = await run_viewer(short_dir)
+    second = Daemon(two_rules(), short_dir, sync=False)
+    with pytest.raises(AlreadyRunning) as info:
+        await asyncio.wait_for(second.run(asyncio.Event()), 5)
+    assert info.value.pid is None
+    async with uds_client(short_dir) as client:  # the first one still serves
+        assert (await client.post("/api/trigger")).status_code == 409
+    stop.set()
+    await asyncio.wait_for(task, 5)
+    assert not (short_dir / "calsync.sock").exists()
+
+
+async def test_trigger_over_the_socket_runs_a_cycle(short_dir: Path) -> None:
+    world = World(block=True)
+    daemon = world.daemon(two_rules(), short_dir, serve=True)
+    task = asyncio.create_task(daemon.run(world.stop))
+    await until(lambda: len(world.delays) == 1)
+    async with uds_client(short_dir) as client:
+        response = await client.post("/api/trigger", json={"rule": "work"})
+        unknown = await client.post("/api/trigger", json={"rule": "nope"})
+        await eventually(lambda: len(world.delays) == 2)
+        status = (await client.get("/api/status")).json()
+    assert response.status_code == 202 and response.json() == {"accepted": True, "rule": "work"}
+    assert unknown.status_code == 404
+    assert runs_by_time(short_dir) == [(0, "family"), (0, "work"), (0, "work")]
+    assert status["daemon"]["cycles"] == 2 and status["daemon"]["sync"] is True
+    world.stop.set()
+    await asyncio.wait_for(task, 5)
+    assert not (short_dir / "calsync.sock").exists()
+
+
+async def test_a_failing_api_server_lets_the_running_cycle_finish(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from calsync import api
+    from calsync import daemon as daemon_module
+
+    world = World()
+    cycle_started = asyncio.Event()
+    real = daemon_module.run_cycle
+
+    async def slow_cycle(*args: Any, **kwargs: Any) -> Any:
+        cycle_started.set()
+        await world.stop.wait()  # the server fails meanwhile: the failure sets stop
+        return await real(*args, **kwargs)
+
+    async def broken_server(*args: Any) -> None:
+        await cycle_started.wait()
+        raise RuntimeError("server broke")
+
+    monkeypatch.setattr(daemon_module, "run_cycle", slow_cycle)
+    monkeypatch.setattr(api, "serve", broken_server)
+    caplog.set_level(logging.INFO, logger="calsync.daemon")
+    daemon = world.daemon(two_rules(), short_dir, serve=True)
+    with pytest.raises(RuntimeError, match="server broke"):
+        await asyncio.wait_for(daemon.run(world.stop), 5)
+    assert runs_by_time(short_dir) == [(0, "family"), (0, "work")]  # the cycle completed
+    assert daemon.snapshot().cycles == 1 and world.delays == []
+    assert "the api server failed (RuntimeError); stopping" in caplog.messages
+    assert all(c.is_closed for c in world.clients)
+    assert not (short_dir / "calsync.sock").exists()
+    with RunLock(short_dir / "run.lock"):
+        pass
+
+
+async def test_a_socket_that_cannot_be_bound_stops_the_start(tmp_path: Path) -> None:
+    world = World(stop_after=1)
+    state_dir = tmp_path / ("d" * 110)  # longer than a unix socket path may be
+    daemon = world.daemon(two_rules(), state_dir, serve=True)
+    with pytest.raises(OSError):
+        await asyncio.wait_for(daemon.run(world.stop), 5)
+    assert world.builds == [] and not (state_dir / "state.db").exists()
+    with RunLock(state_dir / "run.lock"):
+        pass
