@@ -3,8 +3,9 @@ turns account definitions into live clients."""
 
 import contextlib
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -85,11 +86,16 @@ def _add_account(config: Config, account: Account, secret: str, adapters: Adapte
 
 
 async def build_adapters(
-    config: Config, names: set[str], *, environ: Mapping[str, str] = os.environ
+    config: Config,
+    names: set[str],
+    *,
+    environ: Mapping[str, str] = os.environ,
+    log: RequestLog | None = None,
 ) -> Adapters:
     """Adapters for ``names``. An account whose setup fails is recorded in ``errors`` and
-    skipped, so one unreadable secret cannot stop the other accounts."""
-    adapters = Adapters(RequestLog())
+    skipped, so one unreadable secret cannot stop the other accounts. ``log``: record requests
+    there instead of in a new log (the daemon keeps one log across rebuilds)."""
+    adapters = Adapters(log if log is not None else RequestLog())
     try:
         for name in sorted(names):
             account = config.accounts[name]
@@ -119,8 +125,13 @@ def accounts_in_use(config: Config, rule_names: list[str] | None = None) -> set[
     return {r.source.account for r in rules} | {r.target.account for r in rules}
 
 
-def build_engine(config: Config, adapters: Adapters, store: Store) -> Engine:
-    return Engine(config, store, adapters.sources, adapters.targets, request_log=adapters.log)
+def build_engine(
+    config: Config, adapters: Adapters, store: Store, *, clock: Callable[[], datetime] | None = None
+) -> Engine:
+    """The engine over ``adapters``' dicts (by reference: replacing an entry swaps an adapter)."""
+    if clock is None:
+        return Engine(config, store, adapters.sources, adapters.targets, request_log=adapters.log)
+    return Engine(config, store, adapters.sources, adapters.targets, request_log=adapters.log, clock=clock)
 
 
 def state_paths(state_dir: Path) -> tuple[Path, Path]:

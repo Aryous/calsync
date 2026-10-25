@@ -52,6 +52,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", action="store_true", help="show the plan without writing")
     run.add_argument("--allow-deletes", action="store_true", help="bypass the mass-delete guard once")
 
+    daemon = sub.add_parser("daemon", help="sync on a schedule until stopped (SIGUSR1: sync now)")
+    daemon.add_argument(
+        "--no-sync", action="store_true", help="run no sync cycles (no lock, no credentials): serve only"
+    )
+
     status = sub.add_parser("status", help="sync health per rule (read-only)")
     status.add_argument("--json", action="store_true", help="print JSON")
 
@@ -141,7 +146,7 @@ def _describe(exc: BaseException) -> str:
     if isinstance(exc, AuthError):
         return f"authentication error: {exc}\n"
     if isinstance(exc, AlreadyRunning):
-        return f"{exc} (a later version will support `calsync trigger`)\n"
+        return f"{exc}; the daemon is running: use `calsync trigger`\n"
     if isinstance(exc, CalsyncError):  # network and other expected failures
         return f"error: {exc}\n"
     return f"error: {type(exc).__name__}: {exc}\n"
@@ -251,19 +256,10 @@ def _flat(text: str) -> str:
 
 
 def _print_cycle(result: "CycleResult", out: TextIO, verbose: bool) -> None:
+    from calsync.cycle import counts_line
+
     for name, r in result.rules.items():
-        line = (
-            f"rule={name} status={r.status} created={r.created} updated={r.updated} "
-            f"deleted={r.deleted} failed={r.failed}"
-        )
-        if r.protected:
-            line += f" protected={r.protected}"
-        if r.degraded:
-            line += f" degraded={r.degraded}"
-        if r.out_of_window:
-            line += f" out_of_window={r.out_of_window}"
-        if r.reverted:
-            line += f" reverted={r.reverted}"
+        line = counts_line(name, r)
         if r.error:
             line += f" error={r.error!r}"
         out.write(line + "\n")
@@ -287,9 +283,9 @@ def _print_cycle(result: "CycleResult", out: TextIO, verbose: bool) -> None:
 
 
 async def _run(args: argparse.Namespace, out: TextIO) -> int:
-    from calsync.engine import RuleResult
+    from calsync.cycle import run_cycle
     from calsync.lock import RunLock
-    from calsync.store import RunRecord, Store
+    from calsync.store import Store
     from calsync.wiring import accounts_in_use, build_adapters, build_engine, state_paths
 
     config = _load(args)
@@ -297,54 +293,57 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
     if unknown:
         out.write(f"unknown rule(s): {', '.join(unknown)}\n")
         return EXIT_CONFIG
-    selected = [r for r in config.rules if not args.rules or r.name in args.rules]
     db_path, lock_path = state_paths(_state_dir(args))
     with RunLock(lock_path):
         adapters = await build_adapters(config, accounts_in_use(config, args.rules))
         try:
-            # A rule whose source or target account could not be set up fails on its own;
-            # the other rules run normally.
-            skipped: dict[str, RuleResult] = {}
-            for rule in selected:
-                broken = [a for a in (rule.source.account, rule.target.account) if a in adapters.errors]
-                if broken:
-                    skipped[rule.name] = RuleResult(rule.name)
-                    skipped[rule.name].fail(adapters.errors[broken[0]])
             store = Store(db_path)
             try:
-                engine = build_engine(config, adapters, store)
-                result = await engine.cycle(
-                    rules=[r.name for r in selected if r.name not in skipped],
+                result = await run_cycle(
+                    build_engine(config, adapters, store),
+                    store,
+                    config,
+                    adapters,
+                    args.rules or None,
                     dry_run=args.dry_run,
                     allow_deletes=args.allow_deletes,
                 )
-                if skipped and not args.dry_run:  # keep run history complete
-                    start, end = result.started_at, result.finished_at
-                    store.record_runs(
-                        [
-                            RunRecord(
-                                r.rule,
-                                start,
-                                end,
-                                r.status,
-                                0,
-                                0,
-                                0,
-                                0,
-                                result.requests,
-                                r.error,
-                                error_kind=r.error_kind,
-                            )
-                            for r in skipped.values()
-                        ]
-                    )
             finally:
                 store.close()
         finally:
             await adapters.aclose()
-    result.rules = {r.name: result.rules.get(r.name) or skipped[r.name] for r in selected}
     _print_cycle(result, out, verbose=args.dry_run)
     return exit_code_for_results(result.rules.values())
+
+
+async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
+    """Run the daemon until SIGTERM or SIGINT; SIGUSR1 requests a cycle. Logs go to stderr."""
+    import logging
+    import signal
+
+    from calsync.daemon import Daemon
+
+    config = _load(args)
+    sync = not args.no_sync
+    if sync and not config.rules:
+        out.write("no rules configured: nothing to sync\n")
+        return EXIT_CONFIG
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logger = logging.getLogger(__name__)
+    daemon = Daemon(config, _state_dir(args), sync=sync)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    handlers = {signal.SIGTERM: stop.set, signal.SIGINT: stop.set, signal.SIGUSR1: daemon.request_cycle}
+    for signum, handler in handlers.items():
+        loop.add_signal_handler(signum, handler)
+    try:
+        logger.info("daemon started (pid %d, sync %s)", daemon.snapshot().pid, "on" if sync else "off")
+        await daemon.run(stop)
+    finally:
+        for signum in handlers:
+            loop.remove_signal_handler(signum)
+    logger.info("daemon stopped")
+    return EXIT_OK
 
 
 def _now() -> datetime:
@@ -488,6 +487,8 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
             return asyncio.run(_auth(args, out, stdin))
         if args.command == "run":
             return asyncio.run(_run(args, out))
+        if args.command == "daemon":
+            return asyncio.run(_daemon(args, out))
         if args.command == "status":
             return cmd_status(args, out)
         if args.command == "upcoming":

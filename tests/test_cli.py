@@ -1,7 +1,10 @@
 import io
+import os
+import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -175,7 +178,11 @@ def test_lock_busy_mentions_trigger(tmp_path: Path) -> None:
     state = tmp_path / "s"
     with RunLock(state / "run.lock"):
         code, text = run(["--config", str(cfg), "--state-dir", str(state), "run"])
-    assert code == EXIT_RUNNING and "calsync trigger" in text
+    assert code == EXIT_RUNNING
+    assert text == (
+        f"another calsync process holds the lock (pid {os.getpid()}); "
+        "the daemon is running: use `calsync trigger`\n"
+    )
 
 
 # ----- _print_cycle -----------------------------------------------------------
@@ -823,3 +830,104 @@ def test_light_commands_import_no_heavy_modules(tmp_path: Path) -> None:
             [sys.executable, "-c", script, *argv], capture_output=True, text=True, check=True
         )
         assert done.stdout == "\n", (argv, done.stdout, done.stderr)
+
+
+# ----- daemon -------------------------------------------------------------------
+
+
+def test_daemon_without_rules_exits_2(tmp_path: Path) -> None:
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(CONFIG.format(url="https://dav.example.com/", user="u", secret=tmp_path / "pw"))
+    state = tmp_path / "s"
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "daemon"])
+    assert (code, text) == (EXIT_CONFIG, "no rules configured: nothing to sync\n")
+    assert not state.exists()
+
+
+def test_daemon_refuses_a_held_lock(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "s"
+    with RunLock(state / "run.lock"):
+        code, text = run(["--config", str(cfg), "--state-dir", str(state), "daemon"])
+    assert code == EXIT_RUNNING and "holds the lock" in text
+    assert not (state / "state.db").exists()
+
+
+DAEMON_SCRIPT = "import sys\nfrom calsync.cli import main\nsys.exit(main(sys.argv[1:]))\n"
+
+
+def _daemon_process(tmp_path: Path, *extra: str) -> "subprocess.Popen[str]":
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)  # env credentials that are never set: no network, no secret read
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CALSYNC_")}
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            DAEMON_SCRIPT,
+            "--config",
+            str(cfg),
+            "--state-dir",
+            str(tmp_path / "s"),
+            "daemon",
+            *extra,
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _wait_for(condition: "Any", proc: "subprocess.Popen[str]") -> None:
+    deadline = time.monotonic() + 20
+    while not condition():
+        if proc.poll() is not None or time.monotonic() > deadline:
+            proc.kill()
+            out, err = proc.communicate()
+            pytest.fail(f"daemon did not get there: {out}{err}")
+        time.sleep(0.05)
+
+
+def _run_count(db: Path) -> int:
+    from calsync.views import StateReader
+
+    if not db.exists():
+        return 0
+    with StateReader(db) as reader:
+        return len(reader.runs())
+
+
+def test_daemon_signals(tmp_path: Path) -> None:
+    db = tmp_path / "s" / "state.db"
+    proc = _daemon_process(tmp_path)
+    try:
+        _wait_for(lambda: _run_count(db) >= 1, proc)  # the first cycle starts at once
+        proc.send_signal(signal.SIGUSR1)  # a cycle now, despite the backoff of the failed rule
+        _wait_for(lambda: _run_count(db) >= 2, proc)
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    assert proc.returncode == EXIT_OK and out == ""
+    assert err.count("INFO calsync.daemon: rule=family status=failed ") == 2
+    assert "error_kind=auth" in err and "Traceback" not in err
+    with RunLock(tmp_path / "s" / "run.lock"):  # released
+        pass
+
+
+def test_daemon_no_sync_stops_on_sigint(tmp_path: Path) -> None:
+    proc = _daemon_process(tmp_path, "--no-sync")
+    try:
+        _wait_for(lambda: "daemon started" in (proc.stderr.readline() if proc.stderr else ""), proc)
+        proc.send_signal(signal.SIGINT)
+        _, err = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    assert proc.returncode == EXIT_OK and "Traceback" not in err
+    assert not (tmp_path / "s").exists()  # no lock, no state database
