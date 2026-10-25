@@ -272,24 +272,45 @@ def test_changes_older_than_the_retention_are_pruned(tmp_path: Path) -> None:
     assert _rows(db, "SELECT object_id FROM change") == [("o2",)]
 
 
-def test_changes_of_pruned_runs_are_pruned(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(store_mod, "RUN_RETENTION", 1)
+def test_changes_outlive_their_pruned_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Changes are pruned by age only: RUN_RETENTION keeps hours of runs, changes stay 90 days."""
+    monkeypatch.setattr(store_mod, "RUN_RETENTION", 2)
     db = tmp_path / "s.db"
     with Store(db) as store:
         store.record_runs(
             [RunRecord("a", T0, T0, "ok", 1, 0, 0, 0, 1, None)],
             [ChangeRecord("a", "o1", "created", T0, "Lunch")],
         )
-        store.record_runs(
-            [RunRecord("b", T0, T0, "ok", 1, 0, 0, 0, 1, None)],
-            [ChangeRecord("b", "o2", "created", T0, "Lunch")],
-        )
-        assert _count(db, "SELECT COUNT(*) FROM change") == 2  # another rule's run does not prune "a"
-        store.record_runs(
-            [RunRecord("a", T1, T1, "ok", 0, 1, 0, 0, 1, None)],
-            [ChangeRecord("a", "o1", "updated", T1, "Brunch")],
-        )
-    assert _rows(db, "SELECT rule, action FROM change ORDER BY id") == [("b", "created"), ("a", "updated")]
+        later = T0 + store_mod.CHANGE_RETENTION - timedelta(seconds=1)
+        for i in range(5):
+            t = T0 + (later - T0) * (i + 1) / 5
+            store.record_runs([RunRecord("a", t, t, "ok", 0, 0, 0, 0, 1, None)])
+        assert _count(db, "SELECT COUNT(*) FROM run WHERE rule = 'a'") == 2
+        assert store.last_title("a", "o1") == "Lunch"
+    assert _rows(db, "SELECT rule, object_id, action FROM change") == [("a", "o1", "created")]
+
+
+def test_age_prune_uses_an_index_on_at(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    Store(db).close()
+    with closing(sqlite3.connect(db)) as conn:
+        plan = conn.execute("EXPLAIN QUERY PLAN DELETE FROM change WHERE at < ?", ("x",)).fetchall()
+    assert any("change_at" in row[-1] for row in plan), plan
+
+
+def test_failing_change_insert_rolls_back_the_runs_of_the_call(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    with Store(db) as store:
+        store.record_runs([RunRecord("a", T0, T0, "ok", 0, 0, 0, 0, 1, None)])
+        with pytest.raises(KeyError):
+            store.record_runs(
+                [RunRecord("a", T1, T1, "ok", 1, 0, 0, 0, 1, None)],
+                [ChangeRecord("b", "o1", "created", T1, "Lunch")],  # rule "b" has no run in this call
+            )
+        assert _count(db, "SELECT COUNT(*) FROM run") == 1
+        assert _count(db, "SELECT COUNT(*) FROM change") == 0
+        store.record_runs([RunRecord("a", T1, T1, "ok", 0, 0, 0, 0, 1, None)])  # no dangling transaction
+    assert _count(db, "SELECT COUNT(*) FROM run") == 2
 
 
 def test_last_title_is_the_newest_known_title(tmp_path: Path) -> None:

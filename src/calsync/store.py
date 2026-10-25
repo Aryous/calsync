@@ -52,6 +52,7 @@ CREATE TABLE change (
     object_id TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL, title TEXT
 );
 CREATE INDEX change_rule ON change (rule, id);
+CREATE INDEX change_at ON change (at);
 CREATE TABLE alert (key TEXT PRIMARY KEY, state TEXT NOT NULL, last_sent_at TEXT);
 """
 _TABLES = (
@@ -324,7 +325,7 @@ class Store:
     def record_runs(self, runs: Sequence[RunRecord], changes: Sequence[ChangeRecord] = ()) -> None:
         """Runs, their changes and the retention pruning commit together. Each change belongs to
         the run of its rule in this call (a change for a rule with no run here is a bug: KeyError,
-        nothing is written)."""
+        nothing is written, not even the runs)."""
         with self._tx():
             run_ids: dict[str, int] = {}
             for r in runs:
@@ -361,11 +362,9 @@ class Store:
                     "(SELECT id FROM run WHERE rule = ? ORDER BY id DESC LIMIT ?)",
                     (rule, rule, RUN_RETENTION),
                 )
-                self._db.execute(
-                    "DELETE FROM change WHERE rule = ? AND run_id NOT IN (SELECT id FROM run WHERE rule = ?)",
-                    (rule, rule),
-                )
             if runs:
+                # Changes are pruned by age only, never with their run: RUN_RETENTION keeps hours of
+                # runs, changes are kept CHANGE_RETENTION, so a change's run_id may name a pruned run.
                 # "Now" is the newest run in this call, never the wall clock: deterministic.
                 now = max(r.finished_at for r in runs)
                 self._db.execute("DELETE FROM change WHERE at < ?", (_utc(now - CHANGE_RETENTION),))
