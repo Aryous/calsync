@@ -7,14 +7,16 @@ individually modified instance (``Occurrence``).
 
 import hashlib
 import json
+import re
 from collections.abc import Iterable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from itertools import islice
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
-from dateutil.rrule import rrulestr
+from dateutil.rrule import rrule, rruleset, rrulestr
 
 # Bump whenever render.py changes the bytes it produces: every managed
 # resource is then rewritten once on the next cycle.
@@ -365,3 +367,131 @@ def series_span(series: Series) -> tuple[datetime, datetime]:
         series.recurrence,
         ((o.start, o.end) for o in series.overrides),
     )
+
+
+# ----- instance expansion (read-only views) -------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Instance:
+    """One occurrence of a series as a person sees it in their calendar."""
+
+    start: When
+    end: When
+    title: str
+    location: str
+    alarms: tuple[Alarm, ...]
+    recurring: bool
+
+
+_UNTIL = re.compile(r"UNTIL=(\d{8})(T\d{6})?(Z?)", re.IGNORECASE)
+
+
+def _zone(tzid: str | None) -> ZoneInfo:
+    try:
+        return ZoneInfo(tzid or "UTC")
+    except (ValueError, KeyError):  # ZoneInfoNotFoundError is a KeyError
+        return ZoneInfo("UTC")
+
+
+def _until_like_anchor(value: str, zone: ZoneInfo | None) -> str:
+    """dateutil wants UNTIL in UTC for a zoned DTSTART and floating for a naive one; Google sends both."""
+
+    def fix(match: re.Match[str]) -> str:
+        day, clock, utc = match.group(1), match.group(2), match.group(3)
+        if zone is None:  # all-day series: floating UNTIL
+            return f"UNTIL={day}{clock or ''}"
+        if utc:
+            return match.group(0)
+        local = datetime.strptime(day + (clock or "T235959"), "%Y%m%dT%H%M%S").replace(tzinfo=zone)
+        return "UNTIL=" + local.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+    return _UNTIL.sub(fix, value)
+
+
+def _midnight(value: date) -> datetime:
+    return datetime(value.year, value.month, value.day)
+
+
+def _occurrence_set(series: Series, zone: ZoneInfo | None) -> rruleset:
+    """The series' RRULE/RDATE expansion, zoned (timed) or naive (all-day ``zone=None``).
+    DTSTART is always the first instance (RFC 5545)."""
+    from calsync.icalutil import parse_date_line  # icalendar: loaded only when expanding
+
+    value = series.start.value
+    anchor = value.astimezone(zone) if zone and isinstance(value, datetime) else _rrule_anchor(series.start)
+    rset = rruleset()
+    rset.rdate(anchor)
+    for line in series.recurrence:
+        name, _, rest = line.partition(":")
+        head = name.split(";", 1)[0].upper()
+        if head == "RRULE":
+            rule = rrulestr(_until_like_anchor(rest, zone), dtstart=anchor)
+            if not isinstance(rule, rrule):
+                raise ValueError("not a single RRULE")
+            rset.rrule(rule)
+        elif head == "RDATE":
+            for when in parse_date_line(line, series.start.tzid or "UTC"):
+                extra = when.value
+                if zone is None:
+                    rset.rdate(_midnight(extra.date() if isinstance(extra, datetime) else extra))
+                elif isinstance(extra, datetime):
+                    rset.rdate(extra.astimezone(zone))
+                else:  # a date for a timed series: that day at the series' time of day
+                    rset.rdate(datetime.combine(extra, anchor.timetz()))
+    return rset
+
+
+def _overlaps(start: When, end: When, lo: datetime, hi: datetime) -> bool:
+    s, e = start.utc(), end.utc()
+    return s < hi and (e > lo or (s == e and s >= lo))
+
+
+def expand_instances(series: Series, start: datetime, end: datetime, *, limit: int = 1000) -> list[Instance]:
+    """The instances of ``series`` that intersect ``[start, end)``, sorted by start.
+
+    Wall-clock times stay fixed across DST (the expansion runs in the series' zone). EXDATEs and
+    the original starts of overrides are removed; overrides appear with their own fields. At most
+    ``limit`` candidates are considered from the window on. Never raises on a bad recurrence: the
+    master occurrence alone is returned (if it is in range).
+    """
+    recurring = bool(series.recurrence)
+    master = Instance(series.start, series.end, series.title, series.location, series.alarms, recurring)
+    only_master = [master] if _overlaps(series.start, series.end, start, end) else []
+    if not recurring:
+        return only_master
+    all_day = series.start.all_day
+    zone = None if all_day else _zone(series.start.tzid)
+    duration = series.end.utc() - series.start.utc()
+
+    def key(when: When) -> datetime | date:
+        if all_day:
+            return when.value.date() if isinstance(when.value, datetime) else when.value
+        return when.utc()
+
+    removed = {key(w) for w in series.exdates} | {key(o.original_start) for o in series.overrides}
+    found: list[Instance] = []
+    try:
+        rset = _occurrence_set(series, zone)
+        lo, hi = start - duration, end
+        if zone is None:  # naive midnights; dates are anchored at 00:00 UTC, as in When.utc()
+            lo, hi = lo.astimezone(UTC).replace(tzinfo=None), hi.astimezone(UTC).replace(tzinfo=None)
+        for count, dt in enumerate(rset.xafter(lo, inc=True)):
+            if dt >= hi or count >= limit:
+                break
+            if zone is None:
+                inst_start, inst_end = When(dt.date()), When(dt.date() + duration)
+            else:
+                inst_start = When(dt, series.start.tzid or "UTC")
+                inst_end = When((dt.astimezone(UTC) + duration).astimezone(zone), inst_start.tzid)
+            if key(inst_start) in removed or not _overlaps(inst_start, inst_end, start, end):
+                continue
+            found.append(Instance(inst_start, inst_end, series.title, series.location, series.alarms, True))
+    except Exception:  # a bad RRULE/RDATE (dateutil and icalendar raise many types): the master only
+        return only_master
+    found.extend(
+        Instance(o.start, o.end, o.title, o.location, o.alarms, True)
+        for o in series.overrides
+        if _overlaps(o.start, o.end, start, end)
+    )
+    return sorted(found, key=lambda i: _when_order(i.start))

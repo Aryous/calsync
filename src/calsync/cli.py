@@ -4,8 +4,10 @@ so ``calsync --version`` and ``config check`` start instantly."""
 import argparse
 import asyncio
 import getpass
+import json
 import sys
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
@@ -14,6 +16,7 @@ from calsync import __version__
 if TYPE_CHECKING:  # type-only: importing these at runtime would load httpx/icalendar
     from calsync.config import Config
     from calsync.engine import CycleResult, RuleResult
+    from calsync.views import ChangesView, RunsView, StateReader, StatusView, UpcomingView
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_AUTH, EXIT_RUNNING = 0, 1, 2, 3, 4
 
@@ -48,7 +51,47 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--rule", action="append", dest="rules", help="only this rule (repeatable)")
     run.add_argument("--dry-run", action="store_true", help="show the plan without writing")
     run.add_argument("--allow-deletes", action="store_true", help="bypass the mass-delete guard once")
+
+    status = sub.add_parser("status", help="sync health per rule (read-only)")
+    status.add_argument("--json", action="store_true", help="print JSON")
+
+    upcoming = sub.add_parser("upcoming", help="events due soon and whether they reached the target")
+    upcoming.add_argument("--hours", type=_positive_int, default=24, help="how far ahead (default: 24)")
+    upcoming.add_argument("--rule", help="only this rule")
+    upcoming.add_argument("--json", action="store_true", help="print JSON")
+
+    runs = sub.add_parser("runs", help="recorded sync runs, newest first")
+    runs.add_argument("--rule", help="only this rule")
+    runs.add_argument("--limit", type=_positive_int, default=50, help="at most this many (default: 50)")
+    runs.add_argument("--json", action="store_true", help="print JSON")
+
+    changes = sub.add_parser("changes", help="recorded changes to target copies, newest first")
+    changes.add_argument("--rule", help="only this rule")
+    changes.add_argument("--since", type=_instant, help="only changes at or after this ISO 8601 time")
+    changes.add_argument("--limit", type=_positive_int, default=100, help="at most this many (default: 100)")
+    changes.add_argument("--json", action="store_true", help="print JSON")
     return parser
+
+
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {text!r}") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {text!r}")
+    return value
+
+
+def _instant(text: str) -> datetime:
+    """An ISO 8601 time; one without an offset is local time."""
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected an ISO 8601 time such as 2026-10-24T08:00, got {text!r}"
+        ) from None
+    return value if value.tzinfo is not None else value.astimezone()
 
 
 def _load(args: argparse.Namespace) -> "Config":
@@ -304,6 +347,121 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
     return exit_code_for_results(result.rules.values())
 
 
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+ViewBuilder = Callable[["Config", "StateReader"], "StatusView | UpcomingView | RunsView | ChangesView"]
+
+
+def _show(args: argparse.Namespace, out: TextIO, build: ViewBuilder) -> int:
+    """Build a read-only view from the state database and print it (as JSON with ``--json``)."""
+    from calsync.views import NO_STATE_MESSAGE, StateReader, StateUnavailable
+    from calsync.wiring import state_paths
+
+    config = _load(args)
+    rule = getattr(args, "rule", None)
+    if rule is not None and rule not in {r.name for r in config.rules}:
+        out.write(f"unknown rule(s): {rule}\n")
+        return EXIT_CONFIG
+    db_path, _ = state_paths(_state_dir(args))
+    try:
+        reader = StateReader(db_path)
+    except StateUnavailable:
+        out.write(NO_STATE_MESSAGE + "\n")
+        return EXIT_FAILED
+    with reader:
+        view = build(config, reader)
+    if args.json:
+        out.write(json.dumps(view.to_json(), ensure_ascii=False, indent=2) + "\n")
+    else:
+        _print_view(view, out)
+    return EXIT_OK
+
+
+def _print_view(view: "StatusView | UpcomingView | RunsView | ChangesView", out: TextIO) -> None:
+    from calsync.views import ChangesView, RunsView, StatusView, UpcomingView
+
+    if isinstance(view, StatusView):
+        for status in view.rules:
+            last = status.last_ok_at.isoformat() if status.last_ok_at else "never"
+            out.write(
+                f"rule={status.rule.name} health={status.health} last_sync={last} copies={status.copies}\n"
+            )
+            for item in view.attention:
+                if item.rule == status.rule.name:
+                    hint = f" Run: {item.command}" if item.command else ""
+                    out.write(f"  {item.kind}: {item.message}{hint}\n")
+    elif isinstance(view, UpcomingView):
+        if not view.events:
+            out.write(f"no events in the next {view.hours} hours\n")
+        for event in view.events:
+            start = event.instance.start
+            when = "all day" if start.all_day else start.utc().astimezone().strftime("%H:%M")
+            alarms = ",".join(str(m) for m in event.alarms_minutes_before) or "none"
+            out.write(
+                f"{when}  {_flat(event.instance.title)}  [{event.target_calendar}]  alarms={alarms}  "
+                f"{event.delivery}\n"
+            )
+    elif isinstance(view, RunsView):
+        for run in view.runs:
+            line = (
+                f"{run.id} {run.started_at.isoformat()} rule={run.rule} status={run.status} "
+                f"created={run.created} updated={run.updated} deleted={run.deleted} failed={run.failed} "
+                f"duration_ms={run.duration_ms}"
+            )
+            for name in ("reverted", "protected", "out_of_window"):
+                if getattr(run, name):
+                    line += f" {name}={getattr(run, name)}"
+            if run.error_kind:
+                line += f" error_kind={run.error_kind}"
+            if run.error:
+                line += f" error={run.error!r}"
+            out.write(line + "\n")
+    elif isinstance(view, ChangesView):
+        for change in view.changes:
+            title = _flat(change.title) if change.title else "(untitled)"
+            out.write(
+                f"{change.at.isoformat()} rule={change.rule} {change.action} {title} object={change.object_id}\n"
+            )
+
+
+def cmd_status(args: argparse.Namespace, out: TextIO) -> int:
+    from calsync.views import build_status
+
+    return _show(args, out, lambda config, reader: build_status(config, reader, _now()))
+
+
+def cmd_upcoming(args: argparse.Namespace, out: TextIO) -> int:
+    from calsync.views import build_upcoming
+
+    return _show(
+        args,
+        out,
+        lambda config, reader: build_upcoming(config, reader, _now(), hours=args.hours, rule=args.rule),
+    )
+
+
+def cmd_runs(args: argparse.Namespace, out: TextIO) -> int:
+    from calsync.views import build_runs
+
+    return _show(
+        args, out, lambda config, reader: build_runs(config, reader, rule=args.rule, limit=args.limit)
+    )
+
+
+def cmd_changes(args: argparse.Namespace, out: TextIO) -> int:
+    from calsync.views import build_changes
+
+    return _show(
+        args,
+        out,
+        lambda config, reader: build_changes(
+            config, reader, rule=args.rule, since=args.since, limit=args.limit
+        ),
+    )
+
+
 def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: TextIO = sys.stdin) -> int:
     args = _parser().parse_args(argv)
     if args.version:
@@ -320,6 +478,14 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
             return asyncio.run(_auth(args, out, stdin))
         if args.command == "run":
             return asyncio.run(_run(args, out))
+        if args.command == "status":
+            return cmd_status(args, out)
+        if args.command == "upcoming":
+            return cmd_upcoming(args, out)
+        if args.command == "runs":
+            return cmd_runs(args, out)
+        if args.command == "changes":
+            return cmd_changes(args, out)
     except CalsyncError as exc:
         out.write(_describe(exc))
         return exit_code_for(exc)

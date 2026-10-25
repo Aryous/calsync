@@ -1,5 +1,7 @@
 import io
 import stat
+import subprocess
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -587,3 +589,211 @@ def test_auth_google_browser_failure_keeps_existing_credential(
     code, text = run(["--config", str(cfg), "auth", "g"])
     assert code == EXIT_AUTH and "sign-in failed" in text and "access_denied" in text
     assert secret.read_text() == '{"refresh_token": "old"}'
+
+
+# ----- read-only views: status, upcoming, runs, changes ------------------------------
+
+VIEWS_CONFIG = """
+[google]
+client_secret_file = "unused.json"
+
+[accounts.me]
+provider = "google"
+credential = { backend = "env", ref = "CALSYNC_TEST_UNSET" }
+
+[accounts.dav]
+provider = "caldav"
+server_url = "https://dav.example.com/"
+username = "u"
+credential = { backend = "env", ref = "CALSYNC_TEST_UNSET" }
+
+[[rules]]
+name = "family"
+alarms = ["-10m", "0m"]
+source = { account = "me", calendar = "Family" }
+target = { account = "dav", calendar = "Family", create_if_missing = true }
+"""
+
+
+@pytest.fixture
+def synced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Global CLI args for a config plus a state directory after one real cycle at harness NOW."""
+    import anyio
+
+    from calsync.config import load_config
+    from tests.factories import google_event
+    from tests.fakes.google import FakeGoogle
+    from tests.harness import GCAL, NOW, build_fake
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "state"
+    state.mkdir()
+    fake = FakeGoogle()
+    fake.add_calendar(GCAL, "Family")
+    fake.put_event(
+        GCAL,
+        google_event(
+            "standup",
+            "Standup",
+            "2026-10-23T18:00:00+08:00",
+            "2026-10-23T18:15:00+08:00",
+            recurrence=["RRULE:FREQ=DAILY;COUNT=10"],
+        ),
+    )
+    fake.put_event(
+        GCAL, google_event("lunch", "Lunch\nbreak", "2026-10-25T12:00:00+08:00", "2026-10-25T13:00:00+08:00")
+    )
+    holiday = google_event("holiday", "Holiday", "", "")
+    holiday.update(start={"date": "2026-11-05"}, end={"date": "2026-11-06"})
+    fake.put_event(GCAL, holiday)
+    h = build_fake(state, fake, load_config(cfg))
+    anyio.run(h.engine.cycle)
+    h.store.close()
+    monkeypatch.setattr("calsync.cli._now", lambda: NOW)
+    return ["--config", str(cfg), "--state-dir", str(state)]
+
+
+def _local_hhmm(iso: str) -> str:
+    from datetime import datetime
+
+    return datetime.fromisoformat(iso).astimezone().strftime("%H:%M")
+
+
+def test_status_json_has_the_exact_top_level_keys(synced: list[str]) -> None:
+    import json
+
+    code, text = run([*synced, "status", "--json"])
+    assert code == EXIT_OK
+    view = json.loads(text)
+    assert list(view) == ["generated_at", "schema", "summary", "accounts", "rules", "attention"]
+    assert view["summary"]["health"] == "ok" and view["rules"][0]["copies"] == 3
+    assert text == json.dumps(view, ensure_ascii=False, indent=2) + "\n"
+
+
+def test_status_text(synced: list[str]) -> None:
+    code, text = run([*synced, "status"])
+    assert code == EXIT_OK
+    assert text == "rule=family health=ok last_sync=2026-10-24T08:00:00+00:00 copies=3\n"
+
+
+def test_status_text_lists_attention_items(synced: list[str], tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from calsync.store import RunRecord, Store
+
+    at = datetime(2026, 10, 24, 8, 1, tzinfo=UTC)
+    with Store(tmp_path / "state" / "state.db") as store:
+        store.record_runs(
+            [RunRecord("family", at, at, "failed", 0, 0, 0, 0, 1, "Google API 401", error_kind="auth")]
+        )
+    code, text = run([*synced, "status"])
+    assert code == EXIT_OK
+    assert text == (
+        "rule=family health=auth last_sync=2026-10-24T08:00:00+00:00 copies=3\n"
+        "  auth: The me account needs to be connected again. Run: calsync auth me\n"
+    )
+
+
+def test_upcoming_json_48_hours(synced: list[str]) -> None:
+    import json
+
+    code, text = run([*synced, "upcoming", "--json", "--hours", "48"])
+    assert code == EXIT_OK
+    view = json.loads(text)
+    assert view["hours"] == 48
+    assert [(e["title"], e["start"], e["delivery"]) for e in view["events"]] == [
+        ("Standup", "2026-10-24T18:00:00+08:00", "delivered"),
+        ("Lunch\nbreak", "2026-10-25T12:00:00+08:00", "delivered"),
+        ("Standup", "2026-10-25T18:00:00+08:00", "delivered"),
+    ]
+    assert view["events"][0]["alarms_minutes_before"] == [10, 0]
+
+
+def test_upcoming_text(synced: list[str]) -> None:
+    code, text = run([*synced, "upcoming", "--rule", "family"])
+    assert code == EXIT_OK
+    assert text == (
+        f"{_local_hhmm('2026-10-24T18:00:00+08:00')}  Standup  [Family]  alarms=10,0  delivered\n"
+        f"{_local_hhmm('2026-10-25T12:00:00+08:00')}  Lunch break  [Family]  alarms=10,0  delivered\n"
+    )
+
+
+def test_upcoming_text_all_day_and_empty(synced: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import UTC, datetime
+
+    monkeypatch.setattr("calsync.cli._now", lambda: datetime(2026, 11, 4, 12, tzinfo=UTC))
+    assert run([*synced, "upcoming"]) == (EXIT_OK, "all day  Holiday  [Family]  alarms=10,0  delivered\n")
+    monkeypatch.setattr("calsync.cli._now", lambda: datetime(2030, 1, 1, tzinfo=UTC))
+    assert run([*synced, "upcoming"]) == (EXIT_OK, "no events in the next 24 hours\n")
+
+
+def test_runs_text_and_json(synced: list[str]) -> None:
+    import json
+
+    code, text = run([*synced, "runs"])
+    assert code == EXIT_OK
+    assert text == (
+        "1 2026-10-24T08:00:00+00:00 rule=family status=ok created=3 updated=0 deleted=0 failed=0 "
+        "duration_ms=0\n"
+    )
+    code, text = run([*synced, "runs", "--json", "--limit", "1", "--rule", "family"])
+    assert code == EXIT_OK and [r["id"] for r in json.loads(text)["runs"]] == [1]
+
+
+def test_changes_text_and_json(synced: list[str]) -> None:
+    import json
+
+    from calsync.naming import object_id
+    from tests.harness import GCAL
+
+    code, text = run([*synced, "changes"])
+    assert code == EXIT_OK
+    lines = text.splitlines()
+    assert len(lines) == 3
+    assert (
+        f"2026-10-24T08:00:00+00:00 rule=family created Lunch break object={object_id('family', GCAL, 'lunch')}"
+        in lines
+    )
+    code, text = run([*synced, "changes", "--json", "--since", "2026-10-24T09:00:00+00:00"])
+    assert code == EXIT_OK and json.loads(text) == {"changes": []}
+    code, text = run([*synced, "changes", "--json", "--limit", "1"])
+    assert len(json.loads(text)["changes"]) == 1
+
+
+def test_view_commands_without_state_exit_1(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    for command in (["status"], ["upcoming", "--json"], ["runs"], ["changes"]):
+        code, text = run(["--config", str(cfg), "--state-dir", str(tmp_path / "none"), *command])
+        assert (code, text) == (EXIT_FAILED, "no state yet: run `calsync run` or start the daemon\n")
+    assert not (tmp_path / "none").exists()
+
+
+def test_view_commands_reject_unknown_rules_and_bad_config(synced: list[str], tmp_path: Path) -> None:
+    for command in (
+        ["upcoming", "--rule", "nope"],
+        ["runs", "--rule", "nope"],
+        ["changes", "--rule", "nope"],
+    ):
+        code, text = run([*synced, *command])
+        assert code == EXIT_CONFIG and "unknown rule" in text
+    code, text = run(["--config", str(tmp_path / "missing.toml"), "status"])
+    assert code == EXIT_CONFIG and "config file not found" in text
+
+
+def test_light_commands_import_no_heavy_modules(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    script = (
+        "import io, sys\n"
+        "from calsync.cli import main\n"
+        "assert main(sys.argv[1:], out=io.StringIO()) == 0\n"
+        "heavy = sorted(m for m in ('starlette', 'uvicorn', 'httpx', 'icalendar') if m in sys.modules)\n"
+        "print(','.join(heavy))\n"
+    )
+    for argv in (["--version"], ["--config", str(cfg), "config", "check"]):
+        done = subprocess.run(
+            [sys.executable, "-c", script, *argv], capture_output=True, text=True, check=True
+        )
+        assert done.stdout == "\n", (argv, done.stdout, done.stderr)
