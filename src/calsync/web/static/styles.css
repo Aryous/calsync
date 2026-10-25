@@ -310,7 +310,7 @@ code {
   color: var(--carrier);
 }
 .btn-sync.is-busy .icon {
-  animation: spin 1.1s linear infinite;
+  animation: spin 700ms var(--ease-out) 1;
 }
 
 @keyframes spin {
@@ -1282,7 +1282,6 @@ code {
 }
 .count--zero {
   color: var(--mute);
-  opacity: 0.6;
 }
 .count--zero .num {
   color: inherit;
