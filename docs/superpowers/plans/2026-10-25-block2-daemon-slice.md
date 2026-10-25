@@ -121,7 +121,7 @@ The README's command list must not advertise them.
   - `protected`: once per cycle per protected object id (`_run_rule`'s `protected` set). The title comes from `desired[oid].series.title` when present, else `None`. Record it only when the protected set differs from the previous cycle's set for that rule, so a protected series does not add a row every 60 s.
     - Keep `self._last_protected: dict[str, frozenset[str]]` on the Engine (in memory).
     - A fresh process records the set once.
-  - `blocked`: when the delete guard blocks, one row per planned delete. The title is the blocked title when the titles are complete, else `None`.
+  - `blocked`: when the delete guard blocks, one row per planned delete. The title is the summary read from that object's body, or `None` when the body is empty or unreadable (per row).
     - Same dedup as `protected`: record only when the blocked set of object ids differs from the previous cycle's (`self._last_blocked`).
 - `error_kind` and the new counters come from `RuleResult`.
 - In `cli.py`, the skipped-rule `RunRecord` gets `error_kind=r.error_kind`.
