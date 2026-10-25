@@ -1,0 +1,10 @@
+{
+  "from": "@+0m",
+  "to": "@+1440m",
+  "hours": 24,
+  "schema": {
+    "version": 4,
+    "current": true
+  },
+  "events": []
+}

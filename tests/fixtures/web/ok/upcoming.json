@@ -1,0 +1,94 @@
+{
+  "from": "@+0m",
+  "to": "@+1440m",
+  "hours": 24,
+  "schema": {
+    "version": 4,
+    "current": true
+  },
+  "events": [
+    {
+      "rule": "family",
+      "start": "@q+45m",
+      "end": "@q+90m",
+      "all_day": false,
+      "title": "晨跑",
+      "location": "",
+      "alarms_minutes_before": [
+        0
+      ],
+      "recurring": true,
+      "target_calendar": "家庭日程",
+      "delivery": "delivered"
+    },
+    {
+      "rule": "family",
+      "start": "@q+120m",
+      "end": "@q+180m",
+      "all_day": false,
+      "title": "周会",
+      "location": "",
+      "alarms_minutes_before": [
+        10
+      ],
+      "recurring": true,
+      "target_calendar": "家庭日程",
+      "delivery": "delivered"
+    },
+    {
+      "rule": "family",
+      "start": "@q+240m",
+      "end": "@q+330m",
+      "all_day": false,
+      "title": "和朋友吃午饭",
+      "location": "国贸",
+      "alarms_minutes_before": [
+        30
+      ],
+      "recurring": false,
+      "target_calendar": "家庭日程",
+      "delivery": "pending"
+    },
+    {
+      "rule": "family",
+      "start": "@q+420m",
+      "end": "@q+450m",
+      "all_day": false,
+      "title": "接孩子放学",
+      "location": "",
+      "alarms_minutes_before": [
+        0
+      ],
+      "recurring": true,
+      "target_calendar": "家庭日程",
+      "delivery": "delivered"
+    },
+    {
+      "rule": "family",
+      "start": "@q+660m",
+      "end": "@q+705m",
+      "all_day": false,
+      "title": "家庭视频通话",
+      "location": "",
+      "alarms_minutes_before": [
+        10,
+        0
+      ],
+      "recurring": true,
+      "target_calendar": "家庭日程",
+      "delivery": "delivered"
+    },
+    {
+      "rule": "family",
+      "start": "@+1D",
+      "end": "@+2D",
+      "all_day": true,
+      "title": "缴物业费",
+      "location": "",
+      "alarms_minutes_before": [],
+      "recurring": false,
+      "target_calendar": "家庭日程",
+      "delivery": "delivered"
+    }
+  ]
+}
