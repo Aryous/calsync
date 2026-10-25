@@ -529,6 +529,39 @@ async def test_an_error_escaping_the_cycle_is_logged_and_the_schedule_goes_on(
     assert daemon.snapshot().cycles == 1  # the failed cycle is not counted
 
 
+@pytest.mark.parametrize("debug", [False, True])
+async def test_calsync_debug_adds_the_traceback_of_a_failed_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, debug: bool
+) -> None:
+    import sqlite3
+
+    from calsync import daemon as daemon_module
+
+    async def broken(*args: Any, **kwargs: Any) -> Any:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(daemon_module, "run_cycle", broken)
+    if debug:
+        monkeypatch.setenv("CALSYNC_DEBUG", "1")
+    else:
+        monkeypatch.delenv("CALSYNC_DEBUG", raising=False)
+    caplog.set_level(logging.DEBUG)  # every level captured: only the variable decides
+    world = World(stop_after=1)
+    await asyncio.wait_for(world.daemon(two_rules(interval=30), tmp_path).run(world.stop), 5)
+    ours = [r for r in caplog.records if r.name == "calsync.daemon"]
+    errors = [r for r in ours if r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == ["sync cycle failed (OperationalError)"]
+    assert errors[0].exc_info is None  # the error line stays type-only either way
+    detailed = [r for r in ours if r.exc_info is not None]
+    if debug:
+        assert [(r.levelno, r.getMessage()) for r in detailed] == [
+            (logging.DEBUG, "sync cycle failed: details")
+        ]
+        assert "Traceback" in caplog.text and "database is locked" in caplog.text
+    else:
+        assert detailed == [] and "Traceback" not in caplog.text and "database is locked" not in caplog.text
+
+
 async def test_a_rule_request_keeps_the_timed_deadline(tmp_path: Path) -> None:
     world = World(block=True)
     daemon = world.daemon(two_rules(interval=30), tmp_path)

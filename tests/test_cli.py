@@ -1037,7 +1037,10 @@ def test_a_busy_socket_has_its_own_message_and_exit_4(short_dir: Path) -> None:
     assert "lock" not in text and "pid" not in text
 
 
-def test_daemon_logging_keeps_request_urls_out(caplog: pytest.LogCaptureFixture) -> None:
+@pytest.mark.parametrize("debug", [False, True])
+def test_daemon_logging_keeps_request_urls_out(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, debug: bool
+) -> None:
     import asyncio
     import logging
 
@@ -1046,10 +1049,17 @@ def test_daemon_logging_keeps_request_urls_out(caplog: pytest.LogCaptureFixture)
     from calsync import cli
     from calsync.http import RequestLog, make_client
 
+    if debug:  # CALSYNC_DEBUG opens calsync's own loggers, never httpx's or httpcore's
+        monkeypatch.setenv("CALSYNC_DEBUG", "1")
+    else:
+        monkeypatch.delenv("CALSYNC_DEBUG", raising=False)
     for name in ("httpx", "httpcore"):  # restored at teardown, whatever the daemon setup does
         caplog.set_level(logging.DEBUG, logger=name)
+    caplog.set_level(logging.INFO, logger="calsync")
     caplog.set_level(logging.DEBUG)
     cli._configure_daemon_logging()  # pyright: ignore[reportPrivateUsage]
+    assert logging.getLogger("calsync").level == (logging.DEBUG if debug else logging.INFO)
+    assert logging.getLogger("httpx").level == logging.getLogger("httpcore").level == logging.WARNING
 
     async def fetch() -> None:
         transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"items": []}))

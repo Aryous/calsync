@@ -34,7 +34,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from calsync import __version__, views
+from calsync import __version__, debug, views
 from calsync.config import Config
 from calsync.lock import DaemonServing
 from calsync.wiring import state_paths
@@ -220,6 +220,7 @@ def _internal(exc: Exception) -> ApiError:
     """A bug: logged by type only (its text can carry a title or a URL), answered with a fixed
     500, so neither Starlette nor uvicorn logs a traceback."""
     log.error("an API request failed (%s)", type(exc).__name__)
+    debug.details(log, "an API request failed", exc)  # CALSYNC_DEBUG=1 only
     return ApiError(500, "internal", "Internal error.")
 
 

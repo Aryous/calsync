@@ -349,12 +349,20 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
 
 def _configure_daemon_logging() -> None:
     """INFO lines to stderr. httpx and httpcore log every request URL at INFO and DEBUG (with
-    calendar ids and sync tokens): only their warnings are let through."""
+    calendar ids and sync tokens): only their warnings are let through, also with
+    ``CALSYNC_DEBUG=1``, which lets calsync's own loggers through at DEBUG."""
     import logging
+
+    from calsync import debug
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
+    if debug.enabled():
+        logging.getLogger("calsync").setLevel(logging.DEBUG)
+        logging.getLogger(__name__).warning(
+            "%s=1: debug logging is on; the log may contain event titles and URLs", debug.ENV
+        )
 
 
 async def _daemon(args: argparse.Namespace, out: TextIO) -> int:

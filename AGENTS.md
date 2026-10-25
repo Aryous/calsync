@@ -66,9 +66,10 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
 | `cycle.py` | `run_cycle`: one cycle as `calsync run` and the daemon run it (rules whose account failed to set up are recorded as failed); `counts_line` |
 | `views.py` | read-only `StateReader` (never creates or migrates; tolerates older schemas) and the `status` / `upcoming` / `runs` / `changes` views with `to_json()` — the JSON contract shared by `--json`, the API and the web UI |
 | `daemon.py` | `Daemon`: jittered schedule, per-rule backoff, auth rebuilds, `request_cycle`, `--no-sync`; runs the scheduler and the API server as services that stop each other through `stop`, never by cancelling a cycle |
-| `api.py` | Starlette routes under `/api` (`api_routes`, `create_app`), a `StateReader` per request in a worker thread; `unix_socket` (stale check, 0600) and `tcp_socket`, and `serve` (uvicorn without signal handlers, no proxy headers) |
+| `api.py` | Starlette routes under `/api` (`api_routes`, `create_app`), a `StateReader` per request in a worker thread; `ContainErrors` (any escaping error → fixed 500, type-only log), `unix_socket` (stale check, 0600) and `tcp_socket`, and `serve` (uvicorn without signal handlers, no proxy headers) |
 | `web/auth.py` | the pairing key (`web.key`, 0600), the session cookie token, pair links; standard library only |
 | `web/app.py` | `create_web_app`: `/`, `/pair`, `/static`, the `/api` routes behind the cookie; Host, Origin and rate-limit checks |
+| `debug.py` | `CALSYNC_DEBUG=1`: tracebacks at DEBUG for failures otherwise logged by type only |
 | `cli.py` | commands, exit codes, output; heavy imports are lazy |
 
 ### Agent interface

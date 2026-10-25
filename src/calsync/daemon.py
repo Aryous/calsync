@@ -37,7 +37,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
-from calsync import api, wiring
+from calsync import api, debug, wiring
 from calsync.config import Config
 from calsync.cycle import counts_line, run_cycle
 from calsync.engine import CycleResult, Engine, RuleResult
@@ -181,6 +181,7 @@ class Daemon:
         except (Exception, SystemExit) as exc:  # SystemExit too: nothing may cancel a cycle mid-write
             # The type only: an error's text can carry a request URL.
             log.error("the %s failed (%s); stopping", name, type(exc).__name__)
+            debug.details(log, f"the {name} failed", exc)
             failures.append(exc)
             stop.set()
 
@@ -381,8 +382,10 @@ class Daemon:
             )
         except Exception as exc:
             # The state database or a bug; the next cycle tries again. The type only: the text
-            # (and a traceback's locals) can carry a title or a request URL.
+            # (and a traceback's locals) can carry a title or a request URL. CALSYNC_DEBUG=1
+            # adds the traceback, at DEBUG.
             log.error("sync cycle failed (%s)", type(exc).__name__)
+            debug.details(log, "sync cycle failed", exc)
             return
         self._record(result)
 
