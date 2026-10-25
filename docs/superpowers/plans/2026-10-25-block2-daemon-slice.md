@@ -402,6 +402,6 @@ The README's command list must not advertise them.
   - Check the stale-socket cleanup: create a dangling socket file first.
   - Check that `calsync trigger` against the running read-only daemon prints the `--no-sync` message.
   - Note: macOS limits AF_UNIX paths to 104 bytes. If `tmp_path` is too long, use `tempfile.mkdtemp(dir="/tmp")` in that test.
-- [ ] **Step 4: Implement the socket serving and `trigger`.** Also add `calsync daemon --listen HOST:PORT` as a no-op placeholder? No: the TCP listener belongs to block ③; do not add it here.
+- [ ] **Step 4: Implement the socket serving and `trigger`.** The TCP listener and `--listen` belong to block ③; do not add them here.
 - [ ] **Step 5: Docs.** Run the full checks.
 - [ ] **Step 6: Commit** `feat(api): local control API over a unix socket and calsync trigger`, plus `docs: daemon, trigger and read commands`.
