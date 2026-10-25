@@ -219,6 +219,7 @@ async def test_each_request_reads_the_current_state(state: Path) -> None:
     async with client(state) as c:
         before = (await c.get("/api/runs")).json()["runs"]
         add_runs(state, 1)
+        assert not (state / "state.db-wal").exists()  # read immutable: a kept reader would go stale
         after = (await c.get("/api/runs")).json()["runs"]
     assert len(before) == 1 and len(after) == 2
 
