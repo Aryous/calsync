@@ -63,7 +63,19 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
 | `targets/caldav.py` | discovery (iCloud region detection via `server_url = "icloud"`), detection ladder sync → ctag → full, multiget, conditional writes, adaptive `Limiter` |
 | `config.py` / `credentials.py` | validated TOML (all problems at once; `Rule.window` is `None` when omitted = full sync, `window = {}` = 7d/180d; `fields` → `FieldPolicy`; `on_target_edit` accepts only `"revert"`); keychain / env / 0600-file secrets |
 | `wiring.py` | the only place account definitions become clients; one `CalDavTarget` per account; `build_adapters` is **async**; per-account setup errors in `Adapters.errors` |
+| `cycle.py` | `run_cycle`: one cycle as `calsync run` and the daemon run it (rules whose account failed to set up are recorded as failed); `counts_line` |
+| `views.py` | read-only `StateReader` (never creates or migrates; tolerates older schemas) and the `status` / `upcoming` / `runs` / `changes` views with `to_json()` — the JSON contract shared by `--json`, the API and the web UI |
+| `daemon.py` | `Daemon`: jittered schedule, per-rule backoff, auth rebuilds, `request_cycle`, `--no-sync`; runs the scheduler and the API server as services that stop each other through `stop`, never by cancelling a cycle |
+| `api.py` | Starlette routes under `/api` (`api_routes`, `create_app`), a `StateReader` per request in a worker thread; `unix_socket` (stale check, 0600) and `serve` (uvicorn without signal handlers) |
 | `cli.py` | commands, exit codes, output; heavy imports are lazy |
+
+### Agent interface
+
+Agents use the CLI: `calsync status`, `upcoming`, `runs` and `changes` with
+`--json` (stable keys, built in `views.py`), and `calsync trigger` to ask the
+daemon for a cycle. The HTTP API on the daemon's socket is for the web UI; do
+not script against it. `--json` output contains event titles: keep it out of
+logs.
 
 ## 4. Invariants — do not break
 
@@ -86,8 +98,11 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
    (including a revert) and in a fresh process. Enforced by `tests/e2e/test_request_budget.py`;
    if it fails, fix the code, not the test.
 7. **Privacy.** Never log or print event titles, descriptions, locations,
-   attendees, URLs or secrets. Delete-guard titles go to the CLI output only. Test data is
-   synthetic (`example.com`, neutral titles).
+   attendees, URLs or secrets. Delete-guard titles go to the CLI output only;
+   titles also appear in `--json` / view output, the API responses and the
+   `change.title` column. The daemon keeps `httpx` / `httpcore` at WARNING
+   (they log request URLs at INFO). Test data is synthetic (`example.com`,
+   neutral titles).
 8. **Isolation.** A failure in one calendar, account or rule fails only what
    depends on it; `cycle()` always returns a `CycleResult`.
 9. **Error taxonomy → exit codes.** `AuthError` → 3 (only 401 / invalid_grant
@@ -209,13 +224,12 @@ password, `MKCALENDAR` (spec §13).
   reverted only after the series parses again.
 - Only Google pop-up reminders are synced; attendees are never invitees.
 - Renaming or removing a rule orphans its events.
-- `RequestLog` grows forever (fine for `run`, must be reset per cycle in a
-  daemon).
 - `protected` / `degraded` / delete-guard titles live only on `RuleResult`,
   not in run history.
 - No byte counts in run history; no `invalid_client` → `ConfigError` mapping;
   held cursor has no cap or escalation.
-- `[runtime]` and `[notify]` are validated but unused until the daemon exists.
+- `[notify]` is validated but unused until alerts exist. The daemon reads the
+  config once at start (no hot reload).
 
 ## 9. Next work
 

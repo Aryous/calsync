@@ -39,13 +39,27 @@ The phase-2 design is in
 
 ### Plan 3 — block ②: background service and notifications
 
-- `calsync daemon` with a local control socket; the CLI acts as its client
-  (`trigger`, `status`, `upcoming`, `changes`, `approve`, `pause`/`resume`),
-  every command with `--json` for Agents.
+**Done — the daemon slice** (2026-10-25,
+[`plans/2026-10-25-block2-daemon-slice.md`](superpowers/plans/2026-10-25-block2-daemon-slice.md)):
+
+- Run and change history (`change` table, richer `run` rows, 90-day change
+  retention).
+- Read-only views: `calsync status`, `upcoming`, `runs`, `changes`, each with
+  `--json` for agents; they read the state database directly.
+- `calsync daemon`: jittered schedule, per-rule backoff, credential pickup
+  after `calsync auth`, `SIGUSR1`, and `--no-sync` for demos on a copy of the
+  state.
+- Local JSON API under `/api` on a 0600 unix socket in the state directory,
+  and `calsync trigger` as its client.
+
+**Still to do (deferred from the slice):**
+
 - Config hot reload and safe writes (comment-preserving, validated,
-  conflict-checked, atomic, backed up, attributed).
-- Change history (`change`, `config_change` tables); Bark and webhook
-  notifications; `calsync service install` for launchd; Mac mini deployment.
+  conflict-checked, atomic, backed up, attributed); the `config_change` table.
+- Bark and webhook notifications.
+- `approve` and `pause`/`resume`.
+- `calsync service install` for launchd; Mac mini deployment.
+- The TCP listener (`--listen`) belongs to block ③, with its authentication.
 
 ### Plan 4 — block ③: web UI v1
 
