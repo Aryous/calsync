@@ -479,3 +479,101 @@ async def test_a_failing_service_raises_its_error_and_releases_everything(tmp_pa
     assert all(c.is_closed for c in world.clients)
     with RunLock(tmp_path / "run.lock"):
         pass
+
+
+# ----- review fixes: failures, deadline, blocked streak, request result ------------
+
+
+async def test_an_error_escaping_the_cycle_is_logged_and_the_schedule_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import sqlite3
+
+    from calsync import daemon as daemon_module
+
+    real = daemon_module.run_cycle
+    calls: list[int] = []
+
+    async def flaky(*args: Any, **kwargs: Any) -> Any:
+        calls.append(int((world.now - NOW).total_seconds()))
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(daemon_module, "run_cycle", flaky)
+    caplog.set_level(logging.INFO, logger="calsync.daemon")
+    world = World(stop_after=2)
+    daemon = world.daemon(two_rules(interval=30), tmp_path)
+    await asyncio.wait_for(daemon.run(world.stop), 5)
+    errors = [r for r in caplog.records if r.name == "calsync.daemon" and r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == ["sync cycle failed"]
+    assert world.delays == [30, 30]  # a full wait after the failure: no tight loop
+    assert calls == [0, 30] and runs_by_time(tmp_path) == [(30, "family"), (30, "work")]
+    assert daemon.snapshot().cycles == 1  # the failed cycle is not counted
+
+
+async def test_a_rule_request_keeps_the_timed_deadline(tmp_path: Path) -> None:
+    world = World(block=True)
+    daemon = world.daemon(two_rules(interval=30), tmp_path)
+    task = asyncio.create_task(daemon.run(world.stop))
+    await until(lambda: len(world.delays) == 1)
+    deadline = NOW + timedelta(seconds=30)
+    world.now = NOW + timedelta(seconds=10)
+    assert daemon.request_cycle("work") is True
+    await until(lambda: len(world.delays) == 2)
+    assert world.delays[1] == 20  # the rest of the original wait, not a fresh interval
+    assert daemon.snapshot().next_cycle_at == deadline
+    # Past the deadline, a request for `work` must not starve `family`: the timed cycle follows.
+    world.now = NOW + timedelta(seconds=40)
+    daemon.request_cycle("work")
+    await until(lambda: len(world.delays) == 3)
+    assert runs_by_time(tmp_path)[2:] == [(10, "work"), (40, "work"), (40, "family"), (40, "work")]
+    assert world.delays[2] == 30  # the timed cycle set a fresh deadline
+    world.stop.set()
+    await asyncio.wait_for(task, 5)
+
+
+async def test_a_request_for_every_rule_restarts_the_timer(tmp_path: Path) -> None:
+    world = World(block=True)
+    daemon = world.daemon(two_rules(interval=30), tmp_path)
+    task = asyncio.create_task(daemon.run(world.stop))
+    await until(lambda: len(world.delays) == 1)
+    world.now = NOW + timedelta(seconds=10)
+    daemon.request_cycle()
+    await until(lambda: len(world.delays) == 2)
+    assert world.delays[1] == 30 and daemon.snapshot().next_cycle_at == NOW + timedelta(seconds=40)
+    world.stop.set()
+    await asyncio.wait_for(task, 5)
+
+
+async def test_a_blocked_result_leaves_the_failure_streak_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from calsync import daemon as daemon_module
+    from calsync.engine import CycleResult, RuleResult
+
+    script = {0: "ok", 90: "blocked"}  # every other attempt fails
+    calls: list[int] = []
+
+    async def scripted(engine: Any, store: Any, config: Any, adapters: Any, rules: Any, **kw: Any) -> Any:
+        at = int((world.now - NOW).total_seconds())
+        calls.append(at)
+        status = script.get(at, "failed")
+        return CycleResult(world.now, world.now, {r: RuleResult(r, status=status) for r in rules})
+
+    monkeypatch.setattr(daemon_module, "run_cycle", scripted)
+    world = World(stop_after=9)  # ticks at 0, 30, ..., 240 s
+    config = replace(config_for([rule()]), runtime=RuntimeConfig(timedelta(seconds=30), 0.0))
+    await world.daemon(config, tmp_path).run(world.stop)
+    # Failed at 30 (1 in a row: skipped until 90), blocked at 90 (still 1 in a row), failed at
+    # 120: 2 in a row, skipped for 2 minutes until 240. A reset at 90 would have run it at 180.
+    assert calls == [0, 30, 90, 120, 240]
+
+
+async def test_request_cycle_reports_whether_it_was_accepted(tmp_path: Path) -> None:
+    syncing = World().daemon(two_rules(), tmp_path)
+    assert syncing.request_cycle() is True and syncing.request_cycle("work") is True
+    viewer = Daemon(two_rules(), tmp_path, sync=False)
+    assert viewer.request_cycle() is False and viewer.request_cycle("work") is False
+    with pytest.raises(ValueError, match="unknown rule"):
+        viewer.request_cycle("nope")

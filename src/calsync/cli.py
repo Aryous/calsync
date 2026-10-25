@@ -52,7 +52,12 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run", action="store_true", help="show the plan without writing")
     run.add_argument("--allow-deletes", action="store_true", help="bypass the mass-delete guard once")
 
-    daemon = sub.add_parser("daemon", help="sync on a schedule until stopped (SIGUSR1: sync now)")
+    daemon = sub.add_parser(
+        "daemon",
+        help="sync on a schedule until stopped (SIGUSR1: sync now)",
+        description="Sync on a schedule until SIGTERM or Ctrl-C, which stop after the current cycle. "
+        "A second Ctrl-C does not force-quit; SIGKILL (kill -9) is the escape hatch.",
+    )
     daemon.add_argument(
         "--no-sync", action="store_true", help="run no sync cycles (no lock, no credentials): serve only"
     )
@@ -316,6 +321,16 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
     return exit_code_for_results(result.rules.values())
 
 
+def _configure_daemon_logging() -> None:
+    """INFO lines to stderr. httpx and httpcore log every request URL at INFO and DEBUG (with
+    calendar ids and sync tokens): only their warnings are let through."""
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
     """Run the daemon until SIGTERM or SIGINT; SIGUSR1 requests a cycle. Logs go to stderr."""
     import logging
@@ -328,7 +343,7 @@ async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
     if sync and not config.rules:
         out.write("no rules configured: nothing to sync\n")
         return EXIT_CONFIG
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _configure_daemon_logging()
     logger = logging.getLogger(__name__)
     daemon = Daemon(config, _state_dir(args), sync=sync)
     stop = asyncio.Event()

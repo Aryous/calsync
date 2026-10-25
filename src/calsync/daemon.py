@@ -5,10 +5,11 @@ adapters and one ``Engine`` (whose in-memory mirrors and target caches then carr
 cycle), and runs a cycle at start, then after every wait of ``interval × (1 ± jitter)``.
 
 - ``request_cycle()`` cuts the wait short. Requests made during a cycle collapse into one
-  follow-up cycle; a request names one rule or means every rule.
+  follow-up cycle; a request names one rule or means every rule. A cycle for named rules keeps
+  the timer's deadline; a timed cycle or one for every rule restarts it.
 - A rule that keeps failing is skipped for ``BACKOFF`` minutes after its latest failure (by
-  the number of failures in a row). A requested rule runs regardless; a skipped rule records
-  no run.
+  the number of failures in a row; a blocked result neither adds to nor resets the count). A
+  requested rule runs regardless; a skipped rule records no run.
 - A rule that failed for authentication gets its accounts' adapters rebuilt before its next
   attempt, which picks up a credential stored meanwhile by ``calsync auth``.
 
@@ -150,18 +151,22 @@ class Daemon:
         finally:
             self._running = False
 
-    def request_cycle(self, rule: str | None = None) -> None:
+    def request_cycle(self, rule: str | None = None) -> bool:
         """Run a cycle now (after the current one, if one is running): ``rule`` only, or every
-        rule. The backoff does not apply to a requested rule. Ignored without sync."""
+        rule. The backoff does not apply to a requested rule.
+
+        True if accepted; False without sync (nothing runs cycles); ``ValueError`` for a rule
+        that is not configured."""
         if rule is not None and rule not in self._rules:
             raise ValueError(f"unknown rule {rule!r}")
         if not self._sync:
-            return
+            return False
         if rule is None:
             self._pending_all = True
         else:
             self._pending.add(rule)
         self._wake.set()
+        return True
 
     def snapshot(self) -> DaemonInfo:
         return DaemonInfo(
@@ -228,17 +233,26 @@ class Daemon:
     # ----- schedule -----------------------------------------------------------
     async def _scheduler(self, stop: asyncio.Event) -> None:
         due = True  # the first cycle starts at once
+        deadline = self._clock()
         while not stop.is_set():
-            rules = self._select(due)
+            rules, every = self._select(due)
             if rules:
                 await self._cycle(rules)
+            if every:
+                # A timed cycle, or one requested for every rule, restarts the timer. A cycle
+                # for named rules keeps the deadline, so requests for one rule never starve
+                # the others.
+                deadline = self._clock() + timedelta(seconds=self._delay())
             if stop.is_set():
                 break
             if self._wake.is_set():  # requested during the cycle: one follow-up, at once
                 due = False
                 continue
-            delay = self._delay()
-            self._next_cycle_at = self._clock() + timedelta(seconds=delay)
+            delay = (deadline - self._clock()).total_seconds()
+            if delay <= 0:  # the deadline passed during a requested cycle
+                due = True
+                continue
+            self._next_cycle_at = deadline
             try:
                 due = await self._wait(delay, stop)
             finally:
@@ -265,15 +279,18 @@ class Daemon:
             return True
         return False
 
-    def _select(self, due: bool) -> list[str]:
+    def _select(self, due: bool) -> tuple[list[str], bool]:
         """This cycle's rules, in config order: the requested ones and, when the wait ran out,
-        every rule not backed off. Takes the pending requests."""
+        every rule not backed off. Takes the pending requests. The flag: a cycle for every
+        rule (timed, or requested for all)."""
+        every = due or self._pending_all
         requested = set(self._rules) if self._pending_all else set(self._pending)
         self._pending_all = False
         self._pending.clear()
         self._wake.clear()
         now = self._clock()
-        return [r for r in self._rules if r in requested or (due and not self._backed_off(r, now))]
+        rules = [r for r in self._rules if r in requested or (due and not self._backed_off(r, now))]
+        return rules, every
 
     def _backed_off(self, rule: str, now: datetime) -> bool:
         entry = self._failures.get(rule)
@@ -315,7 +332,7 @@ class Daemon:
             if _counts_failure(r):
                 failures = self._failures.get(name, (0, now))[0] + 1
                 self._failures[name] = (failures, now)
-            else:
+            elif r.status != "blocked":  # blocked is neither a failure nor a success
                 self._failures.pop(name, None)
             if r.error_kind == "auth":
                 self._reauth.add(name)

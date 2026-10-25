@@ -931,3 +931,32 @@ def test_daemon_no_sync_stops_on_sigint(tmp_path: Path) -> None:
             proc.communicate()
     assert proc.returncode == EXIT_OK and "Traceback" not in err
     assert not (tmp_path / "s").exists()  # no lock, no state database
+
+
+def test_daemon_logging_keeps_request_urls_out(caplog: pytest.LogCaptureFixture) -> None:
+    import asyncio
+    import logging
+
+    import httpx
+
+    from calsync import cli
+    from calsync.http import RequestLog, make_client
+
+    for name in ("httpx", "httpcore"):  # restored at teardown, whatever the daemon setup does
+        caplog.set_level(logging.DEBUG, logger=name)
+    caplog.set_level(logging.DEBUG)
+    cli._configure_daemon_logging()  # pyright: ignore[reportPrivateUsage]
+
+    async def fetch() -> None:
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"items": []}))
+        async with make_client(RequestLog(), transport=transport) as client:
+            response = await client.get(
+                "https://www.googleapis.example.com/calendar/v3/calendars/someone%40example.com/events",
+                params={"syncToken": "tok123"},
+            )
+            assert response.status_code == 200
+
+    asyncio.run(fetch())
+    text = caplog.text + "".join(r.getMessage() for r in caplog.records)
+    for fragment in ("http", "googleapis", "example.com", "/calendar/", "syncToken", "tok123"):
+        assert fragment not in text, (fragment, text)
