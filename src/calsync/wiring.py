@@ -23,13 +23,6 @@ from calsync.targets.base import Target
 from calsync.targets.caldav import CalDavTarget
 
 
-def default_state_dir(environ: Mapping[str, str] = os.environ) -> Path:
-    explicit = environ.get("CALSYNC_STATE_DIR")
-    if explicit:
-        return Path(explicit).expanduser()
-    return Path.home() / ".local" / "state" / "calsync"
-
-
 @dataclass
 class Adapters:
     log: RequestLog

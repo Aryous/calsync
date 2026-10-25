@@ -14,7 +14,8 @@ cycle), and runs a cycle at start, then after every wait of ``interval × (1 ± 
   attempt, which picks up a credential stored meanwhile by ``calsync auth``.
 
 Beside the scheduler, the daemon serves the local API (``calsync.api``) on
-``<state_dir>/calsync.sock``. Each service catches its own failure, logs it and sets ``stop``:
+``<state_dir>/calsync.sock`` and, given ``listen``, the web UI (``calsync.web.app``) over TCP,
+with and without sync. Each service catches its own failure, logs it and sets ``stop``:
 a failing server never cancels a cycle in progress. Once every service has ended (the cycle
 finished), ``run`` raises the first failure.
 
@@ -43,6 +44,7 @@ from calsync.engine import CycleResult, Engine, RuleResult
 from calsync.http import RequestLog
 from calsync.lock import RunLock
 from calsync.store import Store
+from calsync.web.app import create_web_app
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +110,7 @@ class Daemon:
         *,
         sync: bool = True,
         serve: bool = True,
+        listen: tuple[str, int] | None = None,
         clock: Callable[[], datetime] = _now,
         sleep: Sleep = asyncio.sleep,
         rng: Callable[[], float] = random.random,
@@ -117,7 +120,9 @@ class Daemon:
         self._state_dir = state_dir
         self._db_path, self._lock_path = wiring.state_paths(state_dir)
         self._sync = sync
-        self._serve_api = serve  # False: no socket (tests of the schedule)
+        self._serve_api = serve  # False: no socket and no TCP (tests of the schedule)
+        self._listen = listen  # the web UI's (host, port); None: no TCP listener
+        self.web_address: tuple[str, int] | None = None  # bound (host, port), while serving
         self._clock = clock
         self._sleep = sleep
         self._rng = rng
@@ -153,14 +158,17 @@ class Daemon:
         self._running = True
         failures: list[BaseException] = []
         try:
-            async with self._resources() as sock, asyncio.TaskGroup() as group:
+            async with self._resources() as (sock, tcp), asyncio.TaskGroup() as group:
                 if self._sync:
                     group.create_task(self._service("scheduler", self._scheduler(stop), stop, failures))
                 if sock is not None:
                     group.create_task(self._service("api server", self._serve(sock, stop), stop, failures))
+                if tcp is not None:
+                    group.create_task(self._service("web server", self._serve_web(tcp, stop), stop, failures))
                 group.create_task(stop.wait())
         finally:
             self._running = False
+            self.web_address = None
         if failures:
             raise failures[0]
 
@@ -180,6 +188,20 @@ class Daemon:
         app = api.create_app(
             config_provider=lambda: self._config, state_dir=self._state_dir, daemon=self, clock=self._clock
         )
+        await api.serve(app, sock, stop)
+
+    async def _serve_web(self, sock: socket.socket, stop: asyncio.Event) -> None:
+        assert self._listen is not None
+        app = create_web_app(
+            config_provider=lambda: self._config,
+            state_dir=self._state_dir,
+            daemon=self,
+            listen_host=self._listen[0],
+            clock=self._clock,
+        )
+        host, port = self._listen[0], sock.getsockname()[1]
+        shown = f"[{host}]" if ":" in host else host
+        log.info("web UI on http://%s:%d/ (pair a browser: calsync web pair)", shown, port)  # no key
         await api.serve(app, sock, stop)
 
     def request_cycle(self, rule: str | None = None) -> bool:
@@ -212,9 +234,9 @@ class Daemon:
 
     # ----- resources ----------------------------------------------------------
     @contextlib.asynccontextmanager
-    async def _resources(self) -> AsyncIterator[socket.socket | None]:
-        """The lock (with sync), the API socket (when serving; yielded), then the store, the
-        adapters and the engine (with sync), closed in reverse."""
+    async def _resources(self) -> AsyncIterator[tuple[socket.socket | None, socket.socket | None]]:
+        """The lock (with sync), the API socket and the TCP socket (when serving; yielded),
+        then the store, the adapters and the engine (with sync), closed in reverse."""
         async with contextlib.AsyncExitStack() as stack:
             if self._sync:
                 stack.enter_context(RunLock(self._lock_path))
@@ -222,6 +244,11 @@ class Daemon:
             if self._serve_api:
                 self._state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
                 sock = stack.enter_context(api.unix_socket(wiring.socket_path(self._state_dir)))
+            tcp: socket.socket | None = None
+            if self._serve_api and self._listen is not None:
+                tcp = stack.enter_context(api.tcp_socket(*self._listen))
+                host, port = tcp.getsockname()[:2]
+                self.web_address = (host, port)
             if self._sync:
                 store = Store(self._db_path)
                 stack.callback(store.close)
@@ -229,7 +256,7 @@ class Daemon:
                 await self._build(sorted(wiring.accounts_in_use(self._config)))
                 self._store = store
                 self._engine = wiring.build_engine(self._config, self._adapters, store, clock=self._clock)
-            yield sock
+            yield sock, tcp
 
     async def _release(self) -> None:
         self._engine = self._store = None

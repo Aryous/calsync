@@ -5,8 +5,10 @@ in one pass. Nothing in the code refers to a concrete account: everything
 comes from here.
 """
 
+import ipaddress
 import math
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -84,6 +86,71 @@ class RuntimeConfig:
     jitter: float = 0.1
 
 
+DEFAULT_LISTEN = ("127.0.0.1", 8766)
+_HOSTNAME = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
+
+
+@dataclass(frozen=True, slots=True)
+class WebConfig:
+    """``[web]``: where the daemon serves the web UI, and the extra names it answers to."""
+
+    host: str = DEFAULT_LISTEN[0]
+    port: int = DEFAULT_LISTEN[1]
+    allowed_hosts: tuple[str, ...] = ()
+
+
+def parse_listen(text: str) -> tuple[str, int]:
+    """``"HOST:PORT"`` (an IPv6 host in brackets: ``"[::1]:8766"``) as ``(host, port)``.
+    ``ValueError`` with a message for anything else."""
+    expected = 'expected HOST:PORT such as "127.0.0.1:8766" or "[::]:8766"'
+    if text.startswith("["):
+        inside, sep, rest = text[1:].partition("]")
+        if not sep or not rest.startswith(":"):
+            raise ValueError(expected)
+        try:
+            host = str(ipaddress.IPv6Address(inside))
+        except ValueError:
+            raise ValueError('an IPv6 address goes in brackets, such as "[::1]:8766"') from None
+        port_text = rest[1:]
+    else:
+        host, sep, port_text = text.rpartition(":")
+        if ":" in host:
+            raise ValueError('an IPv6 address goes in brackets, such as "[::1]:8766"')
+        host = host.lower()
+        if not sep or not _HOSTNAME.match(host):
+            raise ValueError(expected)
+    if not (port_text.isascii() and port_text.isdigit()) or not 1 <= int(port_text) <= 65535:
+        raise ValueError(f"the port must be 1 to 65535, got {port_text!r}")
+    return host, int(port_text)
+
+
+def _web(raw: Any, problems: list[str]) -> WebConfig:
+    table = _table(raw, "web", problems)
+    host, port = DEFAULT_LISTEN
+    allowed: tuple[str, ...] = ()
+    for key, value in table.items():
+        if key == "listen":
+            try:
+                if not isinstance(value, str):
+                    raise ValueError('expected HOST:PORT such as "127.0.0.1:8766"')
+                host, port = parse_listen(value)
+            except ValueError as exc:
+                problems.append(f"web.listen: {exc}")
+        elif key == "allowed_hosts":
+            names = (
+                [v.lower().rstrip(".") for v in value]
+                if isinstance(value, list) and all(isinstance(v, str) for v in value)
+                else None
+            )
+            if names is None or not all(_HOSTNAME.match(n) for n in names):
+                problems.append('web.allowed_hosts: expected a list of hostnames such as ["mac-mini.local"]')
+            else:
+                allowed = tuple(dict.fromkeys(names))
+        else:
+            problems.append(f"web.{key}: unknown setting")
+    return WebConfig(host, port, allowed)
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     accounts: Mapping[str, Account]
@@ -91,6 +158,7 @@ class Config:
     google_client_secret_file: Path | None = None
     notify: NotifyConfig = NotifyConfig()
     runtime: RuntimeConfig = RuntimeConfig()
+    web: WebConfig = WebConfig()
 
 
 def default_config_path(environ: Mapping[str, str] = os.environ) -> Path:
@@ -98,6 +166,13 @@ def default_config_path(environ: Mapping[str, str] = os.environ) -> Path:
     if explicit:
         return Path(explicit).expanduser()
     return Path.home() / ".config" / "calsync" / "config.toml"
+
+
+def default_state_dir(environ: Mapping[str, str] = os.environ) -> Path:
+    explicit = environ.get("CALSYNC_STATE_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path.home() / ".local" / "state" / "calsync"
 
 
 def load_config(path: Path) -> Config:
@@ -415,6 +490,8 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:
         expect="a number in [0, 1)",
     )
 
+    web = _web(data.get("web"), problems)
+
     accounts: dict[str, Account] = {}
     for name, raw in _table(data.get("accounts"), "accounts", problems).items():
         account = _account(name, raw, problems)
@@ -451,4 +528,5 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:
         runtime=RuntimeConfig(
             interval=interval if interval is not None else timedelta(seconds=60), jitter=jitter
         ),
+        web=web,
     )

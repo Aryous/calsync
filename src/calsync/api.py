@@ -340,14 +340,43 @@ class _Server(uvicorn.Server):
         yield
 
 
+@contextlib.contextmanager
+def tcp_socket(host: str, port: int) -> Iterator[socket.socket]:
+    """A listening TCP socket on ``host:port`` (port 0: any free port), closed on exit. Bound
+    here, before any cycle, so a port in use stops the start."""
+    family, kind, proto, _, address = socket.getaddrinfo(
+        host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+    )[0]
+    sock = socket.socket(family, kind, proto)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(address)
+        sock.listen(100)
+        sock.setblocking(False)
+    except BaseException:
+        sock.close()
+        raise
+    try:
+        yield sock
+    finally:
+        sock.close()
+
+
 async def serve(app: Starlette, sock: socket.socket, stop: "asyncio.Event") -> None:
-    """Serve ``app`` on the listening ``sock`` until ``stop`` is set (requests in flight finish).
-    The server stopping on its own is an error."""
+    """Serve ``app`` on the listening ``sock`` (unix or TCP) until ``stop`` is set (requests in
+    flight finish). The server stopping on its own is an error."""
     import asyncio
 
+    if sock.family == socket.AF_UNIX:
+        where: dict[str, Any] = {"uds": sock.getsockname()}
+    else:
+        host, port = sock.getsockname()[:2]
+        where = {"host": host, "port": port}
     config = uvicorn.Config(
         app,
-        uds=sock.getsockname(),
+        **where,
+        proxy_headers=False,  # no X-Forwarded-* from anyone: the client address is the peer
+        server_header=False,
         log_level="warning",
         lifespan="off",
         access_log=False,

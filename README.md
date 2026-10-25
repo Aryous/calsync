@@ -26,6 +26,7 @@ Google Calendar ──► calsync (your machine) ──► iCloud / any CalDAV �
 - [Upgrading](#upgrading)
 - [Configuration](#configuration)
 - [Running as a daemon](#running-as-a-daemon)
+- [Web UI](#web-ui)
 - [Command line](#command-line)
 - [Safety guarantees](#safety-guarantees)
 - [Privacy and security](#privacy-and-security)
@@ -369,6 +370,14 @@ Durations are written as `30s`, `5m`, `2h`, `7d`, `1w`, with an optional sign.
 `webhook_url`, `failure_threshold`) is validated today and will be used by
 alerts.
 
+`[web]` sets where the daemon serves the [web UI](#web-ui):
+
+```toml
+[web]
+listen = "127.0.0.1:8766"              # HOST:PORT (default); an IPv6 host in brackets: "[::]:8766"
+allowed_hosts = ["mac-mini.local"]     # other names the browser may use for this machine
+```
+
 ### Files calsync creates
 
 | Path | Contents |
@@ -378,6 +387,7 @@ alerts.
 | `~/.local/state/calsync/state.db` (or `$CALSYNC_STATE_DIR`, `--state-dir`) | rebuildable cache and run history, mode 0600 |
 | `~/.local/state/calsync/run.lock` | prevents two syncing processes (`calsync run`, `calsync daemon`) at once |
 | `~/.local/state/calsync/calsync.sock` | the daemon's local API socket, mode 0600, removed when it stops |
+| `~/.local/state/calsync/web.key` | the web UI's pairing key, mode 0600 (`calsync web pair` creates it) |
 
 ## Running as a daemon
 
@@ -410,7 +420,7 @@ a `calsync run` meanwhile exits with code 4: use `calsync trigger` instead
   URLs).
 - **The socket.** The daemon serves a small JSON API on
   `<state-dir>/calsync.sock` (mode 0600, so only your user can reach it).
-  `calsync trigger` uses it, and so will the web UI.
+  `calsync trigger` uses it.
   `trigger` says `the daemon is not running; use calsync run` when there is
   no daemon.
 - **`--no-sync`** serves the API without syncing: no lock, no credentials, no
@@ -418,6 +428,39 @@ a `calsync run` meanwhile exits with code 4: use `calsync trigger` instead
   running daemon (whose socket is live: exit 4, `another calsync daemon is
   serving …`): point `--state-dir` at a copy of the state directory to show
   the data without touching the live one.
+
+## Web UI
+
+The daemon also serves a web page with the sync status, the events due in the
+next 24 hours, recent changes and the run history, and a "sync now" button. By
+default it listens on `127.0.0.1:8766` (only this computer); set `[web]
+listen` or pass `calsync daemon --listen HOST:PORT` to change that.
+
+A browser has to be paired once:
+
+```sh
+calsync web pair               # prints the pair link(s), creating the key if needed
+calsync web reset-key          # new key: every paired browser has to pair again
+```
+
+`web pair` prints one link per address (`localhost`, each `allowed_hosts`
+entry, and the listen host when it is a specific address). Opening a link
+stores a cookie in that browser for 400 days; you can also paste the key
+(or the whole link) into the page at `/`. **Anyone with the link can see your
+calendar sync status, titles included**, so treat it like a password and
+reset the key if it leaks. A reset takes effect at once, without restarting
+the daemon.
+
+- To reach it from a phone on your network, listen on every address
+  (`listen = "0.0.0.0:8766"`) and open `http://<the computer's IP>:8766/…`;
+  to use a name such as `mac-mini.local`, add it to `allowed_hosts`. Other
+  names are refused (protection against DNS rebinding).
+- It is plain HTTP: use it on networks you trust, or put it behind a TLS
+  proxy or a VPN such as Tailscale.
+- After 10 wrong keys in 10 minutes from one address, pairing from it is
+  refused for a while.
+- The page loads nothing from the internet, and the daemon keeps no access
+  log (a URL can carry the key).
 
 ### Looking at the state
 
@@ -448,7 +491,10 @@ calsync [--config PATH] [--state-dir DIR] <command>
       [--dry-run]                  show the plan, write nothing
       [--allow-deletes]            let this cycle through the mass-delete guard
   daemon [--no-sync]               sync on a schedule until stopped (SIGUSR1: sync now)
+         [--listen HOST:PORT]      serve the web UI there (default: [web] listen)
   trigger [--rule NAME]            ask the running daemon for a cycle now
+  web pair [--listen HOST:PORT]    print the web UI's pair link(s)
+  web reset-key [--listen …]       replace the pairing key (unpairs every browser)
   status [--json]                  sync health per rule
   upcoming [--hours N] [--rule NAME] [--json]
                                    events due soon and their delivery state
@@ -518,8 +564,9 @@ stale one.
 - Logs and error messages never contain event titles, descriptions,
   locations, attendees or links.
 - `--json` output, the text of `upcoming` and `changes`, and the daemon's
-  local API do contain titles and locations. The API listens only on a 0600
-  unix socket in the state directory.
+  local API do contain titles and locations. The API listens on a 0600 unix
+  socket in the state directory and, for the web UI, on TCP behind a pairing
+  cookie (see [Web UI](#web-ui)); by default only on `127.0.0.1`.
 - The state database holds a copy of your calendar data and is created with
   mode 0600.
 - Redirects are followed manually (credentials are re-sent to the new host, as

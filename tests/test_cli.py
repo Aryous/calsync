@@ -825,7 +825,11 @@ def test_light_commands_import_no_heavy_modules(tmp_path: Path) -> None:
         "heavy = sorted(m for m in ('starlette', 'uvicorn', 'httpx', 'icalendar') if m in sys.modules)\n"
         "print(','.join(heavy))\n"
     )
-    for argv in (["--version"], ["--config", str(cfg), "config", "check"]):
+    for argv in (
+        ["--version"],
+        ["--config", str(cfg), "config", "check"],
+        ["--config", str(cfg), "--state-dir", str(tmp_path / "s"), "web", "pair"],
+    ):
         done = subprocess.run(
             [sys.executable, "-c", script, *argv], capture_output=True, text=True, check=True
         )
@@ -854,10 +858,20 @@ def test_daemon_refuses_a_held_lock(tmp_path: Path) -> None:
     assert not (state / "state.db").exists()
 
 
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
 DAEMON_SCRIPT = "import sys\nfrom calsync.cli import main\nsys.exit(main(sys.argv[1:]))\n"
 
 
-def _daemon_process(tmp_path: Path, state: Path, *extra: str) -> "subprocess.Popen[str]":
+def _daemon_process(
+    tmp_path: Path, state: Path, *extra: str, port: int | None = None
+) -> "subprocess.Popen[str]":
     """``calsync daemon`` with a config in ``tmp_path`` and the state (and its socket) in
     ``state``, which must be short: a unix socket path is limited to 104 bytes on macOS."""
     cfg = tmp_path / "config.toml"
@@ -873,6 +887,8 @@ def _daemon_process(tmp_path: Path, state: Path, *extra: str) -> "subprocess.Pop
             "--state-dir",
             str(state),
             "daemon",
+            "--listen",
+            f"127.0.0.1:{port or _free_port()}",  # never the default port
             *extra,
         ],
         env=env,
@@ -942,7 +958,8 @@ def test_daemon_signals_and_trigger(tmp_path: Path, short_dir: Path) -> None:
     assert proc.returncode == EXIT_OK and out == ""
     assert err.count("INFO calsync.daemon: rule=family status=failed ") == 4
     assert "error_kind=auth" in err and "Traceback" not in err
-    assert "http" not in err.replace("httpx", "")  # no request URL in the log
+    logged = [line for line in err.splitlines() if "web UI on http://127.0.0.1:" not in line]
+    assert "http" not in "\n".join(logged).replace("httpx", "")  # no request URL in the log
     with RunLock(state / "run.lock"):  # released
         pass
     assert not (state / "calsync.sock").exists()
@@ -950,13 +967,18 @@ def test_daemon_signals_and_trigger(tmp_path: Path, short_dir: Path) -> None:
 
 def test_daemon_no_sync_serves_and_stops_on_sigint(tmp_path: Path, short_dir: Path) -> None:
     state = short_dir / "s"
-    proc = _daemon_process(tmp_path, state, "--no-sync")
+    import httpx
+
+    port = _free_port()
+    proc = _daemon_process(tmp_path, state, "--no-sync", port=port)
     try:
         _wait_for(lambda: _serving(state), proc)
         assert run(["--state-dir", str(state), "trigger"]) == (
             EXIT_FAILED,
             "the daemon runs with --no-sync\n",
         )
+        unpaired = httpx.get(f"http://127.0.0.1:{port}/api/status", trust_env=False)  # the web UI, TCP
+        assert unpaired.status_code == 401 and unpaired.json()["error"]["kind"] == "unpaired"
         proc.send_signal(signal.SIGINT)  # reaches the daemon's own handler, not uvicorn's
         _, err = proc.communicate(timeout=20)
     finally:
@@ -964,6 +986,7 @@ def test_daemon_no_sync_serves_and_stops_on_sigint(tmp_path: Path, short_dir: Pa
             proc.kill()
             proc.communicate()
     assert proc.returncode == EXIT_OK and "Traceback" not in err and "daemon stopped" in err
+    assert f"web UI on http://127.0.0.1:{port}/" in err and "/api/status" not in err  # no access log
     assert sorted(p.name for p in state.iterdir()) == []  # no lock, no state database; socket removed
 
 
@@ -1041,3 +1064,71 @@ def test_daemon_logging_keeps_request_urls_out(caplog: pytest.LogCaptureFixture)
     text = caplog.text + "".join(r.getMessage() for r in caplog.records)
     for fragment in ("http", "googleapis", "example.com", "/calendar/", "syncToken", "tok123"):
         assert fragment not in text, (fragment, text)
+
+
+# ----- web -------------------------------------------------------------------------
+
+WARNING = "Anyone with this link can see your calendar sync status. Reset it with `calsync web reset-key`.\n"
+
+
+@pytest.mark.parametrize(
+    ("web", "hosts"),
+    [
+        ("", ["localhost:8766", "127.0.0.1:8766"]),
+        (
+            '[web]\nlisten = "0.0.0.0:9000"\nallowed_hosts = ["mac-mini.local"]\n',
+            ["localhost:9000", "mac-mini.local:9000"],
+        ),
+        ('[web]\nlisten = "192.168.1.5:8766"\n', ["localhost:8766", "192.168.1.5:8766"]),
+        ('[web]\nlisten = "[fd00::5]:8766"\n', ["localhost:8766", "[fd00::5]:8766"]),
+        ('[web]\nlisten = "[::]:8766"\nallowed_hosts = ["localhost"]\n', ["localhost:8766"]),
+    ],
+)
+def test_web_pair_prints_one_link_per_address(tmp_path: Path, web: str, hosts: list[str]) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG + web)
+    state = tmp_path / "s"
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"])
+    key = (state / "web.key").read_text().strip()
+    assert code == EXIT_OK
+    assert text == "".join(f"http://{h}/?k={key}\n" for h in hosts) + WARNING
+    assert stat.S_IMODE((state / "web.key").stat().st_mode) == 0o600
+    assert run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"]) == (code, text)  # same key
+
+
+def test_web_pair_takes_listen(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "s"
+    code, text = run(
+        ["--config", str(cfg), "--state-dir", str(state), "web", "pair", "--listen", "0.0.0.0:9001"]
+    )
+    key = (state / "web.key").read_text().strip()
+    assert (code, text) == (EXIT_OK, f"http://localhost:9001/?k={key}\n" + WARNING)
+    with pytest.raises(SystemExit) as info:  # argparse: a usage error, exit 2
+        run(["--config", str(cfg), "web", "pair", "--listen", "nope"])
+    assert info.value.code == EXIT_CONFIG
+
+
+def test_web_reset_key(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "s"
+    run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"])
+    old = (state / "web.key").read_text().strip()
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "web", "reset-key"])
+    new = (state / "web.key").read_text().strip()
+    assert code == EXIT_OK and new != old
+    assert text == (
+        "ok: the key was replaced; every paired browser has to pair again\n"
+        f"http://localhost:8766/?k={new}\nhttp://127.0.0.1:8766/?k={new}\n" + WARNING
+    )
+    assert stat.S_IMODE((state / "web.key").stat().st_mode) == 0o600
+
+
+def test_daemon_listen_is_validated(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    with pytest.raises(SystemExit) as info:
+        run(["--config", str(cfg), "daemon", "--listen", "127.0.0.1:0"])
+    assert info.value.code == 2  # argparse: a usage error

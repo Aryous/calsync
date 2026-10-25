@@ -61,6 +61,18 @@ def _parser() -> argparse.ArgumentParser:
     daemon.add_argument(
         "--no-sync", action="store_true", help="run no sync cycles (no lock, no credentials): serve only"
     )
+    daemon.add_argument(
+        "--listen", type=_listen, help="serve the web UI on HOST:PORT (default: [web] listen)"
+    )
+
+    web = sub.add_parser("web", help="the web UI: pair a browser")
+    web_sub = web.add_subparsers(dest="web_command", required=True)
+    for name, text in (
+        ("pair", "print the pair link(s); creates the key if there is none"),
+        ("reset-key", "replace the key: every paired browser has to pair again"),
+    ):
+        command = web_sub.add_parser(name, help=text)
+        command.add_argument("--listen", type=_listen, help="the daemon's HOST:PORT (default: [web] listen)")
 
     trigger = sub.add_parser("trigger", help="ask the running daemon to sync now")
     trigger.add_argument("--rule", help="only this rule")
@@ -84,6 +96,15 @@ def _parser() -> argparse.ArgumentParser:
     changes.add_argument("--limit", type=_positive_int, default=100, help="at most this many (default: 100)")
     changes.add_argument("--json", action="store_true", help="print JSON")
     return parser
+
+
+def _listen(text: str) -> tuple[str, int]:
+    from calsync.config import parse_listen
+
+    try:
+        return parse_listen(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def _positive_int(text: str) -> int:
@@ -114,7 +135,7 @@ def _load(args: argparse.Namespace) -> "Config":
 
 
 def _state_dir(args: argparse.Namespace) -> Path:
-    from calsync.wiring import default_state_dir
+    from calsync.config import default_state_dir  # light: `web pair` loads no httpx
 
     return args.state_dir or default_state_dir()
 
@@ -350,7 +371,8 @@ async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
         return EXIT_CONFIG
     _configure_daemon_logging()
     logger = logging.getLogger(__name__)
-    daemon = Daemon(config, _state_dir(args), sync=sync)
+    listen = args.listen or (config.web.host, config.web.port)
+    daemon = Daemon(config, _state_dir(args), sync=sync, listen=listen)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     handlers = {signal.SIGTERM: stop.set, signal.SIGINT: stop.set, signal.SIGUSR1: daemon.request_cycle}
@@ -408,6 +430,29 @@ async def _trigger(args: argparse.Namespace, out: TextIO) -> int:
         return EXIT_CONFIG
     out.write(f"error: the daemon answered HTTP {response.status_code}\n")
     return EXIT_FAILED
+
+
+PAIR_WARNING = (
+    "Anyone with this link can see your calendar sync status. Reset it with `calsync web reset-key`.\n"
+)
+
+
+def cmd_web(args: argparse.Namespace, out: TextIO) -> int:
+    """`calsync web pair` and `calsync web reset-key`: the pair links for the daemon's address."""
+    from calsync.web import auth
+
+    config = _load(args)
+    host, port = args.listen or (config.web.host, config.web.port)
+    state_dir = _state_dir(args)
+    if args.web_command == "reset-key":
+        key = auth.reset_key(state_dir)
+        out.write("ok: the key was replaced; every paired browser has to pair again\n")
+    else:
+        key = auth.load_or_create_key(state_dir)
+    for url in auth.pair_urls(key, host, port, config.web.allowed_hosts):
+        out.write(url + "\n")
+    out.write(PAIR_WARNING)
+    return EXIT_OK
 
 
 def _now() -> datetime:
@@ -555,6 +600,8 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
             return asyncio.run(_daemon(args, out))
         if args.command == "trigger":
             return asyncio.run(_trigger(args, out))
+        if args.command == "web":
+            return cmd_web(args, out)
         if args.command == "status":
             return cmd_status(args, out)
         if args.command == "upcoming":
