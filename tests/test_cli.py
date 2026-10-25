@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
@@ -990,6 +990,76 @@ def test_daemon_no_sync_serves_and_stops_on_sigint(tmp_path: Path, short_dir: Pa
     assert sorted(p.name for p in state.iterdir()) == []  # no lock, no state database; socket removed
 
 
+def test_daemon_with_its_port_in_use_exits_2_and_says_why(tmp_path: Path, short_dir: Path) -> None:
+    import socket
+
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
+    try:
+        proc = _daemon_process(tmp_path, short_dir / "s", port=port)  # with sync, as under launchd
+        out, err = proc.communicate(timeout=20)
+    finally:
+        blocker.close()
+    assert proc.returncode == EXIT_CONFIG
+    assert out == (
+        "configuration error:\n"
+        f'  - cannot listen on 127.0.0.1:{port}: address already in use; set [web] listen to another port or "off"\n'
+    )
+    assert "Traceback" not in err and "rule=" not in err  # no cycle ran
+    with RunLock(short_dir / "s" / "run.lock"):  # released
+        pass
+
+
+class _RecordingDaemon:
+    listens: ClassVar[list[tuple[str, int] | None]] = []
+
+    def __init__(self, config: Any, state_dir: Path, *, sync: bool, listen: Any) -> None:
+        self.listens.append(listen)
+
+    def snapshot(self) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(pid=os.getpid())
+
+    def request_cycle(self, rule: str | None = None) -> bool:
+        return False
+
+    async def run(self, stop: Any) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("web", "args", "listen"),
+    [
+        ("", [], ("127.0.0.1", 8766)),
+        ('[web]\nlisten = "off"\n', [], None),
+        ("", ["--no-web"], None),
+        ('[web]\nlisten = "off"\n', ["--listen", "127.0.0.1:9100"], ("127.0.0.1", 9100)),
+    ],
+)
+def test_daemon_web_listener_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, web: str, args: list[str], listen: Any
+) -> None:
+    from calsync import daemon as daemon_module
+
+    monkeypatch.setattr(daemon_module, "Daemon", _RecordingDaemon)
+    monkeypatch.setattr(_RecordingDaemon, "listens", [])
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG + web)
+    code, _ = run(["--config", str(cfg), "--state-dir", str(tmp_path / "s"), "daemon", "--no-sync", *args])
+    assert code == EXIT_OK and _RecordingDaemon.listens == [listen]
+
+
+def test_daemon_no_web_and_listen_exclude_each_other(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    with pytest.raises(SystemExit) as info:
+        run(["--config", str(cfg), "daemon", "--no-web", "--listen", "127.0.0.1:9100"])
+    assert info.value.code == 2
+
+
 def test_trigger_without_a_daemon(short_dir: Path) -> None:
     import socket
 
@@ -1159,3 +1229,28 @@ def test_daemon_listen_is_validated(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as info:
         run(["--config", str(cfg), "daemon", "--listen", "127.0.0.1:0"])
     assert info.value.code == 2  # argparse: a usage error
+
+
+WEB_OFF = 'the web UI is off ([web] listen = "off"); set [web] listen to HOST:PORT to use it\n'
+
+
+def test_web_pair_when_the_web_ui_is_off(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG + '[web]\nlisten = "off"\n')
+    state = tmp_path / "s"
+    assert run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"]) == (EXIT_CONFIG, WEB_OFF)
+    assert not (state / "web.key").exists()  # nothing to pair with: no key made
+    code, text = run(
+        ["--config", str(cfg), "--state-dir", str(state), "web", "pair", "--listen", "127.0.0.1:9100"]
+    )
+    key = (state / "web.key").read_text().strip()
+    assert (code, text) == (
+        EXIT_OK,
+        f"http://localhost:9100/?k={key}\nhttp://127.0.0.1:9100/?k={key}\n" + WARNING,
+    )
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "web", "reset-key"])  # still resets
+    assert (code, text) == (
+        EXIT_OK,
+        "ok: the key was replaced; every paired browser has to pair again\n" + WEB_OFF,
+    )
+    assert (state / "web.key").read_text().strip() != key

@@ -374,7 +374,7 @@ alerts.
 
 ```toml
 [web]
-listen = "127.0.0.1:8766"              # HOST:PORT (default); an IPv6 host in brackets: "[::]:8766"
+listen = "127.0.0.1:8766"              # HOST:PORT (default); an IPv6 host in brackets: "[::]:8766"; "off": no web UI
 allowed_hosts = ["mac-mini.local"]     # other names the browser may use for this machine
 ```
 
@@ -434,7 +434,12 @@ a `calsync run` meanwhile exits with code 4: use `calsync trigger` instead
 The daemon also serves a web page with the sync status, the events due in the
 next 24 hours, recent changes and the run history, and a "sync now" button. By
 default it listens on `127.0.0.1:8766` (only this computer); set `[web]
-listen` or pass `calsync daemon --listen HOST:PORT` to change that.
+listen` or pass `calsync daemon --listen HOST:PORT` to change that. To turn
+the web UI off, set `listen = "off"` or pass `calsync daemon --no-web`; the
+local API socket (and `calsync trigger`) keeps working. If the daemon cannot
+listen on the address (the port is taken, say), it exits with code 2 before
+any sync and says why (`cannot listen on 127.0.0.1:8766: address already in
+use; …`): pick another port or turn the web UI off.
 
 A browser has to be paired once:
 
@@ -492,6 +497,7 @@ calsync [--config PATH] [--state-dir DIR] <command>
       [--allow-deletes]            let this cycle through the mass-delete guard
   daemon [--no-sync]               sync on a schedule until stopped (SIGUSR1: sync now)
          [--listen HOST:PORT]      serve the web UI there (default: [web] listen)
+         [--no-web]                no web UI (the local API socket stays)
   trigger [--rule NAME]            ask the running daemon for a cycle now
   web pair [--listen HOST:PORT]    print the web UI's pair link(s)
   web reset-key [--listen …]       replace the pairing key (unpairs every browser)
@@ -610,6 +616,7 @@ stale one.
 | sync stops after about a week with exit code 3 | the Google OAuth consent screen is still in "Testing"; publish it, then `calsync auth` again |
 | Google sign-in says "access blocked" | your account is not a test user of a "Testing" consent screen; publish it or add yourself |
 | `status=blocked` | the mass-delete guard fired; check the printed titles, then `calsync run --rule NAME --allow-deletes` if intended |
+| the daemon exits with code 2: `cannot listen on 127.0.0.1:8766: address already in use` | another program (or a second daemon) has the web UI's port. Set `[web] listen` to another port, or to `"off"` (or run `calsync daemon --no-web`) if you don't use the web UI |
 | exit code 4 | another `calsync run` or the daemon holds the lock; wait for it, or use `calsync trigger` while the daemon runs |
 | `trigger`: the daemon is not running | no daemon serves the socket in this state directory (check `--state-dir`); start it, or use `calsync run` |
 | an event changed on the iPhone snaps back (`reverted=1`) | expected: sync is one way, the Google version wins. Make the change in Google |

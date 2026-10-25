@@ -5,9 +5,11 @@ Requests go through ``httpx.ASGITransport`` (from 127.0.0.1); the client's ``bas
 """
 
 import asyncio
+import errno
 import hashlib
 import hmac
 import logging
+import socket
 import stat
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -17,8 +19,10 @@ from typing import Any
 import httpx
 import pytest
 
+from calsync import api
 from calsync.config import Config, WebConfig
 from calsync.daemon import Daemon, DaemonInfo
+from calsync.errors import ConfigError, ListenError
 from calsync.web import auth
 from calsync.web.app import create_web_app
 from tests.factories import google_event
@@ -418,3 +422,54 @@ async def test_a_no_sync_daemon_serves_tcp(state: Path, short_dir: Path) -> None
     with pytest.raises(httpx.ConnectError):  # the port is closed again
         async with httpx.AsyncClient(trust_env=False) as c:
             await c.get(f"http://127.0.0.1:{port}/")
+
+
+BUSY = 'cannot listen on {}: address already in use; set [web] listen to another port or "off"'
+
+
+@pytest.fixture
+def busy_port() -> Any:
+    """A port on 127.0.0.1 that another socket listens on."""
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    try:
+        yield blocker.getsockname()[1]
+    finally:
+        blocker.close()
+
+
+async def test_a_port_in_use_is_a_listen_error(busy_port: int) -> None:
+    with pytest.raises(ListenError) as info, api.tcp_socket("127.0.0.1", busy_port):
+        pass
+    assert isinstance(info.value, ConfigError)  # exit code 2
+    assert info.value.problems == [BUSY.format(f"127.0.0.1:{busy_port}")]
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        (errno.EADDRINUSE, BUSY.format("[::1]:8080")),
+        (
+            errno.EACCES,
+            'cannot listen on [::1]:8080: permission denied; set [web] listen to another port or "off"',
+        ),
+        (
+            errno.EADDRNOTAVAIL,
+            "cannot listen on [::1]:8080: this computer has no such address; "
+            'set [web] listen to another address or "off"',
+        ),
+        (errno.ENOBUFS, None),
+    ],
+)
+async def test_bind_problems(code: int, message: str | None) -> None:
+    assert api.bind_problem("::1", 8080, OSError(code, "x")) == message
+
+
+async def test_a_daemon_whose_port_is_in_use_stops_before_any_cycle(
+    state: Path, short_dir: Path, busy_port: int
+) -> None:
+    daemon = Daemon(web_config(), short_dir, sync=False, listen=("127.0.0.1", busy_port), clock=lambda: NOW)
+    with pytest.raises(ListenError):
+        await asyncio.wait_for(daemon.run(asyncio.Event()), 5)
+    assert not (short_dir / "calsync.sock").exists()  # the unix socket was closed and removed

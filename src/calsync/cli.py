@@ -61,8 +61,12 @@ def _parser() -> argparse.ArgumentParser:
     daemon.add_argument(
         "--no-sync", action="store_true", help="run no sync cycles (no lock, no credentials): serve only"
     )
-    daemon.add_argument(
+    web_listener = daemon.add_mutually_exclusive_group()
+    web_listener.add_argument(
         "--listen", type=_listen, help="serve the web UI on HOST:PORT (default: [web] listen)"
+    )
+    web_listener.add_argument(
+        "--no-web", action="store_true", help="no web UI (no TCP listener); the local API socket stays"
     )
 
     web = sub.add_parser("web", help="the web UI: pair a browser")
@@ -365,6 +369,16 @@ def _configure_daemon_logging() -> None:
         )
 
 
+def _web_listen(args: argparse.Namespace, config: "Config") -> tuple[str, int] | None:
+    """The web UI's address: ``--listen``, else ``[web] listen``; None for ``--no-web`` or
+    ``listen = "off"``."""
+    if getattr(args, "no_web", False):
+        return None
+    if args.listen is not None:
+        return args.listen
+    return (config.web.host, config.web.port) if config.web.enabled else None
+
+
 async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
     """Run the daemon until SIGTERM or SIGINT; SIGUSR1 requests a cycle. Logs go to stderr."""
     import logging
@@ -379,7 +393,9 @@ async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
         return EXIT_CONFIG
     _configure_daemon_logging()
     logger = logging.getLogger(__name__)
-    listen = args.listen or (config.web.host, config.web.port)
+    listen = _web_listen(args, config)
+    if listen is None:
+        logger.info("web UI off")
     daemon = Daemon(config, _state_dir(args), sync=sync, listen=listen)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -440,6 +456,7 @@ async def _trigger(args: argparse.Namespace, out: TextIO) -> int:
     return EXIT_FAILED
 
 
+WEB_OFF = 'the web UI is off ([web] listen = "off"); set [web] listen to HOST:PORT to use it\n'
 PAIR_WARNING = (
     "Anyone with this link can see your calendar sync status. Reset it with `calsync web reset-key`.\n"
 )
@@ -450,13 +467,20 @@ def cmd_web(args: argparse.Namespace, out: TextIO) -> int:
     from calsync.web import auth
 
     config = _load(args)
-    host, port = args.listen or (config.web.host, config.web.port)
+    listen = _web_listen(args, config)
     state_dir = _state_dir(args)
     if args.web_command == "reset-key":
-        key = auth.reset_key(state_dir)
+        key = auth.reset_key(state_dir)  # also with the web UI off: a leaked key can be replaced
         out.write("ok: the key was replaced; every paired browser has to pair again\n")
+    elif listen is None:  # nothing to pair with: no key made
+        out.write(WEB_OFF)
+        return EXIT_CONFIG
     else:
         key = auth.load_or_create_key(state_dir)
+    if listen is None:
+        out.write(WEB_OFF)
+        return EXIT_OK
+    host, port = listen
     for url in auth.pair_urls(key, host, port, config.web.allowed_hosts):
         out.write(url + "\n")
     out.write(PAIR_WARNING)

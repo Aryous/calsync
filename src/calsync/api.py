@@ -13,6 +13,7 @@ authentication and static files around it.
 """
 
 import contextlib
+import errno
 import functools
 import json
 import logging
@@ -36,6 +37,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from calsync import __version__, debug, views
 from calsync.config import Config
+from calsync.errors import ListenError
 from calsync.lock import DaemonServing
 from calsync.wiring import state_paths
 
@@ -374,10 +376,24 @@ class _Server(uvicorn.Server):
         yield
 
 
+def bind_problem(host: str, port: int, exc: OSError) -> str | None:
+    """What to tell the user when ``host:port`` cannot be bound; None for an unexpected error."""
+    where = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    reasons = {
+        errno.EADDRINUSE: ("address already in use", "port"),
+        errno.EACCES: ("permission denied", "port"),
+        errno.EADDRNOTAVAIL: ("this computer has no such address", "address"),
+    }
+    if exc.errno not in reasons:
+        return None
+    reason, other = reasons[exc.errno]
+    return f'cannot listen on {where}: {reason}; set [web] listen to another {other} or "off"'
+
+
 @contextlib.contextmanager
 def tcp_socket(host: str, port: int) -> Iterator[socket.socket]:
     """A listening TCP socket on ``host:port`` (port 0: any free port), closed on exit. Bound
-    here, before any cycle, so a port in use stops the start."""
+    here, before any cycle, so a port in use stops the start: ``ListenError`` (exit code 2)."""
     family, kind, proto, _, address = socket.getaddrinfo(
         host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
     )[0]
@@ -387,6 +403,12 @@ def tcp_socket(host: str, port: int) -> Iterator[socket.socket]:
         sock.bind(address)
         sock.listen(100)
         sock.setblocking(False)
+    except OSError as exc:
+        sock.close()
+        problem = bind_problem(host, port, exc)
+        if problem is None:
+            raise
+        raise ListenError(problem) from None
     except BaseException:
         sock.close()
         raise

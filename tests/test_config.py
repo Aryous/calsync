@@ -317,6 +317,13 @@ def test_bad_on_target_edit_reported_with_other_problems_of_the_rule(tmp_path: P
 def test_web_defaults() -> None:
     cfg = parse_config(VALID, base_dir=Path("/cfg"))
     assert (cfg.web.host, cfg.web.port, cfg.web.allowed_hosts) == ("127.0.0.1", 8766, ())
+    assert cfg.web.enabled is True
+
+
+def test_web_listen_off() -> None:
+    data = {**VALID, "web": {"listen": "off", "allowed_hosts": ["nas.lan"]}}
+    cfg = parse_config(data, base_dir=Path("/cfg"))
+    assert cfg.web.enabled is False and cfg.web.allowed_hosts == ("nas.lan",)
 
 
 @pytest.mark.parametrize(
@@ -348,6 +355,8 @@ def test_web_listen(listen: str, host: str, port: int) -> None:
         ({"listen": "[nas.lan]:8766"}, "web.listen: an IPv6 address goes in brackets"),
         ({"listen": "a b:8766"}, "web.listen: expected HOST:PORT"),
         ({"listen": 8766}, "web.listen: expected HOST:PORT"),
+        ({"listen": "OFF"}, "web.listen: expected HOST:PORT"),
+        ({"listen": False}, 'web.listen: expected HOST:PORT such as "127.0.0.1:8766", or "off"'),
         ({"allowed_hosts": "nas.lan"}, "web.allowed_hosts: expected a list of hostnames"),
         ({"allowed_hosts": [""]}, "web.allowed_hosts: expected a list of hostnames"),
         ({"allowed_hosts": ["nas.lan:8766"]}, "web.allowed_hosts: expected a list of hostnames"),

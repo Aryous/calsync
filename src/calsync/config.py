@@ -97,6 +97,7 @@ class WebConfig:
     host: str = DEFAULT_LISTEN[0]
     port: int = DEFAULT_LISTEN[1]
     allowed_hosts: tuple[str, ...] = ()
+    enabled: bool = True  # False: ``listen = "off"``, no TCP listener (the unix socket stays)
 
 
 def parse_listen(text: str) -> tuple[str, int]:
@@ -128,12 +129,16 @@ def _web(raw: Any, problems: list[str]) -> WebConfig:
     table = _table(raw, "web", problems)
     host, port = DEFAULT_LISTEN
     allowed: tuple[str, ...] = ()
+    enabled = True
     for key, value in table.items():
         if key == "listen":
             try:
                 if not isinstance(value, str):
-                    raise ValueError('expected HOST:PORT such as "127.0.0.1:8766"')
-                host, port = parse_listen(value)
+                    raise ValueError('expected HOST:PORT such as "127.0.0.1:8766", or "off"')
+                if value == "off":
+                    enabled = False
+                else:
+                    host, port = parse_listen(value)
             except ValueError as exc:
                 problems.append(f"web.listen: {exc}")
         elif key == "allowed_hosts":
@@ -148,7 +153,7 @@ def _web(raw: Any, problems: list[str]) -> WebConfig:
                 allowed = tuple(dict.fromkeys(names))
         else:
             problems.append(f"web.{key}: unknown setting")
-    return WebConfig(host, port, allowed)
+    return WebConfig(host, port, allowed, enabled)
 
 
 @dataclass(frozen=True, slots=True)
