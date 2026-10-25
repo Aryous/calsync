@@ -1042,9 +1042,11 @@ class _RecordingDaemon:
 def test_daemon_web_listener_choice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, web: str, args: list[str], listen: Any
 ) -> None:
+    from calsync import cli
     from calsync import daemon as daemon_module
 
     monkeypatch.setattr(daemon_module, "Daemon", _RecordingDaemon)
+    monkeypatch.setattr(cli, "_configure_daemon_logging", lambda: None)  # leave global logging alone
     monkeypatch.setattr(_RecordingDaemon, "listens", [])
     cfg = tmp_path / "config.toml"
     cfg.write_text(VIEWS_CONFIG + web)

@@ -17,6 +17,13 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def _no_calsync_debug(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignore[reportUnusedFunction]
+    """The type-only log assertions hold whatever the developer's shell sets; a test that
+    wants ``CALSYNC_DEBUG`` sets it itself."""
+    monkeypatch.delenv("CALSYNC_DEBUG", raising=False)
+
+
 @pytest.fixture
 def short_dir() -> Iterator[Path]:
     """A scratch directory under /tmp: macOS limits a unix socket path to 104 bytes, and
