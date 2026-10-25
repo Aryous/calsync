@@ -53,7 +53,8 @@
   --void: #59627a;
   --focus: #4b2e83;
   --skel: rgba(13, 27, 61, 0.07);
-  --shadow: 0 1px 2px rgba(13, 27, 61, 0.06), 0 6px 18px -10px rgba(13, 27, 61, 0.18);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.05), 0 6px 18px -10px rgba(0, 0, 0, 0.16);
+  --shadow-pop: 0 2px 4px rgba(0, 0, 0, 0.07), 0 18px 40px -16px rgba(0, 0, 0, 0.35);
   --mark-google: #0d1b3d;
   --mark-icloud: #56637f;
   --mark-text: #ffffff;
@@ -88,6 +89,7 @@
   --focus: #b9a6f5;
   --skel: rgba(200, 211, 238, 0.08);
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 22px -12px rgba(0, 0, 0, 0.7);
+  --shadow-pop: 0 2px 4px rgba(0, 0, 0, 0.5), 0 18px 40px -16px rgba(0, 0, 0, 0.85);
   --mark-google: #2a3c6e;
   --mark-icloud: #3c4966;
   --selection: rgba(187, 168, 245, 0.3);
@@ -265,7 +267,6 @@ code {
 }
 .health[data-state="attn"] .health__dot {
   background: #ff5d62;
-  box-shadow: 0 0 0 3px rgba(255, 93, 98, 0.22);
 }
 .health[data-state="attn"] {
   color: #ffffff;
@@ -353,7 +354,7 @@ code {
   color: var(--ink);
   border: 1px solid var(--rule);
   border-radius: var(--radius);
-  box-shadow: 0 2px 4px rgba(13, 27, 61, 0.08), 0 18px 40px -16px rgba(13, 27, 61, 0.45);
+  box-shadow: var(--shadow-pop);
   animation: drop 160ms var(--ease-out);
 }
 .menu__panel :focus-visible {
