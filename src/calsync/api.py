@@ -13,11 +13,13 @@ authentication and static files around it.
 """
 
 import contextlib
+import functools
 import json
+import logging
 import os
 import socket
 import sqlite3
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -32,13 +34,15 @@ from starlette.routing import Route
 
 from calsync import __version__, views
 from calsync.config import Config
-from calsync.lock import AlreadyRunning
+from calsync.lock import DaemonServing
 from calsync.wiring import state_paths
 
 if TYPE_CHECKING:
     import asyncio
 
     from calsync.daemon import DaemonInfo
+
+log = logging.getLogger(__name__)
 
 MAX_HOURS = 168
 MAX_RUNS = 500
@@ -154,6 +158,8 @@ class _Endpoints:
             raise ApiError(503, "no_state", NO_STATE) from None
         except sqlite3.DatabaseError:  # not a database, corrupt, or locked
             raise ApiError(500, "state_unreadable", UNREADABLE) from None
+        except Exception as exc:
+            raise _internal(exc) from None
 
     async def status(self, request: Request) -> Response:
         now = self._clock()
@@ -208,6 +214,31 @@ class _Endpoints:
         return JSONResponse({"accepted": True, "rule": rule}, status_code=202)
 
 
+def _internal(exc: Exception) -> ApiError:
+    """A bug: logged by type only (its text can carry a title or a URL), answered with a fixed
+    500, so neither Starlette nor uvicorn logs a traceback."""
+    log.error("an API request failed (%s)", type(exc).__name__)
+    return ApiError(500, "internal", "Internal error.")
+
+
+Endpoint = Callable[[Request], Awaitable[Response]]
+
+
+def guarded(endpoint: Endpoint) -> Endpoint:
+    """``endpoint`` with every unexpected error turned into the fixed JSON 500."""
+
+    @functools.wraps(endpoint)
+    async def wrapper(request: Request) -> Response:
+        try:
+            return await endpoint(request)
+        except (ApiError, HTTPException):
+            raise
+        except Exception as exc:
+            raise _internal(exc) from None
+
+    return wrapper
+
+
 def api_routes(
     *,
     config_provider: Callable[[], Config],
@@ -218,11 +249,11 @@ def api_routes(
     """The ``/api`` routes. Their errors are ``ApiError``: install ``exception_handlers`` too."""
     endpoints = _Endpoints(config_provider, state_dir, daemon, clock)
     return [
-        Route("/api/status", endpoints.status, methods=["GET"]),
-        Route("/api/upcoming", endpoints.upcoming, methods=["GET"]),
-        Route("/api/runs", endpoints.runs, methods=["GET"]),
-        Route("/api/changes", endpoints.changes, methods=["GET"]),
-        Route("/api/trigger", endpoints.trigger, methods=["POST"]),
+        Route("/api/status", guarded(endpoints.status), methods=["GET"]),
+        Route("/api/upcoming", guarded(endpoints.upcoming), methods=["GET"]),
+        Route("/api/runs", guarded(endpoints.runs), methods=["GET"]),
+        Route("/api/changes", guarded(endpoints.changes), methods=["GET"]),
+        Route("/api/trigger", guarded(endpoints.trigger), methods=["POST"]),
     ]
 
 
@@ -267,7 +298,7 @@ def unix_socket(path: Path) -> Iterator[socket.socket]:
     """A listening socket at ``path`` (mode 0600), removed again on exit.
 
     A socket file left behind by a process that died is removed first; one that still accepts
-    connections belongs to a running daemon: ``AlreadyRunning(None)``."""
+    connections belongs to a running daemon: ``DaemonServing``."""
     if path.is_socket():
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         probe.settimeout(2)
@@ -276,9 +307,9 @@ def unix_socket(path: Path) -> Iterator[socket.socket]:
         except (ConnectionRefusedError, FileNotFoundError):
             path.unlink(missing_ok=True)  # stale: nobody listens on it
         except TimeoutError:
-            raise AlreadyRunning(None) from None  # alive but busy
+            raise DaemonServing(path) from None  # alive but busy
         else:
-            raise AlreadyRunning(None)
+            raise DaemonServing(path)
         finally:
             probe.close()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

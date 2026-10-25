@@ -15,6 +15,15 @@ class AlreadyRunning(CalsyncError):
         super().__init__(f"another calsync process holds the lock (pid {pid or 'unknown'})")
 
 
+class DaemonServing(AlreadyRunning):
+    """The API socket is live: another daemon serves this state directory (its pid unknown)."""
+
+    def __init__(self, path: Path) -> None:
+        CalsyncError.__init__(self, f"another calsync daemon is serving {path}")
+        self.pid = None
+        self.path = path
+
+
 class RunLock:
     def __init__(self, path: Path) -> None:
         self.path = path

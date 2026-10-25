@@ -522,7 +522,8 @@ async def test_an_error_escaping_the_cycle_is_logged_and_the_schedule_goes_on(
     daemon = world.daemon(two_rules(interval=30), tmp_path)
     await asyncio.wait_for(daemon.run(world.stop), 5)
     errors = [r for r in caplog.records if r.name == "calsync.daemon" and r.levelno == logging.ERROR]
-    assert [r.getMessage() for r in errors] == ["sync cycle failed"]
+    assert [r.getMessage() for r in errors] == ["sync cycle failed (OperationalError)"]
+    assert errors[0].exc_info is None and "database is locked" not in caplog.text  # no text, no traceback
     assert world.delays == [30, 30]  # a full wait after the failure: no tight loop
     assert calls == [0, 30] and runs_by_time(tmp_path) == [(30, "family"), (30, "work")]
     assert daemon.snapshot().cycles == 1  # the failed cycle is not counted
@@ -657,6 +658,7 @@ async def test_a_live_socket_means_another_daemon(short_dir: Path) -> None:
     with pytest.raises(AlreadyRunning) as info:
         await asyncio.wait_for(second.run(asyncio.Event()), 5)
     assert info.value.pid is None
+    assert str(info.value) == f"another calsync daemon is serving {short_dir / 'calsync.sock'}"
     async with uds_client(short_dir) as client:  # the first one still serves
         assert (await client.post("/api/trigger")).status_code == 409
     stop.set()
@@ -725,4 +727,34 @@ async def test_a_socket_that_cannot_be_bound_stops_the_start(tmp_path: Path) -> 
         await asyncio.wait_for(daemon.run(world.stop), 5)
     assert world.builds == [] and not (state_dir / "state.db").exists()
     with RunLock(state_dir / "run.lock"):
+        pass
+
+
+async def test_a_service_raising_system_exit_lets_the_running_cycle_finish(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from calsync import api
+    from calsync import daemon as daemon_module
+
+    world = World()
+    cycle_started = asyncio.Event()
+    real = daemon_module.run_cycle
+
+    async def slow_cycle(*args: Any, **kwargs: Any) -> Any:
+        cycle_started.set()
+        await world.stop.wait()
+        return await real(*args, **kwargs)
+
+    async def exiting_server(*args: Any) -> None:
+        await cycle_started.wait()
+        raise SystemExit(3)  # a library calling sys.exit must not cancel the cycle mid-write
+
+    monkeypatch.setattr(daemon_module, "run_cycle", slow_cycle)
+    monkeypatch.setattr(api, "serve", exiting_server)
+    daemon = world.daemon(two_rules(), short_dir, serve=True)
+    with pytest.raises(SystemExit):
+        await asyncio.wait_for(daemon.run(world.stop), 5)
+    assert runs_by_time(short_dir) == [(0, "family"), (0, "work")]  # the cycle completed
+    assert daemon.snapshot().cycles == 1
+    with RunLock(short_dir / "run.lock"):
         pass

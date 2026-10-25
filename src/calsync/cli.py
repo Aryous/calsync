@@ -147,12 +147,14 @@ def exit_code_for_results(results: Iterable["RuleResult"]) -> int:
 def _describe(exc: BaseException) -> str:
     """The message for an error that stopped a command (no traceback)."""
     from calsync.errors import AuthError, CalsyncError, ConfigError
-    from calsync.lock import AlreadyRunning
+    from calsync.lock import AlreadyRunning, DaemonServing
 
     if isinstance(exc, ConfigError):
         return "configuration error:\n" + "".join(f"  - {p}\n" for p in exc.problems)
     if isinstance(exc, AuthError):
         return f"authentication error: {exc}\n"
+    if isinstance(exc, DaemonServing):
+        return f"{exc}; use a copy of the state directory to serve a second one\n"
     if isinstance(exc, AlreadyRunning):
         return f"{exc}; the daemon is running: use `calsync trigger`\n"
     if isinstance(exc, CalsyncError):  # network and other expected failures
@@ -364,6 +366,18 @@ async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
     return EXIT_OK
 
 
+def _root_os_error(exc: BaseException) -> OSError | None:
+    """The ``OSError`` that httpx wrapped (it chains it as the cause or the context)."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, OSError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
 async def _trigger(args: argparse.Namespace, out: TextIO) -> int:
     """Ask the daemon, over its socket, for a cycle now."""
     import httpx
@@ -375,8 +389,13 @@ async def _trigger(args: argparse.Namespace, out: TextIO) -> int:
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://calsync", timeout=10) as client:
             response = await client.post("/api/trigger", json=body)
-    except httpx.ConnectError:  # no socket file, or nobody listening on it
-        out.write("the daemon is not running; use calsync run\n")
+    except httpx.ConnectError as exc:
+        cause = _root_os_error(exc)
+        if cause is None or isinstance(cause, FileNotFoundError | ConnectionRefusedError):
+            # No socket file, or one nobody listens on (left by a daemon that died).
+            out.write("the daemon is not running; use calsync run\n")
+        else:  # a path too long for a socket, no permission, …
+            out.write(f"error: cannot connect to the daemon socket ({type(cause).__name__})\n")
         return EXIT_FAILED
     if response.status_code == 202:
         out.write("ok: cycle requested\n")

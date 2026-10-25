@@ -979,6 +979,41 @@ def test_trigger_without_a_daemon(short_dir: Path) -> None:
     assert not (short_dir / "none").exists()
 
 
+def test_trigger_reports_a_socket_it_cannot_reach(tmp_path: Path, short_dir: Path) -> None:
+    import socket
+
+    long_dir = tmp_path / ("d" * 110)  # longer than a unix socket path may be
+    long_dir.mkdir()
+    (long_dir / "calsync.sock").touch()
+    assert run(["--state-dir", str(long_dir), "trigger"]) == (
+        EXIT_FAILED,
+        "error: cannot connect to the daemon socket (OSError)\n",
+    )
+    listening = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listening.bind(str(short_dir / "calsync.sock"))
+        listening.listen(1)
+        (short_dir / "calsync.sock").chmod(0)  # connect needs write permission on the socket
+        assert run(["--state-dir", str(short_dir), "trigger"]) == (
+            EXIT_FAILED,
+            "error: cannot connect to the daemon socket (PermissionError)\n",
+        )
+    finally:
+        listening.close()
+
+
+def test_a_busy_socket_has_its_own_message_and_exit_4(short_dir: Path) -> None:
+    from calsync.cli import _describe, exit_code_for  # pyright: ignore[reportPrivateUsage]
+    from calsync.lock import DaemonServing
+
+    exc = DaemonServing(short_dir / "calsync.sock")
+    assert isinstance(exc, AlreadyRunning) and exc.pid is None
+    assert exit_code_for(exc) == EXIT_RUNNING
+    text = _describe(exc)
+    assert text.startswith(f"another calsync daemon is serving {short_dir / 'calsync.sock'}")
+    assert "lock" not in text and "pid" not in text
+
+
 def test_daemon_logging_keeps_request_urls_out(caplog: pytest.LogCaptureFixture) -> None:
     import asyncio
     import logging

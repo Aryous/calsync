@@ -303,3 +303,22 @@ async def test_responses_are_utf8_json(state: Path) -> None:
     async with client(state) as c:
         response = await c.get("/api/changes", params={"limit": 1})
     assert json.loads(response.content.decode("utf-8"))["changes"][0]["title"] == "Café ☕"
+
+
+async def test_an_unexpected_view_error_is_a_plain_500_without_its_text(
+    state: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    def broken(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("和朋友吃午饭 at https://calendar.example.invalid/e/123")
+
+    monkeypatch.setattr(views, "build_status", broken)
+    caplog.set_level(logging.DEBUG)
+    async with client(state) as c:  # ASGITransport re-raises whatever reaches the server middleware
+        response = await c.get("/api/status")
+    assert response.status_code == 500
+    assert response.json() == {"error": {"kind": "internal", "message": "Internal error."}}
+    for text in (caplog.text, response.text):
+        assert "和朋友吃午饭" not in text and "example.invalid" not in text
+    assert "RuntimeError" in caplog.text and "Traceback" not in caplog.text

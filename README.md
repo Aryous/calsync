@@ -264,9 +264,12 @@ agent you write yourself. An example
 launchctl load ~/Library/LaunchAgents/dev.calsync.daemon.plist
 ```
 
-`KeepAlive` restarts the daemon if it exits. If you used a `StartInterval`
-agent running `calsync run` before, unload it first: while the daemon runs,
-`calsync run` exits with code 4. The keychain backend needs a logged-in user
+`KeepAlive` restarts the daemon whenever it exits, so stop it with
+`launchctl unload ~/Library/LaunchAgents/dev.calsync.daemon.plist`, not with
+SIGTERM (launchd would start it again). A daemon that fails to start (a
+configuration error, a held lock) is retried about every 10 seconds; the log
+says why. If you used a `StartInterval` agent running `calsync run` before,
+unload it first: while the daemon runs, `calsync run` exits with code 4. The keychain backend needs a logged-in user
 session; on a machine that sits at the login screen use the `file` backend
 instead. There are no notifications yet: check `calsync status`.
 
@@ -391,14 +394,18 @@ a `calsync run` meanwhile exits with code 4: use `calsync trigger` instead
 
 - **Backoff.** A rule that keeps failing is skipped for 1, 2, 4, 8 and then
   15 minutes after its latest failure; the other rules keep their schedule. A
-  triggered rule runs regardless. A rule blocked by the mass-delete guard is
-  not backed off: it stays blocked until you run
-  `calsync run --rule NAME --allow-deletes` (stop the daemon first).
+  triggered rule runs regardless. A cycle blocked by the mass-delete guard
+  neither adds to nor clears a rule's failure streak, so a backoff earned by
+  earlier failures still applies. The rule stays blocked until you run
+  `calsync run --rule NAME --allow-deletes`; stop the daemon first (under
+  launchd: `launchctl unload` the agent, then load it again afterwards).
 - **Authentication.** After `calsync auth <account>` the daemon picks up the
   new credential at the rule's next attempt; `calsync trigger --rule NAME`
   makes that now.
 - **Stopping.** SIGTERM or Ctrl-C lets the current cycle finish, then exits.
-  A second Ctrl-C does not force-quit; `kill -9` does.
+  A second Ctrl-C does not force-quit; `kill -9` does. Under launchd with
+  `KeepAlive`, use `launchctl unload` instead: launchd restarts a daemon that
+  exits.
 - **Logs** go to stderr: one line per cycle with counts only (no titles, no
   URLs).
 - **The socket.** The daemon serves a small JSON API on
@@ -407,8 +414,10 @@ a `calsync run` meanwhile exits with code 4: use `calsync trigger` instead
   `trigger` says `the daemon is not running; use calsync run` when there is
   no daemon.
 - **`--no-sync`** serves the API without syncing: no lock, no credentials, no
-  cycles (`trigger` is refused). Point `--state-dir` at a copy of the state
-  directory to show the data without touching the live one.
+  cycles (`trigger` is refused). It cannot share a state directory with a
+  running daemon (whose socket is live: exit 4, `another calsync daemon is
+  serving …`): point `--state-dir` at a copy of the state directory to show
+  the data without touching the live one.
 
 ### Looking at the state
 

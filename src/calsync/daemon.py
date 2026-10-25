@@ -19,7 +19,9 @@ a failing server never cancels a cycle in progress. Once every service has ended
 finished), ``run`` raises the first failure.
 
 Without sync (``--no-sync``) the daemon takes no lock, reads no credential, opens no store and
-runs no cycle: it only serves the API beside a daemon (or ``calsync run``) that does.
+runs no cycle: it only serves the API. It cannot run beside another daemon in the same state
+directory (that one's socket is live: exit 4), only beside ``calsync run``; to show a running
+daemon's data, point it at a copy of the state directory.
 """
 
 import asyncio
@@ -149,7 +151,7 @@ class Daemon:
         cancelling the others; its error is raised once they have all ended.
         """
         self._running = True
-        failures: list[Exception] = []
+        failures: list[BaseException] = []
         try:
             async with self._resources() as sock, asyncio.TaskGroup() as group:
                 if self._sync:
@@ -164,11 +166,11 @@ class Daemon:
 
     @staticmethod
     async def _service(
-        name: str, work: Coroutine[Any, Any, None], stop: asyncio.Event, failures: list[Exception]
+        name: str, work: Coroutine[Any, Any, None], stop: asyncio.Event, failures: list[BaseException]
     ) -> None:
         try:
             await work
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:  # SystemExit too: nothing may cancel a cycle mid-write
             # The type only: an error's text can carry a request URL.
             log.error("the %s failed (%s); stopping", name, type(exc).__name__)
             failures.append(exc)
@@ -350,9 +352,10 @@ class Daemon:
                 dry_run=False,
                 allow_deletes=False,
             )
-        except Exception:
-            # The state database or a bug; the next cycle tries again.
-            log.exception("sync cycle failed")
+        except Exception as exc:
+            # The state database or a bug; the next cycle tries again. The type only: the text
+            # (and a traceback's locals) can carry a title or a request URL.
+            log.error("sync cycle failed (%s)", type(exc).__name__)
             return
         self._record(result)
 
