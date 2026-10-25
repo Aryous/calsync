@@ -4,12 +4,14 @@
 
 - ``/`` serves ``index.html`` (``pair.html`` for the ``unpaired`` scenario).
 - ``/static/*`` serves ``src/calsync/web/static``.
+- ``/_frame?w=390&h=844&src=/%3Fscenario%3Dok`` wraps a page in a sized iframe (screenshots).
 - ``/api/*`` serves ``tests/fixtures/web/<scenario>/<name>.json``, falling back to ``ok/``.
 
 The scenario comes from ``?scenario=`` on any request (``/?scenario=attention`` also sets a
 cookie that the page's API calls carry), else the cookie, else ``$SCENARIO``, else ``ok``.
-Scenarios with fixtures: ok, attention, never_run, old_schema, readonly. Two more are built
-in: ``no_state`` (every API call answers 503) and ``unpaired`` (401, ``/`` is the pair page).
+Scenarios with fixtures: ok, attention, never_run, old_schema, readonly. Three more are built
+in: ``no_state`` (every API call answers 503), ``offline`` (API connections are dropped) and
+``unpaired`` (401, ``/`` is the pair page).
 
 Time markers in fixtures are resolved at serve time, so "the next 24 hours" stays true:
 ``"@-90s"``, ``"@+35m"``, ``"@-3h"`` become ISO datetimes relative to now; ``"@q+35m"``
@@ -25,6 +27,7 @@ Standard library only; the backend is not imported.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import re
@@ -39,7 +42,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "src" / "calsync" / "web" / "static"
 FIXTURES = ROOT / "tests" / "fixtures" / "web"
-BUILTIN = {"no_state", "unpaired"}
+BUILTIN = {"no_state", "offline", "unpaired"}
 MARKER = re.compile(r"^@(q?)([+-]\d+)([smhD])$")
 SCENARIO_RE = re.compile(r"^[a-z_]+$")
 
@@ -153,6 +156,23 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def send_frame(self, query: dict[str, list[str]]) -> None:
+        # Headless Chrome will not make a window narrower than 500 px; a sized iframe gives the
+        # page a true phone-width viewport for screenshots.
+        w = int(query.get("w", ["390"])[0])
+        h = int(query.get("h", ["844"])[0])
+        src = html.escape(query.get("src", ["/"])[0], quote=True)
+        page = (
+            "<!doctype html><meta charset=utf-8><style>html,body{margin:0;background:#888}"
+            f"iframe{{display:block;margin:0 auto;border:0;width:{w}px;height:{h}px}}</style>"
+            f'<iframe src="{src}"></iframe>'
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page)))
+        self.end_headers()
+        self.wfile.write(page)
+
     def error_json(self, status: int, kind: str, message: str) -> None:
         self.send_json(status, {"error": {"kind": kind, "message": message}})
 
@@ -164,6 +184,9 @@ class Handler(SimpleHTTPRequestHandler):
             TRIGGERED.pop(scenario, None)
             page = "pair.html" if scenario == "unpaired" else "index.html"
             self.send_html(page, cookie=scenario if from_query else None)
+            return
+        if url.path == "/_frame":
+            self.send_frame(parse_qs(url.query))
             return
         if url.path.startswith("/static/"):
             self.path = self.path[len("/static") :]
@@ -197,6 +220,9 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_json(202, {"accepted": True, "rule": None})
 
     def handle_api(self, scenario: str, name: str, query: dict[str, list[str]]) -> None:
+        if scenario == "offline":
+            self.close_connection = True  # no response at all: fetch() rejects
+            return
         if scenario == "unpaired":
             self.error_json(401, "unpaired", "This browser is not paired.")
             return
