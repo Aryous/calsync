@@ -15,6 +15,7 @@ Arguments come from the command line or JSON: values may be the CLI's text (``"3
 names only, never a value: a value can be a push URL with a device key in it.
 """
 
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -27,6 +28,8 @@ from calsync import configfile, credentials
 from calsync.config import CredentialRef
 from calsync.errors import CalsyncError, ConfigError
 from calsync.store import CONFIG_CHANGE_RETENTION, Store
+
+log = logging.getLogger(__name__)
 
 Source = Literal["cli", "ui", "daemon"]
 DRY_RUN = "dry run, nothing written: "
@@ -247,25 +250,34 @@ def _config_op(
     text = new_text(snapshot) if new_text is not None else tomlkit.dumps(doc)
     configfile.validate_text(text, ctx.config_path.parent)  # also in a dry run
     if text == snapshot.text and undoes is None:
-        return OpResult(op, False, change.same or change.summary, "", change.data, change.needs_human)
+        data = {**change.data, "would_change": False} if dry_run else change.data
+        return OpResult(op, False, change.same or change.summary, "", data, change.needs_human)
     diff = configfile.diff_text(snapshot.text, text)
     if dry_run:
-        return OpResult(op, False, DRY_RUN + change.summary, diff, change.data, change.needs_human)
+        data = {**change.data, "would_change": diff != ""}
+        return OpResult(op, False, DRY_RUN + change.summary, diff, data, change.needs_human)
     written = configfile.write_config(snapshot, text)
-    ctx.store.record_config_change(
-        at=ctx.clock(),
-        source=ctx.source,
-        summary=change.summary,
-        before=snapshot.text,
-        after_fingerprint=written.fingerprint,
-        undoes=undoes,
-    )
+    recorded = True
+    try:
+        ctx.store.record_config_change(
+            at=ctx.clock(),
+            source=ctx.source,
+            summary=change.summary,
+            before=snapshot.text,
+            after_fingerprint=written.fingerprint,
+            undoes=undoes,
+        )
+    except Exception as exc:  # the file is written: report it, do not pretend nothing happened
+        log.warning("config history not recorded (%s)", type(exc).__name__)
+        recorded = False
     changed = text != snapshot.text
     if changed:
         ctx.on_config_written(written)
     summary = change.summary
     if change.after_write is not None:
         summary += change.after_write()
+    if not recorded:
+        summary += "; history not recorded"
     return OpResult(op, changed, summary, diff, change.data, change.needs_human)
 
 
@@ -432,18 +444,40 @@ def _account_remove(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpRe
         if users:
             listed = ", ".join(f'"{u}"' for u in users)
             raise ConfigError([f'account "{name}" is used by rules {listed}; remove them first'])
-        account = (raw.get("accounts") or {}).get(name)
+        accounts = raw.get("accounts") or {}
+        account = accounts.get(name)
         configfile.remove_account(doc, name)
         ref = _credential(account.get("credential")) if isinstance(account, Mapping) else None
         if not delete_credential:
             return _Edit(f'account "{name}" removed', after_write=lambda: "; its credential was kept")
+        sharers = sorted(
+            other
+            for other, entry in accounts.items()
+            if other != name and isinstance(entry, Mapping) and _credential(entry.get("credential")) == ref
+        )
+        if ref is not None and sharers:  # deleting it would sign those accounts out too
+            shared[:] = sharers
+            return _Edit(f'account "{name}" removed', after_write=lambda: _shared_tail(sharers, "was kept"))
         return _Edit(f'account "{name}" removed', after_write=lambda: _delete_credential(ref))
 
+    shared: list[str] = []
     result = _config_op(ctx, op, dry_run, edit)
     if dry_run and result.summary.startswith(DRY_RUN):
-        tail = "; its credential would be deleted" if delete_credential else "; its credential would be kept"
+        if shared:
+            tail = _shared_tail(shared, "would be kept")
+        elif delete_credential:
+            tail = "; its credential would be deleted"
+        else:
+            tail = "; its credential would be kept"
         return OpResult(result.op, result.changed, result.summary + tail, result.diff, result.data)
     return result
+
+
+def _shared_tail(sharers: list[str], kept: str) -> str:
+    """Another account uses the same credential: deleting it would sign that one out too."""
+    listed = ", ".join(f'"{s}"' for s in sharers)
+    noun = "account" if len(sharers) == 1 else "accounts"
+    return f"; its credential is also used by {noun} {listed}, so it {kept}"
 
 
 def _accounts_of(rule: Any) -> set[str]:
@@ -497,9 +531,11 @@ def _config_undo(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResul
     undone = {r.undoes for r in rows if r.undoes is not None}
     target = next((r for r in rows if r.undoes is None and r.id not in undone and r.before is not None), None)
     if target is None:
-        return OpResult(op, False, "nothing to undo")
+        return OpResult(op, False, "nothing to undo", data={"would_change": False} if dry_run else {})
     before = target.before
     assert before is not None
+    if before == "":
+        raise ConfigError(["this change created the config file; there is nothing earlier to go back to"])
 
     def edit(doc: tomlkit.TOMLDocument) -> _Edit:
         return _Edit(f"undid change {target.id} ({target.summary})", data={"undoes": target.id})

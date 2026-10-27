@@ -574,3 +574,113 @@ def test_rule_set_false_removes_the_flag(env: Env) -> None:
     result = env.run("rule.set", name="family", key="paused", value="false")
     assert result.changed and env.path.read_text() == TEXT
     assert env.run("rule.set", name="family", key="retire", value=False).changed is False
+
+
+# ----- fix round 1 -----------------------------------------------------------------------
+
+
+class StuckKeyring(FakeKeyring):
+    """macOS's backend: every keychain error on delete (denied, locked) is a PasswordDeleteError."""
+
+    def delete_password(self, service: str, user: str) -> None:
+        import keyring.errors
+
+        self.deleted.append(service)
+        raise keyring.errors.PasswordDeleteError("denied")
+
+
+def test_a_keychain_entry_that_survives_the_delete_is_reported(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = StuckKeyring()
+    fake.store[("calsync:spare-dav", "calsync")] = "pw"
+    monkeypatch.setattr(credentials, "_keyring", lambda: fake)
+    result = env.run("account.remove", name="spare-dav", delete_credential=True)
+    assert result.changed and "spare-dav" not in env.config().accounts
+    assert result.summary == (
+        'account "spare-dav" removed; its keychain entry "calsync:spare-dav" could not be deleted '
+        "(PasswordDeleteError): remove it by hand"
+    )
+    assert ("calsync:spare-dav", "calsync") in fake.store
+
+
+SHARED = """
+[accounts.spare-twin]
+provider = "caldav"
+server_url = "https://dav.example.com/"
+username = "twin"
+credential = { backend = "keychain", ref = "calsync:spare-dav" }
+"""
+
+
+def test_a_credential_another_account_uses_is_kept(env: Env, keychain: FakeKeyring) -> None:
+    env.path.write_text(TEXT + SHARED)
+    keychain.store[("calsync:spare-dav", "calsync")] = "pw"
+    dry = env.run("account.remove", dry_run=True, name="spare-dav", delete_credential=True)
+    kept = '; its credential is also used by account "spare-twin", so it was kept'
+    assert dry.summary == 'dry run, nothing written: account "spare-dav" removed' + kept.replace(
+        "was kept", "would be kept"
+    )
+    result = env.run("account.remove", name="spare-dav", delete_credential=True)
+    assert result.summary == 'account "spare-dav" removed' + kept
+    assert keychain.deleted == [] and ("calsync:spare-dav", "calsync") in keychain.store
+
+
+class BrokenHistory(Store):
+    def record_config_change(self, **kwargs: Any) -> int:  # type: ignore[override]
+        raise RuntimeError("disk full")
+
+
+def test_a_write_whose_history_cannot_be_recorded(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(TEXT)
+    store = BrokenHistory(tmp_path / "state" / "state.db")
+    written: list[Snapshot] = []
+    try:
+        ctx = OpContext(path, tmp_path / "state", store, "cli", lambda: NOW, on_config_written=written.append)
+        with caplog.at_level("WARNING"):
+            result = run_op(ctx, "rule.pause", {"name": "family"}, False)
+    finally:
+        store.close()
+    assert result.changed and result.summary == 'rule "family" paused; history not recorded'
+    assert "paused = true" in path.read_text() and len(written) == 1
+    assert [r.getMessage() for r in caplog.records] == ["config history not recorded (RuntimeError)"]
+
+
+def test_the_change_that_created_the_file_cannot_be_undone(tmp_path: Path) -> None:
+    store = Store(tmp_path / "state" / "state.db")
+    try:
+        path = tmp_path / "fresh" / "config.toml"
+        ctx = OpContext(path, tmp_path / "state", store, "cli", lambda: NOW)
+        args = {
+            "name": "dav",
+            "provider": "caldav",
+            "server_url": "https://dav.example.com/",
+            "username": "u",
+        }
+        run_op(ctx, "account.add", args, False)
+        created = path.read_text()
+        for dry_run in (True, False):
+            with pytest.raises(ConfigError) as info:
+                run_op(ctx, "config.undo", {}, dry_run)
+            assert info.value.problems == [
+                "this change created the config file; there is nothing earlier to go back to"
+            ]
+        assert path.read_text() == created and len(store.config_changes()) == 1
+    finally:
+        store.close()
+
+
+def test_a_dry_run_says_whether_it_would_change_anything(env: Env) -> None:
+    assert env.run("rule.pause", dry_run=True, name="family").data == {"would_change": True}
+    assert env.run("rule.resume", dry_run=True, name="family").data == {"would_change": False}
+    assert env.run("config.undo", dry_run=True).data == {"would_change": False}
+    env.run("rule.pause", name="family")
+    assert env.run("config.undo", dry_run=True).data == {"undoes": 1, "would_change": True}
+    assert env.run("rule.resume", name="family").data == {}  # not a dry run
+
+
+def test_config_set_google_client_secret_file(env: Env) -> None:
+    result = env.run("config.set", key="google.client_secret_file", value="other-client.json")
+    assert result.summary == "google.client_secret_file set"
+    assert env.config().google_client_secret_file == env.path.parent / "other-client.json"

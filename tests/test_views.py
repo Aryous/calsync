@@ -116,6 +116,8 @@ def test_reader_opens_a_path_with_uri_characters(tmp_path: Path) -> None:
         ("https://caldav.icloud.com/", "iCloud"),
         ("https://p42-caldav.icloud.com.cn/123/", "iCloud"),
         ("https://dav.example.com/cal/", "dav.example.com"),
+        ("https://user:tok3n@dav.example.com/cal/", "dav.example.com"),
+        ("https://user:tok3n@/cal/", "(hidden)"),  # no host: never the raw text
     ],
 )
 def test_caldav_host(url: str, host: str) -> None:

@@ -44,7 +44,9 @@ def _parser() -> argparse.ArgumentParser:
     history.add_argument("--limit", type=_positive_int, default=50, help="at most this many (default: 50)")
     history.add_argument("--json", action="store_true", help="print JSON")
     setting = _writer(config_sub, "set", "set one setting (an empty VALUE removes it)")
-    setting.add_argument("key", help="e.g. runtime.interval, notify.bark_url, web.allowed_hosts")
+    setting.add_argument(
+        "key", help="e.g. runtime.interval, notify.bark_url, web.allowed_hosts, google.client_secret_file"
+    )
     setting.add_argument("value", help='e.g. 2m, https://..., "a.local,b.local"')
     _writer(config_sub, "undo", "undo the newest config change not yet undone")
 
@@ -285,6 +287,7 @@ def _error_kind(exc: BaseException) -> str:
     from calsync.configfile import ConfigConflict
     from calsync.errors import ConfigError
     from calsync.lock import AlreadyRunning
+    from calsync.opsclient import DaemonLost
 
     if isinstance(exc, ConfigConflict):
         return "conflict"
@@ -292,6 +295,8 @@ def _error_kind(exc: BaseException) -> str:
         return "config"
     if isinstance(exc, AlreadyRunning):
         return "locked"
+    if isinstance(exc, DaemonLost):
+        return "daemon_lost"
     return "error"
 
 
@@ -328,7 +333,10 @@ def _op_for(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
     """The operation and its arguments for a write command."""
     if args.command == "config":
         if args.config_command == "set":
-            return "config.set", {"key": args.key, "value": args.value}
+            value = args.value
+            if args.key == "google.client_secret_file":  # a quoted ~ reaches us unexpanded
+                value = str(Path(value).expanduser())
+            return "config.set", {"key": args.key, "value": value}
         return "config.undo", {}
     if args.command in ("pause", "resume"):
         return f"rule.{args.command}", {"name": args.rule}

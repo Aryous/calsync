@@ -428,16 +428,26 @@ def host_for(provider: str, server_url: str | None) -> str:
     url = server_url or ""
     if url == "icloud" or "icloud.com" in url.lower():  # also icloud.com.cn
         return "iCloud"
-    return urlparse(url).hostname or url
+    return urlparse(url).hostname or HIDDEN  # never the raw text: it may carry a login
 
 
 HIDDEN = "(hidden)"
 
 
 def _scheme_host(url: str) -> str:
-    """``https://host[:port]`` of a URL: a push URL's path carries its device key."""
+    """``https://host[:port]`` of a URL: a push URL's path carries its device key, and a login
+    (``user:pass@``) never shows. ``"(hidden)"`` when the URL has no host or a bad port."""
     parts = urlparse(url)
-    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else HIDDEN
+    host = parts.hostname
+    try:
+        port = parts.port
+    except ValueError:
+        return HIDDEN
+    if not parts.scheme or not host:
+        return HIDDEN
+    if ":" in host:  # IPv6
+        host = f"[{host}]"
+    return f"{parts.scheme}://{host}" + (f":{port}" if port is not None else "")
 
 
 def config_json(config: Config, *, reveal: bool = False) -> dict[str, Any]:

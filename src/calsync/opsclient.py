@@ -24,6 +24,17 @@ if TYPE_CHECKING:
 OP_TIMEOUT = 600.0
 
 
+class DaemonLost(CalsyncError):
+    """The daemon accepted the operation and then went away (stopped, timed out, hung up)
+    before answering: it may have run it. Not retried, and not run here instead."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "lost contact with the daemon; the operation may still be applied — "
+            "check `calsync config history` before retrying"
+        )
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -97,14 +108,18 @@ def run_in_process(
 
 
 def _over_socket(sock: Path, name: str, args: dict[str, Any], dry_run: bool) -> "OpResult":
-    """The daemon's answer. A transport failure (the daemon stopped meanwhile) is raised as
-    httpx's error: the operation may or may not have run, so it is not retried here."""
+    """The daemon's answer. A transport failure after the probe (the daemon stopped, hung up or
+    did not answer in time) is ``DaemonLost``: the operation may or may not have run, so it is
+    neither retried nor run here."""
     import httpx
 
     transport = httpx.HTTPTransport(uds=str(sock))
     timeout = httpx.Timeout(10.0, read=OP_TIMEOUT)
-    with httpx.Client(transport=transport, base_url="http://calsync", timeout=timeout) as client:
-        response = client.post(f"/api/ops/{name}", json={"args": args, "dry_run": dry_run})
+    try:
+        with httpx.Client(transport=transport, base_url="http://calsync", timeout=timeout) as client:
+            response = client.post(f"/api/ops/{name}", json={"args": args, "dry_run": dry_run})
+    except httpx.HTTPError as exc:
+        raise DaemonLost() from exc
     return _result(name, response)
 
 

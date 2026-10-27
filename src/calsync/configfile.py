@@ -44,6 +44,7 @@ RULE_KEYS = frozenset(
 )
 SETTINGS = frozenset(
     {
+        "google.client_secret_file",
         "notify.bark_url",
         "notify.webhook_url",
         "notify.public_url",

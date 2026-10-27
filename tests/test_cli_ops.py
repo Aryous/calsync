@@ -396,3 +396,114 @@ def test_a_socket_it_cannot_reach_is_an_error(files: Files) -> None:
     finally:
         listening.close()
     assert files.config.read_text() == TEXT
+
+
+# ----- fix round 1 -----------------------------------------------------------------------
+
+
+def test_config_get_never_prints_a_url_login(files: Files) -> None:
+    files.config.write_text(
+        TEXT + '\n[notify]\nwebhook_url = "https://user:tok3n@hooks.example.com:8443/x"\n'
+    )
+    code, out = files.cli("config", "get")
+    assert code == EXIT_OK
+    assert json.loads(out)["notify"]["webhook_url"] == "https://hooks.example.com:8443"
+    assert "user" not in out.replace("username", "") and "tok3n" not in out
+
+
+@pytest.mark.parametrize(
+    ("url", "shown"),
+    [
+        ("https://user:tok3n@hooks.example.com:8443/x", "https://hooks.example.com:8443"),
+        ("https://user@[2001:db8::1]:8443/key", "https://[2001:db8::1]:8443"),
+        ("http://[2001:db8::1]/key", "http://[2001:db8::1]"),
+        ("https://bark.example.com/DEVICEKEY", "https://bark.example.com"),
+        ("https://hooks.example.com:notaport/x", "(hidden)"),
+        ("not a url", "(hidden)"),
+    ],
+)
+def test_scheme_host(url: str, shown: str) -> None:
+    from calsync.views import _scheme_host  # pyright: ignore[reportPrivateUsage]
+
+    assert _scheme_host(url) == shown
+
+
+def test_a_fresh_install_can_set_the_google_client_secret_file(short_dir: Path) -> None:
+    config, state = short_dir / "new" / "config.toml", short_dir / "s"
+
+    def cli(*argv: str) -> tuple[int, str]:
+        return run(["--config", str(config), "--state-dir", str(state), *argv])
+
+    code, out = cli("account", "add", "me-google", "--provider", "google")
+    assert code == EXIT_CONFIG and "google.client_secret_file: required" in out
+    assert cli("config", "set", "google.client_secret_file", "~/Downloads/client.json") == (
+        EXIT_OK,
+        "google.client_secret_file set\n",
+    )
+    assert f'client_secret_file = "{Path.home()}/Downloads/client.json"' in config.read_text()
+    code, out = cli("account", "add", "me-google", "--provider", "google")
+    assert code == EXIT_OK and out.startswith('account "me-google" added\n'), out
+
+
+class SilentDaemon:
+    """A socket that takes connections and answers none: ``close`` hangs up on each one,
+    otherwise each is held open (the daemon is stuck)."""
+
+    def __init__(self, path: Path, *, close: bool) -> None:
+        import socket
+        import threading
+
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(str(path))
+        self.server.listen(4)
+        self.server.settimeout(0.05)
+        self.close = close
+        self.held: list[Any] = []
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self) -> None:
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.server.accept()
+            except TimeoutError:
+                continue
+            if self.close:
+                conn.recv(65536)  # the request (the probe sends nothing and closes)
+                conn.close()
+            else:
+                self.held.append(conn)
+
+    def __enter__(self) -> "SilentDaemon":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.stop.set()
+        self.thread.join(5)
+        for conn in self.held:
+            conn.close()
+        self.server.close()
+
+
+LOST = (
+    "lost contact with the daemon; the operation may still be applied — "
+    "check `calsync config history` before retrying"
+)
+
+
+@pytest.mark.parametrize("close", [True, False], ids=["hung-up", "timed-out"])
+def test_losing_the_daemon_mid_op_is_a_clear_error(
+    files: Files, monkeypatch: pytest.MonkeyPatch, close: bool
+) -> None:
+    files.state.mkdir()
+    monkeypatch.setattr(opsclient, "OP_TIMEOUT", 0.3)
+    with SilentDaemon(socket_path(files.state), close=close):
+        with pytest.raises(opsclient.DaemonLost) as info:
+            _call(files, "rule.pause", {"name": "family"})
+        assert str(info.value) == LOST
+        assert files.cli("pause", "family") == (EXIT_FAILED, f"error: {LOST}\n")
+        code, out = files.cli("pause", "family", "--json")
+    assert code == EXIT_FAILED
+    assert json.loads(out) == {"error": {"kind": "daemon_lost", "message": LOST}}
+    assert files.config.read_text() == TEXT  # not run here as well

@@ -115,3 +115,24 @@ def test_delete_secret_keychain_failure(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(credentials, "_keyring", lambda: Locked())
     with pytest.raises(ConfigError, match=r"could not delete keychain entry 'calsync:test': locked"):
         delete_secret(CredentialRef("keychain", "calsync:test"))
+
+
+class DeniedDelete(FakeKeyring):
+    """macOS's backend wraps every delete failure (not found, denied, locked) in
+    PasswordDeleteError; only a read afterwards tells whether the entry is gone."""
+
+    def delete_password(self, service: str, user: str) -> None:
+        raise keyring.errors.PasswordDeleteError("denied")
+
+
+def test_delete_secret_refused_while_the_entry_still_exists(monkeypatch: pytest.MonkeyPatch) -> None:
+    from calsync.credentials import delete_secret
+
+    fake = DeniedDelete()
+    monkeypatch.setattr(credentials, "_keyring", lambda: fake)
+    ref = CredentialRef("keychain", "calsync:test")
+    assert delete_secret(ref) is True  # absent: nothing left to delete
+    fake.store[("calsync:test", "calsync")] = "pw"
+    with pytest.raises(ConfigError, match=r"could not delete keychain entry 'calsync:test'") as info:
+        delete_secret(ref)
+    assert isinstance(info.value.__cause__, keyring.errors.PasswordDeleteError)
