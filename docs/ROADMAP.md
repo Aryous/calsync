@@ -33,7 +33,14 @@ The phase-2 design is in
   First task: measure on iCloud whether phone edits keep `X-CALSYNC-HASH`
   and whether PUT returns an `ETag` (experiments E1, E2).
 - Still open from the first real run: 401 vs 403 for a bad app-specific
-  password; writing into a family member's own account (E5); `MKCALENDAR`.
+  password; `MKCALENDAR`.
+- Settled by the first real run: writing into a family member's own account
+  (E5). That run is the same situation (calsync writing with an account's own
+  app-specific password into that account's own calendar, whose alerts fire
+  on that account's iPhone) and has been in daily use since 2026-10-24, so no
+  separate experiment is needed. What is left is operational: generate the
+  family member's app-specific password, add their account and a rule, and
+  make sure Calendar notifications are on on their phone.
 - Already measured (2026-10-24, spec v3 §13 item 1): alerts on a calendar
   shared to another Apple ID do not reach the sharee.
 

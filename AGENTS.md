@@ -216,9 +216,11 @@ calendar shared to another Apple ID do **not** reach the sharee (per-user
 `VALARM`); the sharee sees only their own iPhone default alert (spec §13
 item 1). Reverting edits made on the target is implemented and tested against
 Radicale and `FakeTarget`; the real-device check (an edit and a snooze on an
-iPhone against iCloud, experiment E1) is still pending. Also still unverified
-on iCloud: writing into the family member's own account, 401 vs 403 for a bad
-password, `MKCALENDAR` (spec §13).
+iPhone against iCloud, experiment E1) is still pending. Writing into a family
+member's own account (E5) needs no separate check: it is the situation of the
+first real run (an account's own app-specific password, alerts firing on that
+account's iPhone), in daily use since 2026-10-24. Still unverified on iCloud:
+401 vs 403 for a bad password, `MKCALENDAR` (spec §13).
 
 ## 8. Known limitations and debt
 
@@ -227,8 +229,8 @@ password, `MKCALENDAR` (spec §13).
   reverted only after the series parses again.
 - Only Google pop-up reminders are synced; attendees are never invitees.
 - Renaming or removing a rule orphans its events.
-- `protected` / `degraded` / delete-guard titles live only on `RuleResult`,
-  not in run history.
+- `degraded` counts live only on `RuleResult`, not in run history (protected
+  and blocked series are recorded, with their titles, in the `change` table).
 - No byte counts in run history; no `invalid_client` → `ConfigError` mapping;
   held cursor has no cap or escalation.
 - `[notify]` is validated but unused until alerts exist. The daemon reads the

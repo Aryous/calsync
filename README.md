@@ -282,6 +282,16 @@ calsync config check
 calsync run --dry-run          # review before the first real cycle
 ```
 
+### Upgrading to the version with the daemon and the web UI
+
+- **The state database is migrated in place.** Run history, cursors and the
+  cached copies are kept, so the first cycle after the upgrade costs no more
+  than any other. Change history (`calsync changes`) starts with the upgrade.
+- **The daemon replaces a scheduled `calsync run`.** If a `StartInterval`
+  agent ran `calsync run` before, unload it before you load the daemon (see
+  [Keep it running](#7-keep-it-running)): while the daemon runs, `calsync run`
+  exits with code 4.
+
 ### Upgrading to the version with full sync and reverts
 
 The first `calsync run` after this upgrade is a one-time heavy cycle; the
@@ -454,7 +464,9 @@ stores a cookie in that browser for 400 days; you can also paste the key
 (or the whole link) into the page at `/`. **Anyone with the link can see your
 calendar sync status, titles included**, so treat it like a password and
 reset the key if it leaks. A reset takes effect at once, without restarting
-the daemon.
+the daemon. The session cookie is a long-lived credential of the same kind,
+and browsers send it to every service on the same host name (whatever the
+port): if you suspect it leaked, run `calsync web reset-key`.
 
 - To reach it from a phone on your network, listen on every address
   (`listen = "0.0.0.0:8766"`) and open `http://<the computer's IP>:8766/…`;
