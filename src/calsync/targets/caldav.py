@@ -131,7 +131,7 @@ class CalDavTarget:
             try:
                 items = await dav.propfind("", [q(DAV, "current-user-principal")], depth=0)
             except AuthError:
-                rejected.append(urlsplit(base).netloc)
+                rejected.append(urlsplit(base).hostname or "(hidden)")  # never a user:pass@ login
                 continue
             if len(items) != 1:
                 raise CalsyncError(f"unexpected PROPFIND response for {base}: {len(items)} entries")

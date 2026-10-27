@@ -334,7 +334,8 @@ def _op_for(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
     if args.command == "config":
         if args.config_command == "set":
             value = args.value
-            if args.key == "google.client_secret_file":  # a quoted ~ reaches us unexpanded
+            # A quoted ~ reaches us unexpanded; an empty value removes the key, as for any setting.
+            if args.key == "google.client_secret_file" and value.strip():
                 value = str(Path(value).expanduser())
             return "config.set", {"key": args.key, "value": value}
         return "config.undo", {}

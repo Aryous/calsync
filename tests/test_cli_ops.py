@@ -445,6 +445,17 @@ def test_a_fresh_install_can_set_the_google_client_secret_file(short_dir: Path) 
     assert code == EXIT_OK and out.startswith('account "me-google" added\n'), out
 
 
+def test_an_empty_client_secret_file_removes_the_key(short_dir: Path) -> None:
+    config, state = short_dir / "c" / "config.toml", short_dir / "s"
+
+    def cli(*argv: str) -> tuple[int, str]:
+        return run(["--config", str(config), "--state-dir", str(state), *argv])
+
+    assert cli("config", "set", "google.client_secret_file", "/x/client.json")[0] == EXIT_OK
+    assert cli("config", "set", "google.client_secret_file", "")[0] == EXIT_OK
+    assert "client_secret_file" not in config.read_text()
+
+
 class SilentDaemon:
     """A socket that takes connections and answers none: ``close`` hangs up on each one,
     otherwise each is held open (the daemon is stuck)."""
