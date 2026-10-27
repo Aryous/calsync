@@ -8,11 +8,12 @@ up exactly where the last one stopped.
 import asyncio
 import logging
 from collections import defaultdict
-from collections.abc import Callable, Coroutine, Mapping, Sequence, Set
+from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from calsync import debug
 from calsync.config import Config, Rule
 from calsync.errors import AuthError, CalsyncError, ConfigError, ConflictError, NotFoundError
 from calsync.http import RequestLog
@@ -142,6 +143,12 @@ def _blocked_titles(deletes: Sequence[Actual], bodies: Bodies | None) -> tuple[l
 TargetKey = tuple[str, str]  # (account, calendar ref from config)
 
 
+def _rule_names(rules: Iterable[Rule]) -> str:
+    """Rule names for a log line. A calendar ref is never logged: it may be a Google calendar ID
+    (an address) or a CalDAV URL."""
+    return ", ".join(sorted(r.name for r in rules))
+
+
 class Engine:
     def __init__(
         self,
@@ -187,7 +194,13 @@ class Engine:
                     "(source contract violation)"
                 )
         for ref, exc in errors.items():
-            log.warning("source %s calendar %r failed: %s", account, ref, exc)
+            # Never the calendar ref (it may be a Google calendar ID, an address) nor the error's
+            # text (it carries the request URL): the rules it feeds and the type.
+            names = _rule_names(r for r in rules if r.source.calendar == ref)
+            log.warning(
+                "source %s: the calendar of rule(s) %s failed (%s)", account, names, type(exc).__name__
+            )
+            debug.details(log, f"source {account}: the calendar of rule(s) {names} failed", exc)
         # Failed calendars are absent from ``calendars`` and keep their old cursor in ``state``.
         unique = {p.calendar_id: p for p in pull.calendars.values()}
         self._store.save_source(account, pull.state, unique.values())
@@ -273,18 +286,19 @@ class Engine:
         if marker_lost:
             # Counts only: tells whether the target keeps the marker (the real-device check).
             log.info(
-                "target %s %r: %d copy(ies) read back with no calsync marker; judged by visible content",
+                "target %s (rule(s) %s): %d copy(ies) read back with no calsync marker; judged by "
+                "visible content",
                 account,
-                ref,
+                _rule_names(rules),
                 marker_lost,
             )
         if unread:
             # Keep the previous cursor: sync-collection replays (ctag re-lists) these hrefs
             # next cycle; advancing would orphan them until they change on the target again.
             log.warning(
-                "target %s %r: %d changed resource(s) could not be read; re-detecting next cycle",
+                "target %s (rule(s) %s): %d changed resource(s) could not be read; re-detecting next cycle",
                 account,
-                ref,
+                _rule_names(rules),
                 len(unread),
             )
         else:
@@ -543,7 +557,10 @@ class Engine:
         try:
             fetched = await self._targets[rule.target.account].fetch(cal, [a.href for a in deletes])
         except Exception as exc:  # the alert loses detail, but the rule stays blocked
-            log.warning("rule %s: could not read the titles of planned deletes: %s", rule.name, exc)
+            log.warning(
+                "rule %s: could not read the titles of planned deletes (%s)", rule.name, type(exc).__name__
+            )
+            debug.details(log, f"rule {rule.name}: could not read the titles of planned deletes", exc)
             return None
         return {obj.href: inspect(obj.data) for obj in fetched}
 
@@ -665,7 +682,8 @@ class Engine:
                     if not isinstance(outcome, Exception):
                         raise outcome
                     errors.append(outcome)
-                    log.warning("rule %s: write failed: %s", rule.name, outcome)
+                    log.warning("rule %s: write failed (%s)", rule.name, type(outcome).__name__)
+                    debug.details(log, f"rule {rule.name}: write failed", outcome)
         if errors:
             result.failed = len(errors)
             first = errors[0]
@@ -727,7 +745,8 @@ class Engine:
             try:
                 await self._run_rule(rule, results[rule.name], dry_run=dry_run, allow_deletes=allow_deletes)
             except Exception as exc:  # isolate rules from each other
-                log.exception("rule %s failed", rule.name)
+                log.error("rule %s failed (%s)", rule.name, type(exc).__name__)
+                debug.details(log, f"rule {rule.name} failed", exc)
                 results[rule.name].fail(exc)
 
         await asyncio.gather(*(guarded(r) for r in selected if results[r.name].status == "ok"))

@@ -10,6 +10,7 @@ from html.parser import HTMLParser
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from calsync import debug
 from calsync.icalutil import parse_date_line
 from calsync.model import Alarm, Attendee, Occurrence, Series, When, normalize_series
 from calsync.sources.base import CalendarMeta, RawEvent
@@ -177,8 +178,12 @@ def _series(master: RawEvent, exceptions: list[RawEvent], meta: CalendarMeta) ->
                 complete = False
                 # DEBUG: runs every cycle; the engine warns once per process per series.
                 log.debug(
-                    "skipping malformed instance %s of series %s: %s", ex.get("id"), master.get("id"), exc
+                    "skipping malformed instance %s of series %s (%s)",
+                    ex.get("id"),
+                    master.get("id"),
+                    type(exc).__name__,
                 )
+                debug.details(log, f"malformed instance {ex.get('id')}", exc)
     return normalize_series(
         Series(
             source_id=master["id"],
@@ -231,7 +236,10 @@ def build_series(raw_events: Iterable[RawEvent], meta: CalendarMeta) -> list[Ser
         try:
             result.append(_series(master, exceptions.pop(master_id, []), meta))
         except (KeyError, ValueError) as exc:
-            log.debug("skipping malformed event %s: %s", master_id, exc)  # the engine warns once
+            log.debug(
+                "skipping malformed event %s (%s)", master_id, type(exc).__name__
+            )  # the engine warns once
+            debug.details(log, f"malformed event {master_id}", exc)
     for master_id, orphans in exceptions.items():
         live = [o for o in orphans if o.get("status") != "cancelled"]
         if live:
