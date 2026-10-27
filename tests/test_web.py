@@ -530,6 +530,19 @@ async def test_a_port_in_use_is_a_listen_error(busy_port: int) -> None:
     assert info.value.problems == [BUSY.format(f"127.0.0.1:{busy_port}")]
 
 
+async def test_an_unknown_host_name_is_a_listen_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unknown(*args: Any, **kwargs: Any) -> Any:
+        raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+
+    monkeypatch.setattr(socket, "getaddrinfo", unknown)
+    with pytest.raises(ListenError) as info, api.tcp_socket("nas.invalid", 8766):
+        pass
+    assert isinstance(info.value, ConfigError)  # exit code 2, like every other listen problem
+    assert info.value.problems == [
+        'cannot listen on nas.invalid:8766: no such host name; set [web] listen to another address or "off"'
+    ]
+
+
 @pytest.mark.parametrize(
     ("code", "message"),
     [

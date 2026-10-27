@@ -376,9 +376,13 @@ class _Server(uvicorn.Server):
         yield
 
 
+def _where(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 def bind_problem(host: str, port: int, exc: OSError) -> str | None:
     """What to tell the user when ``host:port`` cannot be bound; None for an unexpected error."""
-    where = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    where = _where(host, port)
     reasons = {
         errno.EADDRINUSE: ("address already in use", "port"),
         errno.EACCES: ("permission denied", "port"),
@@ -394,9 +398,14 @@ def bind_problem(host: str, port: int, exc: OSError) -> str | None:
 def tcp_socket(host: str, port: int) -> Iterator[socket.socket]:
     """A listening TCP socket on ``host:port`` (port 0: any free port), closed on exit. Bound
     here, before any cycle, so a port in use stops the start: ``ListenError`` (exit code 2)."""
-    family, kind, proto, _, address = socket.getaddrinfo(
-        host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
-    )[0]
+    try:
+        family, kind, proto, _, address = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+        )[0]
+    except socket.gaierror:
+        raise ListenError(
+            f'cannot listen on {_where(host, port)}: no such host name; set [web] listen to another address or "off"'
+        ) from None
     sock = socket.socket(family, kind, proto)
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
