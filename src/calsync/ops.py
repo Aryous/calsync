@@ -16,9 +16,10 @@ names only, never a value: a value can be a push URL with a device key in it.
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -26,13 +27,14 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import tomlkit
 
-from calsync import configfile, credentials
+from calsync import configfile, credentials, debug
 from calsync.config import Config, CredentialRef
-from calsync.errors import CalsyncError, ConfigError
+from calsync.errors import AuthError, CalsyncError, ConfigError, plain_error
 from calsync.store import CONFIG_CHANGE_RETENTION, Store
 
 if TYPE_CHECKING:
     from calsync.engine import CycleResult, RuleResult
+    from calsync.wiring import Adapters
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +57,13 @@ class DaemonHooks(Protocol):
     ) -> "asyncio.Future[CycleResult | None] | None":
         """Store the approval for the rule's next cycle and request that cycle; with ``wait``,
         a future of that cycle's result (None: the cycle failed)."""
+        ...
+
+    def borrow_adapters(
+        self, config: Config, names: set[str]
+    ) -> "contextlib.AbstractAsyncContextManager[Adapters]":
+        """Adapters for ``names`` while the operation runs (it holds the daemon's lock): the
+        daemon's own where it has them, the others built for the operation and closed after."""
         ...
 
 
@@ -304,26 +313,26 @@ def _config_op(
 # ----- rules -------------------------------------------------------------------------------
 
 
-def _rule_add(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
-    op = "rule.add"
-    a = _Args(
-        op,
-        args,
-        {
-            "name",
-            "source",
-            "target",
-            "create_target",
-            "window",
-            "alarms",
-            "content",
-            "attendees",
-            "conference",
-        },
-    )
+_RULE_ADD_ARGS = {
+    "name",
+    "source",
+    "target",
+    "create_target",
+    "window",
+    "alarms",
+    "content",
+    "attendees",
+    "conference",
+}
+
+
+def _rule_table(
+    op: str, args: dict[str, Any]
+) -> tuple[str, dict[str, Any], tuple[str, str], tuple[str, str]]:
+    """``rule.add``'s arguments as the new ``[[rules]]`` table: (name, table, source, target)."""
+    a = _Args(op, args, _RULE_ADD_ARGS)
     name = a.text("name")
-    source_text, target_text = a.text("source"), a.text("target")
-    source, target = _selection(op, "source", source_text), _selection(op, "target", target_text)
+    source, target = _selection(op, "source", a.text("source")), _selection(op, "target", a.text("target"))
     table: dict[str, Any] = {
         "name": name,
         "source": {"account": source[0], "calendar": source[1]},
@@ -342,15 +351,28 @@ def _rule_add(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
     }
     if fields:
         table["fields"] = fields
+    return name, table, source, target
+
+
+def _add_rule(
+    doc: tomlkit.TOMLDocument, table: dict[str, Any], source: tuple[str, str], target: tuple[str, str]
+) -> None:
+    """Add the rule ``table`` to ``doc``; refused if a rule already syncs ``source`` to ``target``."""
+    for existing in _raw(doc).get("rules") or []:
+        if not isinstance(existing, Mapping):
+            continue
+        if _pair(existing.get("source")) == source and _pair(existing.get("target")) == target:
+            src, tgt = ":".join(source), ":".join(target)
+            raise ConfigError([f'a rule already syncs "{src}" to "{tgt}": "{existing.get("name")}"'])
+    configfile.add_rule(doc, table)
+
+
+def _rule_add(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
+    op = "rule.add"
+    name, table, source, target = _rule_table(op, args)
 
     def edit(doc: tomlkit.TOMLDocument) -> _Edit:
-        for existing in _raw(doc).get("rules") or []:
-            if not isinstance(existing, Mapping):
-                continue
-            if _pair(existing.get("source")) == source and _pair(existing.get("target")) == target:
-                src, tgt = ":".join(source), ":".join(target)
-                raise ConfigError([f'a rule already syncs "{src}" to "{tgt}": "{existing.get("name")}"'])
-        configfile.add_rule(doc, table)
+        _add_rule(doc, table, source, target)
         return _Edit(f'rule "{name}" added: "{":".join(source)}" to "{":".join(target)}"')
 
     return _config_op(ctx, op, dry_run, edit)
@@ -756,6 +778,307 @@ async def _cycle_here(
     return result, removed
 
 
+# ----- the calendar cache -----------------------------------------------------------------
+
+
+def _config_now(ctx: OpContext) -> Config:
+    """The config to act on: the daemon's (what it runs), or the file's."""
+    from calsync.config import load_config
+
+    return ctx.daemon.config if ctx.daemon is not None else load_config(ctx.config_path)
+
+
+@contextlib.asynccontextmanager
+async def _adapters(ctx: OpContext, config: Config, names: set[str]) -> AsyncIterator["Adapters"]:
+    """Adapters for ``names``: borrowed from the daemon, or built here and closed after."""
+    if ctx.daemon is not None:
+        async with ctx.daemon.borrow_adapters(config, names) as adapters:
+            yield adapters
+        return
+    from calsync import wiring
+
+    adapters = await wiring.build_adapters(config, names)
+    try:
+        yield adapters
+    finally:
+        await adapters.aclose()
+
+
+@dataclass(frozen=True)
+class Refreshed:
+    """What ``refresh_calendars`` did: calendars stored per account, and the accounts that failed."""
+
+    counts: dict[str, int] = field(default_factory=dict)
+    errors: dict[str, Exception] = field(default_factory=dict)
+
+
+async def refresh_calendars(
+    store: Store, adapters: "Adapters", names: Sequence[str], at: datetime
+) -> Refreshed:
+    """Fetch each account's calendar list into the cache (``account_calendar``), stamped ``at``.
+    A failing account keeps its old rows; its failure is logged by type (the text can carry a
+    URL: ``debug.details``). Google rows carry calendarList's ``accessRole``; CalDAV rows no role
+    (discovery reads no privilege set, and no request is added just for it)."""
+    from calsync.store import AccountCalendar
+
+    done = Refreshed()
+    for name in names:
+        try:
+            adapters.adapter(name)  # its setup error, if any
+            if name in adapters.sources:
+                found = await adapters.sources[name].list_calendars()
+                rows = [AccountCalendar(name, c.id, c.name, c.role, at) for c in found]
+            else:
+                listed = await adapters.targets[name].list_calendars()
+                rows = [AccountCalendar(name, c.href, c.name, None, at) for c in listed]
+        except Exception as exc:
+            log.warning(
+                "the calendar list of account %s could not be refreshed (%s)", name, type(exc).__name__
+            )
+            debug.details(log, f"the calendar list of account {name} could not be refreshed", exc)
+            done.errors[name] = exc
+            continue
+        store.save_account_calendars(name, rows, at)
+        done.counts[name] = len(rows)
+    return done
+
+
+def _kind(exc: BaseException) -> str:
+    from calsync.engine import error_kind_for
+
+    return error_kind_for(exc)
+
+
+async def _calendars_refresh(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
+    """Fetch the calendar lists now: of ``account``, or of every configured account. A failing
+    account is reported in ``data`` (a plain error, its kind), never raised: through the daemon
+    an escaping error would only be an HTTP 500. An auth failure asks for ``calsync auth``."""
+    op = "calendars.refresh"
+    account = _Args(op, args, {"account"}).opt_text("account")
+    config = _config_now(ctx)
+    if account is not None and account not in config.accounts:
+        raise ConfigError([f'unknown account "{account}"'])
+    names = [account] if account is not None else sorted(config.accounts)
+    if dry_run:
+        listed = ", ".join(f'"{n}"' for n in names) or "no account"
+        summary = f"{DRY_RUN}the calendar lists of {listed} would be fetched"
+        return OpResult(op, False, summary, data={"would_refresh": names, "would_change": bool(names)})
+    at = ctx.clock()
+    async with _adapters(ctx, config, set(names)) as adapters:
+        done = await refresh_calendars(ctx.store, adapters, names, at)
+        setup = set(adapters.errors)
+    outcome: dict[str, dict[str, Any]] = {}
+    for name in names:
+        exc = done.errors.get(name)
+        outcome[name] = {
+            "refreshed": exc is None,
+            "calendars": done.counts.get(name),
+            "fetched_at": at.isoformat() if exc is None else None,
+            "error": None
+            if exc is None
+            else plain_error(exc, f'account "{name}"', account=name, setup=name in setup),
+            "error_kind": None if exc is None else _kind(exc),
+        }
+    human = next((n for n in names if isinstance(done.errors.get(n), AuthError)), None)
+    needs_human = {"command": f"calsync auth {human}", "reason": AUTH_REASON} if human else None
+    return OpResult(
+        op,
+        bool(done.counts),
+        _refresh_summary(names, done),
+        data={"accounts": outcome},
+        needs_human=needs_human,
+    )
+
+
+def _refresh_summary(names: Sequence[str], done: Refreshed) -> str:
+    failed = [n for n in names if n in done.errors]
+    if len(names) == 1:
+        name = names[0]
+        if failed:
+            return f'the calendar list of account "{name}" could not be fetched ({type(done.errors[name]).__name__})'
+        count = done.counts[name]
+        return f'the calendar list of account "{name}" was fetched: {count} {"calendar" if count == 1 else "calendars"}'
+    summary = f"the calendar lists of {len(names) - len(failed)} of {len(names)} accounts were fetched"
+    if failed:
+        summary += "; failed: " + ", ".join(f'"{n}" ({type(done.errors[n]).__name__})' for n in failed)
+    return summary
+
+
+# ----- the rule preview ---------------------------------------------------------------------
+
+
+class _Unreachable(Exception):
+    """An account's adapter failed during a preview: reported in the result, never raised."""
+
+    def __init__(self, exc: Exception, account: str, setup: bool) -> None:
+        super().__init__(type(exc).__name__)
+        self.exc, self.account, self.setup = exc, account, setup
+
+
+def _same_calendar(cal_id: str, ref: str) -> bool:
+    """``cal_id`` (a CalDAV href, absolute) is the calendar ``ref`` names by URL or by path (as
+    ``CalDavTarget.ensure_calendar`` matches)."""
+    from urllib.parse import urlsplit
+
+    if "://" not in ref:
+        cal_id = urlsplit(cal_id).path
+    return cal_id.rstrip("/") == ref.rstrip("/")
+
+
+def _cached_calendar(state_dir: Path, account: str, ref: str) -> tuple[str, str] | None:
+    """The cached calendar of ``account`` that ``ref`` names, as (id, name): by href first, then by
+    name; None if the cache has none. Several by name: ``ConfigError`` (the sync would refuse too)."""
+    from calsync import views
+    from calsync.wiring import state_paths
+
+    try:
+        with views.StateReader(state_paths(state_dir)[0]) as reader:
+            rows = [(c.id, c.name) for c in reader.account_calendars(account)]
+    except views.StateUnavailable:
+        return None
+    matches = [r for r in rows if _same_calendar(r[0], ref)] or [r for r in rows if r[1] == ref]
+    if len(matches) > 1:
+        raise ConfigError(
+            [f'calendar "{ref}" matches {len(matches)} calendars of account "{account}"; use its href']
+        )
+    return matches[0] if matches else None
+
+
+async def _preview_source(
+    ctx: OpContext, config: Config, account: str, ref: str
+) -> tuple[list[dict[str, Any]], Any, bool]:
+    """The source calendar's raw events and metadata, and whether they come from the mirror. A
+    calendar not mirrored yet is pulled once, live, with empty state; nothing of it is stored."""
+    from calsync import views
+    from calsync.errors import NotFoundError
+    from calsync.sources.google import meta_from_state, resolve_calendar_ref
+    from calsync.wiring import state_paths
+
+    try:
+        with views.StateReader(state_paths(ctx.state_dir)[0]) as reader:
+            state = reader.source_state(account)
+            meta = state.get("meta") if isinstance(state.get("meta"), dict) else {}
+            tokens = state.get("events_tokens") if isinstance(state.get("events_tokens"), dict) else {}
+            try:
+                cid: str | None = resolve_calendar_ref(ref, meta or {})
+            except ConfigError:
+                cid = None
+            if cid is not None and cid in (tokens or {}):
+                return reader.source_events(account, cid), meta_from_state((meta or {}).get(cid)), True
+    except views.StateUnavailable:
+        pass
+    async with _adapters(ctx, config, {account}) as adapters:
+        setup = account in adapters.errors
+        try:
+            adapters.adapter(account)
+            pull = await adapters.sources[account].pull([ref], {})
+        except Exception as exc:
+            raise _Unreachable(exc, account, setup) from exc
+    failure = pull.errors.get(ref)
+    if isinstance(failure, ConfigError | NotFoundError):
+        raise ConfigError(
+            [f'calendar "{ref}" was not found in account "{account}"; see `calsync calendars {account}`']
+        )
+    if failure is not None:
+        raise _Unreachable(failure, account, False)
+    found = pull.calendars[ref]
+    return found.upserts, found.meta, False
+
+
+async def _preview_target(ctx: OpContext, config: Config, account: str, ref: str) -> tuple[str, str] | None:
+    """The target calendar ``ref`` names, from the calendar cache, which is refreshed once if
+    it does not have it; None: not there."""
+    found = _cached_calendar(ctx.state_dir, account, ref)
+    if found is not None:
+        return found
+    async with _adapters(ctx, config, {account}) as adapters:
+        done = await refresh_calendars(ctx.store, adapters, [account], ctx.clock())
+        setup = account in adapters.errors
+    if account in done.errors:
+        raise _Unreachable(done.errors[account], account, setup)
+    return _cached_calendar(ctx.state_dir, account, ref)
+
+
+def _preview_summary(data: dict[str, Any], target: str) -> str:
+    what = f"{data['series']} series"
+    if data["instances_in_window"] is not None:
+        what += f" ({data['instances_in_window']} in the window)"
+    if data["target_exists"]:
+        return f'would create {what} in "{target}" (calendar exists)'
+    if data["target_would_be_created"]:
+        return f'would create {what} in "{target}" (calendar would be created)'
+    return f'would create {what} in "{target}" (calendar not found; add --create-target to create it)'
+
+
+async def _rule_preview(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
+    """What ``rule.add`` with these arguments would sync, writing nothing (no config, no history;
+    at most the calendar cache is refreshed). Validated like ``rule.add`` (``ConfigError``).
+    ``data``: ``series`` (the series the first cycle would create; in the window when the rule
+    has one), ``instances_in_window`` (None: the rule syncs everything), ``target_exists``,
+    ``target_would_be_created``, ``source_mirrored``. An account that cannot be reached is
+    reported (``error``, ``error_kind``, ``error_account``, the counts None), never raised."""
+    from calsync.model import Window, apply_alarm_policy, apply_field_policy, expand_instances, series_span
+    from calsync.sources.google_map import build_series
+
+    op = "rule.preview"
+    name, table, source, target = _rule_table(op, args)
+    doc = configfile.load_doc(configfile.read_snapshot(ctx.config_path).text)
+    _add_rule(doc, table, source, target)
+    config = configfile.validate_text(tomlkit.dumps(doc), ctx.config_path.parent)
+    rule = next(r for r in config.rules if r.name == name)
+    data: dict[str, Any] = dict.fromkeys(
+        ("series", "instances_in_window", "target_exists", "target_would_be_created", "source_mirrored")
+    )
+    try:
+        raw, meta, data["source_mirrored"] = await _preview_source(
+            ctx, config, rule.source.account, rule.source.calendar
+        )
+        found = await _preview_target(ctx, config, rule.target.account, rule.target.calendar)
+    except _Unreachable as failure:
+        error = plain_error(
+            failure.exc, f'account "{failure.account}"', account=failure.account, setup=failure.setup
+        )
+        data.update(error=error, error_kind=_kind(failure.exc), error_account=failure.account)
+        human = isinstance(failure.exc, AuthError)
+        return OpResult(
+            op,
+            False,
+            f"could not preview: {error}",
+            data=data,
+            needs_human={"command": f"calsync auth {failure.account}", "reason": AUTH_REASON}
+            if human
+            else None,
+        )
+    shaped = [
+        apply_field_policy(apply_alarm_policy(s, rule.alarms), rule.fields) for s in build_series(raw, meta)
+    ]
+    if rule.window is not None:
+        window = Window.around(ctx.clock(), rule.window.past, rule.window.future)
+        shaped = [s for s in shaped if window.intersects(series_span(s))]
+        data["instances_in_window"] = sum(len(expand_instances(s, window.start, window.end)) for s in shaped)
+    data["series"] = len(shaped)
+    data["target_exists"] = found is not None
+    data["target_would_be_created"] = found is None and rule.target.create_if_missing
+    return OpResult(op, False, _preview_summary(data, found[1] if found else rule.target.calendar), data=data)
+
+
+AsyncOp = Callable[[OpContext, dict[str, Any], bool], Coroutine[Any, Any, OpResult]]
+
+# Operations that talk to the accounts. The daemon awaits them under its lock (``run_op_async``);
+# in a process of their own (``run_op``) they get an event loop of their own.
+ASYNC_OPS: dict[str, AsyncOp] = {
+    "calendars.refresh": _calendars_refresh,
+    "rule.preview": _rule_preview,
+}
+
+
+def _own_loop(op: AsyncOp) -> Callable[[OpContext, dict[str, Any], bool], OpResult]:
+    def run(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
+        return asyncio.run(op(ctx, args, dry_run))
+
+    return run
+
+
 OPS: dict[str, Callable[[OpContext, dict[str, Any], bool], OpResult]] = {
     "config.set": _config_set,
     "config.undo": _config_undo,
@@ -767,6 +1090,7 @@ OPS: dict[str, Callable[[OpContext, dict[str, Any], bool], OpResult]] = {
     "account.add": _account_add,
     "account.remove": _account_remove,
     "approve": _approve,
+    **{name: _own_loop(op) for name, op in ASYNC_OPS.items()},
 }
 
 
@@ -782,3 +1106,12 @@ def run_op(ctx: OpContext, name: str, args: dict[str, Any], dry_run: bool) -> Op
     if op is None:
         raise ConfigError([f'unknown operation "{name}"'])
     return op(ctx, args, dry_run)
+
+
+async def run_op_async(ctx: OpContext, name: str, args: dict[str, Any], dry_run: bool) -> OpResult:
+    """``run_op`` on a running event loop (the daemon's): an operation that talks to the accounts
+    is awaited there, the others run as they are."""
+    op = ASYNC_OPS.get(name)
+    if op is not None:
+        return await op(ctx, args, dry_run)
+    return run_op(ctx, name, args, dry_run)

@@ -239,7 +239,10 @@ def test_op_names() -> None:
         "rule.resume",
         "account.add",
         "account.remove",
+        "calendars.refresh",
+        "rule.preview",
     }
+    assert set(ops.ASYNC_OPS) == {"calendars.refresh", "rule.preview"}  # they talk to the accounts
 
 
 def test_to_json_shape() -> None:

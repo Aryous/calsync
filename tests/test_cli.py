@@ -93,7 +93,9 @@ def test_auth_error_exit_code(tmp_path: Path) -> None:
     cfg = tmp_path / "c.toml"
     cfg.write_text(CONFIG.format(url="https://dav.example.com/", user="u", secret=tmp_path / "missing"))
     code, text = run(["--config", str(cfg), "calendars", "dav"])
-    assert code == EXIT_AUTH and "credential file not found" in text
+    # Nothing cached: the list is fetched first, and that fails at the account's setup.
+    assert code == EXIT_AUTH and 'AuthError: account "dav" has no usable credential' in text
+    assert "next: calsync auth dav" in text
 
 
 # ----- review fixes ---------------------------------------------------------

@@ -137,6 +137,9 @@ class ChangeRecord:
     action: str  # created, updated, reverted, deleted, protected, blocked
     at: datetime
     title: str | None
+    # JSON ``{"fields": {name: [old, new]}}`` (summary fields that differ) for an update or a
+    # revert whose previous summary is known; None otherwise. Event content, like ``title``.
+    detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,9 +350,11 @@ class Store:
             reverting,
             times,
             hold,
+            summary,
         ) in self._db.execute(
             "SELECT href, etag, rule_tag, object_id, content_hash, span_start, span_end, verify_digest, "
-            "reverting, revert_times, hold_until FROM target_object WHERE account = ? AND calendar_href = ?",
+            "reverting, revert_times, hold_until, summary FROM target_object "
+            "WHERE account = ? AND calendar_href = ?",
             (account, calendar_href),
         ):
             span = (datetime.fromisoformat(lo), datetime.fromisoformat(hi)) if lo and hi else None
@@ -363,6 +368,7 @@ class Store:
                 bool(reverting),
                 revert_times=tuple(datetime.fromisoformat(t) for t in json.loads(times)),
                 hold_until=datetime.fromisoformat(hold) if hold else None,
+                summary=summary,
             )
         return cache
 
@@ -382,6 +388,7 @@ class Store:
                 int(obj.reverting),
                 json.dumps([t.isoformat() for t in obj.revert_times]),
                 obj.hold_until.isoformat() if obj.hold_until else None,
+                obj.summary,
             )
             for href, obj in cache.objects.items()
         ]
@@ -391,8 +398,8 @@ class Store:
             )
             self._db.executemany(
                 "INSERT INTO target_object (account, calendar_href, href, etag, rule_tag, object_id, "
-                "content_hash, span_start, span_end, verify_digest, reverting, revert_times, hold_until) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "content_hash, span_start, span_end, verify_digest, reverting, revert_times, hold_until, "
+                "summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
             self._db.execute(
@@ -433,8 +440,12 @@ class Store:
                 assert cursor.lastrowid is not None
                 run_ids[r.rule] = cursor.lastrowid
             self._db.executemany(
-                "INSERT INTO change (run_id, rule, object_id, action, at, title) VALUES (?, ?, ?, ?, ?, ?)",
-                [(run_ids[c.rule], c.rule, c.object_id, c.action, _utc(c.at), c.title) for c in changes],
+                "INSERT INTO change (run_id, rule, object_id, action, at, title, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (run_ids[c.rule], c.rule, c.object_id, c.action, _utc(c.at), c.title, c.detail)
+                    for c in changes
+                ],
             )
             for rule in run_ids:
                 self._db.execute(

@@ -7,6 +7,7 @@ up exactly where the last one stopped.
 
 import asyncio
 import hashlib
+import json
 import logging
 from collections import defaultdict
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence, Set
@@ -30,7 +31,7 @@ from calsync.mirror import Mirror, apply_pull
 from calsync.model import Window, apply_alarm_policy, apply_field_policy, series_hash, series_span
 from calsync.naming import object_id, parse_resource_name, resource_name, rule_tag, uid_for
 from calsync.planner import Actual, Desired, Plan, check_delete_guard, plan
-from calsync.render import Inspected, content_digest, inspect, render
+from calsync.render import Inspected, changed_fields, content_digest, inspect, render, summary_of
 from calsync.sources.base import CalendarMeta, Source
 from calsync.store import ChangeRecord, RunRecord, Store
 from calsync.targets.base import (
@@ -162,6 +163,25 @@ def apply_target_delta(cache: TargetCache, delta: TargetDelta) -> list[str]:
     return need
 
 
+def _summary_json(want: Desired) -> str:
+    """The stored summary of what calsync writes for ``want`` (``target_object.summary``)."""
+    return json.dumps(summary_of(want.series), ensure_ascii=False, sort_keys=True)
+
+
+def _detail(before: str | None, after: Mapping[str, Any] | None) -> str | None:
+    """``change.detail``: the summary fields that differ between ``before`` (a stored summary)
+    and ``after``; None when either side is unknown. Event content: never logged."""
+    if before is None or after is None:
+        return None
+    try:
+        old = json.loads(before)
+    except ValueError:
+        return None
+    if not isinstance(old, dict):
+        return None
+    return json.dumps({"fields": changed_fields(old, after)}, ensure_ascii=False)
+
+
 def _title(text: str | None) -> str | None:
     """A title as the history stores it: an empty or missing one is None, never a placeholder."""
     return text if text and text.strip() else None
@@ -252,6 +272,11 @@ class Engine:
         # reading every planned delete each time would cost a multiget per cycle.
         self._last_protected: dict[str, frozenset[str]] = {}
         self._last_blocked: dict[str, _Blocked] = {}
+        # What detection read in copies edited on the target (``Inspected.fields``), by (account,
+        # href), until the revert is written (its ``change.detail``: what the phone changed) or the
+        # copy turns out not to be an edit. In memory only: the body is read once (request budget),
+        # so a revert written by another process has no detail.
+        self._edited: dict[tuple[str, str], Mapping[str, Any]] = {}
 
     def replace_config(self, config: Config) -> None:
         """Run ``config`` from the next cycle on (the daemon's hot reload; never during a cycle).
@@ -374,6 +399,10 @@ class Engine:
                 content_hash = found.content_hash
             # Changed by someone else (or unknown to us): its rule compares it with the source
             # version when it next runs, which need not be this cycle (see _classify_reads).
+            if found is not None and found.fields is not None and known is not None and known.summary:
+                self._edited[(account, obj.href)] = found.fields
+            else:
+                self._edited.pop((account, obj.href), None)
             cache.objects[obj.href] = CachedObject(
                 etag=obj.etag,
                 rule_tag=name[0],
@@ -384,6 +413,7 @@ class Engine:
                 reverting=known.reverting if known else False,
                 revert_times=known.revert_times if known else (),
                 hold_until=known.hold_until if known else None,
+                summary=known.summary if known else None,
             )
         if marker_lost:
             # Counts only: tells whether the target keeps the marker (the real-device check).
@@ -611,6 +641,7 @@ class Engine:
                     verify_digest=None,
                     reverting=False,
                     hold_until=None,
+                    summary=_summary_json(want),
                 )
             elif obj.reverting or obj.content_hash == want.content_hash:
                 # We wrote (or adopted) the source version and the copy shows something else:
@@ -648,6 +679,8 @@ class Engine:
                 # The source changed since we wrote it (or nothing tells what we wrote): an
                 # ordinary update.
                 cache.objects[have.href] = replace(obj, verify_digest=None)
+            if not cache.objects[have.href].reverting:  # not an edit to write back: no revert detail
+                self._edited.pop((rule.target.account, have.href), None)
         if unrenderable:
             log.warning(
                 "rule %s: %d copy(ies) could not be compared with the source version", rule.name, unrenderable
@@ -718,7 +751,9 @@ class Engine:
 
         def remember(href: str, etag: str | None, want: Desired, *, reverted: bool = False) -> None:
             """After a successful write: nothing pending, nothing left to revert. The loop
-            breaker's record is kept, plus this write if it was a revert."""
+            breaker's record is kept, plus this write if it was a revert; the summary is what
+            was written."""
+            self._edited.pop((rule.target.account, href), None)
             prior = cache.objects.get(href)
             times = prior.revert_times if prior else ()
             if reverted:
@@ -731,6 +766,7 @@ class Engine:
                 want.span,
                 revert_times=times,
                 hold_until=prior.hold_until if prior else None,
+                summary=_summary_json(want),
             )
 
         # Strict servers answer 412 to If-Match (even "*") for a missing resource, so
@@ -761,6 +797,13 @@ class Engine:
         async def update(want: Desired, have: Actual) -> None:
             prior = cache.objects.get(have.href)
             reverting = prior is not None and prior.reverting  # may be from an earlier cycle
+            before = prior.summary if prior is not None else None
+            # A revert: what the phone changed (the stored summary against the edited copy as
+            # detection read it). An update: what the source changed.
+            after = (
+                self._edited.get((rule.target.account, have.href)) if reverting else summary_of(want.series)
+            )
+            detail = _detail(before, after)
             data = body(want)
             try:
                 etag = await target.update(have.href, have.etag, data)
@@ -775,7 +818,7 @@ class Engine:
             result.reverted += reverting
             action = "reverted" if reverting else "updated"
             result.changes.append(
-                ChangeRecord(rule.name, want.object_id, action, now, _title(want.series.title))
+                ChangeRecord(rule.name, want.object_id, action, now, _title(want.series.title), detail)
             )
 
         async def delete(have: Actual) -> None:
@@ -788,6 +831,7 @@ class Engine:
                 if found is not None:
                     await target.delete(have.href, found.etag)
             cache.objects.pop(have.href, None)
+            self._edited.pop((rule.target.account, have.href), None)
             result.deleted += 1
             result.changes.append(ChangeRecord(rule.name, have.object_id, "deleted", now, title))
 

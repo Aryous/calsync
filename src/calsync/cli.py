@@ -70,6 +70,9 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--content", choices=("full", "busy"), help="busy: copies show only Busy")
     add.add_argument("--attendees", choices=("none", "notes"), help="attendees into the notes or dropped")
     add.add_argument("--conference", choices=("copy", "none"), help="the meeting link")
+    add.add_argument(
+        "--preview", action="store_true", help="show what the rule would sync and stop (writes nothing)"
+    )
     change = _writer(rule_sub, "set", "change one setting of a rule")
     change.add_argument("name")
     change.add_argument(
@@ -114,8 +117,12 @@ def _parser() -> argparse.ArgumentParser:
         "--delete-credential", action="store_true", help="also delete its keychain entry"
     )
 
-    calendars = sub.add_parser("calendars", help="list calendars of an account")
+    calendars = sub.add_parser("calendars", help="list calendars of an account (from the cache)")
     calendars.add_argument("account")
+    calendars.add_argument(
+        "--refresh", action="store_true", help="fetch the list now (through the daemon if it runs)"
+    )
+    calendars.add_argument("--json", action="store_true", help="print JSON")
 
     auth = sub.add_parser("auth", help="store credentials for an account")
     auth.add_argument("account")
@@ -337,15 +344,18 @@ def _ops_command(args: argparse.Namespace, out: TextIO, name: str, op_args: dict
             error["problems"] = exc.problems
         _dump({"error": error}, out)
         return exit_code_for(exc)
+    # An operation that reports an account it could not reach (``rule.preview``) exits by kind.
+    kind = result.data.get("error_kind")
+    code = {"auth": EXIT_AUTH, "config": EXIT_CONFIG}.get(kind, EXIT_FAILED) if kind else EXIT_OK
     if args.json:
         _dump(result.to_json(), out)
-        return EXIT_OK
+        return code
     out.write(result.summary + "\n")
     if args.dry_run and result.diff:
         out.write(result.diff)
     if result.needs_human:
         out.write(f"next: {result.needs_human['command']}  ({result.needs_human['reason']})\n")
-    return EXIT_OK
+    return code
 
 
 def _op_for(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
@@ -373,7 +383,7 @@ def _op_for(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
                 "conference",
             )
             given = {n: getattr(args, n) for n in names if getattr(args, n) not in (None, False)}
-            return "rule.add", {"name": args.name, **given}
+            return "rule.preview" if args.preview else "rule.add", {"name": args.name, **given}
         if args.rule_command == "set":
             return "rule.set", {"name": args.name, "key": args.key, "value": args.value}
         op_args: dict[str, object] = {"name": args.name}
@@ -550,24 +560,76 @@ def cmd_config(args: argparse.Namespace, out: TextIO) -> int:
     return cmd_config_check(args, out)
 
 
-async def _calendars(args: argparse.Namespace, out: TextIO) -> int:
-    from calsync.wiring import build_adapters
+def _cached_calendars(state_dir: Path, account: str) -> list[tuple[str, str, str | None, datetime]]:
+    """The account's cached calendar list: (id, name, role, fetched_at) rows (none cached: [])."""
+    from calsync.views import StateReader, StateUnavailable
+    from calsync.wiring import state_paths
+
+    try:
+        with StateReader(state_paths(state_dir)[0]) as reader:
+            return [(c.id, c.name, c.role, c.fetched_at) for c in reader.account_calendars(account)]
+    except StateUnavailable:
+        return []
+
+
+def cmd_calendars(args: argparse.Namespace, out: TextIO) -> int:
+    """`calsync calendars ACCOUNT`: the calendar list from the cache, fetched first with
+    ``--refresh`` or when nothing is cached (``calendars.refresh``: through the daemon if it
+    runs, else here with the run lock)."""
+    from calsync import opsclient
+    from calsync.errors import CalsyncError
 
     config = _load(args)
-    if args.account not in config.accounts:
-        out.write(f"unknown account {args.account!r}\n")
-        return EXIT_CONFIG
-    adapters = await build_adapters(config, {args.account})
-    try:
-        adapters.adapter(args.account)  # raises the account's setup error, if any
-        if args.account in adapters.sources:
-            for cal in await adapters.sources[args.account].list_calendars():
-                out.write(f"{cal.id}\t{cal.name}\n")
+    account = args.account
+    if account not in config.accounts:
+        message = f"unknown account {account!r}"
+        if args.json:
+            _dump({"error": {"kind": "config", "message": message, "problems": [message]}}, out)
         else:
-            for tcal in await adapters.targets[args.account].list_calendars():
-                out.write(f"{tcal.href}\t{tcal.name}\t{tcal.mode}\n")
-    finally:
-        await adapters.aclose()
+            out.write(message + "\n")
+        return EXIT_CONFIG
+    state = _state_dir(args)
+    rows = _cached_calendars(state, account)
+    fetched: str | None = rows[0][3].isoformat() if rows else None
+    if args.refresh or not rows:
+        try:
+            result = opsclient.call(
+                "calendars.refresh",
+                {"account": account},
+                dry_run=False,
+                config_path=_config_path(args),
+                state_dir=state,
+            )
+        except CalsyncError as exc:
+            if not args.json:
+                raise
+            _dump({"error": {"kind": _error_kind(exc), "message": str(exc)}}, out)
+            return exit_code_for(exc)
+        outcome = result.data.get("accounts", {}).get(account, {})
+        if not outcome.get("refreshed"):
+            kind = outcome.get("error_kind") or "error"
+            message = str(outcome.get("error") or result.summary)
+            human = result.needs_human
+            if args.json:
+                error: dict[str, object] = {"kind": kind, "message": message}
+                if human:
+                    error.update(command=human["command"], reason=human["reason"])
+                _dump({"error": error}, out)
+            else:
+                out.write(f"error: {message}\n")
+                if human:
+                    out.write(f"next: {human['command']}  ({human['reason']})\n")
+            return {"auth": EXIT_AUTH, "config": EXIT_CONFIG}.get(kind, EXIT_FAILED)
+        rows = _cached_calendars(state, account)
+        fetched = rows[0][3].isoformat() if rows else outcome.get("fetched_at")
+    if args.json:
+        calendars = [{"id": cid, "name": name, "role": role} for cid, name, role, _ in rows]
+        _dump({"account": account, "fetched_at": fetched, "calendars": calendars}, out)
+        return EXIT_OK
+    when = datetime.fromisoformat(fetched).astimezone().isoformat(timespec="seconds") if fetched else "never"
+    out.write(f"fetched {when}\n")
+    for cid, name, role, _ in rows:
+        out.write(f"{cid}\t{name}\t{role or '-'}\n")
     return EXIT_OK
 
 
@@ -1039,7 +1101,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
         if args.command in ("rule", "pause", "resume", "account"):
             return _ops_command(args, out, *_op_for(args))
         if args.command == "calendars":
-            return asyncio.run(_calendars(args, out))
+            return cmd_calendars(args, out)
         if args.command == "auth":
             return asyncio.run(_auth(args, out, stdin))
         if args.command == "run":

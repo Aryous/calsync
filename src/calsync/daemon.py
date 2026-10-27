@@ -47,6 +47,12 @@ changed copy), the daemon removes it from the config (``source="daemon"``).
 A reload that fails for an unexpected reason (a bug) is contained: logged by type, the running
 config stays, the scheduler goes on.
 
+The calendar-list cache (``account_calendar``, for ``calsync calendars`` and the GUI's map) is
+refreshed for every configured account after the first cycle and then every
+``CALENDAR_REFRESH``, between cycles under ``_cycle_lock``; an account no rule uses gets a
+temporary adapter. A failing account keeps its old rows (logged by type). Operations that talk to
+the accounts (``calendars.refresh``, ``rule.preview``) borrow the daemon's adapters the same way.
+
 Without sync (``--no-sync``) the daemon takes no lock, reads no credential, opens no store and
 runs no cycle: it only serves the API. It cannot run beside another daemon in the same state
 directory (that one's socket is live: exit 4), only beside ``calsync run``; to show a running
@@ -84,6 +90,8 @@ BACKOFF_CAP = timedelta(minutes=15)
 # Seconds between two checks of the config file while the daemon waits for the next cycle.
 WATCH_INTERVAL = 2.0
 EXTERNAL_SUMMARY = "edited outside calsync"
+# How often the daemon fetches every account's calendar list into the cache.
+CALENDAR_REFRESH = timedelta(hours=6)
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -196,6 +204,7 @@ class Daemon:
         # the operations waiting for the next cycle of some rules (None: of any rule).
         self._approvals: dict[str, str] = {}
         self._scheduling = False  # the scheduler runs: something will run the cycles requested
+        self._calendars_due: datetime | None = None  # next calendar-list refresh; None: after the first cycle
         self._waiters: list[tuple[set[str] | None, asyncio.Future[CycleResult | None]]] = []
 
     # ----- interface ----------------------------------------------------------
@@ -304,9 +313,49 @@ class Daemon:
     async def _op(self, ctx: ops.OpContext, name: str, args: dict[str, Any], dry_run: bool) -> ops.OpResult:
         """Run one operation and apply the config it wrote. The caller holds ``_cycle_lock``."""
         try:
-            return ops.run_op(ctx, name, args, dry_run)
+            return await ops.run_op_async(ctx, name, args, dry_run)
         finally:
             await self._apply_written()
+
+    @contextlib.asynccontextmanager
+    async def borrow_adapters(self, config: Config, names: set[str]) -> AsyncIterator[wiring.Adapters]:
+        """``ops.DaemonHooks.borrow_adapters``: the daemon's adapters for the accounts it runs, a
+        temporary build (closed afterwards) for the others. The caller holds ``_cycle_lock``, so
+        no cycle uses the daemon's adapters meanwhile."""
+        borrowed = wiring.Adapters(self._log)
+        own = {n for n in names if n in self._parts}
+        mine = self._adapters
+        borrowed.sources.update({n: a for n, a in mine.sources.items() if n in own})
+        borrowed.targets.update({n: a for n, a in mine.targets.items() if n in own})
+        borrowed.errors.update({n: e for n, e in mine.errors.items() if n in own})
+        extra: wiring.Adapters | None = None
+        if names - own:
+            factory: AdaptersFactory = self._factory or wiring.build_adapters
+            extra = await factory(config, names - own, log=self._log)
+            borrowed.sources.update(extra.sources)
+            borrowed.targets.update(extra.targets)
+            borrowed.errors.update(extra.errors)
+        try:
+            yield borrowed
+        finally:
+            if extra is not None:
+                await self._close("temporary", extra)
+
+    async def _refresh_calendars(self) -> None:
+        """Fetch every configured account's calendar list into the cache when it is due (after
+        the first cycle, then every ``CALENDAR_REFRESH``). The caller holds ``_cycle_lock``. A
+        failure is logged by type and never stops the scheduler."""
+        now = self._clock()
+        if self._store is None or (self._calendars_due is not None and now < self._calendars_due):
+            return
+        self._calendars_due = now + CALENDAR_REFRESH
+        names = sorted(self._config.accounts)
+        try:
+            async with self.borrow_adapters(self._config, set(names)) as adapters:
+                await ops.refresh_calendars(self._store, adapters, names, now)  # logs each failure
+        except Exception as exc:  # the store or a bug; the next refresh tries again
+            log.warning("refreshing the calendar lists failed (%s)", type(exc).__name__)
+            debug.details(log, "refreshing the calendar lists failed", exc)
 
     def _context(self, source: ops.Source) -> ops.OpContext:
         assert self._store is not None and self._config_path is not None
@@ -523,6 +572,8 @@ class Daemon:
             rules, every = self._select(due)
             if rules:
                 await self._cycle(rules)
+            async with self._cycle_lock:
+                await self._refresh_calendars()
             if every:
                 # A timed cycle, or one requested for every rule, restarts the timer. A cycle
                 # for named rules keeps the deadline, so requests for one rule never starve
