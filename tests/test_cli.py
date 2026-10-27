@@ -910,7 +910,9 @@ def _daemon_process(
     ``state``, which must be short: a unix socket path is limited to 104 bytes on macOS."""
     cfg = tmp_path / "config.toml"
     cfg.write_text(VIEWS_CONFIG)  # env credentials that are never set: no network, no secret read
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CALSYNC_")}
+    # The sealed environment (HOME, CALSYNC_CONFIG / CALSYNC_STATE_DIR, the fail keyring, no
+    # proxy) reaches the child too; only the developer's CALSYNC_DEBUG is dropped.
+    env = {k: v for k, v in os.environ.items() if k != "CALSYNC_DEBUG"}
     return subprocess.Popen(
         [
             sys.executable,

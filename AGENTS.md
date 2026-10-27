@@ -128,6 +128,12 @@ uv run ruff check src tests && uv run ruff format --check src tests && uv run py
   `tests/fakes/target.py` (`FakeTarget`: strict 412, `mode="sync"`).
   `tests/harness.py` builds an engine against FakeGoogle + Radicale
   (`build`) or FakeTarget (`build_fake`).
+- **Sealed tests.** An autouse fixture in `tests/conftest.py` gives every test a
+  temporary `HOME`, `CALSYNC_CONFIG` and `CALSYNC_STATE_DIR`, a keychain that
+  refuses every call (`PYTHON_KEYRING_BACKEND=keyring.backends.fail.Keyring` for
+  child processes), no proxy, and no connection or name lookup beyond loopback
+  and unix sockets. A refusal fails the test even if the code swallows it. Fake
+  the keychain per test (patch `credentials._keyring`); never weaken the seal.
 - **Commits:** small, one logical change, Conventional Commits subject; end the
   message with `Co-Authored-By: Claude <model> <noreply@anthropic.com>` naming
   the model that actually made the change.

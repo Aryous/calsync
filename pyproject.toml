@@ -37,7 +37,10 @@ packages = ["src/calsync"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-markers = ["e2e: end-to-end tests against a local Radicale server"]
+markers = [
+    "e2e: end-to-end tests against a local Radicale server",
+    "network: lifts the sealed environment's network guard (see tests/conftest.py); nothing needs it",
+]
 
 [tool.ruff]
 line-length = 110
