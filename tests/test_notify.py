@@ -266,13 +266,21 @@ def test_failing_counts_plain_failures_only(cycles: Cycles) -> None:
     assert cycles.run(result(status="failed")) == []
 
 
-def test_failing_waits_while_the_rule_is_blocked_or_its_account_is_out(cycles: Cycles) -> None:
+def test_failing_waits_while_the_rule_is_blocked(cycles: Cycles) -> None:
     cycles.run(result(status="blocked"))
     for _ in range(4):
         assert cycles.run(result(status="failed")) == []  # on hold: the blocked push stands
-    cycles.run(result("work", "failed", kind="auth", account="me"))  # opens auth:me
-    for _ in range(4):
-        assert cycles.run(result("work", "failed")) == []  # its account needs reconnecting
+
+
+def test_failing_after_an_auth_failure_is_still_pushed(cycles: Cycles) -> None:
+    """``auth:me`` stays open until a rule on "me" succeeds; a plain failure that follows (the
+    user reconnected, but the target calendar is gone) must still reach the user."""
+    [alert] = cycles.run(result("work", "failed", kind="auth", account="me"))
+    assert alert.event == "auth"
+    assert cycles.run(result("work", "failed")) == []
+    assert cycles.run(result("work", "failed")) == []
+    [alert] = cycles.run(result("work", "failed"))  # three plain failures: one push
+    assert alert.event == "failing"
 
 
 def test_status_still_counts_every_run_that_is_not_ok(cycles: Cycles) -> None:

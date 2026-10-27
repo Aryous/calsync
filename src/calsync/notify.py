@@ -300,13 +300,14 @@ def _evaluate(
             raise_(f"auth:{account}", alert)
         else:
             plain.append(name)
-    # ``failing`` last, against what is open after this cycle: a rule on hold (blocked) or with
-    # an account to reconnect already has the push that needs a person.
+    # ``failing`` last, against what is open after this cycle: a rule on hold (blocked) already
+    # has the push that needs a person, and so does one whose account failed sign-in in this
+    # very cycle. An ``auth`` key left open from earlier is not enough: it closes only when a
+    # rule on that account succeeds, and a plain failure after a reconnect must still be heard
+    # (auth runs never count as plain failures anyway).
     still_open = (set(was_open) | set(opened)) - closed
     for name in plain:
-        if _blocked_keys(name, still_open) or any(
-            f"auth:{a}" in still_open or a in failing_auth for a in _accounts(by_name.get(name))
-        ):
+        if _blocked_keys(name, still_open) or any(a in failing_auth for a in _accounts(by_name.get(name))):
             continue
         failures = consecutive_failures(store, name, _plain_failure)
         if failures >= config.notify.failure_threshold:
