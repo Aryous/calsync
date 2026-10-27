@@ -430,3 +430,186 @@ async def test_trigger_for_a_paused_rule_is_409_paused(tmp_path: Path) -> None:
         response = await c.post("/api/trigger", json={"rule": "family"})
     assert response.status_code == 409
     assert response.json() == {"error": {"kind": "paused", "message": 'rule "family" is paused'}}
+
+
+# ----- events, one event, config, calendars ------------------------------------------------------
+
+DAY = {"from": "2026-10-24T00:00:00+08:00", "to": "2026-10-26T00:00:00+08:00"}
+
+
+async def test_events(state: Path) -> None:
+    async with client(state) as c:
+        response = await c.get("/api/events", params=DAY)
+        by_query = (await c.get("/api/events", params={**DAY, "q": "LUNCH"})).json()
+        by_rule = (await c.get("/api/events", params={**DAY, "rule": "family"})).json()
+        by_target = (await c.get("/api/events", params={**DAY, "target": "dav:Family"})).json()
+    assert response.status_code == 200
+    body = response.json()
+    assert list(body) == ["from", "to", "schema", "events"]
+    assert [(e["title"], e["start"]) for e in body["events"]] == [
+        ("Standup", "2026-10-24T18:00:00+08:00"),
+        ("Lunch", "2026-10-25T12:00:00+08:00"),
+        ("Standup", "2026-10-25T18:00:00+08:00"),
+    ]
+    assert {d["state"] for e in body["events"] for d in e["deliveries"]} == {"delivered"}
+    assert [e["title"] for e in by_query["events"]] == ["Lunch"]
+    assert by_rule == body and by_target == body
+
+
+async def test_events_default_to_a_week_from_today(state: Path) -> None:
+    async with client(state) as c:
+        body = (await c.get("/api/events")).json()
+    start, end = datetime.fromisoformat(body["from"]), datetime.fromisoformat(body["to"])
+    local = NOW.astimezone()
+    assert start == local.replace(hour=0, minute=0, second=0, microsecond=0)
+    assert end - start == timedelta(days=7)
+
+
+async def test_events_accept_dates(state: Path) -> None:
+    async with client(state) as c:
+        body = (await c.get("/api/events", params={"from": "2026-10-24", "to": "2026-10-31"})).json()
+    assert datetime.fromisoformat(body["from"]) == datetime(2026, 10, 24).astimezone()
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"from": "2026-10-01", "to": "2026-12-03"},  # 63 days
+        {"from": "2026-10-24", "to": "2026-10-23"},  # backwards
+        {"from": "soon"},
+        {"to": "later"},
+        {**DAY, "target": "no-colon"},
+    ],
+)
+async def test_bad_event_ranges_are_400(state: Path, params: dict[str, str]) -> None:
+    async with client(state) as c:
+        response = await c.get("/api/events", params=params)
+    assert response.status_code == 400 and response.json()["error"]["kind"] == "bad_request"
+
+
+async def test_events_range_of_62_days_is_fine(state: Path) -> None:
+    async with client(state) as c:
+        response = await c.get("/api/events", params={"from": "2026-10-01", "to": "2026-12-02"})
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("params", "kind"), [({"rule": "nope"}, "unknown_rule"), ({"target": "dav:Nowhere"}, "unknown_target")]
+)
+async def test_events_with_an_unknown_rule_or_target_are_404(
+    state: Path, params: dict[str, str], kind: str
+) -> None:
+    async with client(state) as c:
+        response = await c.get("/api/events", params={**DAY, **params})
+    assert response.status_code == 404 and response.json()["error"]["kind"] == kind
+
+
+async def test_one_event(state: Path) -> None:
+    async with client(state) as c:
+        events = (await c.get("/api/events", params=DAY)).json()["events"]
+        response = await c.get("/api/event", params={"id": events[1]["id"]})
+        missing = await c.get("/api/event")
+        unknown = await c.get("/api/event", params={"id": "bm9wZQ"})
+        garbled = await c.get("/api/event", params={"id": "%%%"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["title"] == "Lunch" and body["original"]["title"] == "Lunch"
+    assert body["deliveries"][0]["differs"] == [] and body["deliveries"][0]["copy"]["title"] == "Lunch"
+    assert missing.status_code == 400 and missing.json()["error"]["kind"] == "bad_request"
+    for answer in (unknown, garbled):
+        assert answer.status_code == 404 and answer.json()["error"]["kind"] == "not_found"
+
+
+async def test_blocked(state: Path) -> None:
+    async with client(state) as c:
+        response = await c.get("/api/blocked")
+        unknown = await c.get("/api/blocked", params={"rule": "nope"})
+    assert response.status_code == 200 and response.json() == {"blocked": []}
+    assert unknown.status_code == 404
+
+
+async def test_config_is_masked(tmp_path: Path) -> None:
+    async with client(tmp_path / "none") as c:  # needs no state
+        response = await c.get("/api/config")
+        revealing = await c.get("/api/config", params={"reveal": "1"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body == views.config_json(config()) and body["revealed"] is False
+    assert revealing.json() == body  # --reveal exists only on the CLI
+    dav = body["accounts"]["dav"]
+    assert dav["username"] == "(hidden)" and dav["credential"]["ref"] == "(hidden)"
+    assert dav["server_url"] == "http://unused" and dav["host"] == "unused"
+    assert '"u"' not in response.text and "UNUSED" not in response.text
+
+
+async def test_config_history(state: Path) -> None:
+    with Store(state / "state.db") as store:
+        for i in range(3):
+            store.record_config_change(
+                at=NOW + timedelta(minutes=i),
+                source="cli",
+                summary=f"change {i}",
+                before="secret text",
+                after_fingerprint=f"f{i}",
+            )
+    async with client(state) as c:
+        body = (await c.get("/api/config/history")).json()
+        one = (await c.get("/api/config/history", params={"limit": 1})).json()
+    async with client(state / "none") as c:
+        empty = (await c.get("/api/config/history")).json()
+    assert [c["summary"] for c in body["changes"]] == ["change 2", "change 1", "change 0"]
+    assert list(body["changes"][0]) == ["id", "at", "source", "summary", "after_fingerprint", "undoes"]
+    assert "secret text" not in json.dumps(body)
+    assert [c["summary"] for c in one["changes"]] == ["change 2"]
+    assert empty == {"changes": []}
+
+
+async def test_calendars(state: Path) -> None:
+    from calsync.store import AccountCalendar
+
+    with Store(state / "state.db") as store:
+        store.save_account_calendars("me", [AccountCalendar("me", GCAL, "Family", "owner", NOW)], NOW)
+    async with client(state) as c:
+        body = (await c.get("/api/calendars", params={"account": "me"})).json()
+        none = (await c.get("/api/calendars", params={"account": "dav"})).json()
+        unknown = await c.get("/api/calendars", params={"account": "nope"})
+        missing = await c.get("/api/calendars")
+    assert body == {
+        "account": "me",
+        "fetched_at": NOW.isoformat(),
+        "calendars": [{"id": GCAL, "name": "Family", "role": "owner"}],
+    }
+    assert none == {"account": "dav", "fetched_at": None, "calendars": []}
+    assert unknown.status_code == 404 and unknown.json()["error"]["kind"] == "unknown_account"
+    assert missing.status_code == 400
+
+
+NEW_ROUTES = {
+    "/api/events",
+    "/api/event",
+    "/api/blocked",
+    "/api/config",
+    "/api/config/history",
+    "/api/calendars",
+}
+
+
+def test_the_new_routes_are_shared_by_the_socket_and_the_web_app(tmp_path: Path) -> None:
+    from calsync.web.app import create_web_app
+
+    socket_app = api.create_app(config_provider=config, state_dir=tmp_path, daemon=None)
+    web_app = create_web_app(config_provider=config, state_dir=tmp_path, daemon=None, listen_host="127.0.0.1")
+    for app in (socket_app, web_app):
+        assert {getattr(r, "path", "") for r in app.routes} >= NEW_ROUTES
+
+
+async def test_62_calendar_days_across_a_dst_change_are_fine(state: Path) -> None:
+    """Local midnights on both sides of a fall-back change are 62 days and one hour apart."""
+    async with client(state) as c:
+        ok = await c.get(
+            "/api/events", params={"from": "2026-10-01T00:00-04:00", "to": "2026-12-02T00:00-05:00"}
+        )
+        over = await c.get(
+            "/api/events", params={"from": "2026-10-01T00:00-04:00", "to": "2026-12-02T00:01-05:00"}
+        )
+    assert ok.status_code == 200 and over.status_code == 400

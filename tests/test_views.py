@@ -4,7 +4,7 @@ import json
 import sqlite3
 from collections.abc import Sequence
 from contextlib import closing
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -148,10 +148,11 @@ async def test_status_after_a_cycle(tmp_path: Path) -> None:
         "attention": 0,
         "last_sync_at": NOW.isoformat(),
         "changes_24h": 3,
+        "delivered_today": 3,
     }
-    assert view["accounts"] == [
-        {"name": "me", "provider": "google", "host": "Google Calendar"},
-        {"name": "dav", "provider": "caldav", "host": "unused"},
+    assert view["accounts"] == [  # no calendar list cached yet
+        {"name": "me", "provider": "google", "host": "Google Calendar", "auth": "ok", "calendars": []},
+        {"name": "dav", "provider": "caldav", "host": "unused", "auth": "ok", "calendars": []},
     ]
     (fam,) = view["rules"]
     last_run = fam.pop("last_run")
@@ -186,6 +187,7 @@ async def test_status_after_a_cycle(tmp_path: Path) -> None:
         "requests",
         "error",
         "error_kind",
+        "error_account",
     ]
     assert last_run["status"] == "ok" and last_run["created"] == 3 and last_run["duration_ms"] == 0
     assert view["attention"] == []
@@ -288,7 +290,7 @@ async def test_runs_and_changes_newest_first(tmp_path: Path) -> None:
     assert [run["id"] for run in runs] == [2, 1]
     assert [run["deleted"] for run in runs] == [1, 0]
     assert one == runs[:1] and other == []
-    assert list(changes[0]) == ["id", "run_id", "rule", "object_id", "action", "at", "title"]
+    assert list(changes[0]) == ["id", "run_id", "rule", "object_id", "action", "at", "title", "detail"]
     assert changes[0] == {
         "id": 4,
         "run_id": 2,
@@ -297,6 +299,7 @@ async def test_runs_and_changes_newest_first(tmp_path: Path) -> None:
         "action": "deleted",
         "at": NOW.isoformat(),
         "title": "Weekly review",
+        "detail": None,
     }
     assert sorted(c["action"] for c in changes) == ["created", "created", "created", "deleted"]
     assert [c["id"] for c in changes] == [4, 3, 2, 1]
@@ -885,3 +888,137 @@ def test_a_blocked_retiring_rule_keeps_the_blocked_attention(tmp_path: Path) -> 
 def test_a_paused_rule_is_checked_before_retiring(tmp_path: Path) -> None:
     view = _flagged(tmp_path, [], paused=True, retire=True)
     assert view["rules"][0]["health"] == "paused" and view["attention"] == []
+
+
+# ----- status additions: the calendar map, account auth, deliveries today ---------------------------
+
+
+async def _cached_status(tmp_path: Path, config: Config, **kwargs: Any) -> dict[str, Any]:
+    """After one cycle (of ``family()``), with both accounts' calendar lists cached, as ``config``
+    sees it."""
+    h = build_fake(tmp_path, seeded(), family())
+    await h.engine.cycle()
+    with reader(tmp_path) as r:
+        href = r.target_calendar_href("dav", "Family")
+    assert href is not None
+    h.store.save_account_calendars(
+        "me",
+        [
+            AccountCalendar("me", GCAL, "Family", "owner", NOW),
+            AccountCalendar("me", "other@group.calendar.google.com", "Other", "reader", NOW),
+        ],
+        NOW,
+    )
+    h.store.save_account_calendars(
+        "dav",
+        [
+            AccountCalendar("dav", href, "Family", None, NOW),
+            AccountCalendar("dav", "/dav/x/", "Spare", None, NOW),
+        ],
+        NOW,
+    )
+    for run in kwargs.get("runs", ()):
+        h.store.record_runs([run])
+    with reader(tmp_path) as r:
+        return build_status(config, r, kwargs.get("now", NOW)).to_json()
+
+
+@pytest.mark.anyio
+async def test_status_accounts_carry_their_cached_calendars(tmp_path: Path) -> None:
+    view = await _cached_status(tmp_path, family())
+    me, dav = view["accounts"]
+    assert me["calendars"] == [
+        {"id": GCAL, "name": "Family", "role": "owner", "series": 3, "rules": ["family"], "synced": True},
+        {
+            "id": "other@group.calendar.google.com",
+            "name": "Other",
+            "role": "reader",
+            "series": 0,
+            "rules": [],
+            "synced": False,
+        },
+    ]
+    family_cal, spare = dav["calendars"]
+    assert family_cal["rules"] == ["family"] and family_cal["synced"] is True
+    assert family_cal["series"] is None and family_cal["name"] == "Family"
+    assert spare == {
+        "id": "/dav/x/",
+        "name": "Spare",
+        "role": None,
+        "series": None,
+        "rules": [],
+        "synced": False,
+    }
+
+
+@pytest.mark.anyio
+async def test_a_paused_rule_leaves_its_calendars_unsynced(tmp_path: Path) -> None:
+    view = await _cached_status(tmp_path, family(paused=True))
+    (cal, _) = view["accounts"][0]["calendars"]
+    assert cal["rules"] == ["family"] and cal["synced"] is False
+
+
+@pytest.mark.anyio
+async def test_account_auth(tmp_path: Path) -> None:
+    def failed(account: str | None, kind: str = "auth") -> RunRecord:
+        return RunRecord(
+            "family", NOW, NOW, "failed", 0, 0, 0, 0, 1, "AuthError", error_kind=kind, error_account=account
+        )
+
+    view = await _cached_status(tmp_path / "a", family(), runs=[failed("dav")])
+    assert [a["auth"] for a in view["accounts"]] == ["unknown", "failed"]
+    view = await _cached_status(tmp_path / "b", family(), runs=[failed("me")])
+    assert [a["auth"] for a in view["accounts"]] == ["failed", "unknown"]
+    view = await _cached_status(tmp_path / "c", family(), runs=[failed("me", kind="other")])
+    assert [a["auth"] for a in view["accounts"]] == ["unknown", "unknown"]
+
+
+def test_account_auth_without_runs_or_rules_is_unknown(tmp_path: Path) -> None:
+    view = _status(tmp_path, [])
+    assert [a["auth"] for a in view["accounts"]] == ["unknown", "unknown"]
+    with reader(tmp_path) as r:
+        view = build_status(config_for([]), r, NOW).to_json()
+    assert [a["auth"] for a in view["accounts"]] == ["unknown", "unknown"]
+
+
+def test_delivered_today_counts_writes_since_midnight_in_nows_zone(tmp_path: Path) -> None:
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("Asia/Shanghai")
+    now = NOW.astimezone(zone)  # 16:00 on 2026-10-24 there
+    midnight = datetime(2026, 10, 24, tzinfo=zone)
+
+    def change(action: str, at: datetime) -> ChangeRecord:
+        return ChangeRecord("family", "o1", action, at, "Lunch")
+
+    changes = [
+        change("created", midnight - timedelta(microseconds=1)),  # yesterday there
+        change("created", midnight),
+        change("updated", midnight + timedelta(hours=1, microseconds=5)),
+        change("reverted", now),
+        change("deleted", now),  # not a delivery
+        change("blocked", now),
+    ]
+    with Store(tmp_path / "state.db") as store:
+        store.record_runs([_run("ok")], changes)
+    with reader(tmp_path) as r:
+        assert build_status(family(), r, now).to_json()["summary"]["delivered_today"] == 3
+        utc = build_status(family(), r, NOW).to_json()["summary"]["delivered_today"]
+    assert utc == 1  # midnight UTC is 08:00 in Shanghai: only the last write is after it
+
+
+def test_changes_carry_their_detail(tmp_path: Path) -> None:
+    detail = json.dumps({"fields": {"title": ["Lunch", "Team lunch"]}})
+    with Store(tmp_path / "state.db") as store:
+        store.record_runs(
+            [_run("ok")],
+            [
+                ChangeRecord("family", "o1", "updated", NOW, "Team lunch", detail),
+                ChangeRecord("family", "o2", "created", NOW, "Lunch"),
+            ],
+        )
+    with reader(tmp_path) as r:
+        changes = build_changes(family(), r).to_json()["changes"]
+        runs = build_runs(family(), r).to_json()["runs"]
+    assert [c["detail"] for c in changes] == [None, {"fields": {"title": ["Lunch", "Team lunch"]}}]
+    assert runs[0]["error_account"] is None

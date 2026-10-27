@@ -1,7 +1,8 @@
 """The local JSON API under ``/api``: what ``calsync trigger`` and the web UI talk to.
 
 The daemon serves it on a unix socket, ``<state_dir>/calsync.sock`` (mode 0600), so only its
-user can reach it. Responses carry event titles (``upcoming`` and ``changes``), like ``--json``.
+user can reach it. Responses carry event titles (``upcoming``, ``events``, ``event`` and ``changes``),
+like ``--json``.
 
 Every view request opens its own read-only ``StateReader`` and closes it afterwards: a reader
 opened without a ``-wal`` file reads the database as immutable and would not see later writes.
@@ -35,7 +36,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from calsync import __version__, debug, ops, views
+from calsync import __version__, debug, events_view, ops, views
 from calsync.config import Config
 from calsync.configfile import ConfigConflict
 from calsync.errors import ConfigError, ListenError, RulePaused
@@ -52,6 +53,7 @@ log = logging.getLogger(__name__)
 MAX_HOURS = 168
 MAX_RUNS = 500
 MAX_CHANGES = 1000
+MAX_CONFIG_CHANGES = 200  # the store keeps no more
 NO_STATE = "No sync has run yet."
 UNREADABLE = "The state database could not be read."
 
@@ -68,6 +70,16 @@ class DaemonControl(Protocol):
     async def run_op(
         self, name: str, args: dict[str, Any], dry_run: bool, *, source: ops.Source
     ) -> ops.OpResult: ...
+
+
+class _Json:
+    """A body that is JSON already, for ``_Endpoints._view``."""
+
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = body
+
+    def to_json(self) -> dict[str, Any]:
+        return self._body
 
 
 class ApiError(Exception):
@@ -182,8 +194,15 @@ class _Endpoints:
         self._daemon = daemon
         self._clock = clock
 
-    async def _view(self, build: Callable[[Config, views.StateReader], Any]) -> dict[str, Any]:
-        """``build(config, reader).to_json()`` in a worker thread, with a reader of its own."""
+    async def _view(
+        self,
+        build: Callable[[Config, views.StateReader], Any],
+        *,
+        no_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """``build(config, reader).to_json()`` in a worker thread, with a reader of its own.
+        Without a state database: ``no_state`` if given (a list that is simply empty then), else
+        503. ``events_view.NotFound`` is 404."""
         config = self._config()
         db_path = self._db_path
 
@@ -195,11 +214,22 @@ class _Endpoints:
         try:
             return await anyio.to_thread.run_sync(read)
         except views.StateUnavailable:
+            if no_state is not None:
+                return no_state
             raise ApiError(503, "no_state", NO_STATE) from None
+        except events_view.NotFound:
+            raise ApiError(404, "not_found", "No such event.") from None
         except sqlite3.DatabaseError:  # not a database, corrupt, or locked
             raise ApiError(500, "state_unreadable", UNREADABLE) from None
         except Exception as exc:
             raise _internal(exc) from None
+
+    def _rule(self, request: Request) -> str | None:
+        """The ``rule`` parameter, a configured rule (404 otherwise)."""
+        rule = request.query_params.get("rule")
+        if rule is not None and rule not in {r.name for r in self._config().rules}:
+            raise ApiError(404, "unknown_rule", f"Unknown rule {rule!r}.")
+        return rule
 
     async def status(self, request: Request) -> Response:
         now = self._clock()
@@ -210,9 +240,7 @@ class _Endpoints:
 
     async def upcoming(self, request: Request) -> Response:
         hours = _clamped(request, "hours", 24, MAX_HOURS)
-        rule = request.query_params.get("rule")
-        if rule is not None and rule not in {r.name for r in self._config().rules}:
-            raise ApiError(404, "unknown_rule", f"Unknown rule {rule!r}.")
+        rule = self._rule(request)
         now = self._clock()
         return JSONResponse(
             await self._view(
@@ -221,11 +249,75 @@ class _Endpoints:
         )
 
     async def blocked(self, request: Request) -> Response:
-        rule = request.query_params.get("rule")
-        if rule is not None and rule not in {r.name for r in self._config().rules}:
-            raise ApiError(404, "unknown_rule", f"Unknown rule {rule!r}.")
+        rule = self._rule(request)
         return JSONResponse(
             await self._view(lambda config, reader: views.build_blocked(config, reader, rule))
+        )
+
+    async def events(self, request: Request) -> Response:
+        """``GET /api/events?from&to&rule&target&q``: ``from`` / ``to`` ISO dates or times (local
+        without an offset; ``to`` exclusive; default: today and a week), at most
+        ``MAX_EVENT_DAYS`` apart."""
+        now = self._clock()
+        try:
+            start, end = events_view.event_range(_instant(request, "from"), _instant(request, "to"), now)
+        except ValueError as exc:
+            raise ApiError(400, "bad_request", str(exc)) from None
+        rule = self._rule(request)
+        target: tuple[str, str] | None = None
+        if (text := request.query_params.get("target")) is not None:
+            try:
+                target = events_view.parse_target(text)
+            except ValueError as exc:
+                raise ApiError(400, "bad_request", str(exc)) from None
+            if not events_view.known_target(self._config(), target):
+                raise ApiError(404, "unknown_target", f"No rule syncs into {text!r}.")
+        query = request.query_params.get("q") or None
+        return JSONResponse(
+            await self._view(
+                lambda config, reader: events_view.build_events(
+                    config, reader, start, end, rule=rule, target=target, query=query, now=now
+                )
+            )
+        )
+
+    async def event(self, request: Request) -> Response:
+        """``GET /api/event?id``: one event with its copies (404 ``not_found``: no such event)."""
+        eid = request.query_params.get("id")
+        if not eid:
+            raise ApiError(400, "bad_request", "id: required")
+        now = self._clock()
+        return JSONResponse(
+            await self._view(lambda config, reader: events_view.build_event(config, reader, eid, now))
+        )
+
+    async def config(self, request: Request) -> Response:
+        """``GET /api/config``: the running config, masked (revealing exists only on the CLI)."""
+        return JSONResponse(views.config_json(self._config()))
+
+    async def config_history(self, request: Request) -> Response:
+        limit = _clamped(request, "limit", 50, MAX_CONFIG_CHANGES)
+        return JSONResponse(
+            await self._view(
+                lambda config, reader: _Json(views.config_history_json(reader.config_changes(limit))),
+                no_state={"changes": []},
+            )
+        )
+
+    async def calendars(self, request: Request) -> Response:
+        """``GET /api/calendars?account``: the account's cached calendar list."""
+        account = request.query_params.get("account")
+        if not account:
+            raise ApiError(400, "bad_request", "account: required")
+        if account not in self._config().accounts:
+            raise ApiError(404, "unknown_account", f"Unknown account {account!r}.")
+        return JSONResponse(
+            await self._view(
+                lambda config, reader: _Json(
+                    views.calendars_json(account, reader.account_calendars(account))
+                ),
+                no_state=views.calendars_json(account, []),
+            )
         )
 
     async def runs(self, request: Request) -> Response:
@@ -360,6 +452,11 @@ def api_routes(
         Route("/api/status", guarded(endpoints.status), methods=["GET"]),
         Route("/api/upcoming", guarded(endpoints.upcoming), methods=["GET"]),
         Route("/api/blocked", guarded(endpoints.blocked), methods=["GET"]),
+        Route("/api/events", guarded(endpoints.events), methods=["GET"]),
+        Route("/api/event", guarded(endpoints.event), methods=["GET"]),
+        Route("/api/config", guarded(endpoints.config), methods=["GET"]),
+        Route("/api/config/history", guarded(endpoints.config_history), methods=["GET"]),
+        Route("/api/calendars", guarded(endpoints.calendars), methods=["GET"]),
         Route("/api/runs", guarded(endpoints.runs), methods=["GET"]),
         Route("/api/changes", guarded(endpoints.changes), methods=["GET"]),
         Route("/api/trigger", guarded(endpoints.trigger), methods=["POST"]),

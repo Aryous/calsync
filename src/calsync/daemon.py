@@ -130,6 +130,7 @@ class DaemonInfo:
     last_cycle_at: datetime | None
     next_cycle_at: datetime | None
     cycles: int
+    cycle_started_at: datetime | None = None  # while a cycle runs: when it started (the GUI animates it)
 
     def to_json(self) -> dict[str, Any]:
         def iso(value: datetime | None) -> str | None:
@@ -143,6 +144,7 @@ class DaemonInfo:
             "last_cycle_at": iso(self.last_cycle_at),
             "next_cycle_at": iso(self.next_cycle_at),
             "cycles": self.cycles,
+            "cycle_started_at": iso(self.cycle_started_at),
         }
 
 
@@ -186,6 +188,7 @@ class Daemon:
         self._cycles = 0
         self._last_cycle_at: datetime | None = None
         self._next_cycle_at: datetime | None = None
+        self._cycle_started_at: datetime | None = None
         # Requests not yet taken by a cycle; ``_wake`` is set while there are any.
         self._wake = asyncio.Event()
         self._pending_all = False
@@ -473,6 +476,7 @@ class Daemon:
             last_cycle_at=self._last_cycle_at,
             next_cycle_at=self._next_cycle_at,
             cycles=self._cycles,
+            cycle_started_at=self._cycle_started_at,
         )
 
     # ----- resources ----------------------------------------------------------
@@ -816,7 +820,11 @@ class Daemon:
     # ----- one cycle ----------------------------------------------------------
     async def _cycle(self, rules: list[str]) -> None:
         async with self._cycle_lock:
-            await self._locked_cycle(rules)
+            self._cycle_started_at = self._clock()
+            try:
+                await self._locked_cycle(rules)
+            finally:
+                self._cycle_started_at = None
 
     async def _locked_cycle(self, rules: list[str]) -> None:
         assert self._engine is not None and self._store is not None

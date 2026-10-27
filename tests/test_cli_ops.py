@@ -543,3 +543,42 @@ async def test_trigger_for_a_paused_rule_says_so_and_exits_1(files: Files) -> No
         every = await anyio.to_thread.run_sync(lambda: files.cli("trigger"))
     assert one == (EXIT_FAILED, 'rule "family" is paused\n')
     assert every == (EXIT_OK, "ok: cycle requested\n")
+
+
+# ----- calsync status asks the daemon for its block ---------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_status_shows_the_daemon_block_when_a_daemon_serves(files: Files) -> None:
+    from datetime import timedelta
+
+    from calsync.store import Store
+
+    files.state.mkdir()
+    Store(files.state / "state.db").close()  # an empty state: no run yet
+    daemon = FakeOpsDaemon(ANSWER)
+    info = DaemonInfo(True, True, 4242, NOW, NOW, NOW + timedelta(seconds=60), 3, cycle_started_at=None)
+    daemon.snapshot = lambda: info  # type: ignore[method-assign]
+    async with _serve(files.state, daemon):
+        code, text = await anyio.to_thread.run_sync(lambda: files.cli("status", "--json"))
+        _, plain = await anyio.to_thread.run_sync(lambda: files.cli("status"))
+    assert code == EXIT_OK
+    assert json.loads(text)["daemon"] == info.to_json()
+    assert (
+        plain.splitlines()[-1]
+        == f"daemon: running, {3} cycles, next at {(NOW + timedelta(seconds=60)).isoformat()}"
+    )
+    code, text = files.cli("status", "--json")  # the daemon is gone
+    assert code == EXIT_OK and json.loads(text)["daemon"] is None
+
+
+def test_daemon_status_of_a_wedged_daemon_is_none(files: Files, monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    monkeypatch.setattr(opsclient, "_daemon_listens", lambda sock: True)
+
+    def hung(*args: Any, **kwargs: Any) -> Any:
+        raise httpx.ReadTimeout("the daemon did not answer")
+
+    monkeypatch.setattr(httpx.Client, "get", hung)
+    assert opsclient.daemon_status(files.state) is None

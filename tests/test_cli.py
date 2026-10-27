@@ -706,7 +706,7 @@ def test_status_json_has_the_exact_top_level_keys(synced: list[str]) -> None:
     code, text = run([*synced, "status", "--json"])
     assert code == EXIT_OK
     view = json.loads(text)
-    assert list(view) == ["generated_at", "schema", "summary", "accounts", "rules", "attention"]
+    assert list(view) == ["generated_at", "schema", "summary", "accounts", "rules", "attention", "daemon"]
     assert view["summary"]["health"] == "ok" and view["rules"][0]["copies"] == 3
     assert text == json.dumps(view, ensure_ascii=False, indent=2) + "\n"
 
@@ -1316,3 +1316,118 @@ def test_web_pair_when_the_web_ui_is_off(tmp_path: Path) -> None:
         "ok: the key was replaced; every paired browser has to pair again\n" + WEB_OFF,
     )
     assert (state / "web.key").read_text().strip() != key
+
+
+# ----- events and event show ------------------------------------------------------------------
+
+RANGE = ["--from", "2026-10-24T00:00+08:00", "--to", "2026-10-26T00:00+08:00"]
+
+
+def _local_day(iso: str) -> str:
+    from datetime import datetime
+
+    return datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d")
+
+
+def test_events_text(synced: list[str]) -> None:
+    code, text = run([*synced, "events", *RANGE])
+    assert code == EXIT_OK
+
+    def line(start: str, end: str, title: str) -> str:
+        return f"{_local_day(start)} {_local_hhmm(start)}–{_local_hhmm(end)}  {title}  [Family → Family: delivered]"
+
+    assert text.splitlines() == [
+        line("2026-10-24T18:00:00+08:00", "2026-10-24T18:15:00+08:00", "Standup"),
+        line("2026-10-25T12:00:00+08:00", "2026-10-25T13:00:00+08:00", "Lunch break"),
+        line("2026-10-25T18:00:00+08:00", "2026-10-25T18:15:00+08:00", "Standup"),
+    ]
+
+
+def test_events_text_all_day_and_empty(synced: list[str]) -> None:
+    code, text = run(
+        [*synced, "events", "--from", "2026-11-05T00:00+00:00", "--to", "2026-11-06T00:00+00:00"]
+    )
+    assert (code, text) == (EXIT_OK, "2026-11-05 all day  Holiday  [Family → Family: delivered]\n")
+    code, text = run([*synced, "events", "--from", "2030-01-01", "--to", "2030-01-02"])
+    assert (code, text) == (EXIT_OK, "no events\n")
+
+
+def test_events_json_and_filters(synced: list[str]) -> None:
+    import json
+
+    code, text = run([*synced, "events", *RANGE, "--json"])
+    assert code == EXIT_OK
+    body = json.loads(text)
+    assert list(body) == ["from", "to", "schema", "events"]
+    assert [e["title"] for e in body["events"]] == ["Standup", "Lunch\nbreak", "Standup"]
+    code, text = run([*synced, "events", *RANGE, "--json", "--query", "LUNCH", "--rule", "family"])
+    assert [e["title"] for e in json.loads(text)["events"]] == ["Lunch\nbreak"]
+    code, text = run([*synced, "events", *RANGE, "--json", "--target", "dav:Family"])
+    assert len(json.loads(text)["events"]) == 3
+
+
+def test_events_defaults_to_a_week_from_today(synced: list[str]) -> None:
+    import json
+    from datetime import datetime, timedelta
+
+    from tests.harness import NOW
+
+    body = json.loads(run([*synced, "events", "--json"])[1])
+    start, end = datetime.fromisoformat(body["from"]), datetime.fromisoformat(body["to"])
+    assert start == NOW.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    assert end - start == timedelta(days=7)
+    body = json.loads(run([*synced, "events", "--json", "--from", "2026-10-30"])[1])
+    assert datetime.fromisoformat(body["to"]) - datetime.fromisoformat(body["from"]) == timedelta(days=7)
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--from", "2026-10-01", "--to", "2026-12-03"], "to: at most 62 days after from"),
+        (["--from", "2026-10-24", "--to", "2026-10-23"], "to: must not be before from"),
+        (["--rule", "nope"], "unknown rule(s): nope"),
+        (["--target", "dav:Nowhere"], "no rule syncs into dav:Nowhere"),
+        (["--target", "nocolon"], "target: expected ACCOUNT:CALENDAR, got 'nocolon'"),
+    ],
+)
+def test_events_refuses_bad_arguments(synced: list[str], argv: list[str], message: str) -> None:
+    import json
+
+    assert run([*synced, "events", *argv]) == (EXIT_CONFIG, message + "\n")
+    code, text = run([*synced, "events", *argv, "--json"])
+    assert code == EXIT_CONFIG and json.loads(text)["error"]["message"] == message
+
+
+def test_event_show(synced: list[str]) -> None:
+    import json
+
+    events = json.loads(run([*synced, "events", *RANGE, "--json"])[1])["events"]
+    lunch = events[1]["id"]
+    code, text = run([*synced, "event", "show", lunch, "--json"])
+    assert code == EXIT_OK
+    body = json.loads(text)
+    assert body["id"] == lunch and body["original"]["title"] == "Lunch\nbreak"
+    assert body["deliveries"][0]["copy"]["title"] == "Lunch\nbreak"
+    code, text = run([*synced, "event", "show", lunch])
+    assert code == EXIT_OK
+    start, end = "2026-10-25T12:00:00+08:00", "2026-10-25T13:00:00+08:00"
+    assert text == (
+        "Lunch break\n"
+        f"  when: {_local_day(start)} {_local_hhmm(start)}–{_local_hhmm(end)}\n"
+        "  source: me / Family\n"
+        "  family → dav / Family: delivered at 2026-10-24T08:00:00+00:00\n"
+    )
+
+
+def test_event_show_of_an_unknown_event(synced: list[str]) -> None:
+    import json
+
+    assert run([*synced, "event", "show", "bm9wZQ"]) == (EXIT_FAILED, "no such event\n")
+    code, text = run([*synced, "event", "show", "bm9wZQ", "--json"])
+    assert code == EXIT_FAILED and json.loads(text)["error"]["kind"] == "not_found"
+
+
+def test_status_json_daemon_is_null_without_a_daemon(synced: list[str]) -> None:
+    import json
+
+    assert json.loads(run([*synced, "status", "--json"])[1])["daemon"] is None

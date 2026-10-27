@@ -444,6 +444,7 @@ async def test_snapshot_json(tmp_path: Path) -> None:
         "last_cycle_at": NOW.isoformat(),
         "next_cycle_at": (NOW + timedelta(seconds=30)).isoformat(),
         "cycles": 1,
+        "cycle_started_at": None,
     }
     world.stop.set()
     await asyncio.wait_for(task, 5)
@@ -887,3 +888,31 @@ async def test_ops_on_a_daemon_without_sync_are_refused(short_dir: Path) -> None
     assert config_path.read_text() == OPS_CONFIG
     stop.set()
     await asyncio.wait_for(task, 5)
+
+
+# ----- cycle_started_at -------------------------------------------------------------------------
+
+
+async def test_cycle_started_at_is_set_only_while_a_cycle_runs(tmp_path: Path) -> None:
+    world = World(stop_after=2)
+    daemon = world.daemon(two_rules(interval=30), tmp_path)
+    during: list[Any] = []
+    world.on_google = lambda: during.append(daemon.snapshot().cycle_started_at)
+    between: list[Any] = []
+    world.before_sleep = lambda: between.append(daemon.snapshot().cycle_started_at)
+    await daemon.run(world.stop)
+    assert during == [NOW]
+    assert between == [None, None]
+    assert daemon.snapshot().to_json()["cycle_started_at"] is None
+
+
+async def test_cycle_started_at_is_cleared_after_a_failing_cycle(tmp_path: Path) -> None:
+    world = World(stop_after=1)
+    daemon = world.daemon(two_rules(), tmp_path)
+
+    def boom() -> None:
+        raise RuntimeError("the store broke")
+
+    world.on_google = boom
+    await daemon.run(world.stop)
+    assert daemon.snapshot().cycle_started_at is None

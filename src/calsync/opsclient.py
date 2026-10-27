@@ -89,6 +89,34 @@ def _daemon_listens(sock: Path) -> bool:
     return True
 
 
+DAEMON_STATUS_TIMEOUT = 5.0  # seconds: `calsync status` never hangs on a wedged daemon
+
+
+def daemon_status(state_dir: Path) -> dict[str, Any] | None:
+    """The running daemon's own block (``DaemonInfo.to_json``, from ``GET /api/status`` on its
+    socket); None when no daemon serves ``state_dir`` or it does not answer in time."""
+    import httpx
+
+    from calsync.wiring import socket_path
+
+    sock = socket_path(state_dir)
+    try:
+        if not _daemon_listens(sock):
+            return None
+    except CalsyncError:  # a socket it cannot reach: no block, the status shows anyway
+        return None
+    transport = httpx.HTTPTransport(uds=str(sock))
+    try:
+        with httpx.Client(
+            transport=transport, base_url="http://calsync", timeout=DAEMON_STATUS_TIMEOUT
+        ) as client:
+            body: Any = client.get("/api/status").json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    daemon = body.get("daemon") if isinstance(body, dict) else None
+    return daemon if isinstance(daemon, dict) else None
+
+
 def run_in_process(
     name: str,
     args: dict[str, Any],

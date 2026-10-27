@@ -18,6 +18,8 @@ if TYPE_CHECKING:  # type-only: importing these at runtime would load httpx/ical
 
     from calsync.config import Config
     from calsync.engine import CycleResult, RuleResult
+    from calsync.events_view import EventDetail, EventsView
+    from calsync.model import When
     from calsync.ops import OpResult
     from calsync.store import Store
     from calsync.views import BlockedView, ChangesView, RunsView, StateReader, StatusView, UpcomingView
@@ -172,6 +174,21 @@ def _parser() -> argparse.ArgumentParser:
     upcoming.add_argument("--hours", type=_positive_int, default=24, help="how far ahead (default: 24)")
     upcoming.add_argument("--rule", help="only this rule")
     upcoming.add_argument("--json", action="store_true", help="print JSON")
+
+    events = sub.add_parser("events", help="events by date, each with its delivery per rule (read-only)")
+    events.add_argument("--from", dest="start", type=_instant, help="ISO date or time (default: today)")
+    events.add_argument(
+        "--to", dest="end", type=_instant, help="ISO date or time, exclusive (default: --from + 7 days)"
+    )
+    events.add_argument("--rule", help="only this rule's deliveries")
+    events.add_argument("--target", metavar="ACCOUNT:CALENDAR", help="only deliveries into this calendar")
+    events.add_argument("--query", help="only events whose title or location contains this text")
+    events.add_argument("--json", action="store_true", help="print JSON")
+    event = sub.add_parser("event", help="one event: the source and each copy")
+    event_sub = event.add_subparsers(dest="event_command", required=True)
+    show = event_sub.add_parser("show", help="the event, its original and its copies")
+    show.add_argument("id", help="an id from `calsync events --json`")
+    show.add_argument("--json", action="store_true", help="print JSON")
 
     runs = sub.add_parser("runs", help="recorded sync runs, newest first")
     runs.add_argument("--rule", help="only this rule")
@@ -522,7 +539,7 @@ def cmd_config_get(args: argparse.Namespace, out: TextIO) -> int:
 
 def cmd_config_history(args: argparse.Namespace, out: TextIO) -> int:
     """Recorded config changes. Never their ``before`` text: a whole config, URLs included."""
-    from calsync.views import StateReader, StateUnavailable
+    from calsync.views import StateReader, StateUnavailable, config_history_json
     from calsync.wiring import state_paths
 
     db_path, _ = state_paths(_state_dir(args))
@@ -532,22 +549,7 @@ def cmd_config_history(args: argparse.Namespace, out: TextIO) -> int:
     except StateUnavailable:
         changes = []
     if args.json:
-        _dump(
-            {
-                "changes": [
-                    {
-                        "id": c.id,
-                        "at": c.at.isoformat(),
-                        "source": c.source,
-                        "summary": c.summary,
-                        "after_fingerprint": c.after_fingerprint,
-                        "undoes": c.undoes,
-                    }
-                    for c in changes
-                ]
-            },
-            out,
-        )
+        _dump(config_history_json(changes), out)
         return EXIT_OK
     if not changes:
         out.write("no config changes recorded\n")
@@ -948,13 +950,21 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-ViewBuilder = Callable[
-    ["Config", "StateReader"], "StatusView | UpcomingView | RunsView | ChangesView | BlockedView"
-]
+# Evaluated lazily (the classes are imported for type checking only).
+type View = StatusView | UpcomingView | RunsView | ChangesView | BlockedView | EventsView | EventDetail
+ViewBuilder = Callable[["Config", "StateReader"], View]
 
 
-def _show(args: argparse.Namespace, out: TextIO, build: ViewBuilder, *, check_rule: bool = True) -> int:
-    """Build a read-only view from the state database and print it (as JSON with ``--json``)."""
+def _show(
+    args: argparse.Namespace,
+    out: TextIO,
+    build: ViewBuilder,
+    *,
+    check_rule: bool = True,
+    extra: dict[str, object] | None = None,
+) -> int:
+    """Build a read-only view from the state database and print it (as JSON with ``--json``,
+    with ``extra`` keys added)."""
     import sqlite3
 
     from calsync.views import NO_STATE_MESSAGE, StateReader, StateUnavailable
@@ -978,15 +988,34 @@ def _show(args: argparse.Namespace, out: TextIO, build: ViewBuilder, *, check_ru
         out.write(f"error: the state database could not be read: {type(exc).__name__}\n")
         return EXIT_FAILED
     if args.json:
-        out.write(json.dumps(view.to_json(), ensure_ascii=False, indent=2) + "\n")
+        out.write(json.dumps({**view.to_json(), **(extra or {})}, ensure_ascii=False, indent=2) + "\n")
     else:
         _print_view(view, out)
     return EXIT_OK
 
 
-def _print_view(
-    view: "StatusView | UpcomingView | RunsView | ChangesView | BlockedView", out: TextIO
-) -> None:
+def _span_text(start: "When", end: "When") -> str:
+    """``2026-10-24 18:00–18:15`` in local time; ``2026-11-05 all day``."""
+    if start.all_day:
+        return f"{start.value.isoformat()} all day"
+    lo, hi = start.utc().astimezone(), end.utc().astimezone()
+    return f"{lo.strftime('%Y-%m-%d %H:%M')}–{hi.strftime('%H:%M')}"
+
+
+def _print_event(view: "EventDetail", out: TextIO) -> None:
+    event = view.event
+    out.write(f"{_flat(event.instance.title)}\n")
+    out.write(f"  when: {_span_text(event.instance.start, event.instance.end)}\n")
+    out.write(f"  source: {event.source['account']} / {event.source['calendar_name']}\n")
+    for d in event.deliveries:
+        at = f" at {d.delivered_at.isoformat()}" if d.delivered_at else ""
+        out.write(f"  {d.rule} → {d.target['account']} / {d.target['calendar_name']}: {d.state}{at}\n")
+        if d.differs:
+            out.write(f"    differs: {', '.join(d.differs)}\n")
+
+
+def _print_view(view: View, out: TextIO) -> None:
+    from calsync.events_view import EventDetail, EventsView
     from calsync.views import BlockedView, ChangesView, RunsView, StatusView, UpcomingView
 
     if isinstance(view, StatusView):
@@ -1037,6 +1066,17 @@ def _print_view(
             for item in blocked.items:
                 out.write(f"  - {_flat(item.title) if item.title else '(untitled)'}\n")
             out.write(f"  approve with: calsync approve {blocked.rule}\n")
+    elif isinstance(view, EventsView):
+        if not view.events:
+            out.write("no events\n")
+        for event in view.events:
+            deliveries = ", ".join(f"{d.target['calendar_name']}: {d.state}" for d in event.deliveries)
+            out.write(
+                f"{_span_text(event.instance.start, event.instance.end)}  {_flat(event.instance.title)}  "
+                f"[{event.source['calendar_name']} → {deliveries}]\n"
+            )
+    elif isinstance(view, EventDetail):
+        _print_event(view, out)
     elif isinstance(view, ChangesView):
         for change in view.changes:
             title = _flat(change.title) if change.title else "(untitled)"
@@ -1046,9 +1086,61 @@ def _print_view(
 
 
 def cmd_status(args: argparse.Namespace, out: TextIO) -> int:
+    """The status; with ``--json`` also the running daemon's block (asked over its socket;
+    ``null`` when no daemon runs)."""
+    from calsync.opsclient import daemon_status
     from calsync.views import build_status
 
-    return _show(args, out, lambda config, reader: build_status(config, reader, _now()))
+    daemon = daemon_status(_state_dir(args))
+    code = _show(
+        args, out, lambda config, reader: build_status(config, reader, _now()), extra={"daemon": daemon}
+    )
+    if code == EXIT_OK and not args.json and daemon is not None:
+        out.write(
+            f"daemon: running, {daemon.get('cycles')} cycles, next at {daemon.get('next_cycle_at') or '-'}\n"
+        )
+    return code
+
+
+def _refuse(args: argparse.Namespace, out: TextIO, kind: str, message: str, code: int) -> int:
+    """A refused read: the message, or ``{"error": ...}`` with ``--json``."""
+    if args.json:
+        _dump({"error": {"kind": kind, "message": message}}, out)
+    else:
+        out.write(message + "\n")
+    return code
+
+
+def cmd_events(args: argparse.Namespace, out: TextIO) -> int:
+    from calsync.events_view import build_events, event_range, known_target, parse_target
+
+    now = _now()
+    try:
+        start, end = event_range(args.start, args.end, now)
+        target = parse_target(args.target) if args.target is not None else None
+    except ValueError as exc:
+        return _refuse(args, out, "bad_request", str(exc), EXIT_CONFIG)
+    config = _load(args)
+    if args.rule is not None and args.rule not in {r.name for r in config.rules}:
+        return _refuse(args, out, "unknown_rule", f"unknown rule(s): {args.rule}", EXIT_CONFIG)
+    if target is not None and not known_target(config, target):
+        return _refuse(args, out, "unknown_target", f"no rule syncs into {args.target}", EXIT_CONFIG)
+    return _show(
+        args,
+        out,
+        lambda config, reader: build_events(
+            config, reader, start, end, rule=args.rule, target=target, query=args.query or None, now=now
+        ),
+    )
+
+
+def cmd_event(args: argparse.Namespace, out: TextIO) -> int:
+    from calsync.events_view import NotFound, build_event
+
+    try:
+        return _show(args, out, lambda config, reader: build_event(config, reader, args.id, _now()))
+    except NotFound:
+        return _refuse(args, out, "not_found", "no such event", EXIT_FAILED)
 
 
 def cmd_upcoming(args: argparse.Namespace, out: TextIO) -> int:
@@ -1123,6 +1215,10 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
             return cmd_status(args, out)
         if args.command == "upcoming":
             return cmd_upcoming(args, out)
+        if args.command == "events":
+            return cmd_events(args, out)
+        if args.command == "event":
+            return cmd_event(args, out)
         if args.command == "runs":
             return cmd_runs(args, out)
         if args.command == "changes":
