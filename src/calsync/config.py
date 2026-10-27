@@ -82,6 +82,7 @@ class NotifyConfig:
     webhook_url: str | None = None
     failure_threshold: int = 3
     public_url: str | None = None  # links in notifications point here
+    language: str = "zh"  # of the push texts: "zh" or "en"
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,6 +312,16 @@ def _public_url(raw: Any, problems: list[str]) -> str | None:
     return None
 
 
+LANGUAGES = ("zh", "en")
+
+
+def _language(raw: Any, problems: list[str]) -> str:
+    if raw in LANGUAGES:
+        return raw
+    problems.append('notify.language: must be "zh" or "en"')
+    return "zh"
+
+
 def _account(name: str, raw: Any, problems: list[str]) -> Account | None:
     where = f"accounts.{name}"
     if not isinstance(raw, Mapping):
@@ -501,6 +512,7 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:
             expect="an integer >= 1",
         ),
         public_url=_public_url(notify_raw.get("public_url"), problems),
+        language=_language(notify_raw.get("language", "zh"), problems),
     )
 
     runtime_raw = _table(data.get("runtime"), "runtime", problems)

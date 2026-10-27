@@ -79,7 +79,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol, overload
 
-from calsync import api, debug, ops, wiring
+from calsync import api, debug, notify, ops, wiring
 from calsync.config import Config
 from calsync.configfile import Snapshot, read_snapshot, validate_text
 from calsync.cycle import counts_line, remove_retired, retired, run_cycle
@@ -221,6 +221,8 @@ class Daemon:
         # waiter is answered only by a cycle numbered above the count when it was registered.
         self._started_cycles = 0
         self._waiters: list[_Waiter] = []
+        # Pushes in flight (``notify``): sent in the background, drained when the daemon stops.
+        self._outbox = notify.Outbox()
 
     # ----- interface ----------------------------------------------------------
     async def run(self, stop: asyncio.Event) -> None:
@@ -244,6 +246,7 @@ class Daemon:
         finally:
             self._running = False
             self.web_address = None
+            await self._outbox.drain()
         if failures:
             raise failures[0]
 
@@ -427,8 +430,13 @@ class Daemon:
         return self._wait_for_cycle({rule}) if wait else None
 
     def _on_approved(self, rule: str, count: int, origin: ops.Source) -> None:
-        """Blocked deletes were approved. The ``approved`` alert (with its origin) hooks in here."""
+        """Blocked deletes were approved: logged and pushed (``approved``, every time)."""
         log.info("rule %s: %d deletes approved (%s)", rule, count, origin)
+        self._notify([notify.approved(rule, count, origin, self._config, self._clock())])
+
+    def _notify(self, alerts: list[notify.Alert]) -> None:
+        """Send ``alerts`` in the background: a slow channel never holds up the schedule."""
+        self._outbox.post(self._config.notify, alerts)
 
     def _wait_for_cycle(self, rules: set[str] | None) -> "asyncio.Future[CycleResult | None]":
         """A future of the first cycle that starts from now on and runs any of ``rules`` (None:
@@ -493,6 +501,7 @@ class Daemon:
             debug.details(log, "config reload failed", exc)
             self._unremember(before)
             return
+        self._reload_ok()
         log.info("config changed; applied")
 
     def _unremember(self, before: Snapshot | None) -> None:
@@ -733,6 +742,7 @@ class Daemon:
         previous = self._snapshot
         if previous is not None and snapshot.fingerprint == previous.fingerprint:
             self._rejected = None  # touched, or edited back to what runs
+            self._reload_ok()
             return
         if snapshot.fingerprint == self._rejected:
             return
@@ -747,6 +757,7 @@ class Daemon:
             self._rejected = snapshot.fingerprint  # logged once (by the caller), not every poll
             raise
         self._snapshot, self._rejected = snapshot, None
+        self._reload_ok()
         log.info("config reloaded (%s)", EXTERNAL_SUMMARY)
         try:
             self._store.record_config_change(
@@ -763,13 +774,22 @@ class Daemon:
         if fingerprint == self._rejected:
             return
         self._rejected = fingerprint
-        self._on_reload_failed(problems)
+        self._on_reload_failed(fingerprint, problems)
 
-    def _on_reload_failed(self, problems: list[str]) -> None:
+    def _on_reload_failed(self, fingerprint: str, problems: list[str]) -> None:
         """An edit made outside calsync is invalid; the running config stays. The count only:
-        a problem can quote a value (a push URL with a device key in it). The ``reload_failed``
-        alert hooks in here."""
+        a problem can quote a value (a push URL with a device key in it). Pushed once per text
+        (``reload_failed``, keyed by ``fingerprint``) until a config applies."""
         log.warning("config reload failed (%d problems)", len(problems))
+        if self._store is not None:
+            self._notify(
+                notify.reload_failed(self._store, fingerprint, len(problems), self._config, self._clock())
+            )
+
+    def _reload_ok(self) -> None:
+        """The file holds a config that runs again: an open ``reload_failed`` alert closes."""
+        if self._store is not None:
+            notify.reload_ok(self._store, self._clock())
 
     async def _apply(self, config: Config) -> None:
         """Run ``config`` from now on. The caller holds ``_cycle_lock`` (never during a cycle).
@@ -939,6 +959,8 @@ class Daemon:
             parts.append(counts_line(name, r) + (f" error_kind={r.error_kind}" if r.error_kind else ""))
         parts.append(f"requests={result.requests}")
         log.info("%s", "; ".join(parts))
+        if self._store is not None:  # the runs are recorded: what needs a person is pushed
+            self._notify(notify.evaluate(result.rules, store=self._store, config=self._config, now=now))
         self._resolve_waiters(cycle, result.rules, result)
 
 

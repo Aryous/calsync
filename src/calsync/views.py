@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import quote, urlparse
 
 from calsync.config import Account, Config, Rule
@@ -587,6 +587,7 @@ def config_json(config: Config, *, reveal: bool = False) -> dict[str, Any]:
             "webhook_url": url(config.notify.webhook_url),
             "public_url": url(config.notify.public_url),
             "failure_threshold": config.notify.failure_threshold,
+            "language": config.notify.language,
         },
         "runtime": {
             "interval": format_duration(config.runtime.interval),
@@ -962,7 +963,13 @@ def _is_ok(status: str, failed: int) -> bool:
     return status == "ok" or (status == "partial" and failed == 0)
 
 
-def _consecutive_failures(reader: StateReader, rule: str) -> int:
+class RunStatuses(Protocol):
+    """What ``_consecutive_failures`` reads: a ``StateReader``, or the writer's ``Store``."""
+
+    def statuses(self, rule: str) -> Iterator[tuple[str, int]]: ...
+
+
+def _consecutive_failures(reader: RunStatuses, rule: str) -> int:
     """The newest runs in a row whose health is not ``ok``."""
     count = 0
     for status, failed in reader.statuses(rule):

@@ -18,7 +18,7 @@ import json
 import os
 import sqlite3
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -468,6 +468,27 @@ class Store:
             (rule, object_id),
         ).fetchone()
         return row[0] if row else None
+
+    def statuses(self, rule: str) -> Iterator[tuple[str, int]]:
+        """The rule's run (status, failed) pairs, newest first (as ``StateReader.statuses``)."""
+        rows = self._db.execute("SELECT status, failed FROM run WHERE rule = ? ORDER BY id DESC", (rule,))
+        return ((r[0], r[1]) for r in rows.fetchall())
+
+    # ----- alerts -------------------------------------------------------
+    def open_alerts(self) -> set[str]:
+        """The keys of the alerts sent and not yet closed (``notify``)."""
+        return {r[0] for r in self._db.execute("SELECT key FROM alert WHERE state = 'open'")}
+
+    def update_alerts(self, *, opened: Iterable[str] = (), closed: Iterable[str] = (), at: datetime) -> None:
+        """Open ``opened`` (sent at ``at``) and close ``closed``, in one transaction."""
+        with self._tx():
+            self._db.executemany(
+                "INSERT OR REPLACE INTO alert (key, state, last_sent_at) VALUES (?, 'open', ?)",
+                [(key, _utc(at)) for key in opened],
+            )
+            self._db.executemany(
+                "UPDATE alert SET state = 'closed' WHERE key = ?", [(key,) for key in closed]
+            )
 
     # ----- config history ------------------------------------------------
     def copies(self, tag: str, account: str, ref: str) -> int:

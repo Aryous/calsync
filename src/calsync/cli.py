@@ -134,6 +134,12 @@ def _parser() -> argparse.ArgumentParser:
         "--refresh-token-stdin", action="store_true", help="google: read an existing refresh token from stdin"
     )
 
+    notify_cmd = sub.add_parser("notify", help="push notifications (Bark, webhook)")
+    notify_sub = notify_cmd.add_subparsers(dest="notify_command", required=True)
+    notify_test = notify_sub.add_parser("test", help="send a test push to every configured channel")
+    notify_test.add_argument("--json", action="store_true", help="print JSON")
+    notify_test.set_defaults(op_command=True)  # through the daemon if it runs: a busy lock reads as such
+
     run = sub.add_parser("run", help="run one sync cycle")
     run.add_argument("--rule", action="append", dest="rules", help="only this rule (repeatable)")
     run.add_argument("--dry-run", action="store_true", help="show the plan without writing")
@@ -554,6 +560,42 @@ def _confirm_blocked(
     return blocked.fingerprint
 
 
+def cmd_notify_test(args: argparse.Namespace, out: TextIO) -> int:
+    """`calsync notify test`: 0 when every configured channel took the push, 1 when one failed,
+    2 when none is configured."""
+    from calsync import opsclient
+    from calsync.errors import CalsyncError, ConfigError
+
+    try:
+        result = opsclient.call(
+            "notify.test", {}, dry_run=False, config_path=_config_path(args), state_dir=_state_dir(args)
+        )
+    except CalsyncError as exc:
+        if not args.json:
+            raise
+        error: dict[str, object] = {"kind": _error_kind(exc), "message": str(exc)}
+        if isinstance(exc, ConfigError):
+            error["problems"] = exc.problems
+        _dump({"error": error}, out)
+        return exit_code_for(exc)
+    channels: dict[str, str] = result.data.get("channels") or {}
+    outcomes = list(channels.values())
+    if all(o == "not configured" for o in outcomes):
+        code = EXIT_CONFIG
+    elif any(o.startswith("failed") for o in outcomes):
+        code = EXIT_FAILED
+    else:
+        code = EXIT_OK
+    if args.json:
+        _dump(result.to_json(), out)
+        return code
+    for channel, outcome in channels.items():
+        out.write(f"{channel}: {outcome}\n")
+    if code == EXIT_CONFIG:
+        out.write("no channel is configured\n")
+    return code
+
+
 def cmd_config_get(args: argparse.Namespace, out: TextIO) -> int:
     from calsync.views import config_json
 
@@ -772,6 +814,7 @@ def _print_cycle(result: "CycleResult", out: TextIO, verbose: bool) -> None:
 
 
 async def _run(args: argparse.Namespace, out: TextIO) -> int:
+    from calsync import notify
     from calsync.cycle import run_cycle
     from calsync.lock import RunLock
     from calsync.store import Store
@@ -791,6 +834,7 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
         return EXIT_OK
     db_path, lock_path = state_paths(_state_dir(args))
     removed: list[str] = []
+    alerts: list[notify.Alert] = []
     with RunLock(lock_path):
         adapters = await build_adapters(config, accounts_in_use(config, active))
         try:
@@ -805,7 +849,8 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
                     dry_run=args.dry_run,
                     allow_deletes=args.allow_deletes,
                 )
-                if not args.dry_run:
+                if not args.dry_run:  # a dry run records nothing, so it alerts nothing
+                    alerts = notify.evaluate(result.rules, store=store, config=config, now=_now())
                     removed = _remove_retired(args, config, result, store)
             finally:
                 store.close()
@@ -814,6 +859,8 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
     _print_cycle(result, out, verbose=args.dry_run)
     for summary in removed:
         out.write(summary + "\n")
+    out.flush()  # the result first: a slow channel delays only the exit
+    await notify.Notifier(config.notify).send(alerts)  # each push bounded; a failure only logged
     return exit_code_for_results(result.rules.values())
 
 
@@ -1343,6 +1390,8 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
             return cmd_calendars(args, out)
         if args.command == "auth":
             return asyncio.run(_auth(args, out, stdin))
+        if args.command == "notify":
+            return cmd_notify_test(args, out)
         if args.command == "run":
             return asyncio.run(_run(args, out))
         if args.command == "daemon":

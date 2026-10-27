@@ -49,6 +49,7 @@ SETTINGS = frozenset(
         "notify.webhook_url",
         "notify.public_url",
         "notify.failure_threshold",
+        "notify.language",
         "runtime.interval",
         "runtime.jitter",
         "web.allowed_hosts",

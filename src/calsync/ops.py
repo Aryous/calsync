@@ -34,6 +34,7 @@ from calsync.store import CONFIG_CHANGE_RETENTION, AccountCalendar, Store
 
 if TYPE_CHECKING:
     from calsync.engine import CycleResult, RuleResult
+    from calsync.notify import Alert
     from calsync.wiring import Adapters
 
 log = logging.getLogger(__name__)
@@ -707,7 +708,10 @@ def _approve(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
             data=data,
         )
     log.info("rule %s: %d deletes approved (%s)", name, blocked.count, ctx.source)
-    result, removed = asyncio.run(_cycle_here(ctx, config, [name], {name: fingerprint}))
+    from calsync import notify
+
+    approval = notify.approved(name, blocked.count, ctx.source, config, ctx.clock())
+    result, removed = asyncio.run(_cycle_here(ctx, config, [name], {name: fingerprint}, alerts=[approval]))
     outcome = _outcome(op, name, fingerprint, blocked.count, result)
     if removed:
         return dataclasses.replace(outcome, summary=outcome.summary + "; " + "; ".join(removed))
@@ -791,12 +795,18 @@ def _outcome(op: str, rule: str, fingerprint: str, count: int, cycle: "CycleResu
 
 
 async def _cycle_here(
-    ctx: OpContext, config: Config, rules: list[str], approvals: Mapping[str, str] | None = None
+    ctx: OpContext,
+    config: Config,
+    rules: list[str],
+    approvals: Mapping[str, str] | None = None,
+    *,
+    alerts: Sequence["Alert"] = (),
 ) -> tuple["CycleResult", list[str]]:
     """One cycle for ``rules`` (paused ones are skipped) in this process (the caller holds the
     run lock), with ``approvals``; then, as ``calsync run`` does, the removal of the rules
-    that retired."""
-    from calsync import wiring
+    that retired, and the pushes: ``alerts`` and what the cycle raised (``notify``), sent
+    before returning."""
+    from calsync import notify, wiring
     from calsync.cycle import remove_retired, retired, run_cycle
 
     adapters = await wiring.build_adapters(config, wiring.accounts_in_use(config, rules))
@@ -814,10 +824,12 @@ async def _cycle_here(
         )
     finally:
         await adapters.aclose()
+    raised = notify.evaluate(result.rules, store=ctx.store, config=config, now=ctx.clock())
     removal = dataclasses.replace(ctx, source="daemon")
     removed = [
         done.summary for n in retired(config, result, ctx.store) if (done := remove_retired(removal, n))
     ]
+    await notify.Notifier(config.notify).send([*alerts, *raised])
     return result, removed
 
 
@@ -935,6 +947,27 @@ async def _trigger(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpRes
 
     ctx.followup = finish
     return OpResult(op, False, "cycle requested", data={"accepted": True, "rule": name})
+
+
+# ----- notifications --------------------------------------------------------------------------
+
+NOTIFY_TEST_NO_DRY_RUN = "notify.test has no dry run; it only sends a test push"
+
+
+async def _notify_test(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
+    """One test push to every configured channel. ``data``: ``{"channels": {"bark": …,
+    "webhook": …}}``, each ``ok``, ``failed (<Type>)`` or ``not configured``. It changes
+    nothing; each push waits at most ``notify.SEND_TIMEOUT`` seconds."""
+    from calsync import notify
+
+    op = "notify.test"
+    if dry_run:
+        raise ConfigError([NOTIFY_TEST_NO_DRY_RUN])
+    _Args(op, args, set())
+    config = _config_now(ctx)
+    report = await notify.Notifier(config.notify).test(config.notify.language)
+    summary = "test push: " + ", ".join(f"{channel} {outcome}" for channel, outcome in report.items())
+    return OpResult(op, False, summary, data={"channels": report})
 
 
 # ----- the calendar cache -----------------------------------------------------------------
@@ -1250,9 +1283,11 @@ ASYNC_OPS: dict[str, AsyncOp] = {
     "calendars.refresh": _calendars_refresh,
     "rule.preview": _rule_preview,
     "trigger": _trigger,
+    "notify.test": _notify_test,
 }
-# Operations the daemon runs without its lock: they only ask it for a cycle (and may wait for it).
-UNLOCKED_OPS = frozenset({"trigger"})
+# Operations the daemon runs without its lock: they touch neither the store nor the config, only
+# ask it for a cycle (and may wait for it) or send a test push.
+UNLOCKED_OPS = frozenset({"trigger", "notify.test"})
 
 
 def _own_loop(op: AsyncOp) -> Callable[[OpContext, dict[str, Any], bool], OpResult]:
