@@ -241,8 +241,11 @@ def test_op_names() -> None:
         "account.remove",
         "calendars.refresh",
         "rule.preview",
+        "trigger",
     }
-    assert set(ops.ASYNC_OPS) == {"calendars.refresh", "rule.preview"}  # they talk to the accounts
+    # They talk to the accounts, or wait for a cycle that does.
+    assert set(ops.ASYNC_OPS) == {"calendars.refresh", "rule.preview", "trigger"}
+    assert set(ops.UNLOCKED_OPS) == {"trigger"}  # the daemon runs it without its lock
 
 
 def test_to_json_shape() -> None:

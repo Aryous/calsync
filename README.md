@@ -406,6 +406,7 @@ allowed_hosts = ["mac-mini.local"]     # other names the browser may use for thi
 calsync daemon                 # sync on a schedule until SIGTERM or Ctrl-C
 calsync trigger                # ask it for a cycle now (all rules)
 calsync trigger --rule family  # just this rule
+calsync trigger --rule family --wait --json   # and wait for that cycle's result
 ```
 
 `calsync daemon` runs one cycle at once, then one after every wait of
@@ -431,9 +432,16 @@ a `calsync run` meanwhile exits with code 4: use `calsync trigger` instead
   URLs).
 - **The socket.** The daemon serves a small JSON API on
   `<state-dir>/calsync.sock` (mode 0600, so only your user can reach it).
-  `calsync trigger` uses it.
-  `trigger` says `the daemon is not running; use calsync run` when there is
-  no daemon.
+  `calsync trigger` uses it. With `--wait` it waits (at most `--timeout`
+  seconds, default 120, at most 600) for the first cycle that starts after the
+  request and runs the rule (all unpaused rules without `--rule`; a request
+  made during a cycle is answered by the follow-up), and prints its counts per
+  rule; `--json` gives `{"ran": true, "rules": {NAME: {"status", "created",
+  "updated", "deleted", "failed", "error_kind"}}, "requests": N}` in `data`, or
+  `{"ran": false, "reason": "timeout" | "cycle_failed"}` (exit 1). The exit code
+  of a cycle that ran follows `calsync run`. Without a daemon, `trigger` runs
+  the cycle itself, holding the lock, as `calsync run [--rule NAME]` would
+  (with or without `--wait`, same output).
 - **`--no-sync`** serves the API without syncing: no lock, no credentials, no
   cycles (`trigger` is refused). It cannot share a state directory with a
   running daemon (whose socket is live: exit 4, `another calsync daemon is
@@ -514,7 +522,8 @@ calsync [--config PATH] [--state-dir DIR] <command>
   daemon [--no-sync]               sync on a schedule until stopped (SIGUSR1: sync now)
          [--listen HOST:PORT]      serve the web UI there (default: [web] listen)
          [--no-web]                no web UI (the local API socket stays)
-  trigger [--rule NAME]            ask the running daemon for a cycle now
+  trigger [--rule NAME]            a cycle now: asked of the daemon, or run here without one
+          [--wait] [--timeout S]   wait for that cycle (default 120 s, at most 600) and show it
   web pair [--listen HOST:PORT]    print the web UI's pair link(s)
   web reset-key [--listen …]       replace the pairing key (unpairs every browser)
   status [--json]                  sync health per rule
@@ -634,7 +643,7 @@ stale one.
 | `status=blocked` | the mass-delete guard fired; check the printed titles, then `calsync run --rule NAME --allow-deletes` if intended |
 | the daemon exits with code 2: `cannot listen on 127.0.0.1:8766: address already in use` | another program (or a second daemon) has the web UI's port. Set `[web] listen` to another port, or to `"off"` (or run `calsync daemon --no-web`) if you don't use the web UI |
 | exit code 4 | another `calsync run` or the daemon holds the lock; wait for it, or use `calsync trigger` while the daemon runs |
-| `trigger`: the daemon is not running | no daemon serves the socket in this state directory (check `--state-dir`); start it, or use `calsync run` |
+| `trigger` ran the cycle itself ("no daemon runs, so the cycle ran here") | no daemon serves the socket in this state directory (check `--state-dir`); start it if one should be running |
 | an event changed on the iPhone snaps back (`reverted=1`) | expected: sync is one way, the Google version wins. Make the change in Google |
 | log says an object "was reverted 3 times within 6:00:00 … not reverting it until …; the source version will be written back then" | something on the target rewrites that event after every write (the loop breaker stepped in). calsync leaves it alone for 24 hours (changes made in Google still sync), then writes the Google version back once ("the hold on 1 copy(ies) ended"). If it keeps happening, look for another app or sync service editing that calendar |
 | log says "copy(ies) read back with no calsync marker" | information only: the target (e.g. iOS) dropped calsync's hidden `X-CALSYNC-HASH` from those copies (a copy that keeps an older marker is not reported). Edits are still judged by visible content and reverted as usual |

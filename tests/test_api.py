@@ -323,8 +323,8 @@ async def test_an_op_runs_in_the_daemon(tmp_path: Path) -> None:
 
 async def test_op_errors(tmp_path: Path) -> None:
     from calsync.configfile import ConfigConflict
-    from calsync.errors import ConfigError
-    from calsync.ops import OpsUnavailable
+    from calsync.errors import ConfigError, RulePaused
+    from calsync.ops import DaemonStopping, OpsUnavailable
 
     cases: list[tuple[Any, int, dict[str, Any]]] = [
         (ConfigError(["a", "b"]), 422, {"kind": "config", "message": "a; b", "problems": ["a", "b"]}),
@@ -338,6 +338,12 @@ async def test_op_errors(tmp_path: Path) -> None:
             },
         ),
         (OpsUnavailable("no ops here"), 409, {"kind": "read_only", "message": "no ops here"}),
+        (
+            RulePaused("family"),
+            409,
+            {"kind": "paused", "message": 'rule "family" is paused', "rule": "family"},
+        ),
+        (DaemonStopping(), 503, {"kind": "unavailable", "message": "The daemon is stopping."}),
     ]
     for answer, status, error in cases:
         async with client(tmp_path, OpsDaemon(answer)) as c:
@@ -369,6 +375,17 @@ async def test_an_op_rejects_a_bad_body(tmp_path: Path, body: bytes) -> None:
     assert daemon.ops == []
 
 
+async def test_a_large_body_is_413(tmp_path: Path) -> None:
+    daemon = OpsDaemon(None)
+    big = b'{"args": {"name": "' + b"x" * (64 * 1024) + b'"}}'
+    async with client(tmp_path, daemon) as c:
+        op = await c.post("/api/ops/rule.pause", content=big, headers={"content-type": "application/json"})
+        trigger = await c.post("/api/trigger", content=big, headers={"content-type": "application/json"})
+    for response in (op, trigger):
+        assert response.status_code == 413 and response.json()["error"]["kind"] == "too_large"
+    assert daemon.ops == [] and daemon.calls == []
+
+
 async def test_an_op_refuses_internal_arguments(tmp_path: Path) -> None:
     daemon = OpsDaemon(None)
     async with client(tmp_path, daemon) as c:
@@ -383,8 +400,8 @@ async def test_an_op_refuses_internal_arguments(tmp_path: Path) -> None:
 
 
 def test_ops_are_not_among_the_shared_routes(tmp_path: Path) -> None:
-    """The web UI mounts ``api_routes``: the operations reach it only in a later task, with its
-    own source and checks."""
+    """The operations come only with a source: ``"cli"`` on the socket, ``"ui"`` on the web UI
+    (behind its own checks, ``test_web``)."""
     routes = api.api_routes(config_provider=config, state_dir=tmp_path, daemon=None)
     assert all("/api/ops" not in getattr(r, "path", "") for r in routes)
     app_routes = api.create_app(config_provider=config, state_dir=tmp_path, daemon=None).routes

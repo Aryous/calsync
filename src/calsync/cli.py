@@ -3,13 +3,14 @@ so ``calsync --version`` and ``config check`` start instantly."""
 
 import argparse
 import asyncio
+import contextlib
 import getpass
 import json
 import sys
 from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TextIO
+from typing import TYPE_CHECKING, Any, Literal, TextIO
 
 from calsync import __version__
 
@@ -164,8 +165,18 @@ def _parser() -> argparse.ArgumentParser:
         command = web_sub.add_parser(name, help=text)
         command.add_argument("--listen", type=_listen, help="the daemon's HOST:PORT (default: [web] listen)")
 
-    trigger = sub.add_parser("trigger", help="ask the running daemon to sync now")
+    trigger = sub.add_parser(
+        "trigger", help="sync now: ask the running daemon for a cycle, or run one here without a daemon"
+    )
     trigger.add_argument("--rule", help="only this rule")
+    trigger.add_argument("--wait", action="store_true", help="wait for that cycle and show its result")
+    trigger.add_argument(
+        "--timeout",
+        type=_trigger_timeout,
+        default=120,
+        help="with --wait: seconds to wait for the daemon's cycle (default: 120, at most 600)",
+    )
+    trigger.add_argument("--json", action="store_true", help="print JSON")
 
     status = sub.add_parser("status", help="sync health per rule (read-only)")
     status.add_argument("--json", action="store_true", help="print JSON")
@@ -230,6 +241,13 @@ def _positive_int(text: str) -> int:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {text!r}") from None
     if value <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive integer, got {text!r}")
+    return value
+
+
+def _trigger_timeout(text: str) -> int:
+    value = _positive_int(text)
+    if value > 600:
+        raise argparse.ArgumentTypeError("at most 600 seconds")
     return value
 
 
@@ -303,6 +321,8 @@ def _describe(exc: BaseException, args: argparse.Namespace | None = None) -> str
         if getattr(args, "op_command", False):  # the daemon would have run it: not the daemon
             return f"{exc}; try again once it has finished\n"
         command = getattr(args, "command", None)
+        if command == "trigger":  # no daemon serves: the lock holder is `calsync run` (or another)
+            return f"{exc}; try again once it has finished\n"
         if command == "daemon":
             return f"{exc}; wait for it to finish, or stop the other daemon\n"
         if command == "run" and getattr(args, "allow_deletes", False):
@@ -856,7 +876,14 @@ async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
     daemon = Daemon(config, _state_dir(args), sync=sync, listen=listen, config_path=_config_path(args))
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    handlers = {signal.SIGTERM: stop.set, signal.SIGINT: stop.set, signal.SIGUSR1: daemon.request_cycle}
+
+    def cycle_now() -> None:
+        from calsync.ops import OpsUnavailable
+
+        with contextlib.suppress(OpsUnavailable):  # the scheduler has stopped: nothing to run it
+            daemon.request_cycle()
+
+    handlers = {signal.SIGTERM: stop.set, signal.SIGINT: stop.set, signal.SIGUSR1: cycle_now}
     for signum, handler in handlers.items():
         loop.add_signal_handler(signum, handler)
     try:
@@ -869,8 +896,80 @@ async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
     return EXIT_OK
 
 
+def cmd_trigger(args: argparse.Namespace, out: TextIO) -> int:
+    """A cycle now. With a daemon: requested from it (``--wait``: the ``trigger`` operation over
+    its socket, answered with that cycle's result). Without one: run here, holding the lock,
+    as ``calsync run [--rule R]`` would, with the same result as ``--wait``."""
+    from calsync import opsclient
+    from calsync.errors import CalsyncError, ConfigError, RulePaused
+    from calsync.wiring import socket_path
+
+    state_dir = _state_dir(args)
+    listens = opsclient.daemon_listens(socket_path(state_dir))
+    if listens and not args.wait:
+        return asyncio.run(_trigger(args, out))
+    op_args: dict[str, object] = {"wait": True, "timeout": args.timeout} if args.wait else {}
+    if args.rule:
+        op_args["rule"] = args.rule
+    try:
+        if listens:
+            result = opsclient.call(
+                "trigger",
+                op_args,
+                dry_run=False,
+                config_path=_config_path(args),
+                state_dir=state_dir,
+                read_timeout=args.timeout + opsclient.TRIGGER_MARGIN,
+            )
+        else:
+            _load(args)  # a config problem stops it before the state directory is touched
+            result = opsclient.run_in_process(
+                "trigger", op_args, dry_run=False, config_path=_config_path(args), state_dir=state_dir
+            )
+    except RulePaused as exc:
+        return _refuse(args, out, "paused", str(exc), EXIT_FAILED)
+    except CalsyncError as exc:
+        if not args.json:
+            raise
+        error: dict[str, object] = {"kind": _error_kind(exc), "message": str(exc)}
+        if isinstance(exc, ConfigError):
+            error["problems"] = exc.problems
+        _dump({"error": error}, out)
+        return exit_code_for(exc)
+    code = _trigger_exit(result.data)
+    if args.json:
+        _dump(result.to_json(), out)
+        return code
+    out.write(result.summary + "\n")
+    rules: dict[str, dict[str, object]] = result.data.get("rules") or {}
+    for name, r in rules.items():
+        line = " ".join(f"{key}={r[key]}" for key in ("status", "created", "updated", "deleted", "failed"))
+        out.write(
+            f"rule={name} {line}" + (f" error_kind={r['error_kind']}" if r.get("error_kind") else "") + "\n"
+        )
+    if "requests" in result.data:
+        out.write(f"requests={result.data['requests']}\n")
+    return code
+
+
+def _trigger_exit(data: dict[str, object]) -> int:
+    """``trigger``'s exit code: requested 0; ran: as ``calsync run`` (auth 3 > config 2 > any
+    rule not ok 1); every rule paused 0 (nothing to run); a timeout or a failed cycle 1."""
+    if data.get("accepted"):
+        return EXIT_OK
+    if not data.get("ran"):
+        return EXIT_OK if data.get("reason") == "paused" else EXIT_FAILED
+    rules: Any = data.get("rules") or {}
+    kinds = {r.get("error_kind") for r in rules.values()}
+    if "auth" in kinds:
+        return EXIT_AUTH
+    if "config" in kinds:
+        return EXIT_CONFIG
+    return EXIT_OK if all(r.get("status") == "ok" for r in rules.values()) else EXIT_FAILED
+
+
 async def _trigger(args: argparse.Namespace, out: TextIO) -> int:
-    """Ask the daemon, over its socket, for a cycle now."""
+    """Ask the daemon, over its socket, for a cycle now (``POST /api/trigger``)."""
     import httpx
 
     from calsync.opsclient import root_os_error
@@ -890,20 +989,30 @@ async def _trigger(args: argparse.Namespace, out: TextIO) -> int:
             out.write(f"error: cannot connect to the daemon socket ({type(cause).__name__})\n")
         return EXIT_FAILED
     if response.status_code == 202:
-        out.write("ok: cycle requested\n")
+        if args.json:
+            from calsync.ops import OpResult
+
+            _dump(
+                OpResult(
+                    "trigger", False, "cycle requested", data={"accepted": True, "rule": args.rule}
+                ).to_json(),
+                out,
+            )
+        else:
+            out.write("ok: cycle requested\n")
         return EXIT_OK
+    error = _error_body(response)
     if response.status_code == 409:
-        error = _error_body(response)
         if error.get("kind") == "paused":
-            out.write(f"{error.get('message') or 'the rule is paused'}\n")
-            return EXIT_FAILED
-        out.write("the daemon runs with --no-sync\n")
-        return EXIT_FAILED
+            return _refuse(
+                args, out, "paused", str(error.get("message") or "the rule is paused"), EXIT_FAILED
+            )
+        return _refuse(args, out, "read_only", "the daemon runs with --no-sync", EXIT_FAILED)
     if response.status_code == 404:
-        out.write(f"unknown rule(s): {args.rule}\n")
-        return EXIT_CONFIG
-    out.write(f"error: the daemon answered HTTP {response.status_code}\n")
-    return EXIT_FAILED
+        return _refuse(args, out, "unknown_rule", f"unknown rule(s): {args.rule}", EXIT_CONFIG)
+    if response.status_code == 503:
+        return _refuse(args, out, "unavailable", "the daemon is stopping", EXIT_FAILED)
+    return _refuse(args, out, "error", f"error: the daemon answered HTTP {response.status_code}", EXIT_FAILED)
 
 
 def _error_body(response: "httpx.Response") -> dict[str, object]:
@@ -1232,7 +1341,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
         if args.command == "daemon":
             return asyncio.run(_daemon(args, out))
         if args.command == "trigger":
-            return asyncio.run(_trigger(args, out))
+            return cmd_trigger(args, out)
         if args.command == "web":
             return cmd_web(args, out)
         if args.command == "status":

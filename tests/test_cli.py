@@ -1122,37 +1122,34 @@ def test_daemon_no_web_and_listen_exclude_each_other(tmp_path: Path) -> None:
     assert info.value.code == 2
 
 
-def test_trigger_without_a_daemon(short_dir: Path) -> None:
+def test_trigger_without_a_daemon_runs_here(short_dir: Path) -> None:
+    """No socket, or one nobody listens on: nothing to hand the cycle to, so it runs here (and
+    needs the config; ``tests.test_trigger`` runs real cycles)."""
     import socket
 
-    not_running = (EXIT_FAILED, "the daemon is not running; use calsync run\n")
-    assert run(["--state-dir", str(short_dir / "none"), "trigger"]) == not_running  # no socket
+    missing = (EXIT_CONFIG, f"configuration error:\n  - config file not found: {short_dir / 'none.toml'}\n")
+    argv = ["--config", str(short_dir / "none.toml"), "--state-dir"]
+    assert run([*argv, str(short_dir / "none"), "trigger"]) == missing  # no socket
     dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     dead.bind(str(short_dir / "calsync.sock"))  # a socket file nobody listens on: refused
     dead.close()
-    assert run(["--state-dir", str(short_dir), "trigger"]) == not_running
+    assert run([*argv, str(short_dir), "trigger"]) == missing
     assert not (short_dir / "none").exists()
 
 
-def test_trigger_reports_a_socket_it_cannot_reach(tmp_path: Path, short_dir: Path) -> None:
+def test_trigger_reports_a_socket_it_cannot_reach(short_dir: Path) -> None:
     import socket
 
-    long_dir = tmp_path / ("d" * 110)  # longer than a unix socket path may be
-    long_dir.mkdir()
-    (long_dir / "calsync.sock").touch()
-    assert run(["--state-dir", str(long_dir), "trigger"]) == (
-        EXIT_FAILED,
-        "error: cannot connect to the daemon socket (OSError)\n",
-    )
     listening = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         listening.bind(str(short_dir / "calsync.sock"))
         listening.listen(1)
         (short_dir / "calsync.sock").chmod(0)  # connect needs write permission on the socket
-        assert run(["--state-dir", str(short_dir), "trigger"]) == (
-            EXIT_FAILED,
-            "error: cannot connect to the daemon socket (PermissionError)\n",
-        )
+        for wait in ([], ["--wait"]):
+            assert run(["--state-dir", str(short_dir), "trigger", *wait]) == (
+                EXIT_FAILED,
+                "error: cannot connect to the daemon socket (PermissionError)\n",
+            )
     finally:
         listening.close()
 

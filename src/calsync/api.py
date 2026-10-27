@@ -19,6 +19,7 @@ import functools
 import json
 import logging
 import os
+import shlex
 import socket
 import sqlite3
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
@@ -54,6 +55,7 @@ MAX_HOURS = 168
 MAX_RUNS = 500
 MAX_CHANGES = 1000
 MAX_CONFIG_CHANGES = 200  # the store keeps no more
+MAX_BODY = 64 * 1024  # bytes: a request body (an operation's arguments) is never larger
 NO_STATE = "No sync has run yet."
 UNREADABLE = "The state database could not be read."
 
@@ -83,12 +85,20 @@ class _Json:
 
 
 class ApiError(Exception):
-    def __init__(self, status: int, kind: str, message: str, problems: Sequence[str] | None = None) -> None:
+    def __init__(
+        self,
+        status: int,
+        kind: str,
+        message: str,
+        problems: Sequence[str] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.kind = kind
         self.message = message
         self.problems = problems
+        self.extra = extra  # more fields of the error object (``needs_human``: the command)
 
 
 def _now() -> datetime:
@@ -101,10 +111,12 @@ def error_response(
     message: str,
     headers: Mapping[str, str] | None = None,
     problems: Sequence[str] | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> Response:
     error: dict[str, Any] = {"kind": kind, "message": message}
     if problems is not None:
         error["problems"] = list(problems)
+    error.update(extra or {})
     return JSONResponse({"error": error}, status_code=status, headers=headers)
 
 
@@ -139,9 +151,19 @@ def _instant(request: Request, name: str) -> datetime | None:
         raise ApiError(400, "bad_request", f"{name}: expected an ISO 8601 time, got {text!r}") from None
 
 
+async def _body(request: Request) -> bytes:
+    """The request body, refused (413) beyond ``MAX_BODY`` bytes without reading the rest."""
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_BODY:
+            raise ApiError(413, "too_large", f"The request body is larger than {MAX_BODY // 1024} KiB.")
+    return body
+
+
 async def _trigger_rule(request: Request) -> str | None:
     """The optional ``{"rule": "R"}`` body; no body means every rule."""
-    raw = await request.body()
+    raw = await _body(request)
     if not raw.strip():
         return None
     try:
@@ -158,7 +180,7 @@ async def _trigger_rule(request: Request) -> str | None:
 
 async def _op_body(request: Request) -> tuple[dict[str, Any], bool]:
     """The ``{"args": {...}, "dry_run": bool}`` body; no body means no arguments."""
-    raw = await request.body()
+    raw = await _body(request)
     if not raw.strip():
         return {}, False
     try:
@@ -352,12 +374,15 @@ class _Endpoints:
             raise ApiError(409, "paused", str(exc)) from None
         except ValueError:
             raise ApiError(404, "unknown_rule", f"Unknown rule {rule!r}.") from None
+        except ops.OpsUnavailable as exc:  # the scheduler has stopped: nothing would run it
+            raise ApiError(503, "unavailable", str(exc)) from None
         if not accepted:
             raise ApiError(409, "read_only", "The daemon runs with --no-sync: it runs no sync cycles.")
         return JSONResponse({"accepted": True, "rule": rule}, status_code=202)
 
     def op(self, source: ops.Source) -> "Endpoint":
-        """``POST /api/ops/{name}``: one operation, run by the daemon between its cycles."""
+        """``POST /api/ops/{name}``: one operation, run by the daemon between its cycles (except
+        ``trigger``, which only requests one and may wait for it)."""
 
         async def endpoint(request: Request) -> Response:
             name = request.path_params["name"]
@@ -368,17 +393,36 @@ class _Endpoints:
                 raise ApiError(404, "unknown_op", f"Unknown operation {name!r}.")
             if (internal := ops.internal_arg(args)) is not None:
                 raise ApiError(400, "bad_request", f"{internal}: an internal argument")
+            if source == "ui" and (human := _terminal_only(name, args)) is not None:
+                raise ApiError(403, "needs_human", human["reason"], extra={"needs_human": True, **human})
             try:
                 result = await self._daemon.run_op(name, args, dry_run, source=source)
             except ConfigConflict as exc:
                 raise ApiError(422, "config_conflict", str(exc), exc.problems) from None
             except ConfigError as exc:
                 raise ApiError(422, "config", str(exc), exc.problems) from None
+            except RulePaused as exc:
+                raise ApiError(409, "paused", str(exc), extra={"rule": exc.rule}) from None
+            except ops.DaemonStopping as exc:
+                raise ApiError(503, "unavailable", str(exc)) from None
             except ops.OpsUnavailable as exc:
                 raise ApiError(409, "read_only", str(exc)) from None
             return JSONResponse(result.to_json())
 
         return endpoint
+
+
+def _terminal_only(name: str, args: Mapping[str, Any]) -> dict[str, str] | None:
+    """What the web UI may not do, as the command a person runs instead: deleting a credential
+    (credentials are managed from the terminal). None: allowed."""
+    if name == "account.remove" and args.get("delete_credential") is True:  # a mistyped value: the op says so
+        account = args.get("name")
+        shown = account if isinstance(account, str) and account else "NAME"
+        return {
+            "command": f"calsync account remove {shlex.quote(shown)} --delete-credential",
+            "reason": "credentials are managed from the terminal",
+        }
+    return None
 
 
 def _internal(exc: Exception) -> ApiError:
@@ -447,7 +491,8 @@ def api_routes(
     """The ``/api`` routes. Their errors are ``ApiError``: install ``exception_handlers`` too.
 
     ``ops_source``: also ``POST /api/ops/{name}``, recording changes as made from there. The
-    unix-socket app passes ``"cli"``; the web UI does not have the operations yet."""
+    unix-socket app passes ``"cli"``, the web UI ``"ui"`` (behind its pairing cookie and Origin
+    check; deleting a credential is refused there with the command to run instead)."""
     endpoints = _Endpoints(config_provider, state_dir, daemon, clock)
     routes = [
         Route("/api/status", guarded(endpoints.status), methods=["GET"]),
@@ -469,7 +514,7 @@ def api_routes(
 
 async def _api_error(request: Request, exc: Exception) -> Response:
     assert isinstance(exc, ApiError)
-    return error_response(exc.status, exc.kind, exc.message, problems=exc.problems)
+    return error_response(exc.status, exc.kind, exc.message, problems=exc.problems, extra=exc.extra)
 
 
 async def _http_error(request: Request, exc: Exception) -> Response:

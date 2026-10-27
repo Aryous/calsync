@@ -68,16 +68,17 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
 | `daemon.py` | `Daemon`: jittered schedule, per-rule backoff, auth rebuilds, `request_cycle`, `--no-sync`; runs the scheduler and the API server as services that stop each other through `stop`, never by cancelling a cycle; hot reload of the config file (between cycles, under `_cycle_lock`: `Engine.replace_config`, only changed accounts rebuilt; external edits recorded as `config_change` rows), paused rules never selected, retiring rules removed once their copies are gone |
 | `api.py` | Starlette routes under `/api` (`api_routes`, `create_app`), a `StateReader` per request in a worker thread; `ContainErrors` (any escaping error → fixed 500, type-only log), `unix_socket` (stale check, 0600) and `tcp_socket`, and `serve` (uvicorn without signal handlers, no proxy headers) |
 | `web/auth.py` | the pairing key (`web.key`, 0600), the session cookie token, pair links; standard library only |
-| `web/app.py` | `create_web_app`: `/`, `/pair`, `/static`, the `/api` routes behind the cookie; Host, Origin and rate-limit checks |
+| `web/app.py` | `create_web_app`: `/`, `/pair`, `/static`, the `/api` routes behind the cookie, the operations among them (`POST /api/ops/<name>`, source `ui`, a same-origin `Origin` required; deleting a credential answers `needs_human`); Host, Origin and rate-limit checks |
 | `debug.py` | `CALSYNC_DEBUG=1`: tracebacks at DEBUG for failures otherwise logged by type only |
 | `cli.py` | commands, exit codes, output; heavy imports are lazy |
 
 ### Agent interface
 
 Agents use the CLI: `calsync status`, `upcoming`, `runs` and `changes` with
-`--json` (stable keys, built in `views.py`), and `calsync trigger` to ask the
-daemon for a cycle. The HTTP API on the daemon's socket is for the web UI; do
-not script against it. `--json` output contains event titles: keep it out of
+`--json` (stable keys, built in `views.py`), and `calsync trigger --wait` to
+sync now and wait for that cycle's result (through the daemon, or in-process
+without one). The HTTP API on the daemon's socket is for the CLI and the web UI;
+do not script against it. `--json` output contains event titles: keep it out of
 logs.
 
 ## 4. Invariants — do not break

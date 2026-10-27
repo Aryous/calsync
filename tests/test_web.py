@@ -8,6 +8,7 @@ import asyncio
 import errno
 import hashlib
 import hmac
+import json
 import logging
 import socket
 import stat
@@ -601,3 +602,114 @@ async def test_a_daemon_whose_port_is_in_use_stops_before_any_cycle(
     with pytest.raises(ListenError):
         await asyncio.wait_for(daemon.run(asyncio.Event()), 5)
     assert not (short_dir / "calsync.sock").exists()  # the unix socket was closed and removed
+
+
+# ----- operations over TCP ------------------------------------------------------------------
+
+SAME_ORIGIN = {"origin": "http://127.0.0.1:8766"}
+
+
+class OpsDaemon(FakeDaemon):
+    """Records the operations it is asked to run, and their source."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ops: list[tuple[str, dict[str, Any], bool, str]] = []
+
+    async def run_op(self, name: str, args: dict[str, Any], dry_run: bool, *, source: str) -> Any:
+        from calsync.ops import OpResult
+
+        self.ops.append((name, args, dry_run, source))
+        return OpResult(name, True, "done")
+
+
+async def test_an_op_over_tcp_runs_with_source_ui(state: Path) -> None:
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    response = await c.post("/api/ops/rule.pause", json={"args": {"name": "family"}}, headers=SAME_ORIGIN)
+    assert response.status_code == 200 and response.json()["summary"] == "done"
+    assert daemon.ops == [("rule.pause", {"name": "family"}, False, "ui")]
+
+
+async def test_an_op_over_tcp_needs_the_cookie(state: Path) -> None:
+    auth.load_or_create_key(state)
+    daemon = OpsDaemon()
+    c = client(state, daemon=daemon)
+    response = await c.post("/api/ops/rule.pause", json={"args": {"name": "family"}}, headers=SAME_ORIGIN)
+    assert response.status_code == 401 and response.json() == UNPAIRED
+    assert daemon.ops == []
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{"origin": "http://evil.example"}, {"origin": "http://127.0.0.1:9999"}, {"origin": "null"}, {}],
+)
+async def test_an_op_over_tcp_needs_this_origin(state: Path, headers: dict[str, str]) -> None:
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    response = await c.post("/api/ops/rule.pause", json={"args": {"name": "family"}}, headers=headers)
+    assert response.status_code == 403 and response.json()["error"]["kind"] == "cross_origin"
+    assert daemon.ops == []
+
+
+async def test_deleting_a_credential_over_tcp_needs_the_terminal(state: Path) -> None:
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    args = {"name": "kid-dav", "delete_credential": True}
+    response = await c.post("/api/ops/account.remove", json={"args": args}, headers=SAME_ORIGIN)
+    assert response.status_code == 403
+    assert response.json() == {
+        "error": {
+            "kind": "needs_human",
+            "message": "credentials are managed from the terminal",
+            "needs_human": True,
+            "command": "calsync account remove kid-dav --delete-credential",
+            "reason": "credentials are managed from the terminal",
+        }
+    }
+    assert daemon.ops == []
+    kept = await c.post("/api/ops/account.remove", json={"args": {"name": "kid-dav"}}, headers=SAME_ORIGIN)
+    assert kept.status_code == 200 and daemon.ops == [("account.remove", {"name": "kid-dav"}, False, "ui")]
+
+
+async def test_a_large_op_body_is_413(state: Path) -> None:
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    body = json.dumps({"args": {"name": "x" * (64 * 1024)}})
+    response = await c.post(
+        "/api/ops/rule.pause",
+        content=body,
+        headers={**SAME_ORIGIN, "content-type": "application/json"},
+    )
+    assert response.status_code == 413 and response.json()["error"]["kind"] == "too_large"
+    assert daemon.ops == []
+    small = await c.post("/api/ops/rule.pause", json={"args": {"name": "x" * 1000}}, headers=SAME_ORIGIN)
+    assert small.status_code == 200
+
+
+async def test_ops_and_trigger_over_the_daemons_tcp_listener(short_dir: Path) -> None:
+    """A real daemon: an operation over TCP is recorded with source ``ui``; ``trigger`` waits."""
+    from calsync.views import StateReader
+    from tests.test_daemon import eventually
+    from tests.test_trigger import Running
+
+    d = Running(short_dir, serve=True, listen=("127.0.0.1", 0))
+    await d.start()
+    await eventually(lambda: d.daemon.web_address is not None)
+    assert d.daemon.web_address is not None
+    port = d.daemon.web_address[1]
+    key = auth.load_or_create_key(short_dir)
+    origin = {"origin": f"http://127.0.0.1:{port}"}
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=10) as c:
+        assert (await c.get("/", params={"k": key})).status_code == 303
+        paused = await c.post("/api/ops/rule.pause", json={"args": {"name": "work"}}, headers=origin)
+        waited = await c.post(
+            "/api/ops/trigger", json={"args": {"rule": "family", "wait": True, "timeout": 5}}, headers=origin
+        )
+    assert paused.status_code == 200 and paused.json()["summary"] == 'rule "work" paused'
+    with StateReader(short_dir / "state.db") as reader:
+        assert [(c.source, c.summary) for c in reader.config_changes()] == [("ui", 'rule "work" paused')]
+    assert waited.status_code == 200, waited.text
+    data = waited.json()["data"]
+    assert data["ran"] is True and list(data["rules"]) == ["family"]
+    await d.stop()

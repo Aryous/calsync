@@ -22,6 +22,9 @@ if TYPE_CHECKING:
 # An operation over the socket waits for a running cycle to finish; a first full sync of a
 # large calendar can take minutes.
 OP_TIMEOUT = 600.0
+# ``trigger --wait``: the daemon answers by its own timeout (it never waits for its lock first);
+# the client waits this much longer, so a slow answer is the daemon's ``timeout``, not a lost one.
+TRIGGER_MARGIN = 30.0
 
 
 class DaemonLost(CalsyncError):
@@ -51,20 +54,29 @@ def root_os_error(exc: BaseException) -> OSError | None:
     return None
 
 
-def call(name: str, args: dict[str, Any], *, dry_run: bool, config_path: Path, state_dir: Path) -> "OpResult":
-    """Run ``name`` through the daemon if one serves ``state_dir``, else in this process."""
+def call(
+    name: str,
+    args: dict[str, Any],
+    *,
+    dry_run: bool,
+    config_path: Path,
+    state_dir: Path,
+    read_timeout: float | None = None,
+) -> "OpResult":
+    """Run ``name`` through the daemon if one serves ``state_dir`` (waiting at most
+    ``read_timeout`` seconds for its answer; default ``OP_TIMEOUT``), else in this process."""
     from calsync.ops import internal_arg
     from calsync.wiring import socket_path
 
     if (internal := internal_arg(args)) is not None:
         raise ConfigError([f"{internal}: an internal argument"])
     sock = socket_path(state_dir)
-    if _daemon_listens(sock):
-        return _over_socket(sock, name, args, dry_run)
+    if daemon_listens(sock):
+        return _over_socket(sock, name, args, dry_run, read_timeout)
     return run_in_process(name, args, dry_run=dry_run, config_path=config_path, state_dir=state_dir)
 
 
-def _daemon_listens(sock: Path) -> bool:
+def daemon_listens(sock: Path) -> bool:
     """Whether a daemon accepts connections on ``sock`` (the probe ``api.unix_socket`` uses).
 
     A plain socket, not httpx: httpcore's sync transport leaks its socket when a unix-socket
@@ -101,7 +113,7 @@ def daemon_status(state_dir: Path) -> dict[str, Any] | None:
 
     sock = socket_path(state_dir)
     try:
-        if not _daemon_listens(sock):
+        if not daemon_listens(sock):
             return None
     except CalsyncError:  # a socket it cannot reach: no block, the status shows anyway
         return None
@@ -138,14 +150,16 @@ def run_in_process(
         return run_op(ctx, name, args, dry_run)
 
 
-def _over_socket(sock: Path, name: str, args: dict[str, Any], dry_run: bool) -> "OpResult":
+def _over_socket(
+    sock: Path, name: str, args: dict[str, Any], dry_run: bool, read_timeout: float | None = None
+) -> "OpResult":
     """The daemon's answer. A transport failure after the probe (the daemon stopped, hung up or
     did not answer in time) is ``DaemonLost``: the operation may or may not have run, so it is
     neither retried nor run here."""
     import httpx
 
     transport = httpx.HTTPTransport(uds=str(sock))
-    timeout = httpx.Timeout(10.0, read=OP_TIMEOUT)
+    timeout = httpx.Timeout(10.0, read=OP_TIMEOUT if read_timeout is None else read_timeout)
     try:
         with httpx.Client(transport=transport, base_url="http://calsync", timeout=timeout) as client:
             response = client.post(f"/api/ops/{name}", json={"args": args, "dry_run": dry_run})
@@ -156,7 +170,8 @@ def _over_socket(sock: Path, name: str, args: dict[str, Any], dry_run: bool) -> 
 
 def _result(name: str, response: "httpx.Response") -> "OpResult":
     from calsync.configfile import ConfigConflict
-    from calsync.ops import OpResult, OpsUnavailable
+    from calsync.errors import RulePaused
+    from calsync.ops import DaemonStopping, OpResult, OpsUnavailable
 
     try:
         body: Any = response.json()
@@ -174,8 +189,12 @@ def _result(name: str, response: "httpx.Response") -> "OpResult":
         raise ConfigError(
             [str(p) for p in problems] if isinstance(problems, list) and problems else [message]
         )
+    if response.status_code == 409 and error.get("kind") == "paused" and isinstance(error.get("rule"), str):
+        raise RulePaused(error["rule"])
     if response.status_code == 409:
         raise OpsUnavailable(message)
+    if response.status_code == 503 and error.get("kind") == "unavailable":
+        raise DaemonStopping()
     if response.status_code == 404:
         raise ConfigError([f'unknown operation "{name}"'])
     if response.status_code == 400:

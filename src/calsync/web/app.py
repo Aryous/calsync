@@ -3,11 +3,13 @@ on every request against DNS rebinding and cross-site requests.
 
 - ``GET /``: ``?k=<key>`` pairs this browser (cookie, then 303 to ``/``); otherwise the app
   when paired, else the pair page. ``POST /pair`` (form field ``key``) pairs too.
-- ``/api/*`` needs the cookie (401 ``unpaired`` without it). ``/static/*`` is public, except
+- ``/api/*`` needs the cookie (401 ``unpaired`` without it), the operations
+  (``POST /api/ops/<name>``, recorded with source ``ui``) included. ``/static/*`` is public, except
   the pages (``*.html``), which only ``/`` serves, with a CSP and ``X-Frame-Options: DENY``.
 - The ``Host`` header must name this machine: ``localhost``, a loopback address, the listen
   host, an ``allowed_hosts`` entry, or (when listening on every address) any IP literal.
-- A request other than GET or HEAD that carries ``Origin`` must come from this same origin.
+- A request other than GET or HEAD that carries ``Origin`` must come from this same origin; an
+  operation (``POST /api/ops/<name>``) must carry it.
 - 10 wrong keys within 10 minutes from one client address: every further wrong key from it
   is 429 until the oldest of them is 10 minutes old. The right key always pairs.
 
@@ -49,6 +51,7 @@ MAX_FAILURES = 10
 FAILURE_WINDOW = timedelta(minutes=10)
 MAX_CLIENTS = 1024  # addresses whose failures are kept
 MAX_FORM = 4096  # bytes: the pair form holds one key
+OPS_PREFIX = "/api/ops/"
 LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
 NO_CACHE = {"Cache-Control": "no-cache"}
 # Every HTML page: no framing (clickjacking), and nothing but this origin's own files.
@@ -163,6 +166,15 @@ class _Guard:
             and not _same_origin(headers["origin"], host)
         ):
             response = api.error_response(403, "cross_origin", "Cross-origin requests are refused.")
+        elif (
+            scope["method"] not in {"GET", "HEAD"}
+            and scope["path"].startswith(OPS_PREFIX)
+            and "origin" not in headers
+        ):
+            # An operation changes the config: only this origin's own page may post one.
+            response = api.error_response(
+                403, "cross_origin", "An operation needs this page's Origin header."
+            )
         if response is None and (scope["path"] == "/api" or scope["path"].startswith("/api/")):
             cookie = cookie_parser(headers.get("cookie", "")).get(COOKIE)
             if not self._keys.valid_cookie(cookie):
@@ -288,7 +300,9 @@ def create_web_app(
     routes = [
         Route("/", api.guarded(pages.home), methods=["GET"]),
         Route("/pair", api.guarded(pages.pair), methods=["POST"]),
-        *api.api_routes(config_provider=config_provider, state_dir=state_dir, daemon=daemon, clock=clock),
+        *api.api_routes(
+            config_provider=config_provider, state_dir=state_dir, daemon=daemon, clock=clock, ops_source="ui"
+        ),
         Mount("/static", app=_Static(directory=STATIC_DIR), name="static"),
     ]
     guard = Middleware(_Guard, keys=keys, config_provider=config_provider, listen_host=listen_host)

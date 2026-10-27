@@ -576,7 +576,7 @@ async def test_status_shows_the_daemon_block_when_a_daemon_serves(files: Files) 
 def test_daemon_status_of_a_wedged_daemon_is_none(files: Files, monkeypatch: pytest.MonkeyPatch) -> None:
     import httpx
 
-    monkeypatch.setattr(opsclient, "_daemon_listens", lambda sock: True)
+    monkeypatch.setattr(opsclient, "daemon_listens", lambda sock: True)
 
     def hung(*args: Any, **kwargs: Any) -> Any:
         raise httpx.ReadTimeout("the daemon did not answer")

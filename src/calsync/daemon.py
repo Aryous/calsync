@@ -6,7 +6,10 @@ cycle), and runs a cycle at start, then after every wait of ``interval × (1 ± 
 
 - ``request_cycle()`` cuts the wait short. Requests made during a cycle collapse into one
   follow-up cycle; a request names one rule or means every rule. A cycle for named rules keeps
-  the timer's deadline; a timed cycle or one for every rule restarts it.
+  the timer's deadline; a timed cycle or one for every rule restarts it. With ``wait`` it also
+  returns a future of the first cycle that starts after the request and runs the rule (every
+  unpaused rule, for a request of every rule): a request made during a cycle is answered by the
+  follow-up. Once the scheduler has stopped, a request is refused (``DaemonStopping``).
 - A rule that keeps failing is skipped for ``BACKOFF`` minutes after its latest failure (by
   the number of failures in a row; a blocked result neither adds to nor resets the count). A
   requested rule runs regardless; a skipped rule records no run.
@@ -36,8 +39,10 @@ Approving blocked deletes (``ops`` ``approve``): the approval (rule -> fingerpri
 set) is kept in memory for the rule's next cycle, which is requested at once and consumes it
 whatever its outcome; the engine lets through only a set with that fingerprint. An operation
 that waits for that cycle (``wait``) waits after the lock is released, so the cycle can run.
-Waiters are answered by the cycle that includes their rule (``_record``), also when it fails,
-and refused when the rule is removed or paused first, or when the daemon stops.
+Waiters (``approve`` and ``trigger`` with ``wait``) are answered by the first cycle that starts
+after they were registered and includes their rule (``_record``; None when that cycle failed),
+and refused when the rule is removed or paused first, or when the daemon stops. ``trigger``
+never takes ``_cycle_lock``: it only requests and waits.
 
 Paused rules never run (``request_cycle`` refuses them with ``RulePaused``). A retiring rule
 (``retire = true``) deletes its copies (the delete guard applies) and never creates its target
@@ -72,7 +77,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Itera
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol, overload
 
 from calsync import api, debug, ops, wiring
 from calsync.config import Config
@@ -210,8 +215,12 @@ class Daemon:
         # the operations waiting for the next cycle of some rules (None: of any rule).
         self._approvals: dict[str, str] = {}
         self._scheduling = False  # the scheduler runs: something will run the cycles requested
+        self._scheduled = False  # the scheduler has ended: nothing will run a cycle any more
         self._calendars_due: datetime | None = None  # next calendar-list refresh; None: now (at start)
-        self._waiters: list[tuple[set[str] | None, asyncio.Future[CycleResult | None]]] = []
+        # Cycles started so far (a cycle's number is taken under ``_cycle_lock`` as it starts); a
+        # waiter is answered only by a cycle numbered above the count when it was registered.
+        self._started_cycles = 0
+        self._waiters: list[_Waiter] = []
 
     # ----- interface ----------------------------------------------------------
     async def run(self, stop: asyncio.Event) -> None:
@@ -271,25 +280,44 @@ class Daemon:
         log.info("web UI on http://%s:%d/ (pair a browser: calsync web pair)", shown, port)  # no key
         await api.serve(app, sock, stop)
 
-    def request_cycle(self, rule: str | None = None) -> bool:
+    @overload
+    def request_cycle(self, rule: str | None = None, *, wait: Literal[False] = False) -> bool: ...
+
+    @overload
+    def request_cycle(
+        self, rule: str | None = None, *, wait: Literal[True]
+    ) -> "asyncio.Future[CycleResult | None]": ...
+
+    def request_cycle(
+        self, rule: str | None = None, *, wait: bool = False
+    ) -> "bool | asyncio.Future[CycleResult | None]":
         """Run a cycle now (after the current one, if one is running): ``rule`` only, or every
         rule. The backoff does not apply to a requested rule.
 
         True if accepted; False without sync (nothing runs cycles); ``ValueError`` for a rule
-        that is not configured, ``RulePaused`` (a ``ValueError``) for a paused one. Every rule
-        means every rule that is not paused."""
+        that is not configured, ``RulePaused`` (a ``ValueError``) for a paused one; once the
+        scheduler has stopped, ``DaemonStopping``. Every rule means every rule that is not paused.
+
+        With ``wait``: a future of the first cycle that starts after this request and runs
+        ``rule`` (every unpaused rule, for None), resolved with its result (None: that cycle
+        failed); ``OpsUnavailable`` without sync. Cancelling the future only stops the waiting."""
         if rule is not None and rule not in self._rules:
             raise ValueError(f"unknown rule {rule!r}")
         if rule is not None and rule in self._paused():
             raise RulePaused(rule)
         if not self._sync:
+            if wait:
+                raise ops.OpsUnavailable("The daemon runs with --no-sync: it runs no sync cycles.")
             return False
+        if self._scheduled:
+            raise ops.DaemonStopping()
+        future = self._wait_for_cycle(None if rule is None else {rule}) if wait else None
         if rule is None:
             self._pending_all = True
         else:
             self._pending.add(rule)
         self._wake.set()
-        return True
+        return future if future is not None else True
 
     async def run_op(
         self, name: str, args: dict[str, Any], dry_run: bool, *, source: ops.Source
@@ -303,9 +331,13 @@ class Daemon:
             raise ops.OpsUnavailable("The daemon runs with --no-sync: it changes no configuration.")
         if self._config_path is None:
             raise ops.OpsUnavailable("The daemon was started without a config file path.")
+        if name in ops.UNLOCKED_OPS:  # only asks for a cycle: never waits for one to finish first
+            ctx = self._context(source)
+            result = await ops.run_op_async(ctx, name, args, dry_run)
+            return await ctx.followup() if ctx.followup is not None else result
         async with self._cycle_lock:
             if self._store is None:  # stopped while waiting
-                raise ops.OpsUnavailable("The daemon is stopping.")
+                raise ops.DaemonStopping()
             # An edit made by hand just before is applied and recorded first, as its own change
             # (the operation would otherwise fold it into its own row).
             await self._check_config()
@@ -387,7 +419,7 @@ class Daemon:
         for a rule that is unknown or paused, ``OpsUnavailable`` once the scheduler has stopped
         (no cycle would consume it); nothing is stored then."""
         if not self._scheduling:
-            raise ops.OpsUnavailable("The daemon is stopping.")
+            raise ops.DaemonStopping()
         self.request_cycle(rule)
         self._approvals[rule] = fingerprint
         self._on_approved(rule, count, origin)
@@ -398,34 +430,39 @@ class Daemon:
         log.info("rule %s: %d deletes approved (%s)", rule, count, origin)
 
     def _wait_for_cycle(self, rules: set[str] | None) -> "asyncio.Future[CycleResult | None]":
-        """A future of the next cycle that runs any of ``rules`` (None: any cycle): its result,
-        or None if that cycle failed."""
+        """A future of the first cycle that starts from now on and runs any of ``rules`` (None:
+        every rule not paused then): its result, or None if that cycle failed."""
         future: asyncio.Future[CycleResult | None] = asyncio.get_running_loop().create_future()
-        self._waiters.append((rules, future))
+        self._waiters = [w for w in self._waiters if not w.future.done()]  # given up meanwhile
+        self._waiters.append(_Waiter(rules, self._started_cycles, future))
         return future
 
-    def _resolve_waiters(self, ran: Iterable[str], result: CycleResult | None) -> None:
+    def _resolve_waiters(self, cycle: int, ran: Iterable[str], result: CycleResult | None) -> None:
+        """Answer the waiters that cycle number ``cycle`` (which ran ``ran``) satisfies."""
         ran = set(ran)
-        keep: list[tuple[set[str] | None, asyncio.Future[CycleResult | None]]] = []
-        for rules, future in self._waiters:
-            if rules is None or rules & ran:
-                if not future.done():
-                    future.set_result(result)
+        unpaused = set(self._rules) - self._paused()
+        keep: list[_Waiter] = []
+        for waiter in self._waiters:
+            if waiter.future.done():  # given up (a timeout, a client gone): forgotten
+                continue
+            wanted = unpaused if waiter.rules is None else waiter.rules
+            if waiter.after < cycle and (ran >= wanted if waiter.rules is None else bool(wanted & ran)):
+                waiter.future.set_result(result)
             else:
-                keep.append((rules, future))
+                keep.append(waiter)
         self._waiters = keep
 
     def _abandon(self, rules: set[str], error: Exception) -> None:
         """Drop the approvals of ``rules`` and refuse the waiters that wait only for them."""
         for name in rules:
             self._approvals.pop(name, None)
-        keep: list[tuple[set[str] | None, asyncio.Future[CycleResult | None]]] = []
-        for waiting, future in self._waiters:
-            if waiting is not None and waiting <= rules:
-                if not future.done():
-                    future.set_exception(error)
+        keep: list[_Waiter] = []
+        for waiter in self._waiters:
+            if waiter.rules is not None and waiter.rules <= rules:
+                if not waiter.future.done():
+                    waiter.future.set_exception(error)
             else:
-                keep.append((waiting, future))
+                keep.append(waiter)
         self._waiters = keep
 
     def _config_written(self, snapshot: Snapshot) -> None:
@@ -567,11 +604,12 @@ class Daemon:
             await self._schedule(stop)
         finally:  # nothing runs cycles any more: nobody waits for one
             self._scheduling = False
+            self._scheduled = True
             self._approvals.clear()
             waiters, self._waiters = self._waiters, []
-            for _, future in waiters:
-                if not future.done():
-                    future.set_exception(ops.OpsUnavailable("The daemon stopped before the cycle ran."))
+            for waiter in waiters:
+                if not waiter.future.done():
+                    waiter.future.set_exception(ops.DaemonStopping())
 
     async def _schedule(self, stop: asyncio.Event) -> None:
         due = True  # the first cycle starts at once
@@ -779,6 +817,13 @@ class Daemon:
         for name in sorted(gone | held):
             why = "removed" if name in gone else "paused"
             self._abandon({name}, ConfigError([f'rule "{name}" was {why} before its approved deletes ran']))
+        # The other waiters of a rule removed or paused meanwhile (``trigger``): no cycle runs it.
+        waited = {n for w in self._waiters if w.rules is not None for n in w.rules}
+        paused = {r.name for r in config.rules if r.paused}
+        for name in sorted(waited - names):
+            self._abandon({name}, ConfigError([f'rule "{name}" was removed before its cycle ran']))
+        for name in sorted(waited & paused):
+            self._abandon({name}, RulePaused(name))
         for name in [n for n in self._failures if n not in names]:
             del self._failures[name]
         # The listener is bound at start; the address is config, not a URL of anyone's data.
@@ -820,13 +865,14 @@ class Daemon:
     # ----- one cycle ----------------------------------------------------------
     async def _cycle(self, rules: list[str]) -> None:
         async with self._cycle_lock:
+            self._started_cycles += 1  # a waiter registered from now on waits for the next one
             self._cycle_started_at = self._clock()
             try:
-                await self._locked_cycle(rules)
+                await self._locked_cycle(self._started_cycles, rules)
             finally:
                 self._cycle_started_at = None
 
-    async def _locked_cycle(self, rules: list[str]) -> None:
+    async def _locked_cycle(self, cycle: int, rules: list[str]) -> None:
         assert self._engine is not None and self._store is not None
         # This cycle consumes the approvals of its rules, whatever its outcome.
         approvals = {r: self._approvals.pop(r) for r in rules if r in self._approvals}
@@ -852,9 +898,9 @@ class Daemon:
             # adds the traceback, at DEBUG.
             log.error("sync cycle failed (%s)", type(exc).__name__)
             debug.details(log, "sync cycle failed", exc)
-            self._resolve_waiters(rules, None)
+            self._resolve_waiters(cycle, rules, None)
             return
-        self._record(result)
+        self._record(cycle, result)
         await self._remove_retired(result)
 
     async def _remove_retired(self, result: CycleResult) -> None:
@@ -876,7 +922,7 @@ class Daemon:
             finally:
                 await self._apply_written()
 
-    def _record(self, result: CycleResult) -> None:
+    def _record(self, cycle: int, result: CycleResult) -> None:
         now = self._clock()
         self._cycles += 1
         self._last_cycle_at = now
@@ -892,7 +938,17 @@ class Daemon:
             parts.append(counts_line(name, r) + (f" error_kind={r.error_kind}" if r.error_kind else ""))
         parts.append(f"requests={result.requests}")
         log.info("%s", "; ".join(parts))
-        self._resolve_waiters(result.rules, result)
+        self._resolve_waiters(cycle, result.rules, result)
+
+
+@dataclass(frozen=True, slots=True)
+class _Waiter:
+    """An operation waiting for a cycle: of any of ``rules`` (None: of every unpaused rule),
+    started after cycle number ``after``."""
+
+    rules: set[str] | None
+    after: int
+    future: "asyncio.Future[CycleResult | None]"
 
 
 _UNCHECKABLE = (-1, -1)

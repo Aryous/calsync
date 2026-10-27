@@ -23,13 +23,13 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mappi
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol, overload
 
 import tomlkit
 
 from calsync import configfile, credentials, debug
 from calsync.config import Config, CredentialRef
-from calsync.errors import AuthError, CalsyncError, ConfigError, plain_error
+from calsync.errors import AuthError, CalsyncError, ConfigError, RulePaused, plain_error
 from calsync.store import CONFIG_CHANGE_RETENTION, AccountCalendar, Store
 
 if TYPE_CHECKING:
@@ -66,9 +66,33 @@ class DaemonHooks(Protocol):
         daemon's own where it has them, the others built for the operation and closed after."""
         ...
 
+    @overload
+    def request_cycle(self, rule: str | None = None, *, wait: Literal[False] = False) -> bool: ...
+
+    @overload
+    def request_cycle(
+        self, rule: str | None = None, *, wait: Literal[True]
+    ) -> "asyncio.Future[CycleResult | None]": ...
+
+    def request_cycle(
+        self, rule: str | None = None, *, wait: bool = False
+    ) -> "bool | asyncio.Future[CycleResult | None]":
+        """Request a cycle for ``rule`` (None: every rule); with ``wait``, a future of the first
+        cycle that starts after the request and runs it (None: that cycle failed). ``ValueError``
+        for an unknown rule, ``RulePaused`` for a paused one, ``DaemonStopping`` once the
+        scheduler has stopped."""
+        ...
+
 
 class OpsUnavailable(CalsyncError):
     """This daemon runs no operations (``--no-sync``: no lock, no store)."""
+
+
+class DaemonStopping(OpsUnavailable):
+    """The daemon's scheduler has stopped: no cycle will run (the API answers 503)."""
+
+    def __init__(self) -> None:
+        super().__init__("The daemon is stopping.")
 
 
 @dataclass
@@ -665,7 +689,7 @@ def _approve(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
             data=data,
         )
     log.info("rule %s: %d deletes approved (%s)", name, blocked.count, ctx.source)
-    result, removed = asyncio.run(_cycle_here(ctx, config, name, fingerprint))
+    result, removed = asyncio.run(_cycle_here(ctx, config, [name], {name: fingerprint}))
     outcome = _outcome(op, name, fingerprint, blocked.count, result)
     if removed:
         return dataclasses.replace(outcome, summary=outcome.summary + "; " + "; ".join(removed))
@@ -749,14 +773,15 @@ def _outcome(op: str, rule: str, fingerprint: str, count: int, cycle: "CycleResu
 
 
 async def _cycle_here(
-    ctx: OpContext, config: Config, rule: str, fingerprint: str
+    ctx: OpContext, config: Config, rules: list[str], approvals: Mapping[str, str] | None = None
 ) -> tuple["CycleResult", list[str]]:
-    """One cycle for ``rule`` in this process (the caller holds the run lock), with the
-    approval; then, as ``calsync run`` does, the removal of a rule that retired."""
+    """One cycle for ``rules`` (paused ones are skipped) in this process (the caller holds the
+    run lock), with ``approvals``; then, as ``calsync run`` does, the removal of the rules
+    that retired."""
     from calsync import wiring
     from calsync.cycle import remove_retired, retired, run_cycle
 
-    adapters = await wiring.build_adapters(config, wiring.accounts_in_use(config, [rule]))
+    adapters = await wiring.build_adapters(config, wiring.accounts_in_use(config, rules))
     try:
         engine = wiring.build_engine(config, adapters, ctx.store, clock=ctx.clock)
         result = await run_cycle(
@@ -764,10 +789,10 @@ async def _cycle_here(
             ctx.store,
             config,
             adapters,
-            [rule],
+            rules,
             dry_run=False,
             allow_deletes=False,
-            approvals={rule: fingerprint},
+            approvals=approvals,
         )
     finally:
         await adapters.aclose()
@@ -776,6 +801,121 @@ async def _cycle_here(
         done.summary for n in retired(config, result, ctx.store) if (done := remove_retired(removal, n))
     ]
     return result, removed
+
+
+# ----- a cycle now ---------------------------------------------------------------------------
+
+TRIGGER_TIMEOUT = 120.0  # seconds ``trigger`` waits by default
+TRIGGER_TIMEOUT_MAX = 600.0
+RESULT_KEYS = ("status", "created", "updated", "deleted", "failed", "error_kind")
+
+
+def _timeout(op: str, raw: Any) -> float:
+    if raw is None:
+        return TRIGGER_TIMEOUT
+    if isinstance(raw, str):
+        try:
+            raw = float(raw)
+        except ValueError:
+            raise _bad(op, "timeout", "a number of seconds", raw) from None
+    if isinstance(raw, bool) or not isinstance(raw, int | float) or not 0 < raw <= TRIGGER_TIMEOUT_MAX:
+        raise ConfigError(
+            [f'{op}: "timeout" must be a number of seconds above 0 and at most {TRIGGER_TIMEOUT_MAX:g}']
+        )
+    return float(raw)
+
+
+def _ran(cycle: "CycleResult") -> dict[str, Any]:
+    """A finished cycle as ``trigger`` reports it: each rule it ran, and its request count."""
+    rules = {name: {key: getattr(r, key) for key in RESULT_KEYS} for name, r in cycle.rules.items()}
+    return {"ran": True, "rules": rules, "requests": cycle.requests}
+
+
+def _ran_summary(cycle: "CycleResult", lead: str = "the cycle ran") -> str:
+    """``the cycle ran: family ok, work failed (auth)`` (rule names and statuses only)."""
+    if not cycle.rules:
+        return f"{lead} no rule"
+    parts = [
+        f"{name} {r.status}" + (f" ({r.error_kind})" if r.error_kind and r.status != "ok" else "")
+        for name, r in cycle.rules.items()
+    ]
+    return f"{lead}: " + ", ".join(parts)
+
+
+def _wrote(cycle: "CycleResult") -> bool:
+    return any(r.created or r.updated or r.deleted for r in cycle.rules.values())
+
+
+async def _trigger(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
+    """A sync cycle now: ``rule`` (None: every rule that is not paused).
+
+    Through the daemon, the cycle is requested (never under the daemon's lock); with ``wait``
+    the answer waits, at most ``timeout`` seconds (default 120, at most 600), for the first
+    cycle that starts after the request and runs the rule(s): ``data`` is ``{"ran": true,
+    "rules": {name: {status, created, updated, deleted, failed, error_kind}}, "requests": N}``
+    (the rules that cycle ran), or ``{"ran": false, "reason": "timeout" | "cycle_failed"}``.
+    Without ``wait`` it is ``{"accepted": true, "rule": ...}``. In-process (no daemon) the cycle
+    runs here, holding the run lock, whatever ``wait`` says (``timeout`` does not cut a cycle
+    short); a retiring rule that finished is removed as ``calsync run`` does. ``RulePaused``
+    for a paused rule, ``ConfigError`` for an unknown one or bad arguments."""
+    from calsync.config import load_config
+
+    op = "trigger"
+    a = _Args(op, args, {"rule", "wait", "timeout"})
+    name = a.opt_text("rule")
+    wait = a.flag("wait")
+    timeout = _timeout(op, args.get("timeout"))
+    config = ctx.daemon.config if ctx.daemon is not None else load_config(ctx.config_path)
+    by_name = {r.name: r for r in config.rules}
+    if name is not None and name not in by_name:
+        raise ConfigError([f'unknown rule "{name}"'])
+    if name is not None and by_name[name].paused:
+        raise RulePaused(name)
+    rules = [name] if name is not None else [r.name for r in config.rules if not r.paused]
+    if not rules:
+        return OpResult(
+            op, False, "every rule is paused: nothing to run", data={"ran": False, "reason": "paused"}
+        )
+    if dry_run:
+        return OpResult(op, False, f"{DRY_RUN}a cycle would run", data={"would_change": True})
+    if ctx.daemon is None:
+        result, removed = await _cycle_here(ctx, config, rules)
+        summary = _ran_summary(result, "no daemon runs, so the cycle ran here")
+        return OpResult(op, _wrote(result), "; ".join([summary, *removed]), data=_ran(result))
+    try:
+        if not wait:
+            if not ctx.daemon.request_cycle(name):
+                raise OpsUnavailable("The daemon runs with --no-sync: it runs no sync cycles.")
+            return OpResult(op, False, "cycle requested", data={"accepted": True, "rule": name})
+        waiter = ctx.daemon.request_cycle(name, wait=True)
+    except RulePaused:
+        raise
+    except ValueError as exc:  # unknown since: the daemon's own check
+        raise ConfigError([str(exc)]) from None
+
+    async def finish() -> OpResult:
+        try:
+            # ``asyncio.wait`` leaves the future alone on a timeout; cancelling it below only
+            # stops this waiting (a cycle in progress is never touched).
+            await asyncio.wait({waiter}, timeout=timeout)
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+        if waiter.cancelled():
+            return OpResult(
+                op,
+                False,
+                f"no cycle finished within {timeout:g} s; the requested cycle still runs",
+                data={"ran": False, "reason": "timeout"},
+            )
+        cycle = waiter.result()  # a refusal (paused, removed, stopping) is raised here
+        if cycle is None:
+            summary = "the sync cycle failed; see the daemon log"
+            return OpResult(op, False, summary, data={"ran": False, "reason": "cycle_failed"})
+        return OpResult(op, _wrote(cycle), _ran_summary(cycle), data=_ran(cycle))
+
+    ctx.followup = finish
+    return OpResult(op, False, "cycle requested", data={"accepted": True, "rule": name})
 
 
 # ----- the calendar cache -----------------------------------------------------------------
@@ -1090,7 +1230,10 @@ AsyncOp = Callable[[OpContext, dict[str, Any], bool], Coroutine[Any, Any, OpResu
 ASYNC_OPS: dict[str, AsyncOp] = {
     "calendars.refresh": _calendars_refresh,
     "rule.preview": _rule_preview,
+    "trigger": _trigger,
 }
+# Operations the daemon runs without its lock: they only ask it for a cycle (and may wait for it).
+UNLOCKED_OPS = frozenset({"trigger"})
 
 
 def _own_loop(op: AsyncOp) -> Callable[[OpContext, dict[str, Any], bool], OpResult]:

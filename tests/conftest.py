@@ -25,6 +25,17 @@ def _no_calsync_debug(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: igno
     monkeypatch.delenv("CALSYNC_DEBUG", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _no_real_config(  # pyright: ignore[reportUnusedFunction]
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """A command a test runs without ``--config`` / ``--state-dir`` never reaches the
+    developer's own ``~/.config/calsync`` or state (``trigger`` without a daemon runs a cycle)."""
+    home = tmp_path_factory.mktemp("no-home")
+    monkeypatch.setenv("CALSYNC_CONFIG", str(home / "config.toml"))
+    monkeypatch.setenv("CALSYNC_STATE_DIR", str(home / "state"))
+
+
 @pytest.fixture
 def local_zone() -> Iterator[Callable[[str], None]]:
     """``local_zone("Asia/Shanghai")`` makes that the process's local zone (``TZ`` plus
