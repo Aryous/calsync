@@ -1079,6 +1079,32 @@ def test_daemon_web_listener_choice(
     assert code == EXIT_OK and _RecordingDaemon.listens == [listen]
 
 
+class _FailingDaemon(_RecordingDaemon):
+    async def run(self, stop: Any) -> None:
+        raise RuntimeError("the API server stopped at https://example.com/x")
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_daemon_service_failure_is_a_type_only_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, debug: bool
+) -> None:
+    from calsync import cli
+    from calsync import daemon as daemon_module
+
+    monkeypatch.setattr(daemon_module, "Daemon", _FailingDaemon)
+    monkeypatch.setattr(cli, "_configure_daemon_logging", lambda: None)  # leave global logging alone
+    monkeypatch.setattr(_RecordingDaemon, "listens", [])
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    argv = ["--config", str(cfg), "--state-dir", str(tmp_path / "s"), "daemon", "--no-sync"]
+    if debug:
+        monkeypatch.setenv("CALSYNC_DEBUG", "1")
+        with pytest.raises(RuntimeError, match="the API server stopped"):  # the traceback, on request
+            run(argv)
+    else:
+        assert run(argv) == (EXIT_FAILED, "error: RuntimeError\n")
+
+
 def test_daemon_no_web_and_listen_exclude_each_other(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
     cfg.write_text(VIEWS_CONFIG)

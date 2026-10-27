@@ -31,7 +31,7 @@ from starlette.requests import Request, cookie_parser
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from calsync import api
 from calsync.config import Config
@@ -173,6 +173,27 @@ class _Guard:
         await self._app(scope, receive, send)
 
 
+class _NoSniff:
+    """``X-Content-Type-Options: nosniff`` on every response (the JSON API, the pages, static
+    files and the checks' own errors): a browser never guesses another type than the one sent."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        async def sending(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = [*message.get("headers", []), (b"x-content-type-options", b"nosniff")]
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self._app(scope, receive, sending)
+
+
 class _Static(StaticFiles):
     """Static files, revalidated on every use (``no-cache``): an upgrade never mixes versions.
     The pages (``*.html``) are not among them: they are served by ``/``, which decides between
@@ -271,5 +292,6 @@ def create_web_app(
         Mount("/static", app=_Static(directory=STATIC_DIR), name="static"),
     ]
     guard = Middleware(_Guard, keys=keys, config_provider=config_provider, listen_host=listen_host)
-    middleware = [Middleware(api.ContainErrors), guard]  # errors in the checks are contained too
+    # Outermost first: nosniff on everything, then errors in the checks are contained too.
+    middleware = [Middleware(_NoSniff), Middleware(api.ContainErrors), guard]
     return Starlette(routes=routes, middleware=middleware, exception_handlers=api.exception_handlers)

@@ -376,6 +376,37 @@ async def test_html_responses_refuse_frames_and_set_a_csp(state: Path) -> None:
         assert not any("unsafe" in d for d in csp)
 
 
+async def test_every_response_says_nosniff(state: Path) -> None:
+    c = await paired(state)
+    responses = [
+        await c.get("/api/status"),
+        await c.post("/api/trigger"),  # no daemon: an error, still JSON
+        await c.get("/api/nope"),
+        await c.get("/"),
+        await c.get("/static/app.js"),
+        await c.get("/api/status", headers={"host": "evil.example.com"}),  # refused by the checks
+        await client(state).get("/api/status"),  # unpaired
+    ]
+    assert [r.status_code for r in responses][-2:] == [400, 401]
+    for response in responses:
+        assert response.headers["x-content-type-options"] == "nosniff", response.url
+
+
+async def test_the_api_socket_is_created_private(short_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bind itself makes the socket 0600 (no window before the chmod), and the umask is restored."""
+    import os
+
+    path = short_dir / "t.sock"
+    old = os.umask(0o022)
+    try:
+        monkeypatch.setattr(os, "chmod", lambda *_, **__: None)  # leaves only the mode bind gave it
+        with api.unix_socket(path):
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert os.umask(0o022) == 0o022
+    finally:
+        os.umask(old)
+
+
 # ----- Host and Origin ------------------------------------------------------------------
 
 

@@ -349,11 +349,14 @@ def unix_socket(path: Path) -> Iterator[socket.socket]:
         finally:
             probe.close()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    old_umask = os.umask(0o177)  # created 0600: never reachable by others, not even briefly
     try:
         sock.bind(str(path))
     except BaseException:
         sock.close()
         raise
+    finally:
+        os.umask(old_umask)
     inode = os.stat(path).st_ino
     try:
         os.chmod(path, 0o600)

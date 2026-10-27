@@ -662,9 +662,16 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
 
         import httpx
 
-        if not isinstance(exc, httpx.HTTPError | sqlite3.Error | OSError):
-            raise
-        out.write(_describe(exc, args))
-        return exit_code_for(exc)
+        if isinstance(exc, httpx.HTTPError | sqlite3.Error | OSError):
+            out.write(_describe(exc, args))
+            return exit_code_for(exc)
+        from calsync import debug
+
+        if args.command != "daemon" or debug.enabled():
+            raise  # a bug: the traceback helps, except in the daemon's log
+        # The daemon's output is its log (under launchd, a file): the type only, as for its other
+        # failures, since the text can carry a URL. CALSYNC_DEBUG=1 lets the traceback through.
+        out.write(f"error: {type(exc).__name__}\n")
+        return EXIT_FAILED
     _parser().print_help(out)
     return EXIT_CONFIG
