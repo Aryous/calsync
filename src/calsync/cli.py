@@ -171,6 +171,31 @@ def _parser() -> argparse.ArgumentParser:
         command = web_sub.add_parser(name, help=text)
         command.add_argument("--listen", type=_listen, help="the daemon's HOST:PORT (default: [web] listen)")
 
+    service = sub.add_parser("service", help="run the daemon at login as a launchd agent (macOS)")
+    service_sub = service.add_subparsers(dest="service_command", required=True)
+    install = service_sub.add_parser(
+        "install",
+        help="write ~/Library/LaunchAgents/dev.calsync.daemon.plist and load it",
+        description="Install `calsync daemon` as the launchd agent dev.calsync.daemon. Global "
+        "--config and --state-dir, if given, go into the agent; $CALSYNC_CONFIG and "
+        "$CALSYNC_STATE_DIR do not (launchd does not see your shell's environment).",
+    )
+    install.add_argument(
+        "--listen",
+        type=_listen_text,
+        metavar="HOST:PORT",
+        help="the daemon's --listen (default: [web] listen)",
+    )
+    install.add_argument(
+        "--force", action="store_true", help="replace a different plist; install despite another calsync job"
+    )
+    uninstall = service_sub.add_parser("uninstall", help="unload the agent and remove its plist (logs stay)")
+    for command in (install, uninstall):
+        command.add_argument("--dry-run", action="store_true", help="show the plist and commands; do nothing")
+        command.add_argument("--json", action="store_true", help="print JSON")
+    service_status = service_sub.add_parser("status", help="whether the agent is installed and running")
+    service_status.add_argument("--json", action="store_true", help="print JSON")
+
     trigger = sub.add_parser(
         "trigger", help="sync now: ask the running daemon for a cycle, or run one here without a daemon"
     )
@@ -241,6 +266,12 @@ def _listen(text: str) -> tuple[str, int]:
         return parse_listen(text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _listen_text(text: str) -> str:
+    """A valid ``HOST:PORT``, kept as written (it goes into the launchd agent)."""
+    _listen(text)
+    return text
 
 
 def _positive_int(text: str) -> int:
@@ -1107,6 +1138,40 @@ def cmd_web(args: argparse.Namespace, out: TextIO) -> int:
     return EXIT_OK
 
 
+def cmd_service(args: argparse.Namespace, out: TextIO) -> int:
+    """`calsync service install|uninstall|status`: the launchd agent for `calsync daemon`."""
+    import os
+
+    from calsync import service
+
+    paths = service.Paths.default()
+    launchctl = service.system_launchctl()
+    uid = os.getuid()
+    if args.service_command == "install":
+        outcome = service.install(
+            launchctl,
+            paths,
+            uid,
+            executable=service.find_executable(),
+            # launchd starts the daemon in /: relative paths and ~ would not survive.
+            config=args.config.expanduser().resolve() if args.config is not None else None,
+            state_dir=args.state_dir.expanduser().resolve() if args.state_dir is not None else None,
+            listen=args.listen,
+            lang=os.environ.get("LANG"),
+            force=args.force,
+            dry_run=args.dry_run,
+        )
+    elif args.service_command == "uninstall":
+        outcome = service.uninstall(launchctl, paths, uid, dry_run=args.dry_run)
+    else:
+        outcome = service.status(launchctl, paths, uid)
+    if args.json:
+        _dump(outcome.data, out)
+    else:
+        out.write("".join(line + "\n" for line in outcome.lines))
+    return outcome.code
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -1395,6 +1460,8 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
             return asyncio.run(_run(args, out))
         if args.command == "daemon":
             return asyncio.run(_daemon(args, out))
+        if args.command == "service":
+            return cmd_service(args, out)
         if args.command == "trigger":
             return cmd_trigger(args, out)
         if args.command == "web":

@@ -34,6 +34,7 @@ def _no_calsync_debug(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: igno
 
 PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 KEYRING_REFUSED = "a test reached the real keyring"
+LAUNCHCTL_REFUSED = "a test reached the real launchctl"
 
 
 class Seal:
@@ -138,6 +139,7 @@ def sealed(
       config reaches the developer's own files (``trigger`` without a daemon runs a cycle);
     - the keychain fails closed: ``credentials._keyring`` refuses every call, and
       ``PYTHON_KEYRING_BACKEND`` gives a child process keyring's ``fail`` backend;
+    - ``launchctl`` is never run: ``service._run`` refuses (a test passes a fake launchctl);
     - no connection leaves the machine: a connect or name lookup for anything but loopback or
       a unix socket is refused, and no proxy is used (the developer's proxy listens on
       loopback and would carry the request out). ``@pytest.mark.network`` lifts the network
@@ -153,6 +155,14 @@ def sealed(
 
     monkeypatch.setattr(credentials, "_keyring", lambda: SealedKeyring(seal))
     monkeypatch.setenv("PYTHON_KEYRING_BACKEND", "keyring.backends.fail.Keyring")
+
+    from calsync import service
+
+    def no_launchctl(argv: list[str]) -> subprocess.CompletedProcess[str]:
+        raise seal.refuse(LAUNCHCTL_REFUSED)
+
+    # The developer's machine runs real launchd jobs: `calsync service` only ever gets a fake.
+    monkeypatch.setattr(service, "_run", no_launchctl)
 
     for name in PROXY_VARIABLES:
         monkeypatch.delenv(name, raising=False)

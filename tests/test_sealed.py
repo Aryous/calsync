@@ -13,11 +13,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from calsync import credentials
+from calsync import credentials, service
 from calsync.config import CredentialRef, default_config_path, default_state_dir, load_config
 from calsync.errors import ConfigError
 from calsync.http import RequestLog, make_client
-from tests.conftest import KEYRING_REFUSED, Seal
+from tests.conftest import KEYRING_REFUSED, LAUNCHCTL_REFUSED, Seal
 
 REAL_GETADDRINFO = socket.getaddrinfo  # taken at import, before any test patches it
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -53,6 +53,15 @@ def test_the_real_keyring_is_refused(sealed: Seal) -> None:
     with pytest.raises(AssertionError, match=KEYRING_REFUSED):
         credentials.write_secret(CredentialRef("keychain", "calsync-test"), "x")
     assert len(sealed.refused) == 3
+    sealed.refused.clear()
+
+
+def test_the_real_launchctl_is_refused(sealed: Seal) -> None:
+    with pytest.raises(AssertionError, match=LAUNCHCTL_REFUSED):
+        service.SystemLaunchctl().list()
+    with pytest.raises(AssertionError, match=LAUNCHCTL_REFUSED):
+        service.system_launchctl().print("gui/501/dev.calsync.daemon")
+    assert len(sealed.refused) == 2
     sealed.refused.clear()
 
 
