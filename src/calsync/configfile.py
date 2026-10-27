@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import tomlkit
+from tomlkit.container import OutOfOrderTableProxy
 from tomlkit.exceptions import ConvertError, ParseError
 from tomlkit.items import AoT, InlineTable, Item, Table
 
@@ -119,11 +120,16 @@ def _fsync_dir(directory: Path) -> None:
 
 def write_config(snapshot: Snapshot, new_text: str) -> Snapshot:
     """Validate, check the fingerprint, back up, then atomically replace the file.
-    Returns the new snapshot; identical text writes nothing and returns ``snapshot``."""
-    path = snapshot.path
-    validate_text(new_text, path.parent)
+    Returns the new snapshot; identical text writes nothing and returns ``snapshot``.
+
+    A symlinked path is written through to its target (the backup and the temporary file live
+    next to the target), so a config kept in a dotfiles repository stays linked. Relative paths
+    in the text still resolve against the link's directory, as ``load_config`` reads them. A
+    missing file is created 0600, its directory 0700."""
+    validate_text(new_text, snapshot.path.parent)
     if new_text == snapshot.text:
         return snapshot
+    path = Path(os.path.realpath(snapshot.path))  # resolved once: every step below uses it
     current = _read_bytes(path)
     if _fingerprint(current) != snapshot.fingerprint:
         raise ConfigConflict()
@@ -131,6 +137,8 @@ def write_config(snapshot: Snapshot, new_text: str) -> Snapshot:
     if current is not None:
         mode = stat.S_IMODE(path.stat().st_mode)
         _write_backup(path, current)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     data = new_text.encode("utf-8")
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
@@ -144,12 +152,27 @@ def write_config(snapshot: Snapshot, new_text: str) -> Snapshot:
         with contextlib.suppress(FileNotFoundError):
             os.unlink(tmp)
     _fsync_dir(path.parent)
-    return Snapshot(path, new_text, _fingerprint(data))
+    return Snapshot(snapshot.path, new_text, _fingerprint(data))
+
+
+_NO_NEWLINE = "\\ No newline at end of file\n"
 
 
 def diff_text(old: str, new: str, name: str = "config.toml") -> str:
-    lines = difflib.unified_diff(old.splitlines(), new.splitlines(), fromfile=name, tofile=name, lineterm="")
-    return "".join(line + "\n" for line in lines)
+    """A unified diff, like ``diff -u``: a missing newline at the end of a file is shown, so a
+    real change never diffs as empty."""
+    out: list[str] = []
+    lines = difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True), fromfile=name, tofile=name, lineterm=""
+    )
+    for line in lines:
+        if line.endswith("\n"):
+            out.append(line)
+        elif line.startswith(("---", "+++", "@@")):
+            out.append(line + "\n")
+        else:  # the last line of a file that does not end with a newline
+            out.append(line + "\n" + _NO_NEWLINE)
+    return "".join(out)
 
 
 # ----- tomlkit editing helpers ---------------------------------------------------
@@ -297,6 +320,11 @@ def set_key(doc: tomlkit.TOMLDocument, dotted: str, value: Any) -> None:
             return
         doc[head] = tomlkit.table()
         section = doc[head]
+    if isinstance(section, OutOfOrderTableProxy):
+        # tomlkit edits such a section unreliably (a key added to it cannot be deleted again).
+        raise ConfigError(
+            [f"{head}: this section is split across the file; join its parts into one [{head}] table by hand"]
+        )
     if not isinstance(section, Table | InlineTable):
         raise ConfigError([f"{head}: must be a table"])
     if value is None:

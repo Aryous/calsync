@@ -379,3 +379,58 @@ def test_diff_text() -> None:
     assert "-b = 2" in diff
     assert "+b = 3" in diff
     assert diff_text("x\n", "x\n") == ""
+
+
+# ----- review fixes: symlinks, a missing file, newline diffs, split tables --------------
+
+
+def test_a_symlinked_config_is_written_through_to_its_target(tmp_path: Path) -> None:
+    dotfiles = tmp_path / "dotfiles"
+    dotfiles.mkdir()
+    real = dotfiles / "calsync.toml"
+    real.write_text(TEXT)
+    real.chmod(0o600)
+    home = tmp_path / "home"
+    home.mkdir()
+    link = home / "config.toml"
+    link.symlink_to(real)
+    snap = read_snapshot(link)
+    new = _edit(link, lambda d: set_rule_key(d, "family", "paused", True))
+    result = write_config(snap, new)
+    assert link.is_symlink() and link.resolve() == real.resolve()
+    assert real.read_text() == new and result.text == new
+    assert sorted(p.name for p in dotfiles.iterdir()) == ["calsync.toml", "calsync.toml.bak"]
+    assert sorted(p.name for p in home.iterdir()) == ["config.toml"]
+    assert (dotfiles / "calsync.toml.bak").read_text() == TEXT
+    assert result.fingerprint == read_snapshot(link).fingerprint
+    # relative paths still resolve against the link's directory, as load_config does
+    assert validate_text(new, link.parent).google_client_secret_file == home / "google-client.json"
+
+
+def test_writing_a_missing_config_creates_its_directory_0700(tmp_path: Path) -> None:
+    path = tmp_path / "fresh" / "calsync" / "config.toml"
+    snap = read_snapshot(path)
+    assert (snap.text, snap.fingerprint) == ("", "")
+    write_config(snap, '[runtime]\ninterval = "2m"\n')
+    assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert path.read_text() == '[runtime]\ninterval = "2m"\n'
+
+
+def test_diff_text_shows_a_trailing_newline_change() -> None:
+    added = diff_text("a = 1", "a = 1\n")
+    assert added == (
+        "--- config.toml\n+++ config.toml\n@@ -1 +1 @@\n-a = 1\n\\ No newline at end of file\n+a = 1\n"
+    )
+    removed = diff_text("a = 1\nb = 2\n", "a = 1\nb = 2")
+    assert removed.endswith("-b = 2\n+b = 2\n\\ No newline at end of file\n")
+
+
+def test_set_key_refuses_a_section_split_across_the_file() -> None:
+    text = '[notify]\nbark_url = "https://bark.example.com/K"\n\n[web]\nlisten = "off"\n\n[notify.extra]\na = 1\n'
+    doc = load_doc(text)
+    with pytest.raises(ConfigError) as info:
+        set_key(doc, "notify.public_url", "https://calsync.example.com")
+    assert info.value.problems == [
+        "notify: this section is split across the file; join its parts into one [notify] table by hand"
+    ]

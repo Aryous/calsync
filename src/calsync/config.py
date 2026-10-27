@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal, overload
+from urllib.parse import urlsplit
 
 from calsync.durations import parse_duration
 from calsync.errors import ConfigError
@@ -300,8 +301,12 @@ def _flag(raw: Any, where: str, problems: list[str]) -> bool:
 
 
 def _public_url(raw: Any, problems: list[str]) -> str | None:
-    if raw is None or (isinstance(raw, str) and raw.startswith(("http://", "https://"))):
-        return raw
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        parts = urlsplit(raw)
+        if parts.scheme.lower() in ("http", "https") and parts.netloc:
+            return raw
     problems.append("notify.public_url: must be an http(s) URL")
     return None
 

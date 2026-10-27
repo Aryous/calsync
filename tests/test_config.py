@@ -338,13 +338,15 @@ def test_paused_and_retire_must_be_bool(tmp_path: Path, key: str, value: object)
 
 def test_public_url(tmp_path: Path) -> None:
     assert parse_config(copy.deepcopy(VALID), tmp_path).notify.public_url is None
-    for url in ("https://calsync.example.com", "http://192.0.2.1:8766/"):
+    for url in ("https://calsync.example.com", "http://192.0.2.1:8766/", "HTTPS://calsync.example.com/"):
         data = copy.deepcopy(VALID)
         data["notify"]["public_url"] = url
         assert parse_config(data, tmp_path).notify.public_url == url
 
 
-@pytest.mark.parametrize("url", ["calsync.example.com", "ftp://example.com", 5, ""])
+@pytest.mark.parametrize(
+    "url", ["calsync.example.com", "ftp://example.com", 5, "", "https://", "http:///path", "https:calsync"]
+)
 def test_public_url_must_be_http(tmp_path: Path, url: object) -> None:
     data = copy.deepcopy(VALID)
     data["notify"]["public_url"] = url
