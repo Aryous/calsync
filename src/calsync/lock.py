@@ -12,7 +12,8 @@ from calsync.errors import CalsyncError
 class AlreadyRunning(CalsyncError):
     def __init__(self, pid: int | None) -> None:
         self.pid = pid
-        super().__init__(f"another calsync process holds the lock (pid {pid or 'unknown'})")
+        held = f"another calsync process (pid {pid})" if pid else "another calsync process"
+        super().__init__(f"{held} holds the lock")
 
 
 class DaemonServing(AlreadyRunning):

@@ -384,7 +384,7 @@ def test_blocked_attention_counts_the_blocked_deletions(tmp_path: Path) -> None:
             "kind": "blocked",
             "rule": "family",
             "account": None,
-            "message": "Sync paused: 4 deletions are waiting for your confirmation.",
+            "message": "Sync paused: 4 deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again.",
             "command": "calsync run --rule family --allow-deletes",
         }
     ]
@@ -392,7 +392,10 @@ def test_blocked_attention_counts_the_blocked_deletions(tmp_path: Path) -> None:
 
 def test_blocked_attention_without_rows_has_no_count(tmp_path: Path) -> None:
     view = _status(tmp_path, [_run("blocked", error="guard", kind="guard")])
-    assert view["attention"][0]["message"] == "Sync paused: deletions are waiting for your confirmation."
+    assert (
+        view["attention"][0]["message"]
+        == "Sync paused: deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again."
+    )
 
 
 def four() -> FakeGoogle:
@@ -420,7 +423,10 @@ async def test_blocked_count_survives_consecutive_blocked_runs(tmp_path: Path) -
     with reader(tmp_path) as r:
         view = build_status(config, r, NOW).to_json()
     assert view["rules"][0]["consecutive_failures"] == 2
-    assert view["attention"][0]["message"] == "Sync paused: 4 deletions are waiting for your confirmation."
+    assert (
+        view["attention"][0]["message"]
+        == "Sync paused: 4 deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again."
+    )
 
 
 def test_summary_health_is_the_worst_rule(tmp_path: Path) -> None:
@@ -560,7 +566,10 @@ def test_v1_database_is_read_gracefully(tmp_path: Path) -> None:
     assert other["health"] == "blocked"
     assert [a["kind"] for a in status["attention"]] == ["auth", "blocked"]
     assert status["attention"][0]["account"] == "me"
-    assert status["attention"][1]["message"] == "Sync paused: deletions are waiting for your confirmation."
+    assert (
+        status["attention"][1]["message"]
+        == "Sync paused: deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again."
+    )
     assert status["summary"]["health"] == "auth"
 
     assert upcoming["schema"] == {"version": 1, "current": False}

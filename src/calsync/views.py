@@ -516,6 +516,9 @@ def _consecutive_failures(reader: StateReader, rule: str) -> int:
     return count
 
 
+BLOCKED_ADVICE = "To allow them, stop the daemon, run the command, then start the daemon again."
+
+
 def _attention(reader: StateReader, status: RuleStatus) -> Attention | None:
     rule = status.rule
     if status.health == "auth":
@@ -531,11 +534,13 @@ def _attention(reader: StateReader, status: RuleStatus) -> Attention | None:
     if status.health == "blocked":
         n = reader.blocked_count(rule.name)
         waiting = f"{n} deletions are" if n else "deletions are"
+        # While the daemon runs it holds the lock, so the command can only run with it stopped
+        # (``approve`` will let the daemon do it).
         return Attention(
             "blocked",
             rule.name,
             None,
-            f"Sync paused: {waiting} waiting for your confirmation.",
+            f"Sync paused: {waiting} waiting for your confirmation. {BLOCKED_ADVICE}",
             f"calsync run --rule {rule.name} --allow-deletes",
         )
     if status.health == "failing":

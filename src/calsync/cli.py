@@ -169,7 +169,7 @@ def exit_code_for_results(results: Iterable["RuleResult"]) -> int:
     return EXIT_OK if all(r.status == "ok" for r in results) else EXIT_FAILED
 
 
-def _describe(exc: BaseException) -> str:
+def _describe(exc: BaseException, args: argparse.Namespace | None = None) -> str:
     """The message for an error that stopped a command (no traceback)."""
     from calsync.errors import AuthError, CalsyncError, ConfigError
     from calsync.lock import AlreadyRunning, DaemonServing
@@ -181,7 +181,17 @@ def _describe(exc: BaseException) -> str:
     if isinstance(exc, DaemonServing):
         return f"{exc}; use a copy of the state directory to serve a second one\n"
     if isinstance(exc, AlreadyRunning):
-        return f"{exc}; the daemon is running: use `calsync trigger`\n"
+        command = getattr(args, "command", None)
+        if command == "daemon":
+            return f"{exc}; wait for it to finish, or stop the other daemon\n"
+        if command == "run" and getattr(args, "allow_deletes", False):
+            # `trigger` cannot let deletes through: the daemon never passes the guard itself.
+            return (
+                f"{exc}. If it is the daemon: deletes blocked by the mass-delete guard can only be "
+                "allowed with the daemon stopped. Stop the daemon, run this command again, then "
+                "start the daemon again.\n"
+            )
+        return f"{exc}; if it is the daemon, use `calsync trigger`\n"
     if isinstance(exc, CalsyncError):  # network and other expected failures
         return f"error: {exc}\n"
     return f"error: {type(exc).__name__}: {exc}\n"
@@ -643,7 +653,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
         if args.command == "changes":
             return cmd_changes(args, out)
     except CalsyncError as exc:
-        out.write(_describe(exc))
+        out.write(_describe(exc, args))
         return exit_code_for(exc)
     except Exception as exc:
         # The network, the state database or the filesystem failing outside an adapter:
@@ -654,7 +664,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
 
         if not isinstance(exc, httpx.HTTPError | sqlite3.Error | OSError):
             raise
-        out.write(_describe(exc))
+        out.write(_describe(exc, args))
         return exit_code_for(exc)
     _parser().print_help(out)
     return EXIT_CONFIG

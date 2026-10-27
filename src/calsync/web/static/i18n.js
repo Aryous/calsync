@@ -64,6 +64,7 @@ const zh = {
   "The {account} account needs to be connected again.": "{account} 账号需要重新连接。",
   "Sync paused: {n} deletions are waiting for your confirmation.": "同步已暂停：{n} 个删除在等你确认。",
   "Sync paused: deletions are waiting for your confirmation.": "同步已暂停：有删除在等你确认。",
+  "To allow them, stop the daemon, run the command, then start the daemon again.": "要放行，请先停止常驻进程，执行下面的命令，再启动常驻进程。",
   "Sync has failed {n} times in a row.": "同步已连续失败 {n} 次。",
   "Sync line {rule}": "同步线路 {rule}",
   "(untitled)": "（无标题）",
