@@ -1417,6 +1417,18 @@ def test_upcoming_refuses_hours_beyond_the_calendar(synced: list[str]) -> None:
     assert run([*synced, "upcoming", "--hours", "999999999999"]) == (EXIT_CONFIG, "hours: too far ahead\n")
 
 
+def test_upcoming_refuses_hours_whose_local_end_is_beyond_the_calendar(
+    synced: list[str], local_zone: Any
+) -> None:
+    from datetime import UTC, datetime
+
+    from tests.harness import NOW
+
+    local_zone("Asia/Shanghai")  # +08:00: the UTC end is representable, the local one is not
+    hours = int((datetime(9999, 12, 31, 20, tzinfo=UTC) - NOW).total_seconds() // 3600)
+    assert run([*synced, "upcoming", "--hours", str(hours)]) == (EXIT_CONFIG, "hours: too far ahead\n")
+
+
 def test_span_text_shows_the_end_date_of_a_multi_day_event(local_zone: Any) -> None:
     from datetime import date, datetime, timedelta, timezone
 

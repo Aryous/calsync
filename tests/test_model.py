@@ -507,6 +507,23 @@ def test_expand_respects_the_limit() -> None:
     assert len(got) == 7
 
 
+def test_expand_bounds_the_iterations_of_a_dense_old_series() -> None:
+    import time
+
+    # A secondly series started a year before the range: ~31.5 million occurrences before it.
+    s = series(start=at(2025, 10, 23, 9, 30), recurrence=("RRULE:FREQ=SECONDLY",))
+    began = time.monotonic()
+    got = model.expand(s, _utc(2026, 10, 24), _utc(2026, 10, 25))
+    assert time.monotonic() - began < 5
+    assert got.truncated and got.instances == []
+
+
+def test_expand_finds_instances_within_the_iteration_bound() -> None:
+    s = series(start=at(2026, 10, 23, 9, 30), recurrence=("RRULE:FREQ=MINUTELY",))
+    got = model.expand(s, _utc(2026, 10, 24), _utc(2026, 10, 24, 0, 10))  # 1350 minutes later
+    assert not got.truncated and _utc(2026, 10, 24, 0, 9) in _starts(got.instances)
+
+
 def test_expand_non_recurring_yields_itself() -> None:
     s = series(start=at(2026, 10, 23, 9, 30))
     (only,) = model.expand_instances(s, _utc(2026, 10, 23), _utc(2026, 10, 24))

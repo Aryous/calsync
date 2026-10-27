@@ -1166,7 +1166,8 @@ def cmd_upcoming(args: argparse.Namespace, out: TextIO) -> int:
 
     now = _now()
     try:
-        _ = now + timedelta(hours=args.hours)  # only whether it is representable
+        # Only whether it is representable, in the local zone too (the view shows local times).
+        _ = (now + timedelta(hours=args.hours)).astimezone()
     except OverflowError:
         return _refuse(args, out, "bad_request", "hours: too far ahead", EXIT_CONFIG)
     return _show(

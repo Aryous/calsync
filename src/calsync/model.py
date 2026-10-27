@@ -27,6 +27,9 @@ MAX_TIME = datetime(9999, 12, 31, tzinfo=UTC)
 SPAN_EXPANSION_LIMIT = 10_000
 # Most candidate instances one read-only expansion (``expand``) considers from its range on.
 EXPANSION_LIMIT = 1000
+# Most occurrences one expansion enumerates in all, those before its range included: a minutely
+# or secondly series started years ago would otherwise cost seconds of CPU (``truncated`` then).
+EXPANSION_ITERATIONS = 200_000
 
 AlarmPolicy = Literal["copy", "strip"] | tuple[timedelta, ...]
 AttendeeMode = Literal["none", "notes"]
@@ -473,8 +476,9 @@ def expand(series: Series, start: datetime, end: datetime, *, limit: int = EXPAN
     Wall-clock times stay fixed across DST (the expansion runs in the series' zone). An all-day
     series is matched by day: against the days ``[start, end)`` touches in its own zone (see
     ``_day_range``). EXDATEs and the original starts of overrides are removed; overrides appear
-    with their own fields. At most ``limit`` candidates are considered from the window on
-    (``truncated`` when that cut the range short). Never raises on a bad recurrence: the master
+    with their own fields. At most ``limit`` candidates are considered from the window on, and at
+    most ``EXPANSION_ITERATIONS`` occurrences are enumerated from the series' start (``truncated``
+    when either cut the range short). Never raises on a bad recurrence: the master
     occurrence alone is returned (if it is in range).
     """
     if series.start.all_day:
@@ -501,12 +505,19 @@ def expand(series: Series, start: datetime, end: datetime, *, limit: int = EXPAN
         lo, hi = start - duration, end
         if zone is None:  # naive midnights; dates are anchored at 00:00 UTC, as in When.utc()
             lo, hi = lo.astimezone(UTC).replace(tzinfo=None), hi.astimezone(UTC).replace(tzinfo=None)
-        for count, dt in enumerate(rset.xafter(lo, inc=True)):
+        count = 0
+        for iterations, dt in enumerate(rset):
+            if iterations >= EXPANSION_ITERATIONS:
+                truncated = True
+                break
+            if dt < lo:
+                continue
             if dt >= hi:
                 break
             if count >= limit:
                 truncated = True
                 break
+            count += 1
             if zone is None:
                 inst_start, inst_end = When(dt.date()), When(dt.date() + duration)
             else:

@@ -487,6 +487,14 @@ def test_the_range_must_lie_within_ten_years_of_now(start: datetime) -> None:
         event_range(start, None, NOW)
 
 
+def test_a_default_end_beyond_the_horizon_names_from() -> None:
+    from calsync.events_view import event_range
+
+    start = NOW + timedelta(days=3650)  # inside; a week later is not
+    with pytest.raises(ValueError, match=r"^from: the default end \(a week later\) must be within 10 years"):
+        event_range(start, None, NOW)
+
+
 def test_the_range_end_must_lie_within_ten_years_of_now() -> None:
     from calsync.events_view import event_range
 

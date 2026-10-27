@@ -54,12 +54,17 @@ def event_range(start: datetime | None, end: datetime | None, now: datetime) -> 
         start = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
     if not _in_horizon(start, now):  # before the default end: that could overflow
         raise ValueError(f"from: must be within {HORIZON_YEARS} years of today")
+    defaulted = end is None
     if end is None:
         try:
             end = start + timedelta(days=7)
         except OverflowError:
             raise ValueError("from: too far from today") from None
     if not _in_horizon(end, now):
+        if defaulted:  # the person gave no end: name what they gave
+            raise ValueError(
+                f"from: the default end (a week later) must be within {HORIZON_YEARS} years of today"
+            )
         raise ValueError(f"to: must be within {HORIZON_YEARS} years of today")
     if end < start:
         raise ValueError("to: must not be before from")
