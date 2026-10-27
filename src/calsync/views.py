@@ -647,22 +647,75 @@ def _masked_value(key: str, raw: str) -> str:
     return json.dumps(HIDDEN)
 
 
+# Keys shown as they are inside these tables; every other key there is hidden, so a key
+# calsync does not know (``password = ...`` written by hand) never reaches the web UI.
+_SHOWN_IN = {
+    "accounts": frozenset({"provider", "max_concurrency", "backend"}),
+    "notify": frozenset({"failure_threshold"}),
+    "google": frozenset(),
+}
+_TABLE_HEADER = re.compile(r"^\s*\[\[?\s*(?P<name>[^\]]+?)\s*\]\]?\s*$")
+COMMENT_HIDDEN = "# (comment hidden)"
+
+
+def _dotted(text: str) -> list[str]:
+    return [part.strip("\"'") for part in re.findall(_TOML_KEY, text)]
+
+
+def _hide_comment(line: str) -> str:
+    """The line with any comment's text replaced: a comment can quote anything (an old
+    device key, a password), so the web UI never sees comment text."""
+    quote: str | None = None
+    i = 0
+    while i < len(line):
+        char = line[i]
+        if quote is None:
+            if char == "#":
+                newline = "\n" if line.endswith("\n") else ""
+                return line[:i] + COMMENT_HIDDEN + newline
+            if char in "\"'":
+                quote = char
+        elif char == "\\" and quote == '"':
+            i += 1
+        elif char == quote:
+            quote = None
+        i += 1
+    return line
+
+
+def _is_hidden(path: list[str]) -> bool:
+    if not path:
+        return False
+    if path[-1] in _MASKED_KEYS:
+        return True
+    shown = _SHOWN_IN.get(path[0])
+    return shown is not None and path[-1] not in shown
+
+
 def mask_config_text(text: str) -> str:
     """The config file's text with what ``config_json`` masks masked, line by line by TOML key
-    name (in a comment, an inline table or a dotted key too): what the web UI may see of a
-    diff. A masked multi-line string loses its continuation lines."""
+    (in an inline table or a dotted key too), every comment's text hidden, and unknown keys
+    in the ``accounts``, ``notify`` and ``google`` tables hidden: what the web UI may see of
+    a diff. A masked multi-line string loses its continuation lines."""
     out: list[str] = []
     open_quote: str | None = None  # inside a masked multi-line string
-    for line in text.splitlines(keepends=True):
+    section: list[str] = []
+    for raw_line in text.splitlines(keepends=True):
         if open_quote is not None:
-            if open_quote in line:
+            if open_quote in raw_line:
                 open_quote = None
+            continue
+        line = _hide_comment(raw_line)
+        header = _TABLE_HEADER.match(line.split("#", 1)[0])
+        if header is not None:
+            section = _dotted(header.group("name"))
+            out.append(line)
             continue
         pieces: list[str] = []
         pos = 0
         while (match := _KEY_EQUALS.search(line, pos)) is not None:
             key = _last_key(match.group("key"))
-            if key not in _MASKED_KEYS or line.startswith("{", match.end()):
+            if not _is_hidden(section + _dotted(match.group("key"))) or line.startswith("{", match.end()):
                 pieces.append(line[pos : match.end()])
                 pos = match.end()
                 continue

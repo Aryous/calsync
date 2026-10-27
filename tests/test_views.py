@@ -1058,6 +1058,8 @@ def test_changes_carry_their_detail(tmp_path: Path) -> None:
 # ----- the config text as the web UI sees it ---------------------------------------------------
 
 UNMASKED_TOML = """\
+accounts.top.token = "TOPTOKEN"
+
 [google]
 client_secret_file = "~/secret.json"
 
@@ -1071,6 +1073,7 @@ credential = { backend = "keychain", ref = "calsync:icloud" }
 provider = "caldav"
 server_url = "https://user:pw@dav.example.com:8443/path"
 username = 'lit@example.com'
+password = "PLAINPW"
 credential.backend = "file"
 credential.ref = "~/.pw-file"
 
@@ -1080,27 +1083,31 @@ ref = "PW_VAR"
 
 [notify]
 bark_url = "https://api.day.app/DEVICEKEY"
+## bark_url = "https://api.day.app/HASHHASH"
 # webhook_url = "https://hooks.example.com/OLDPATH"
 webhook_url = \"\"\"https://hooks.example.com/
 MULTILINE\"\"\"
-failure_threshold = 3
+failure_threshold = 3  # old bark_url = "https://api.day.app/TRAILING"
 public_url="http://nas.lan:8766/x"
 """
 
 MASKED_TOML = """\
+accounts.top.token = "(hidden)"
+
 [google]
 client_secret_file = "(hidden)"
 
 [accounts.icloud]
 provider = "caldav"
 server_url = "icloud"
-username = "(hidden)"  # the Apple ID
+username = "(hidden)"  # (comment hidden)
 credential = { backend = "keychain", ref = "(hidden)" }
 
 [accounts.other]
 provider = "caldav"
 server_url = "https://dav.example.com:8443"
 username = "(hidden)"
+password = "(hidden)"
 credential.backend = "file"
 credential.ref = "(hidden)"
 
@@ -1110,9 +1117,10 @@ ref = "(hidden)"
 
 [notify]
 bark_url = "https://api.day.app"
-# webhook_url = "https://hooks.example.com"
+# (comment hidden)
+# (comment hidden)
 webhook_url = "(hidden)"
-failure_threshold = 3
+failure_threshold = 3  # (comment hidden)
 public_url="http://nas.lan:8766"
 """
 
@@ -1131,6 +1139,10 @@ def test_mask_config_text_masks_what_config_json_masks() -> None:
         "calsync:icloud",
         "pw-file",
         "PW_VAR",
+        "PLAINPW",
+        "TOPTOKEN",
+        "HASHHASH",
+        "TRAILING",
     ):
         assert secret not in masked
     for secret in ("secret.json", "OLDPATH", "MULTILINE", "nas.lan:8766/x"):
