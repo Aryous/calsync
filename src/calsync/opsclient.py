@@ -53,8 +53,11 @@ def root_os_error(exc: BaseException) -> OSError | None:
 
 def call(name: str, args: dict[str, Any], *, dry_run: bool, config_path: Path, state_dir: Path) -> "OpResult":
     """Run ``name`` through the daemon if one serves ``state_dir``, else in this process."""
+    from calsync.ops import internal_arg
     from calsync.wiring import socket_path
 
+    if (internal := internal_arg(args)) is not None:
+        raise ConfigError([f"{internal}: an internal argument"])
     sock = socket_path(state_dir)
     if _daemon_listens(sock):
         return _over_socket(sock, name, args, dry_run)

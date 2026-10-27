@@ -33,8 +33,12 @@ running engine the new config (``Engine.replace_config``), all under ``_cycle_lo
 ``[web]`` address needs a restart (logged); ``allowed_hosts`` take effect at once.
 
 Paused rules never run (``request_cycle`` refuses them with ``RulePaused``). A retiring rule
-(``retire = true``) deletes its copies (the delete guard applies); after a cycle in which it
-ended ``ok`` with no copy left, the daemon removes it from the config (``source="daemon"``).
+(``retire = true``) deletes its copies (the delete guard applies) and never creates its target
+calendar; after a cycle in which it ended ``ok`` with no copy left (and detection read every
+changed copy), the daemon removes it from the config (``source="daemon"``).
+
+A reload that fails for an unexpected reason (a bug) is contained: logged by type, the running
+config stays, the scheduler goes on.
 
 Without sync (``--no-sync``) the daemon takes no lock, reads no credential, opens no store and
 runs no cycle: it only serves the API. It cannot run beside another daemon in the same state
@@ -313,7 +317,12 @@ class Daemon:
         except ConfigError as exc:  # cannot happen short of a bug; keep running what runs
             log.error("the written config could not be applied (%d problems)", len(exc.problems))
             return
-        await self._apply(config)
+        try:
+            await self._apply(config)
+        except Exception as exc:  # a bug: the running config stays (``_apply`` rolled back)
+            log.error("config reload failed (%s)", type(exc).__name__)
+            debug.details(log, "config reload failed", exc)
+            return
         log.info("config changed; applied")
 
     @property
@@ -484,7 +493,15 @@ class Daemon:
     # ----- hot reload ---------------------------------------------------------
     async def _check_config(self) -> None:
         """Apply an edit made to the config file outside calsync. The caller holds
-        ``_cycle_lock``. Cheap when nothing changed: one ``stat``."""
+        ``_cycle_lock``. Cheap when nothing changed: one ``stat``. An unexpected failure is
+        logged by type and the running config stays: it never stops the scheduler."""
+        try:
+            await self._reload()
+        except Exception as exc:  # the text could quote a value; the type only
+            log.error("config reload failed (%s)", type(exc).__name__)
+            debug.details(log, "config reload failed", exc)
+
+    async def _reload(self) -> None:
         path = self._config_path
         if path is None or self._store is None:
             return
@@ -529,7 +546,11 @@ class Daemon:
         except ConfigError as exc:
             self._reload_failed(snapshot.fingerprint, exc.problems)
             return
-        await self._apply(config)
+        try:
+            await self._apply(config)
+        except Exception:
+            self._rejected = snapshot.fingerprint  # logged once (by the caller), not every poll
+            raise
         self._snapshot, self._rejected = snapshot, None
         log.info("config reloaded (%s)", EXTERNAL_SUMMARY)
         try:
@@ -556,7 +577,11 @@ class Daemon:
         log.warning("config reload failed (%d problems)", len(problems))
 
     async def _apply(self, config: Config) -> None:
-        """Run ``config`` from now on. The caller holds ``_cycle_lock`` (never during a cycle)."""
+        """Run ``config`` from now on. The caller holds ``_cycle_lock`` (never during a cycle).
+
+        If it fails (a bug), the old config is restored before the error is raised: the
+        accounts rebuilt for the new one are rebuilt again before their rules' next attempt,
+        and accounts the new config no longer uses are closed only once it is in place."""
         old, self._config = self._config, config  # first: ``_build`` reads it
         self._rules = [r.name for r in config.rules]
         before, after = wiring.accounts_in_use(old), wiring.accounts_in_use(config)
@@ -568,19 +593,28 @@ class Daemon:
             or old.accounts.get(name) != config.accounts.get(name)
             or (secret_changed and config.accounts[name].provider == "google")
         )
+        try:
+            for name in rebuild:
+                try:
+                    await self._build([name])
+                except Exception as exc:  # its rules fail on their own (run_cycle); the rest applies
+                    log.warning("setting up account %s failed (%s)", name, type(exc).__name__)
+                    debug.details(log, f"setting up account {name} failed", exc)
+                    self._adapters.errors[name] = CalsyncError(
+                        f"account {name} could not be set up ({type(exc).__name__})"
+                    )
+            if self._engine is not None:
+                self._engine.replace_config(config)
+        except Exception:
+            self._config, self._rules = old, [r.name for r in old.rules]
+            if self._engine is not None:
+                with contextlib.suppress(Exception):
+                    self._engine.replace_config(old)
+            rebuilt = set(rebuild)
+            self._reauth |= {r.name for r in old.rules if {r.source.account, r.target.account} & rebuilt}
+            raise
         for name in sorted(before - after):
             await self._drop(name)
-        for name in rebuild:
-            try:
-                await self._build([name])
-            except Exception as exc:  # its rules fail on their own (run_cycle); the rest applies
-                log.warning("setting up account %s failed (%s)", name, type(exc).__name__)
-                debug.details(log, f"setting up account {name} failed", exc)
-                self._adapters.errors[name] = CalsyncError(
-                    f"account {name} could not be set up ({type(exc).__name__})"
-                )
-        if self._engine is not None:
-            self._engine.replace_config(config)
         names = set(self._rules)
         self._pending &= names
         self._reauth &= names
@@ -659,14 +693,12 @@ class Daemon:
         removal is logged and tried again after the next cycle."""
         if self._config_path is None or self._store is None:
             return
-        done = retired(self._config, result, self._store)
-        if not done:
+        if not retired(self._config, result, self._store):
             return
         await self._check_config()  # a hand edit since the cycle started is recorded first
-        for name in done:
-            rule = next((r for r in self._config.rules if r.name == name), None)
-            if rule is None or not rule.retire:  # the hand edit removed or kept it
-                continue
+        # Judged again against the config as it is now: a hand edit may have kept the rule, or
+        # pointed it at another target (then the next cycle, run against that one, decides).
+        for name in retired(self._config, result, self._store):
             try:
                 if remove_retired(self._context("daemon"), name) is not None:
                     log.info(

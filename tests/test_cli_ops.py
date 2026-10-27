@@ -380,6 +380,12 @@ def test_call_runs_in_process_without_a_daemon(files: Files, short_dir: Path) ->
     assert files.history() == [("cli", 'rule "family" resumed', None), ("cli", 'rule "family" paused', None)]
 
 
+def test_internal_arguments_are_refused_from_the_cli(files: Files) -> None:
+    with pytest.raises(ConfigError, match="after_retire: an internal argument"):
+        _call(files, "rule.remove", {"name": "family", "after_retire": True})
+    assert files.config.read_text() == TEXT
+
+
 def test_a_socket_it_cannot_reach_is_an_error(files: Files) -> None:
     import socket
 

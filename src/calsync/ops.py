@@ -32,6 +32,9 @@ from calsync.store import CONFIG_CHANGE_RETENTION, Store
 log = logging.getLogger(__name__)
 
 Source = Literal["cli", "ui", "daemon"]
+# Arguments only calsync itself passes (``run_op`` called in-process by the daemon or by
+# ``calsync run``); the transports (the socket, the CLI) refuse them.
+INTERNAL_ARGS = frozenset({"after_retire"})
 DRY_RUN = "dry run, nothing written: "
 AUTH_REASON = "a person signs in (Google) or types the app-specific password (iCloud)"
 
@@ -364,13 +367,14 @@ def _target_calendar(doc: tomlkit.TOMLDocument, name: str) -> str:
 
 def _rule_remove(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
     op = "rule.remove"
-    a = _Args(op, args, {"name", "delete_copies"})
+    a = _Args(op, args, {"name", "delete_copies", "after_retire"})
     name = a.text("name")
     delete_copies = a.flag("delete_copies")
+    after_retire = a.flag("after_retire")
 
     def edit(doc: tomlkit.TOMLDocument) -> _Edit:
         calendar = _target_calendar(doc, name)
-        if ctx.source == "daemon":
+        if after_retire:
             # The engine finished a retirement (``retire = true``, no copies left): only then
             # does calsync remove a rule by itself. A hand edit that stopped it wins.
             if configfile.rule_table(doc, name).get("retire") is not True:
@@ -571,6 +575,11 @@ OPS: dict[str, Callable[[OpContext, dict[str, Any], bool], OpResult]] = {
     "account.add": _account_add,
     "account.remove": _account_remove,
 }
+
+
+def internal_arg(args: Mapping[str, Any]) -> str | None:
+    """The first internal argument in ``args`` (a transport refuses it), or None."""
+    return next((key for key in sorted(INTERNAL_ARGS) if key in args), None)
 
 
 def run_op(ctx: OpContext, name: str, args: dict[str, Any], dry_run: bool) -> OpResult:

@@ -77,6 +77,12 @@ class RuleResult:
     seen_protected: frozenset[str] | None = None
     seen_blocked: frozenset[str] | None = None
     seen_blocked_read: bool = False  # the title lookup for ``seen_blocked`` succeeded
+    # What a retirement is judged by (``cycle.retired``): the target this cycle ran against,
+    # whether its detection read every changed copy (no unread copy, no held cursor), and
+    # whether that calendar does not exist (a retiring rule never creates it: no copies).
+    target: tuple[str, str] | None = None  # (account, calendar ref from config)
+    detection_complete: bool = False
+    target_missing: bool = False
 
     def fail(self, exc: BaseException) -> None:
         self.status = "failed"
@@ -142,6 +148,10 @@ def _blocked_titles(deletes: Sequence[Actual], bodies: Bodies | None) -> tuple[l
 
 
 TargetKey = tuple[str, str]  # (account, calendar ref from config)
+
+
+class _CalendarMissing(NotFoundError):
+    """The target calendar does not exist and no rule of it may create it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,19 +263,24 @@ class Engine:
         return errors
 
     # ----- phase 2: detect ---------------------------------------------
-    async def _detect(self, key: TargetKey, rules: list[Rule], dry_run: bool) -> None:
+    async def _detect(self, key: TargetKey, rules: list[Rule], dry_run: bool) -> bool:
+        """Detect the target calendar's changes; True if every changed copy was read (the
+        cursor advanced). ``_CalendarMissing`` if it does not exist and none may create it."""
         account, ref = key
         target = self._targets[account]
         cal = self._calendars.get(key) or self._store.load_target_calendar(account, ref)
         if cal is None:
-            wants_create = any(r.target.create_if_missing for r in rules)
+            # A retiring rule only deletes: it never creates the calendar it deletes from.
+            wants_create = any(r.target.create_if_missing and not r.retire for r in rules)
             try:
                 cal = await target.ensure_calendar(ref, create=wants_create and not dry_run)
-            except NotFoundError:
+            except NotFoundError as exc:
                 if dry_run and wants_create:
                     raise NotFoundError(
                         f"target calendar {ref!r} does not exist yet; a real run creates it"
                     ) from None
+                if not wants_create:
+                    raise _CalendarMissing(str(exc)) from exc
                 raise
             self._store.save_target_calendar(account, ref, cal)
         self._calendars[key] = cal
@@ -343,6 +358,7 @@ class Engine:
         else:
             cache.cursor = delta.cursor
         self._store.save_target_cache(account, cal.href, cache)
+        return not unread
 
     # ----- phase 3-5: plan, guard, push --------------------------------
     def _desired(self, rule: Rule) -> tuple[dict[str, Desired], frozenset[str]]:
@@ -779,6 +795,7 @@ class Engine:
 
         by_target: dict[TargetKey, list[Rule]] = defaultdict(list)
         for rule in selected:
+            results[rule.name].target = (rule.target.account, rule.target.calendar)
             if results[rule.name].status == "ok":
                 by_target[(rule.target.account, rule.target.calendar)].append(rule)
         outcomes = await asyncio.gather(
@@ -789,7 +806,15 @@ class Engine:
                 if not isinstance(outcome, Exception):
                     raise outcome
                 for rule in rs:
-                    results[rule.name].fail(outcome)
+                    if isinstance(outcome, _CalendarMissing) and rule.retire:
+                        # Nothing to delete where there is no calendar: the retirement is done.
+                        results[rule.name].target_missing = True
+                        results[rule.name].detection_complete = True
+                    else:
+                        results[rule.name].fail(outcome)
+                continue
+            for rule in rs:
+                results[rule.name].detection_complete = outcome
 
         async def guarded(rule: Rule) -> None:
             try:
@@ -799,7 +824,13 @@ class Engine:
                 debug.details(log, f"rule {rule.name} failed", exc)
                 results[rule.name].fail(exc)
 
-        await asyncio.gather(*(guarded(r) for r in selected if results[r.name].status == "ok"))
+        await asyncio.gather(
+            *(
+                guarded(r)
+                for r in selected
+                if results[r.name].status == "ok" and not results[r.name].target_missing
+            )
+        )
 
         if not dry_run:
             touched = {

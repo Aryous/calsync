@@ -20,7 +20,7 @@ from calsync.config import Config
 from calsync.daemon import WATCH_INTERVAL, RulePaused
 from calsync.views import StateReader
 from tests.factories import google_event
-from tests.harness import GCAL
+from tests.harness import GCAL, NOW
 from tests.test_daemon import World, runs_by_time, until
 
 pytestmark = pytest.mark.anyio
@@ -433,3 +433,96 @@ async def test_an_account_that_fails_to_set_up_fails_only_its_rules(
         latest = {r.rule: r for r in reversed(reader.runs())}
     assert {r.status for r in latest.values()} == {"failed"}  # both rules write to dav
     assert history(tmp_path) == [("external", "edited outside calsync")]
+
+
+async def test_a_retiring_rule_waits_while_a_changed_copy_could_not_be_read(tmp_path: Path) -> None:
+    """Detection that held a changed copy back (unread) is no proof that no copy is left."""
+    path, config = setup(tmp_path)
+    world = World(stop_after=50)
+    daemon = world.daemon(config, tmp_path, config_path=path)
+
+    def retire_and_touch() -> None:
+        write(path, retiring(TEXT))
+        [href] = [h for h in world.target.objects if "/family/" in h]
+        world.target.put(href, world.target.objects[href][1])  # changed on the target: a new etag
+        world.target.hide_once.add(href)  # and left out of the next read
+
+    on_wait(world, 1, retire_and_touch)
+    await daemon.run(world.stop)
+    assert [h for h in world.target.objects if "/family/" in h] == []
+    with StateReader(tmp_path / "state.db") as reader:
+        family_runs = [
+            (int((r.started_at - NOW).total_seconds()), r.status, r.deleted) for r in reader.runs("family")
+        ]
+        removal = reader.config_changes()[0]
+    # 30 s: the copy could not be read (nothing to delete, but not finished); 60 s: deleted.
+    assert list(reversed(family_runs)) == [(0, "ok", 0), (30, "ok", 0), (60, "ok", 1)]
+    assert (removal.source, int((removal.at - NOW).total_seconds())) == ("daemon", 60)
+
+
+async def test_a_hand_edit_during_the_retiring_cycle_waits_for_the_next_cycle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The evidence is the cycle's: a rule whose target was edited meanwhile is judged again."""
+    from calsync import daemon as daemon_module
+
+    path, config = setup(tmp_path)
+    world = World(stop_after=50)
+    daemon = world.daemon(config, tmp_path, config_path=path)
+    on_wait(world, 1, lambda: write(path, retiring(TEXT)))
+    real = daemon_module.run_cycle
+    calls = 0
+    elsewhere = retiring(TEXT).replace(
+        'calendar = "Family", create_if_missing', 'calendar = "Elsewhere", create_if_missing'
+    )
+
+    async def cycle(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        result = await real(*args, **kwargs)
+        if calls == 2:  # the retiring cycle deleted the copy; meanwhile the target is edited
+            write(path, elsewhere)
+        return result
+
+    monkeypatch.setattr(daemon_module, "run_cycle", cycle)
+    await daemon.run(world.stop)
+    with StateReader(tmp_path / "state.db") as reader:
+        changes = [(c.source, int((c.at - NOW).total_seconds())) for c in reversed(reader.config_changes())]
+    assert changes == [("external", 2), ("external", 30), ("daemon", 60)]
+    assert "Elsewhere" not in world.target.calendars  # a retiring rule creates no calendar
+
+
+async def test_a_retiring_rule_never_creates_its_target_calendar(tmp_path: Path) -> None:
+    """A missing target calendar holds no copies: the rule retires without an MKCALENDAR."""
+    path, config = setup(tmp_path, retiring(TEXT))
+    world = World(stop_after=5)
+    daemon = world.daemon(config, tmp_path, config_path=path)
+    await daemon.run(world.stop)
+    assert "Family" not in world.target.calendars and "Work" in world.target.calendars
+    assert 'name = "family"' not in path.read_text()
+    assert history(tmp_path) == [("daemon", 'rule "family" removed after its copies were deleted')]
+    with StateReader(tmp_path / "state.db") as reader:
+        assert [(r.status, r.deleted) for r in reader.runs("family")] == [("ok", 0)]
+
+
+async def test_a_reload_that_fails_keeps_the_running_config_and_the_schedule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from calsync.engine import Engine
+
+    caplog.set_level(logging.INFO, logger="calsync.daemon")
+    path, config = setup(tmp_path)
+    world = World(stop_after=20)
+    daemon = world.daemon(config, tmp_path, config_path=path)
+
+    def boom(self: Engine, config: Config) -> None:
+        raise RuntimeError("a bug")
+
+    monkeypatch.setattr(Engine, "replace_config", boom)
+    on_wait(world, 1, lambda: write(path, ACCOUNTS + FAMILY))
+    await daemon.run(world.stop)  # no exception: the scheduler lives on
+    assert "config reload failed (RuntimeError)" in caplog.messages
+    assert caplog.messages.count("config reload failed (RuntimeError)") == 1
+    assert rules_of(daemon.config) == ["family", "work"]
+    assert runs_by_time(tmp_path) == [(0, "family"), (0, "work"), (30, "family"), (30, "work")]
+    assert history(tmp_path) == []

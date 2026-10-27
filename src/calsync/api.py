@@ -265,6 +265,8 @@ class _Endpoints:
                 raise ApiError(409, "read_only", "No daemon runs operations here.")
             if name not in ops.OPS:
                 raise ApiError(404, "unknown_op", f"Unknown operation {name!r}.")
+            if (internal := ops.internal_arg(args)) is not None:
+                raise ApiError(400, "bad_request", f"{internal}: an internal argument")
             try:
                 result = await self._daemon.run_op(name, args, dry_run, source=source)
             except ConfigConflict as exc:

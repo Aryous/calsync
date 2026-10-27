@@ -383,6 +383,23 @@ def test_rule_remove_with_delete_copies_retires_it(env: Env) -> None:
     assert env.rule("work").retire is True
 
 
+def test_after_retire_removes_only_a_rule_that_still_retires(env: Env) -> None:
+    with pytest.raises(ConfigError, match='rule "work" no longer retires'):
+        env.run("rule.remove", name="work", after_retire=True)
+    env.run("rule.set", name="work", key="retire", value=True)
+    result = env.run("rule.remove", name="work", after_retire=True)
+    assert result.summary == 'rule "work" removed after its copies were deleted'
+    assert [r.name for r in env.config().rules] == ["family"]
+
+
+def test_a_removal_from_the_daemon_without_after_retire_is_an_ordinary_one(env: Env) -> None:
+    """The retire semantics come from the argument, never from who calls."""
+    env.run("rule.set", name="work", key="retire", value=True)
+    env.ctx.source = "daemon"
+    result = env.run("rule.remove", name="work")
+    assert result.summary == 'rule "work" removed; its copies stay in "Work"'
+
+
 # ----- accounts --------------------------------------------------------------------------
 
 

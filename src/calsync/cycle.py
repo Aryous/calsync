@@ -81,8 +81,10 @@ def counts_line(name: str, result: RuleResult) -> str:
 
 
 def retired(config: Config, result: CycleResult, store: Store) -> list[str]:
-    """The retiring rules of ``config`` that ``result`` finished: the rule ended ``ok`` and the
-    store records no copy of it in its target calendar."""
+    """The retiring rules of ``config`` that ``result`` finished: the rule ended ``ok`` against
+    the target ``config`` still names, and either that calendar does not exist or the cycle's
+    detection read every changed copy and the store records no copy of the rule there. Anything
+    less (an unread copy, a target edited since) waits for the next cycle."""
     by_name = {r.name: r for r in config.rules}
     return [
         name
@@ -90,16 +92,23 @@ def retired(config: Config, result: CycleResult, store: Store) -> list[str]:
         if (rule := by_name.get(name)) is not None
         and rule.retire
         and r.status == "ok"
-        and store.copies(rule_tag(name), rule.target.account, rule.target.calendar) == 0
+        and r.target == (rule.target.account, rule.target.calendar)
+        and (
+            r.target_missing
+            or (
+                r.detection_complete
+                and store.copies(rule_tag(name), rule.target.account, rule.target.calendar) == 0
+            )
+        )
     ]
 
 
 def remove_retired(ctx: ops.OpContext, name: str) -> ops.OpResult | None:
-    """Remove a rule that retired (``rule.remove`` with ``ctx.source == "daemon"``). A failure
-    (a conflict with a hand edit, an unreadable file) is logged by type; the next cycle that
-    finds the rule retired tries again. None on failure."""
+    """Remove a rule that retired (``rule.remove`` with ``after_retire``, an argument only
+    calsync itself passes). A failure (a conflict with a hand edit, an unreadable file) is logged
+    by type; the next cycle that finds the rule retired tries again. None on failure."""
     try:
-        return ops.run_op(ctx, "rule.remove", {"name": name}, False)
+        return ops.run_op(ctx, "rule.remove", {"name": name, "after_retire": True}, False)
     except Exception as exc:  # never the text: a config problem can quote a value
         log.warning("rule %s retired, but removing it from the config failed (%s)", name, type(exc).__name__)
         debug.details(log, f"rule {name}: removing it from the config failed", exc)

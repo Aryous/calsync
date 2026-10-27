@@ -369,6 +369,19 @@ async def test_an_op_rejects_a_bad_body(tmp_path: Path, body: bytes) -> None:
     assert daemon.ops == []
 
 
+async def test_an_op_refuses_internal_arguments(tmp_path: Path) -> None:
+    daemon = OpsDaemon(None)
+    async with client(tmp_path, daemon) as c:
+        response = await c.post(
+            "/api/ops/rule.remove", json={"args": {"name": "family", "after_retire": True}}
+        )
+    assert response.status_code == 400 and response.json()["error"] == {
+        "kind": "bad_request",
+        "message": "after_retire: an internal argument",
+    }
+    assert daemon.ops == []
+
+
 def test_ops_are_not_among_the_shared_routes(tmp_path: Path) -> None:
     """The web UI mounts ``api_routes``: the operations reach it only in a later task, with its
     own source and checks."""
