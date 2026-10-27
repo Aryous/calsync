@@ -136,3 +136,26 @@ def test_delete_secret_refused_while_the_entry_still_exists(monkeypatch: pytest.
     with pytest.raises(ConfigError, match=r"could not delete keychain entry 'calsync:test'") as info:
         delete_secret(ref)
     assert isinstance(info.value.__cause__, keyring.errors.PasswordDeleteError)
+
+
+def test_secret_exists_says_whether_never_what(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeKeyring()
+    monkeypatch.setattr(credentials, "_keyring", lambda: fake)
+    ref = CredentialRef("keychain", "calsync:dav")
+    assert credentials.secret_exists(ref) is False
+    write_secret(ref, "pw")
+    assert credentials.secret_exists(ref) is True
+    assert credentials.secret_exists(CredentialRef("env", "PW"), environ={"PW": "x"}) is True
+    assert credentials.secret_exists(CredentialRef("env", "PW"), environ={}) is False
+    assert credentials.secret_exists(CredentialRef("file", str(tmp_path / "pw"))) is False
+    (tmp_path / "pw").write_text("x")
+    assert credentials.secret_exists(CredentialRef("file", str(tmp_path / "pw"))) is True
+
+
+def test_secret_exists_is_none_when_the_keychain_cannot_be_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Locked:
+        def get_password(self, service: str, user: str) -> str | None:
+            raise keyring.errors.KeyringLocked("locked")
+
+    monkeypatch.setattr(credentials, "_keyring", lambda: Locked())
+    assert credentials.secret_exists(CredentialRef("keychain", "calsync:dav")) is None

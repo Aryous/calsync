@@ -306,9 +306,10 @@ def _config_op(
         data = {**change.data, "would_change": False} if dry_run else change.data
         return OpResult(op, False, change.same or change.summary, "", data, change.needs_human)
     diff = configfile.diff_text(snapshot.text, text)
+    shown = _shown_diff(ctx, snapshot.text, text, diff)
     if dry_run:
         data = {**change.data, "would_change": diff != ""}
-        return OpResult(op, False, DRY_RUN + change.summary, diff, data, change.needs_human)
+        return OpResult(op, False, DRY_RUN + change.summary, shown, data, change.needs_human)
     written = configfile.write_config(snapshot, text)
     recorded = True
     try:
@@ -331,7 +332,18 @@ def _config_op(
         summary += change.after_write()
     if not recorded:
         summary += "; history not recorded"
-    return OpResult(op, changed, summary, diff, change.data, change.needs_human)
+    return OpResult(op, changed, summary, shown, change.data, change.needs_human)
+
+
+def _shown_diff(ctx: OpContext, old: str, new: str, diff: str) -> str:
+    """The diff an operation answers with. The web UI (``source == "ui"``) sees the diff of the
+    masked texts, masked as ``GET /api/config`` masks the config (a push URL's device key, a
+    username, a credential ref, a server URL never reach a browser); the CLI sees the file."""
+    if ctx.source != "ui":
+        return diff
+    from calsync.views import mask_config_text
+
+    return configfile.diff_text(mask_config_text(old), mask_config_text(new))
 
 
 # ----- rules -------------------------------------------------------------------------------
@@ -477,6 +489,11 @@ def _pause(paused: bool) -> Callable[[OpContext, dict[str, Any], bool], OpResult
 # ----- accounts ----------------------------------------------------------------------------
 
 
+def account_credential(name: str) -> CredentialRef:
+    """The credential ``account.add`` gives account ``name``: its keychain entry."""
+    return CredentialRef("keychain", f"calsync:{name}")
+
+
 def _account_add(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
     op = "account.add"
     a = _Args(op, args, {"name", "provider", "server_url", "username"})
@@ -486,7 +503,8 @@ def _account_add(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResul
         if (value := a.opt_text(key)) is not None:
             table[key] = value
     # No operation takes a secret (D10): a person stores it with `calsync auth`.
-    table["credential"] = {"backend": "keychain", "ref": f"calsync:{name}"}
+    ref = account_credential(name)
+    table["credential"] = {"backend": ref.backend, "ref": ref.ref}
 
     def edit(doc: tomlkit.TOMLDocument) -> _Edit:
         configfile.add_account(doc, name, table)
@@ -807,6 +825,7 @@ async def _cycle_here(
 
 TRIGGER_TIMEOUT = 120.0  # seconds ``trigger`` waits by default
 TRIGGER_TIMEOUT_MAX = 600.0
+TRIGGER_NO_DRY_RUN = "trigger has no dry run; use calsync run --dry-run"
 RESULT_KEYS = ("status", "created", "updated", "deleted", "failed", "error_kind")
 
 
@@ -861,6 +880,8 @@ async def _trigger(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpRes
     from calsync.config import load_config
 
     op = "trigger"
+    if dry_run:  # it writes no config; what a cycle would do is `calsync run --dry-run`
+        raise ConfigError([TRIGGER_NO_DRY_RUN])
     a = _Args(op, args, {"rule", "wait", "timeout"})
     name = a.opt_text("rule")
     wait = a.flag("wait")
@@ -876,8 +897,6 @@ async def _trigger(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpRes
         return OpResult(
             op, False, "every rule is paused: nothing to run", data={"ran": False, "reason": "paused"}
         )
-    if dry_run:
-        return OpResult(op, False, f"{DRY_RUN}a cycle would run", data={"would_change": True})
     if ctx.daemon is None:
         result, removed = await _cycle_here(ctx, config, rules)
         summary = _ran_summary(result, "no daemon runs, so the cycle ran here")

@@ -48,6 +48,19 @@ def read_secret(ref: CredentialRef, *, environ: Mapping[str, str] = os.environ) 
     return value
 
 
+def secret_exists(ref: CredentialRef, *, environ: Mapping[str, str] = os.environ) -> bool | None:
+    """Whether the secret ``ref`` names is there (never its value, nothing logged); None when
+    the keychain cannot be asked."""
+    if ref.backend == "env":
+        return bool(environ.get(ref.ref))
+    if ref.backend == "file":
+        return Path(ref.ref).expanduser().exists()
+    try:
+        return _keyring().get_password(ref.ref, KEYRING_USER) is not None
+    except _keyring_error():
+        return None
+
+
 def write_secret(ref: CredentialRef, value: str) -> None:
     if ref.backend == "env":
         raise ConfigError([f"cannot store a secret in environment variable {ref.ref}"])

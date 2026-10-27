@@ -9,7 +9,9 @@ The JSON shapes built here are a contract shared by every consumer: keep the key
 """
 
 import json
+import re
 import sqlite3
+import tomllib
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -595,6 +597,83 @@ def config_json(config: Config, *, reveal: bool = False) -> dict[str, Any]:
             "allowed_hosts": list(web.allowed_hosts),
         },
     }
+
+
+# What ``config_json`` masks, as the TOML keys (their last dotted part) that hold it: the URLs
+# are cut to scheme and host, the rest hidden. ``credential`` and ``ref`` cover an account's
+# credential however it is written (an inline table, a sub-table, a dotted key).
+_MASKED_URL_KEYS = frozenset({"bark_url", "webhook_url", "public_url", "server_url"})
+_MASKED_KEYS = _MASKED_URL_KEYS | {"username", "credential", "ref", "client_secret_file"}
+_TOML_KEY = r"""(?:[A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*"|'[^']*')"""
+# A key and its "=": at the start of a line (a commented-out one too), or inside an inline table.
+_KEY_EQUALS = re.compile(rf"(?:^\s*(?:#\s*)?|[{{,]\s*)(?P<key>{_TOML_KEY}(?:\s*\.\s*{_TOML_KEY})*)\s*=\s*")
+_BASIC_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
+_BARE_VALUE = re.compile(r"[^,}\s#]*")
+_MULTILINE_QUOTES = ('"""', "'''")
+
+
+def _last_key(dotted: str) -> str:
+    parts: list[str] = re.findall(_TOML_KEY, dotted)
+    return parts[-1].strip("\"'") if parts else ""
+
+
+def _value_end(line: str, start: int) -> tuple[int, str | None]:
+    """Where the TOML value starting at ``start`` ends on this line, and the delimiter of a
+    multi-line string it leaves open (None: closed on this line)."""
+    for delimiter in _MULTILINE_QUOTES:
+        if line.startswith(delimiter, start):
+            close = line.find(delimiter, start + 3)
+            return (close + 3, None) if close >= 0 else (len(line), delimiter)
+    if line.startswith('"', start):
+        match = _BASIC_STRING.match(line, start)
+        return (match.end() if match else len(line)), None
+    if line.startswith("'", start):
+        close = line.find("'", start + 1)
+        return (close + 1 if close >= 0 else len(line)), None
+    if line.startswith("[", start):  # an array: hidden to the end of the line
+        return len(line.rstrip("\n")), None
+    match = _BARE_VALUE.match(line, start)
+    return (match.end() if match else start), None
+
+
+def _masked_value(key: str, raw: str) -> str:
+    if key in _MASKED_URL_KEYS:
+        try:
+            value = tomllib.loads(f"v = {raw}").get("v")
+        except tomllib.TOMLDecodeError:
+            value = None
+        if isinstance(value, str):
+            return json.dumps(value if value == "icloud" else _scheme_host(value))
+    return json.dumps(HIDDEN)
+
+
+def mask_config_text(text: str) -> str:
+    """The config file's text with what ``config_json`` masks masked, line by line by TOML key
+    name (in a comment, an inline table or a dotted key too): what the web UI may see of a
+    diff. A masked multi-line string loses its continuation lines."""
+    out: list[str] = []
+    open_quote: str | None = None  # inside a masked multi-line string
+    for line in text.splitlines(keepends=True):
+        if open_quote is not None:
+            if open_quote in line:
+                open_quote = None
+            continue
+        pieces: list[str] = []
+        pos = 0
+        while (match := _KEY_EQUALS.search(line, pos)) is not None:
+            key = _last_key(match.group("key"))
+            if key not in _MASKED_KEYS or line.startswith("{", match.end()):
+                pieces.append(line[pos : match.end()])
+                pos = match.end()
+                continue
+            end, open_quote = _value_end(line, match.end())
+            pieces.append(line[pos : match.end()] + _masked_value(key, line[match.end() : end]))
+            pos = end
+            if open_quote is not None:
+                break
+        rest = "\n" if open_quote is not None else line[pos:]
+        out.append("".join(pieces) + rest)
+    return "".join(out)
 
 
 def config_history_json(changes: Sequence[ConfigChangeView]) -> dict[str, Any]:

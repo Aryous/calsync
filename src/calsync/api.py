@@ -37,7 +37,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from calsync import __version__, debug, events_view, ops, views
+from calsync import __version__, credentials, debug, events_view, ops, views
 from calsync.config import Config
 from calsync.configfile import ConfigConflict
 from calsync.errors import ConfigError, ListenError, RulePaused
@@ -393,8 +393,10 @@ class _Endpoints:
                 raise ApiError(404, "unknown_op", f"Unknown operation {name!r}.")
             if (internal := ops.internal_arg(args)) is not None:
                 raise ApiError(400, "bad_request", f"{internal}: an internal argument")
-            if source == "ui" and (human := _terminal_only(name, args)) is not None:
-                raise ApiError(403, "needs_human", human["reason"], extra={"needs_human": True, **human})
+            if source == "ui":
+                human = _terminal_only(name, args) or await _repoints_credential(name, args)
+                if human is not None:
+                    raise ApiError(403, "needs_human", human["reason"], extra={"needs_human": True, **human})
             try:
                 result = await self._daemon.run_op(name, args, dry_run, source=source)
             except ConfigConflict as exc:
@@ -423,6 +425,29 @@ def _terminal_only(name: str, args: Mapping[str, Any]) -> dict[str, str] | None:
             "reason": "credentials are managed from the terminal",
         }
     return None
+
+
+async def _repoints_credential(name: str, args: Mapping[str, Any]) -> dict[str, str] | None:
+    """``account.add`` from the web UI when the keychain already holds the new account's entry
+    (left by an account removed without ``--delete-credential``): the browser would re-point a
+    stored password at a server of its choosing. A person adds it from the terminal. A keychain
+    that cannot be asked refuses too. None: allowed (or arguments the op itself refuses)."""
+    account = args.get("name")
+    if name != "account.add" or not isinstance(account, str) or not account:
+        return None
+    exists = await anyio.to_thread.run_sync(credentials.secret_exists, ops.account_credential(account))
+    if exists is False:
+        return None
+    words = ["calsync", "account", "add", account]
+    for key in ("provider", "server_url", "username"):
+        if isinstance(value := args.get(key), str) and value:
+            words += ["--" + key.replace("_", "-"), value]
+    reason = (
+        "the keychain already holds a credential for this account; add it from the terminal"
+        if exists
+        else "the keychain could not be checked; add the account from the terminal"
+    )
+    return {"command": shlex.join(words), "reason": reason}
 
 
 def _internal(exc: Exception) -> ApiError:

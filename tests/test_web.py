@@ -713,3 +713,152 @@ async def test_ops_and_trigger_over_the_daemons_tcp_listener(short_dir: Path) ->
     data = waited.json()["data"]
     assert data["ran"] is True and list(data["rules"]) == ["family"]
     await d.stop()
+
+
+# ----- what an operation's diff shows over TCP --------------------------------------------------
+
+MASKED_ACCOUNTS = """\
+[google]
+client_secret_file = "unused.json"
+
+[runtime]
+interval = "30s"
+jitter = 0.0
+
+[accounts.me]
+provider = "google"
+credential = { backend = "env", ref = "UNUSED" }
+
+[accounts.dav]
+provider = "caldav"
+server_url = "http://unused/"
+username = "someone@example.com"
+credential = { backend = "env", ref = "UNUSED" }
+
+[notify]
+bark_url = "https://api.day.app/DEVICEKEY"
+failure_threshold = 3
+"""
+
+
+async def test_an_op_diff_over_tcp_is_masked_and_the_socket_sees_the_file(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GET /api/config`` masks the push URL's key and a username: a dry run's (or a write's)
+    diff over TCP masks them the same way, while the CLI's socket shows the file."""
+    from calsync import credentials
+    from tests.test_daemon import eventually
+    from tests.test_daemon_reload import FAMILY
+    from tests.test_ops import FakeKeyring
+    from tests.test_trigger import Running, uds
+
+    keychain = FakeKeyring()  # no entry for the new account: the web UI may add it
+    monkeypatch.setattr(credentials, "_keyring", lambda: keychain)
+    d = Running(short_dir, MASKED_ACCOUNTS + FAMILY, serve=True, listen=("127.0.0.1", 0))
+    await d.start()
+    await eventually(lambda: d.daemon.web_address is not None and (short_dir / "calsync.sock").is_socket())
+    assert d.daemon.web_address is not None
+    port = d.daemon.web_address[1]
+    key = auth.load_or_create_key(short_dir)
+    origin = {"origin": f"http://127.0.0.1:{port}"}
+    threshold = {"args": {"key": "notify.failure_threshold", "value": "5"}, "dry_run": True}
+    added = {
+        "args": {
+            "name": "new",
+            "provider": "caldav",
+            "server_url": "https://dav.example.com/principals/SECRETPATH/",
+            "username": "another@example.com",
+        },
+        "dry_run": True,
+    }
+    secrets = ("DEVICEKEY", "someone@example.com", "another@example.com", "SECRETPATH")
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=10) as c:
+        assert (await c.get("/", params={"k": key})).status_code == 303
+        tcp = [
+            await c.post("/api/ops/config.set", json=threshold, headers=origin),
+            await c.post("/api/ops/account.add", json=added, headers=origin),
+        ]
+        written = await c.post("/api/ops/account.add", json={"args": added["args"]}, headers=origin)
+    async with uds(short_dir) as s:
+        sock = [
+            await s.post("/api/ops/config.set", json=threshold),
+            await s.post("/api/ops/account.add", json={**added, "args": {**added["args"], "name": "newer"}}),
+        ]
+    await d.stop()
+    for response in [*tcp, written, *sock]:
+        assert response.status_code == 200, response.text
+    set_diff, add_diff = (r.json()["diff"] for r in tcp)
+    assert "-failure_threshold = 3\n+failure_threshold = 5\n" in set_diff
+    assert ' bark_url = "https://api.day.app"\n' in set_diff  # context, cut to scheme and host
+    assert '+username = "(hidden)"\n' in add_diff and '+server_url = "https://dav.example.com"\n' in add_diff
+    assert '+credential = {backend = "keychain", ref = "(hidden)"}\n' in add_diff
+    assert ' username = "(hidden)"\n' in add_diff  # the existing account, in the context
+    for text in (*(r.text for r in tcp), written.text):
+        for secret in secrets:
+            assert secret not in text
+    assert written.json()["changed"] is True
+    assert "another@example.com" in (short_dir / "config.toml").read_text()  # the file has it all
+    sock_set, sock_add = (r.json()["diff"] for r in sock)
+    assert "DEVICEKEY" in sock_set
+    assert "another@example.com" in sock_add and "SECRETPATH" in sock_add
+
+
+async def test_adding_an_account_over_tcp_never_re_points_a_stored_credential(
+    state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A keychain entry left by an account removed without ``--delete-credential``: a browser
+    adding an account of that name could point the stored password at a server it chose."""
+    from calsync import credentials
+    from tests.test_ops import FakeKeyring
+
+    keychain = FakeKeyring()
+    keychain.store[("calsync:old-dav", credentials.KEYRING_USER)] = "app-password"
+    monkeypatch.setattr(credentials, "_keyring", lambda: keychain)
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    args = {"name": "old-dav", "provider": "caldav", "server_url": "https://evil.example/", "username": "a b"}
+    response = await c.post("/api/ops/account.add", json={"args": args}, headers=SAME_ORIGIN)
+    assert response.status_code == 403
+    reason = "the keychain already holds a credential for this account; add it from the terminal"
+    assert response.json() == {
+        "error": {
+            "kind": "needs_human",
+            "message": reason,
+            "needs_human": True,
+            "command": "calsync account add old-dav --provider caldav --server-url https://evil.example/ "
+            "--username 'a b'",
+            "reason": reason,
+        }
+    }
+    dry = await c.post("/api/ops/account.add", json={"args": args, "dry_run": True}, headers=SAME_ORIGIN)
+    assert dry.status_code == 403
+    assert daemon.ops == []
+    assert "app-password" not in response.text
+    fresh = {"name": "new-dav", "provider": "caldav"}
+    allowed = await c.post("/api/ops/account.add", json={"args": fresh}, headers=SAME_ORIGIN)
+    assert allowed.status_code == 200 and daemon.ops == [("account.add", fresh, False, "ui")]
+
+
+async def test_adding_an_account_over_tcp_when_the_keychain_cannot_be_asked(
+    state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import keyring.errors
+
+    from calsync import credentials
+
+    class Locked:
+        def get_password(self, service: str, user: str) -> str | None:
+            raise keyring.errors.KeyringLocked("locked")
+
+    monkeypatch.setattr(credentials, "_keyring", lambda: Locked())
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    args = {"name": "dav", "provider": "caldav"}
+    response = await c.post("/api/ops/account.add", json={"args": args}, headers=SAME_ORIGIN)
+    assert response.status_code == 403
+    assert (
+        response.json()["error"]["reason"]
+        == "the keychain could not be checked; add the account from the terminal"
+    )
+    assert response.json()["error"]["command"] == "calsync account add dav --provider caldav"
+    assert daemon.ops == []

@@ -328,7 +328,8 @@ class Daemon:
         The operation runs on the event loop's thread: the store's sqlite connection belongs to
         it, and an operation is one small file write and one row; the lock keeps cycles out."""
         if self._store is None:
-            raise ops.OpsUnavailable("The daemon runs with --no-sync: it changes no configuration.")
+            does = "runs no sync cycles" if name == "trigger" else "changes no configuration"
+            raise ops.OpsUnavailable(f"The daemon runs with --no-sync: it {does}.")
         if self._config_path is None:
             raise ops.OpsUnavailable("The daemon was started without a config file path.")
         if name in ops.UNLOCKED_OPS:  # only asks for a cycle: never waits for one to finish first

@@ -2,8 +2,10 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -507,15 +509,23 @@ def test_expand_respects_the_limit() -> None:
     assert len(got) == 7
 
 
-def test_expand_bounds_the_iterations_of_a_dense_old_series() -> None:
-    import time
-
+def test_expand_bounds_the_iterations_of_a_dense_old_series(monkeypatch: pytest.MonkeyPatch) -> None:
     # A secondly series started a year before the range: ~31.5 million occurrences before it.
+    # The cap, not the clock: the occurrences enumerated are counted.
+    pulled = 0
+    real = model._occurrence_set  # pyright: ignore[reportPrivateUsage]
+
+    def counting(*args: Any, **kwargs: Any) -> Iterator[datetime]:
+        nonlocal pulled
+        for dt in real(*args, **kwargs):
+            pulled += 1
+            yield dt
+
+    monkeypatch.setattr(model, "_occurrence_set", counting)
     s = series(start=at(2025, 10, 23, 9, 30), recurrence=("RRULE:FREQ=SECONDLY",))
-    began = time.monotonic()
     got = model.expand(s, _utc(2026, 10, 24), _utc(2026, 10, 25))
-    assert time.monotonic() - began < 5
     assert got.truncated and got.instances == []
+    assert pulled == model.EXPANSION_ITERATIONS + 1  # the one past the cap stops it
 
 
 def test_expand_finds_instances_within_the_iteration_bound() -> None:

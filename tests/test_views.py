@@ -1053,3 +1053,86 @@ def test_changes_carry_their_detail(tmp_path: Path) -> None:
         runs = build_runs(family(), r).to_json()["runs"]
     assert [c["detail"] for c in changes] == [None, {"fields": {"title": ["Lunch", "Team lunch"]}}]
     assert runs[0]["error_account"] is None
+
+
+# ----- the config text as the web UI sees it ---------------------------------------------------
+
+UNMASKED_TOML = """\
+[google]
+client_secret_file = "~/secret.json"
+
+[accounts.icloud]
+provider = "caldav"
+server_url = "icloud"
+username = "someone@example.com"  # the Apple ID
+credential = { backend = "keychain", ref = "calsync:icloud" }
+
+[accounts.other]
+provider = "caldav"
+server_url = "https://user:pw@dav.example.com:8443/path"
+username = 'lit@example.com'
+credential.backend = "file"
+credential.ref = "~/.pw-file"
+
+[accounts.third.credential]
+backend = "env"
+ref = "PW_VAR"
+
+[notify]
+bark_url = "https://api.day.app/DEVICEKEY"
+# webhook_url = "https://hooks.example.com/OLDPATH"
+webhook_url = \"\"\"https://hooks.example.com/
+MULTILINE\"\"\"
+failure_threshold = 3
+public_url="http://nas.lan:8766/x"
+"""
+
+MASKED_TOML = """\
+[google]
+client_secret_file = "(hidden)"
+
+[accounts.icloud]
+provider = "caldav"
+server_url = "icloud"
+username = "(hidden)"  # the Apple ID
+credential = { backend = "keychain", ref = "(hidden)" }
+
+[accounts.other]
+provider = "caldav"
+server_url = "https://dav.example.com:8443"
+username = "(hidden)"
+credential.backend = "file"
+credential.ref = "(hidden)"
+
+[accounts.third.credential]
+backend = "env"
+ref = "(hidden)"
+
+[notify]
+bark_url = "https://api.day.app"
+# webhook_url = "https://hooks.example.com"
+webhook_url = "(hidden)"
+failure_threshold = 3
+public_url="http://nas.lan:8766"
+"""
+
+
+def test_mask_config_text_masks_what_config_json_masks() -> None:
+    from calsync.views import mask_config_text
+
+    masked = mask_config_text(UNMASKED_TOML)
+    assert masked == MASKED_TOML
+    for secret in (
+        "DEVICEKEY",
+        "someone@",
+        "lit@",
+        "user:pw",
+        "/path",
+        "calsync:icloud",
+        "pw-file",
+        "PW_VAR",
+    ):
+        assert secret not in masked
+    for secret in ("secret.json", "OLDPATH", "MULTILINE", "nas.lan:8766/x"):
+        assert secret not in masked
+    assert mask_config_text(masked) == masked  # stable

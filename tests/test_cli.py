@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import signal
 import stat
@@ -1152,6 +1153,11 @@ def test_trigger_reports_a_socket_it_cannot_reach(short_dir: Path) -> None:
                 EXIT_FAILED,
                 "error: cannot connect to the daemon socket (PermissionError)\n",
             )
+            code, out = run(["--state-dir", str(short_dir), "trigger", *wait, "--json"])
+            assert code == EXIT_FAILED
+            assert json.loads(out) == {
+                "error": {"kind": "error", "message": "cannot connect to the daemon socket (PermissionError)"}
+            }
     finally:
         listening.close()
 

@@ -166,6 +166,17 @@ async def test_request_cycle_with_wait_without_sync_is_unavailable(tmp_path: Pat
         viewer.request_cycle(wait=True)
 
 
+async def test_the_trigger_op_on_a_no_sync_daemon_says_it_runs_no_cycles(tmp_path: Path) -> None:
+    from calsync.ops import OpsUnavailable
+    from tests.test_daemon import two_rules
+
+    viewer = Daemon(two_rules(), tmp_path, sync=False)
+    with pytest.raises(OpsUnavailable, match="--no-sync: it runs no sync cycles"):
+        await viewer.run_op("trigger", {"wait": True}, False, source="cli")
+    with pytest.raises(OpsUnavailable, match="--no-sync: it changes no configuration"):
+        await viewer.run_op("rule.pause", {"name": "family"}, False, source="cli")
+
+
 # ----- the trigger operation in the daemon -----------------------------------------------------
 
 
@@ -254,6 +265,16 @@ async def test_trigger_refuses_bad_arguments(
     await d.start()
     with pytest.raises(error, match=match):
         await d.trigger(**args)
+    await d.stop()
+
+
+async def test_trigger_has_no_dry_run(tmp_path: Path) -> None:
+    d = Running(tmp_path)
+    await d.start()
+    before = d.cycles()
+    with pytest.raises(ConfigError, match=r"trigger has no dry run; use calsync run --dry-run"):
+        await d.daemon.run_op("trigger", {"wait": True}, True, source="cli")
+    assert d.cycles() == before and not d.daemon._pending_all  # pyright: ignore[reportPrivateUsage]
     await d.stop()
 
 
@@ -441,9 +462,28 @@ def test_trigger_without_a_daemon_waits_for_the_lock_holder(
 
     here = Here(short_dir, monkeypatch)
     here.state.mkdir()
-    with RunLock(here.state / "run.lock"):  # `calsync run` holds it
+    with RunLock(here.state / "run.lock"):  # `calsync run`, or a daemon not serving yet, holds it
         code, out = here.cli("--wait")
-    assert code == EXIT_RUNNING and "holds the lock" in out
+    assert code == EXIT_RUNNING
+    assert out.endswith("holds the lock; if a daemon is starting, try again in a moment\n")
+
+
+def test_trigger_dry_run_is_refused_with_exit_2(short_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    here = Here(short_dir, monkeypatch)
+    assert here.cli("--dry-run") == (
+        EXIT_CONFIG,
+        "configuration error:\n  - trigger has no dry run; use calsync run --dry-run\n",
+    )
+    code, out = here.cli("--dry-run", "--wait", "--json")
+    assert code == EXIT_CONFIG
+    assert json.loads(out) == {
+        "error": {
+            "kind": "config",
+            "message": "trigger has no dry run; use calsync run --dry-run",
+            "problems": ["trigger has no dry run; use calsync run --dry-run"],
+        }
+    }
+    assert not here.state.exists()  # nothing ran, nothing was created
 
 
 def test_trigger_timeout_bounds() -> None:

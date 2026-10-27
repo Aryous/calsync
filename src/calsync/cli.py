@@ -177,6 +177,9 @@ def _parser() -> argparse.ArgumentParser:
         help="with --wait: seconds to wait for the daemon's cycle (default: 120, at most 600)",
     )
     trigger.add_argument("--json", action="store_true", help="print JSON")
+    trigger.add_argument(
+        "--dry-run", action="store_true", help="refused: trigger has no dry run (use calsync run --dry-run)"
+    )
 
     status = sub.add_parser("status", help="sync health per rule (read-only)")
     status.add_argument("--json", action="store_true", help="print JSON")
@@ -321,8 +324,8 @@ def _describe(exc: BaseException, args: argparse.Namespace | None = None) -> str
         if getattr(args, "op_command", False):  # the daemon would have run it: not the daemon
             return f"{exc}; try again once it has finished\n"
         command = getattr(args, "command", None)
-        if command == "trigger":  # no daemon serves: the lock holder is `calsync run` (or another)
-            return f"{exc}; try again once it has finished\n"
+        if command == "trigger":  # `calsync run`, or a daemon that has not bound its socket yet
+            return f"{exc}; if a daemon is starting, try again in a moment\n"
         if command == "daemon":
             return f"{exc}; wait for it to finish, or stop the other daemon\n"
         if command == "run" and getattr(args, "allow_deletes", False):
@@ -905,13 +908,17 @@ def cmd_trigger(args: argparse.Namespace, out: TextIO) -> int:
     from calsync.wiring import socket_path
 
     state_dir = _state_dir(args)
-    listens = opsclient.daemon_listens(socket_path(state_dir))
-    if listens and not args.wait:
-        return asyncio.run(_trigger(args, out))
     op_args: dict[str, object] = {"wait": True, "timeout": args.timeout} if args.wait else {}
     if args.rule:
         op_args["rule"] = args.rule
     try:
+        if args.dry_run:  # it writes no config: refused, like the operation
+            from calsync.ops import TRIGGER_NO_DRY_RUN
+
+            raise ConfigError([TRIGGER_NO_DRY_RUN])
+        listens = opsclient.daemon_listens(socket_path(state_dir))  # a socket it cannot reach raises
+        if listens and not args.wait:
+            return asyncio.run(_trigger(args, out))
         if listens:
             result = opsclient.call(
                 "trigger",
