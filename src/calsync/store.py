@@ -10,7 +10,9 @@ in one transaction. A version with no path to ``SCHEMA_VERSION`` (older than the
 newer than this code, or unreadable) is dropped and rebuilt. To add version N+1: bump
 ``SCHEMA_VERSION``, change ``_SCHEMA`` (a fresh database), and add an ``N: _upgrade_N`` step
 that turns a version-N database into exactly that, keeping ``run`` and ``change``; a step may
-still empty a cache table if that is simpler."""
+still empty a cache table if that is simpler. A step that creates a table drops it first: an
+older calsync that reopened a newer database rebuilt only the tables it knows and left the
+newer ones behind."""
 
 import json
 import os
@@ -418,6 +420,9 @@ def _upgrade_3(db: sqlite3.Connection) -> None:
     for column in ("reverted", "protected", "out_of_window"):
         db.execute(f"ALTER TABLE run ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
     db.execute("ALTER TABLE run ADD COLUMN error_kind TEXT")
+    # An older calsync that reopened a v4 database rebuilt its own tables but left ``change``
+    # behind; its rows point at run ids that rebuild reset, so they go.
+    db.execute("DROP TABLE IF EXISTS change")
     for statement in _CHANGE_SCHEMA:
         db.execute(statement)
 

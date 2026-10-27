@@ -436,6 +436,27 @@ def test_v3_database_is_upgraded_in_place(tmp_path: Path) -> None:
     assert {"run_rule", "change_rule", "change_at"} <= indexes
 
 
+def test_upgrade_after_a_rollback_drops_the_stale_change_table(tmp_path: Path) -> None:
+    """An older calsync that reopened a v4 database rebuilt its own v3 tables but left ``change``
+    behind (it does not know the table); upgrading again must not fail on it."""
+    db = tmp_path / "s.db"
+    _v3_database(db)
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute(
+            "CREATE TABLE change (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, "
+            "rule TEXT NOT NULL, object_id TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL, "
+            "title TEXT)"
+        )
+        conn.execute("CREATE INDEX change_rule ON change (rule, id)")
+        conn.execute("INSERT INTO change VALUES (1, 99, 'a', 'o1', 'created', ?, 'Old')", (T0.isoformat(),))
+        conn.commit()
+    with Store(db) as store:
+        assert [r.rule for r in store.latest_runs()] == ["a"]
+        assert store.last_title("a", "o1") is None  # its run ids no longer exist: dropped
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("4",)]
+    assert _count(db, "SELECT COUNT(*) FROM change") == 0
+
+
 def test_upgraded_schema_equals_a_fresh_one(tmp_path: Path) -> None:
     """The upgrade step and a fresh schema describe the same tables and columns."""
     _v3_database(tmp_path / "old.db")
