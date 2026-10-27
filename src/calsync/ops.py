@@ -827,30 +827,36 @@ async def refresh_calendars(
 ) -> Refreshed:
     """Fetch each account's calendar list into the cache (``account_calendar``), stamped ``at``;
     with ``save=False`` only list it (a dry run). Each listing waits at most ``REFRESH_TIMEOUT``.
-    A failing account keeps its old rows; its failure is logged by type (the text can carry a
+    The accounts are listed concurrently. A failing account keeps its old rows; its failure is logged by type (the text can carry a
     URL: ``debug.details``). Google rows carry calendarList's ``accessRole``; CalDAV rows no role
     (discovery reads no privilege set, and no request is added just for it)."""
     done = Refreshed()
-    for name in names:
-        try:
-            adapters.adapter(name)  # its setup error, if any
-            if name in adapters.sources:
-                found = await asyncio.wait_for(adapters.sources[name].list_calendars(), REFRESH_TIMEOUT)
-                rows = [AccountCalendar(name, c.id, c.name, c.role, at) for c in found]
-            else:
-                listed = await asyncio.wait_for(adapters.targets[name].list_calendars(), REFRESH_TIMEOUT)
-                rows = [AccountCalendar(name, c.href, c.name, None, at) for c in listed]
-        except Exception as exc:
+
+    async def listing(name: str) -> list[AccountCalendar]:
+        adapters.adapter(name)  # its setup error, if any
+        if name in adapters.sources:
+            found = await asyncio.wait_for(adapters.sources[name].list_calendars(), REFRESH_TIMEOUT)
+            return [AccountCalendar(name, c.id, c.name, c.role, at) for c in found]
+        listed = await asyncio.wait_for(adapters.targets[name].list_calendars(), REFRESH_TIMEOUT)
+        return [AccountCalendar(name, c.href, c.name, None, at) for c in listed]
+
+    # Every account at once (each has its own client): accounts that do not answer cost one
+    # timeout together. Written one account at a time, in ``names`` order.
+    outcomes = await asyncio.gather(*(listing(n) for n in names), return_exceptions=True)
+    for name, outcome in zip(names, outcomes, strict=True):
+        if isinstance(outcome, BaseException):
+            if not isinstance(outcome, Exception):  # cancelled, KeyboardInterrupt: not an account failure
+                raise outcome
             log.warning(
-                "the calendar list of account %s could not be refreshed (%s)", name, type(exc).__name__
+                "the calendar list of account %s could not be refreshed (%s)", name, type(outcome).__name__
             )
-            debug.details(log, f"the calendar list of account {name} could not be refreshed", exc)
-            done.errors[name] = exc
+            debug.details(log, f"the calendar list of account {name} could not be refreshed", outcome)
+            done.errors[name] = outcome
             continue
         if save:
-            store.save_account_calendars(name, rows, at)
-        done.counts[name] = len(rows)
-        done.rows[name] = rows
+            store.save_account_calendars(name, outcome, at)
+        done.counts[name] = len(outcome)
+        done.rows[name] = outcome
     return done
 
 
@@ -1048,6 +1054,8 @@ async def _rule_preview(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> 
         )
         found = await _preview_target(ctx, config, rule.target.account, rule.target.calendar, dry_run)
     except _Unreachable as failure:
+        log.warning("rule preview: account %s unreachable (%s)", failure.account, type(failure.exc).__name__)
+        debug.details(log, f"rule preview: account {failure.account} unreachable", failure.exc)
         error = plain_error(
             failure.exc, f'account "{failure.account}"', account=failure.account, setup=failure.setup
         )

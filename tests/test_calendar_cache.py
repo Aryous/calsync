@@ -440,3 +440,65 @@ async def test_daemon_refreshes_before_the_first_cycle_and_bounds_each_listing(
     assert daemon.snapshot().cycles == 1
     assert cached(tmp_path, "me") == []
     assert any("me" in r.getMessage() and "TimeoutError" in r.getMessage() for r in caplog.records)
+
+
+# ----- fix round 2: no cycle after a stop during the refresh; accounts in parallel -------------------
+
+
+async def test_a_stop_during_the_start_refresh_runs_no_cycle(tmp_path: Path) -> None:
+    """``stop`` set while the calendar lists are fetched: the daemon ends without a cycle."""
+    world = World()
+    world.target.add_calendar("Family")
+
+    class Stopping(SlowList):
+        async def list_calendars(self) -> Any:
+            world.stop.set()
+            return await self._inner.list_calendars()
+
+    async def factory(config: Config, names: set[str], **kw: Any) -> wiring.Adapters:
+        adapters = await world.factory(config, names, **kw)
+        if "me" in adapters.sources:
+            adapters.sources["me"] = Stopping(adapters.sources["me"])  # type: ignore[assignment]
+        return adapters
+
+    daemon = world.daemon(config_for([rule()]), tmp_path, adapters_factory=factory)
+    await daemon.run(world.stop)
+    assert daemon.snapshot().cycles == 0
+    with StateReader(tmp_path / "state.db") as reader:
+        assert reader.runs() == []
+
+
+async def test_accounts_are_refreshed_concurrently(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two accounts that never answer cost one timeout, not two; each still fails on its own."""
+    import time
+
+    monkeypatch.setattr(ops, "REFRESH_TIMEOUT", 0.3)
+    accounts = Accounts()
+    adapters = await accounts.build(config_for([rule()]), {"me", "dav"})
+    adapters.targets["dav"] = SlowList(adapters.targets["dav"])  # type: ignore[assignment]
+    adapters.sources["me"] = SlowList(adapters.sources["me"])  # type: ignore[assignment]
+    with Store(tmp_path / "state.db") as store:
+        started = time.monotonic()
+        done = await ops.refresh_calendars(store, adapters, ["dav", "me"], NOW)
+        elapsed = time.monotonic() - started
+    await adapters.aclose()
+    assert set(done.errors) == {"dav", "me"} and done.counts == {}
+    assert all(isinstance(e, TimeoutError) for e in done.errors.values())
+    assert elapsed < 0.55  # one timeout (0.3 s); one after the other would take 0.6 s
+
+
+async def test_concurrent_refresh_writes_each_account_once(tmp_path: Path) -> None:
+    accounts = Accounts()
+    adapters = await accounts.build(config_for([rule()]), {"me", "dav"})
+    with Store(tmp_path / "state.db") as store:
+        writes: list[str] = []
+        real = store.save_account_calendars
+
+        def spy(account: str, rows: Any, at: datetime) -> None:
+            writes.append(account)
+            real(account, rows, at)
+
+        store.save_account_calendars = spy  # type: ignore[method-assign]
+        done = await ops.refresh_calendars(store, adapters, ["dav", "me"], NOW)
+    await adapters.aclose()
+    assert done.counts == {"dav": 1, "me": 2} and writes == ["dav", "me"]

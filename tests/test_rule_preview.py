@@ -318,3 +318,24 @@ def test_only_named_operations_exit_by_their_error_kind(
     preview = ["--preview"] if op == "rule.preview" else []
     code, _ = setup.cli("rule", "add", "kids", "--source", "me:Family", "--target", "dav:Home", *preview)
     assert code == expected
+
+
+def test_an_unreachable_account_is_logged_by_type(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    monkeypatch.setattr(ops, "PREVIEW_TIMEOUT", 0.05)
+    real = setup.accounts.build
+
+    async def build(config: Any, names: set[str], **kw: Any) -> wiring.Adapters:
+        adapters = await real(config, names, **kw)
+        if "me" in adapters.sources:
+            adapters.sources["me"] = Hanging()  # type: ignore[assignment]
+        return adapters
+
+    monkeypatch.setattr(wiring, "build_adapters", build)
+    with caplog.at_level(logging.WARNING):
+        setup.preview(source="me:Work", target="dav:Work")
+    messages = [r.getMessage() for r in caplog.records]
+    assert "rule preview: account me unreachable (TimeoutError)" in messages

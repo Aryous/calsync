@@ -579,6 +579,8 @@ class Daemon:
                 # long first sync; then every CALENDAR_REFRESH). Not while stopping.
                 if not stop.is_set():
                     await self._refresh_calendars()
+            if stop.is_set():  # set during the refresh: no cycle starts after it
+                break
             rules, every = self._select(due)
             if rules:
                 await self._cycle(rules)
