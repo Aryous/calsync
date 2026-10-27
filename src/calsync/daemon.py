@@ -158,6 +158,7 @@ class Daemon:
         self._stat: tuple[int, int] | None = None
         self._rejected: str | None = None  # fingerprint of an invalid edit, logged once
         self._written: Snapshot | None = None  # written by an operation, applied when it returns
+        self._before_written: Snapshot | None = None  # ``_snapshot`` before that write
         self._state_dir = state_dir
         self._db_path, self._lock_path = wiring.state_paths(state_dir)
         self._sync = sync
@@ -194,6 +195,7 @@ class Daemon:
         # Approved blocked sets (rule -> fingerprint), consumed by the rule's next cycle; and
         # the operations waiting for the next cycle of some rules (None: of any rule).
         self._approvals: dict[str, str] = {}
+        self._scheduling = False  # the scheduler runs: something will run the cycles requested
         self._waiters: list[tuple[set[str] | None, asyncio.Future[CycleResult | None]]] = []
 
     # ----- interface ----------------------------------------------------------
@@ -324,7 +326,10 @@ class Daemon:
     ) -> "asyncio.Future[CycleResult | None] | None":
         """``ops.DaemonHooks.approve``: keep the approval for the rule's next cycle and request
         it. The caller holds ``_cycle_lock`` (no cycle runs). ``ValueError`` (``RulePaused``)
-        for a rule that is unknown or paused; nothing is stored then."""
+        for a rule that is unknown or paused, ``OpsUnavailable`` once the scheduler has stopped
+        (no cycle would consume it); nothing is stored then."""
+        if not self._scheduling:
+            raise ops.OpsUnavailable("The daemon is stopping.")
         self.request_cycle(rule)
         self._approvals[rule] = fingerprint
         self._on_approved(rule, count, origin)
@@ -369,25 +374,35 @@ class Daemon:
         """``on_config_written``: the file now holds ``snapshot``. Remembered at once, so the
         watcher never takes the daemon's own write for an external edit; applied (async) when
         the operation returns."""
+        if self._written is None:
+            self._before_written = self._snapshot
         self._snapshot, self._rejected = snapshot, None
         self._written = snapshot
 
     async def _apply_written(self) -> None:
         snapshot, self._written = self._written, None
+        before, self._before_written = self._before_written, None
         if snapshot is None:
             return
         try:
             config = validate_text(snapshot.text, snapshot.path.parent)  # write_config validated it
         except ConfigError as exc:  # cannot happen short of a bug; keep running what runs
             log.error("the written config could not be applied (%d problems)", len(exc.problems))
+            self._unremember(before)
             return
         try:
             await self._apply(config)
         except Exception as exc:  # a bug: the running config stays (``_apply`` rolled back)
             log.error("config reload failed (%s)", type(exc).__name__)
             debug.details(log, "config reload failed", exc)
+            self._unremember(before)
             return
         log.info("config changed; applied")
+
+    def _unremember(self, before: Snapshot | None) -> None:
+        """The written file is not what runs: the watcher remembers what runs again, and reads
+        the file at its next poll, which retries (or reports) the written config."""
+        self._snapshot, self._stat = before, None
 
     @property
     def config(self) -> Config:
@@ -488,9 +503,11 @@ class Daemon:
 
     # ----- schedule -----------------------------------------------------------
     async def _scheduler(self, stop: asyncio.Event) -> None:
+        self._scheduling = True
         try:
             await self._schedule(stop)
         finally:  # nothing runs cycles any more: nobody waits for one
+            self._scheduling = False
             self._approvals.clear()
             waiters, self._waiters = self._waiters, []
             for _, future in waiters:

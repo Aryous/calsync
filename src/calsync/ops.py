@@ -614,18 +614,11 @@ def _approve(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
     except views.StateUnavailable:
         view = views.BlockedView(())
     if not view.rules:
-        return OpResult(
-            op, False, f'rule "{name}" is not blocked: nothing to approve', data=_status(name, "not_blocked")
-        )
+        return not_blocked(name)
     blocked = view.rules[0]
     fingerprint = blocked.fingerprint
     if fingerprint is None:
-        raise ConfigError(
-            [
-                f'rule "{name}" is blocked, but its blocked set is no longer recorded; restart the daemon '
-                f"(or run `calsync run --rule {name}` with the daemon stopped) to record it, then approve"
-            ]
-        )
+        raise unrecorded_block(name)
     if wanted is not None and wanted != fingerprint:
         return _stale(op, name, fingerprint, blocked.count, wanted)
     data = {**_status(name, "pending"), "fingerprint": fingerprint, "count": blocked.count}
@@ -655,6 +648,26 @@ def _approve(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
     if removed:
         return dataclasses.replace(outcome, summary=outcome.summary + "; " + "; ".join(removed))
     return outcome
+
+
+def not_blocked(rule: str) -> OpResult:
+    """``approve``'s answer for a rule with nothing blocked (the CLI's prompt answers it too)."""
+    return OpResult(
+        "approve",
+        False,
+        f'rule "{rule}" is not blocked: nothing to approve',
+        data=_status(rule, "not_blocked"),
+    )
+
+
+def unrecorded_block(rule: str) -> ConfigError:
+    """A blocked rule whose blocked set (so its fingerprint) is no longer recorded."""
+    return ConfigError(
+        [
+            f'rule "{rule}" is blocked, but its blocked set is no longer recorded; restart the daemon '
+            f"(or run `calsync run --rule {rule}` with the daemon stopped) to record it, then approve"
+        ]
+    )
 
 
 def _status(rule: str, status: str) -> dict[str, Any]:

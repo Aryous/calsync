@@ -7,7 +7,14 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from calsync.errors import AuthError, CalsyncError, ConfigError, CursorExpired, NotFoundError
+from calsync.errors import (
+    AuthError,
+    CalendarNotListed,
+    CalsyncError,
+    ConfigError,
+    CursorExpired,
+    NotFoundError,
+)
 from calsync.http import Sleep
 from calsync.naming import parse_resource_name
 from calsync.targets.base import DetectMode, FetchedObject, TargetCalendar, TargetDelta
@@ -189,7 +196,7 @@ class CalDavTarget:
         if len(matches) > 1:
             raise ConfigError([f"CalDAV calendar {ref!r} matches {len(matches)} calendars; use its href"])
         if not create:
-            raise NotFoundError(f"CalDAV calendar {ref!r} not found")
+            raise CalendarNotListed(f"CalDAV calendar {ref!r} not found")
         href = f"{(await self._calendar_home()).rstrip('/')}/{uuid.uuid4().hex}/"
         await self._dav.mkcalendar(href, ref)
         for cal in await self.list_calendars():

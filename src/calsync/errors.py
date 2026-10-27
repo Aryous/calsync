@@ -41,6 +41,12 @@ class NotFoundError(CalsyncError):
     """The requested calendar or resource does not exist."""
 
 
+class CalendarNotListed(NotFoundError):
+    """The calendar listing was read and no calendar in it matches the ref. Unlike any other
+    ``NotFoundError`` (a 404 on the principal or the calendar home during discovery), this is
+    evidence that the calendar does not exist."""
+
+
 class CursorExpired(CalsyncError):
     """An incremental sync cursor is no longer valid; a full resync is required."""
 

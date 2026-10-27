@@ -292,6 +292,42 @@ async def test_an_own_write_is_applied_at_once_and_not_recorded_as_external(
     assert runs_by_time(tmp_path) == [(0, "family"), (0, "work"), (30, "family")]
 
 
+async def test_an_own_write_that_fails_to_apply_is_retried_by_the_watcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``_apply`` rolled back: the file no longer holds what runs, so the next poll sees it."""
+    from calsync.daemon import Daemon
+
+    caplog.set_level(logging.INFO, logger="calsync.daemon")
+    path, config = setup(tmp_path)
+    world = World(stop_after=20)
+    daemon = world.daemon(config, tmp_path, config_path=path)
+    real = Daemon._apply  # pyright: ignore[reportPrivateUsage]
+    attempts: list[int] = []
+
+    async def apply_once_broken(self: Daemon, config: Config) -> None:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("a bug")
+        await real(self, config)
+
+    monkeypatch.setattr(Daemon, "_apply", apply_once_broken)
+    after_op: list[list[str]] = []
+
+    async def pause() -> None:
+        await daemon.run_op("rule.pause", {"name": "work"}, False, source="cli")
+        after_op.append([r.name for r in daemon.config.rules if r.paused])
+
+    tasks: list[asyncio.Task[None]] = []
+    on_wait(world, 1, lambda: tasks.append(asyncio.ensure_future(pause())))
+    await daemon.run(world.stop)
+    await asyncio.gather(*tasks)
+    assert after_op == [[]]  # the failed apply kept the running config
+    assert caplog.messages.count("config reload failed (RuntimeError)") == 1
+    assert len(attempts) == 2  # retried by the watcher at its next poll
+    assert [r.name for r in daemon.config.rules if r.paused] == ["work"]
+
+
 async def test_an_external_edit_is_recorded_before_an_op_that_follows_it(tmp_path: Path) -> None:
     path, config = setup(tmp_path)
     world = World(block=True)
@@ -503,6 +539,28 @@ async def test_a_retiring_rule_never_creates_its_target_calendar(tmp_path: Path)
     assert history(tmp_path) == [("daemon", 'rule "family" removed after its copies were deleted')]
     with StateReader(tmp_path / "state.db") as reader:
         assert [(r.status, r.deleted) for r in reader.runs("family")] == [("ok", 0)]
+
+
+async def test_a_discovery_404_never_retires_a_rule_whose_copies_remain(tmp_path: Path) -> None:
+    """Only a listing without the calendar means "no copies left": a 404 on the way to the
+    listing (principal, calendar home) fails the rule, which stays in the file."""
+    from calsync.errors import NotFoundError
+    from calsync.naming import resource_name
+
+    path, config = setup(tmp_path, retiring(TEXT))
+    world = World(stop_after=5)
+    cal = world.target.add_calendar("Family")
+    copy = cal.href + resource_name("family", "c" * 24)
+    world.target.put(copy, b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n")
+    world.target.fail_discovery = NotFoundError("/dav/home/")
+    daemon = world.daemon(config, tmp_path, config_path=path)
+    await daemon.run(world.stop)
+    assert 'name = "family"' in path.read_text()
+    assert rules_of(daemon.config) == ["family", "work"]
+    assert history(tmp_path) == []
+    assert copy in world.target.objects
+    with StateReader(tmp_path / "state.db") as reader:
+        assert {r.status for r in reader.runs("family")} == {"failed"}
 
 
 async def test_a_reload_that_fails_keeps_the_running_config_and_the_schedule(

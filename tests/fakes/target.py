@@ -12,6 +12,8 @@ Use ``put``/``remove`` (not ``objects`` directly) to change resources in sync mo
 Injection points drive edge cases:
 - ``fail_changes[ref]``: exception raised by the next ``changes()`` call for a
   calendar (consumed once); ``fail_fetch`` fails every ``fetch()`` while set.
+- ``fail_discovery``: raised by every ``list_calendars()`` / ``ensure_calendar()`` while set
+  (a discovery failure, e.g. a 404 on the principal or the calendar home).
 - ``before_write(op, href)``: called at the start of every write; it may mutate
   ``objects`` (to stage a race) or raise (to fail that one write).
 """
@@ -19,7 +21,7 @@ Injection points drive edge cases:
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
-from calsync.errors import ConflictError, NotFoundError
+from calsync.errors import CalendarNotListed, ConflictError
 from calsync.naming import parse_resource_name
 from calsync.targets.base import DetectMode, FetchedObject, TargetCalendar, TargetDelta
 
@@ -32,6 +34,7 @@ class FakeTarget:
     objects: dict[str, tuple[str, bytes]] = field(default_factory=dict)  # href -> (etag, data)
     fail_changes: dict[str, Exception] = field(default_factory=dict)
     fail_fetch: Exception | None = None  # raised by every fetch() while set
+    fail_discovery: Exception | None = None  # raised by list_calendars/ensure_calendar while set
     hide_once: set[str] = field(default_factory=set)  # left out of the next fetch() only
     before_write: Callable[[str, str], None] | None = None
     calls: list[tuple[str, str]] = field(default_factory=list)
@@ -67,13 +70,17 @@ class FakeTarget:
         pass
 
     async def list_calendars(self) -> list[TargetCalendar]:
+        if self.fail_discovery is not None:
+            raise self.fail_discovery
         return list(self.calendars.values())
 
     async def ensure_calendar(self, ref: str, *, create: bool) -> TargetCalendar:
+        if self.fail_discovery is not None:
+            raise self.fail_discovery
         if ref in self.calendars:
             return self.calendars[ref]
         if not create:
-            raise NotFoundError(f"fake calendar {ref!r} not found")
+            raise CalendarNotListed(f"fake calendar {ref!r} not found")
         return self.add_calendar(ref)
 
     async def changes(self, cal: TargetCalendar, cursor: str | None) -> TargetDelta:

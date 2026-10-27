@@ -329,6 +329,19 @@ async def test_a_rule_paused_before_its_approval_cycle_refuses_the_waiter(tmp_pa
     assert d.family_copies() == COUNT
 
 
+async def test_an_approval_after_the_scheduler_stopped_is_refused(tmp_path: Path) -> None:
+    """No cycle would ever consume it: refused, nothing stored, nothing logged as approved."""
+    from calsync.ops import OpsUnavailable
+
+    d = Running(tmp_path)
+    fingerprint = await d.start()
+    await d.stop()
+    with pytest.raises(OpsUnavailable, match=r"The daemon is stopping\."):
+        d.daemon.approve("family", fingerprint, COUNT, "cli", wait=False)
+    assert d.daemon._approvals == {}  # pyright: ignore[reportPrivateUsage]
+    assert d.family_copies() == COUNT
+
+
 async def test_a_dry_run_stores_nothing(tmp_path: Path) -> None:
     d = Running(tmp_path)
     fingerprint = await d.start()
@@ -488,6 +501,33 @@ def test_on_a_tty_the_rule_name_confirms_the_shown_set(files: Files, calls: list
 def test_on_a_tty_anything_else_aborts(files: Files, calls: list[Any]) -> None:
     code, out = files.cli("approve", "family", stdin=Tty("yes\n"))
     assert code == EXIT_FAILED and out.endswith("not approved\n")
+    assert calls[1:] == []
+
+
+def test_on_a_tty_a_rule_that_is_not_blocked_is_answered_without_sending(
+    files: Files, calls: list[Any]
+) -> None:
+    """Nothing was shown, so nothing is sent: never an approval of an unseen set."""
+    code, out = files.cli("approve", "work", stdin=Tty("work\n"))
+    assert (code, out) == (EXIT_CONFIG, 'rule "work" is not blocked: nothing to approve\n')
+    assert calls[1:] == []
+
+
+def test_on_a_tty_an_unrecorded_block_is_refused_without_sending(files: Files, calls: list[Any]) -> None:
+    """Blocked again after an ok run, with the rows of the older block only: unknown set."""
+    with Store(files.state / "state.db") as store:
+        store.record_runs([RunRecord("family", NOW, NOW, "ok", 0, 0, 0, 0, 1, None)])
+        store.record_runs(
+            [RunRecord("family", NOW, NOW, "blocked", 0, 0, 0, 0, 1, "guard", error_kind="guard")]
+        )
+    code, out = files.cli("approve", "family", stdin=Tty("family\n"))
+    assert code == EXIT_CONFIG and "its blocked set is no longer recorded" in out
+    assert "would be deleted" not in out and calls[1:] == []
+
+
+def test_on_a_tty_an_unknown_rule_is_refused_without_sending(files: Files, calls: list[Any]) -> None:
+    code, out = files.cli("approve", "nope", stdin=Tty("nope\n"))
+    assert code == EXIT_CONFIG and 'unknown rule "nope"' in out
     assert calls[1:] == []
 
 

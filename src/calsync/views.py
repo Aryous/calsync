@@ -307,11 +307,6 @@ class StateReader:
             return None
         return int(rows[0][0]), [(oid, title) for _, oid, title in rows]
 
-    def blocked_count(self, rule: str) -> int:
-        """Deletions in the most recently recorded blocked set (0: none recorded)."""
-        found = self.latest_blocked(rule)
-        return len(found[1]) if found is not None else 0
-
     def delivered_at(self, rule: str, object_id: str) -> datetime | None:
         """When the rule last wrote the object to its target (the newest create, update or
         revert); ``None``: never recorded."""
@@ -743,7 +738,9 @@ def _attention(reader: StateReader, status: RuleStatus) -> Attention | None:
             f"calsync auth {account}",
         )
     if health == "blocked":
-        message = blocked_message(rule.name, reader.blocked_count(rule.name))
+        # The rows of this block, as ``calsync blocked`` reads them: one count per block.
+        entry = _blocked_rule(rule, reader)
+        message = blocked_message(rule.name, entry.count if entry is not None else 0)
         return Attention("blocked", rule.name, None, message, f"calsync approve {rule.name}")
     if health == "failing":
         k = status.consecutive_failures

@@ -20,6 +20,7 @@ from calsync.views import (
     ConfigChangeView,
     StateReader,
     StateUnavailable,
+    build_blocked,
     build_changes,
     build_runs,
     build_status,
@@ -410,6 +411,71 @@ def test_blocked_attention_without_rows_has_no_count(tmp_path: Path) -> None:
         view["attention"][0]["message"]
         == "Copies would be deleted — check `calsync blocked --rule family`, then approve if intended"
     )
+
+
+# A blocked rule's history, run by run: (status, blocked object ids recorded with that run).
+T0, T1, T2 = NOW, NOW + timedelta(minutes=1), NOW + timedelta(minutes=2)
+SET_A = ["oa1", "oa2", "oa3", "oa4"]
+
+
+def _history(tmp_path: Path, runs: list[tuple[str, list[str]]]) -> None:
+    """Records ``runs`` one minute apart from ``T0``, each with its own blocked rows."""
+    with Store(tmp_path / "state.db") as store:
+        for i, (status, blocked) in enumerate(runs):
+            at = T0 + timedelta(minutes=i)
+            error, kind = (
+                ("guard", "guard")
+                if status == "blocked"
+                else ("boom", "other")
+                if status == "failed"
+                else (None, None)
+            )
+            store.record_runs(
+                [RunRecord("family", at, at, status, 0, 0, 0, 0, 1, error, error_kind=kind)],
+                [ChangeRecord("family", oid, "blocked", at, f"Event {oid}") for oid in blocked],
+            )
+
+
+def _blocked_and_attention(tmp_path: Path) -> tuple[Any, str]:
+    config = family()
+    with reader(tmp_path) as r:
+        view = build_blocked(config, r)
+        status = build_status(config, r, T2).to_json()
+    [entry] = view.rules
+    return entry, status["attention"][0]["message"]
+
+
+def test_rows_of_an_older_block_are_not_the_current_one(tmp_path: Path) -> None:
+    """Blocked again after an ok run, without rows of its own: the set is unknown, and the
+    attention count agrees with ``calsync blocked`` (no count from the older block's rows)."""
+    from calsync.engine import delete_fingerprint
+
+    _history(tmp_path, [("blocked", SET_A), ("ok", []), ("blocked", [])])
+    entry, message = _blocked_and_attention(tmp_path)
+    assert (entry.since, entry.count, entry.fingerprint, entry.items) == (T2, 0, None, ())
+    assert (
+        message == "Copies would be deleted — check `calsync blocked --rule family`, then approve if intended"
+    )
+    assert delete_fingerprint(SET_A) != entry.fingerprint
+
+
+def test_the_same_set_blocked_again_after_an_ok_run_is_a_new_block(tmp_path: Path) -> None:
+    from calsync.engine import delete_fingerprint
+
+    _history(tmp_path, [("blocked", SET_A), ("ok", []), ("blocked", SET_A)])
+    entry, message = _blocked_and_attention(tmp_path)
+    assert (entry.since, entry.count, entry.fingerprint) == (T2, 4, delete_fingerprint(SET_A))
+    assert message.startswith("4 copies would be deleted")
+
+
+def test_a_failed_run_in_the_middle_keeps_the_block(tmp_path: Path) -> None:
+    from calsync.engine import delete_fingerprint
+
+    _history(tmp_path, [("blocked", SET_A), ("failed", []), ("blocked", [])])
+    entry, message = _blocked_and_attention(tmp_path)
+    assert (entry.since, entry.count, entry.fingerprint) == (T0, 4, delete_fingerprint(SET_A))
+    assert [i.object_id for i in entry.items] == SET_A
+    assert message.startswith("4 copies would be deleted")
 
 
 def four() -> FakeGoogle:

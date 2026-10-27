@@ -16,7 +16,14 @@ from typing import Any, Literal
 
 from calsync import debug
 from calsync.config import Config, Rule
-from calsync.errors import AuthError, CalsyncError, ConfigError, ConflictError, NotFoundError
+from calsync.errors import (
+    AuthError,
+    CalendarNotListed,
+    CalsyncError,
+    ConfigError,
+    ConflictError,
+    NotFoundError,
+)
 from calsync.http import RequestLog
 from calsync.mirror import Mirror, apply_pull
 from calsync.model import Window, apply_alarm_policy, apply_field_policy, series_hash, series_span
@@ -160,7 +167,8 @@ TargetKey = tuple[str, str]  # (account, calendar ref from config)
 
 
 class _CalendarMissing(NotFoundError):
-    """The target calendar does not exist and no rule of it may create it."""
+    """The calendar listing has no target calendar (``CalendarNotListed``) and no rule of it may
+    create it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -274,7 +282,9 @@ class Engine:
     # ----- phase 2: detect ---------------------------------------------
     async def _detect(self, key: TargetKey, rules: list[Rule], dry_run: bool) -> bool:
         """Detect the target calendar's changes; True if every changed copy was read (the
-        cursor advanced). ``_CalendarMissing`` if it does not exist and none may create it."""
+        cursor advanced). ``_CalendarMissing`` if the calendar listing does not have it and none
+        may create it; any other ``NotFoundError`` (a 404 during discovery) is no evidence that
+        the calendar is gone and fails its rules as any error does."""
         account, ref = key
         target = self._targets[account]
         cal = self._calendars.get(key) or self._store.load_target_calendar(account, ref)
@@ -283,7 +293,7 @@ class Engine:
             wants_create = any(r.target.create_if_missing and not r.retire for r in rules)
             try:
                 cal = await target.ensure_calendar(ref, create=wants_create and not dry_run)
-            except NotFoundError as exc:
+            except CalendarNotListed as exc:
                 if dry_run and wants_create:
                     raise NotFoundError(
                         f"target calendar {ref!r} does not exist yet; a real run creates it"

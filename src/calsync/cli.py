@@ -9,7 +9,7 @@ import sys
 from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, TextIO
+from typing import TYPE_CHECKING, Literal, TextIO
 
 from calsync import __version__
 
@@ -18,6 +18,7 @@ if TYPE_CHECKING:  # type-only: importing these at runtime would load httpx/ical
 
     from calsync.config import Config
     from calsync.engine import CycleResult, RuleResult
+    from calsync.ops import OpResult
     from calsync.store import Store
     from calsync.views import BlockedView, ChangesView, RunsView, StateReader, StatusView, UpcomingView
 
@@ -419,7 +420,9 @@ def cmd_approve(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
         if shown is False:
             out.write("not approved\n")
             return EXIT_FAILED
-        if shown is not None and fingerprint is None:
+        if not isinstance(shown, str):  # nothing shown: nothing a person could approve
+            return _approve_answer(shown, args, out)
+        if fingerprint is None:
             fingerprint = shown
     op_args: dict[str, object] = {"rule": args.rule}
     if fingerprint is not None:
@@ -442,6 +445,10 @@ def cmd_approve(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
             error["problems"] = exc.problems
         _dump({"error": error}, out)
         return exit_code_for(exc)
+    return _approve_answer(result, args, out)
+
+
+def _approve_answer(result: "OpResult", args: argparse.Namespace, out: TextIO) -> int:
     if args.json:
         _dump(result.to_json(), out)
     else:
@@ -449,22 +456,32 @@ def cmd_approve(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
     return APPROVE_EXIT.get(str(result.data.get("status")), EXIT_FAILED)
 
 
-def _confirm_blocked(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> "str | bool | None":
+def _confirm_blocked(
+    args: argparse.Namespace, out: TextIO, stdin: TextIO
+) -> "str | Literal[False] | OpResult":
     """Show the rule's blocked set and ask for the rule name. Its fingerprint once confirmed,
-    False if not; None if the rule is not blocked (the operation says so)."""
+    False if not. Nothing is sent for a set the person was not shown: ``not_blocked`` (an
+    ``OpResult``) when the rule is not blocked; ``ConfigError`` for an unknown rule or a blocked
+    set that is no longer recorded (the operation's own answers)."""
+    from calsync import ops
+    from calsync.errors import ConfigError
     from calsync.views import StateReader, StateUnavailable, build_blocked
     from calsync.wiring import state_paths
 
     config = _load(args)
+    if all(r.name != args.rule for r in config.rules):
+        raise ConfigError([f'unknown rule "{args.rule}"'])
     db_path, _ = state_paths(_state_dir(args))
     try:
         with StateReader(db_path) as reader:
             view = build_blocked(config, reader, args.rule)
     except StateUnavailable:
-        return None
-    if not view.rules or view.rules[0].fingerprint is None:
-        return None
+        return ops.not_blocked(args.rule)
+    if not view.rules:
+        return ops.not_blocked(args.rule)
     blocked = view.rules[0]
+    if blocked.fingerprint is None:
+        raise ops.unrecorded_block(args.rule)
     noun = "copy" if blocked.count == 1 else "copies"
     out.write(f"rule {blocked.rule}: {blocked.count} {noun} would be deleted:\n")
     for item in blocked.items[:PROMPT_TITLES]:
