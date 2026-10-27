@@ -286,7 +286,8 @@ calsync run --dry-run          # review before the first real cycle
 
 - **The state database is migrated in place.** Run history, cursors and the
   cached copies are kept, so the first cycle after the upgrade costs no more
-  than any other. Change history (`calsync changes`) starts with the upgrade.
+  than any other. Change history (`calsync changes`) starts with the upgrade:
+  an event synced before it and deleted later is listed without its title.
 - **The daemon replaces a scheduled `calsync run`.** If a `StartInterval`
   agent ran `calsync run` before, unload it before you load the daemon (see
   [Keep it running](#7-keep-it-running)): while the daemon runs, `calsync run`
