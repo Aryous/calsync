@@ -266,6 +266,43 @@ async def test_title_lookup_failure_keeps_the_rule_blocked(tmp_path: Path) -> No
     assert len(h.target.objects) == 4
 
 
+async def test_repeated_block_reuses_the_titles_without_reading_bodies(tmp_path: Path) -> None:
+    """A blocked rule runs every cycle until someone acts: the same set is read once."""
+    fake = many(5)
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    for i in range(4):
+        fake.cancel_event(GCAL, f"e{i}")
+    first = (await h.engine.cycle()).rules["family"]
+    assert first.status == "blocked" and sorted(first.blocked_titles) == ["E0", "E1", "E2", "E3"]
+    h.target.calls.clear()
+    again = (await h.engine.cycle()).rules["family"]
+    assert again.status == "blocked"
+    assert [op for op, _ in h.target.calls] == ["changes"]  # no fetch of the planned deletes
+    assert again.blocked_titles == first.blocked_titles and again.blocked_titles_complete
+    fake.cancel_event(GCAL, "e4")  # a different set: read again
+    h.target.calls.clear()
+    changed = (await h.engine.cycle()).rules["family"]
+    assert changed.status == "blocked" and sorted(changed.blocked_titles) == [f"E{i}" for i in range(5)]
+    assert [op for op, _ in h.target.calls] == ["changes", "fetch"]
+
+
+async def test_failed_title_lookup_is_retried_while_the_block_lasts(tmp_path: Path) -> None:
+    fake = many(4)
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    for i in range(4):
+        fake.cancel_event(GCAL, f"e{i}")
+    h.target.fail_fetch = TransientError("multiget timed out")
+    assert (await h.engine.cycle()).rules["family"].blocked_titles == []
+    h.target.fail_fetch = None
+    res = (await h.engine.cycle()).rules["family"]
+    assert sorted(res.blocked_titles) == ["E0", "E1", "E2", "E3"] and res.blocked_titles_complete
+    h.target.calls.clear()
+    assert (await h.engine.cycle()).rules["family"].blocked_titles_complete
+    assert [op for op, _ in h.target.calls] == ["changes"]
+
+
 # ----- 6. minor ---------------------------------------------------------------
 
 

@@ -76,6 +76,7 @@ class RuleResult:
     # once ``changes`` is written. None: not reached (dry run, or the rule failed earlier).
     seen_protected: frozenset[str] | None = None
     seen_blocked: frozenset[str] | None = None
+    seen_blocked_read: bool = False  # the title lookup for ``seen_blocked`` succeeded
 
     def fail(self, exc: BaseException) -> None:
         self.status = "failed"
@@ -143,6 +144,16 @@ def _blocked_titles(deletes: Sequence[Actual], bodies: Bodies | None) -> tuple[l
 TargetKey = tuple[str, str]  # (account, calendar ref from config)
 
 
+@dataclass(frozen=True, slots=True)
+class _Blocked:
+    """The last recorded blocked set of a rule, with the titles its lookup found."""
+
+    ids: frozenset[str]
+    titles: tuple[str, ...] = ()
+    complete: bool = True
+    read: bool = False  # the lookup succeeded: the same set need not be read again
+
+
 def _rule_names(rules: Iterable[Rule]) -> str:
     """Rule names for a log line. A calendar ref is never logged: it may be a Google calendar ID
     (an address) or a CalDAV URL."""
@@ -175,9 +186,11 @@ class Engine:
         self._warned_degraded: set[tuple[str, str]] = set()  # (rule, source id), once per process
         # Last recorded protected / blocked object ids per rule, updated only after the cycle's
         # history is written: protected ids are recorded when they join the set, a blocked set
-        # when it differs. In memory: a fresh process records the current sets once.
+        # when it differs. In memory: a fresh process records the current sets once. A blocked
+        # set keeps its titles: a rule stays blocked cycle after cycle until someone acts, and
+        # reading every planned delete each time would cost a multiget per cycle.
         self._last_protected: dict[str, frozenset[str]] = {}
-        self._last_blocked: dict[str, frozenset[str]] = {}
+        self._last_blocked: dict[str, _Blocked] = {}
 
     # ----- phase 1: ingest ---------------------------------------------
     async def _ingest(self, account: str, rules: list[Rule]) -> dict[str, Exception]:
@@ -401,14 +414,22 @@ class Engine:
         reason = None if allow_deletes else check_delete_guard(result.plan, deletable, rule.delete_guard)
         if reason:
             result.status, result.error, result.error_kind = "blocked", reason, "guard"
-            bodies = await self._bodies(rule, cal, result.plan.delete)
-            result.blocked_titles, result.blocked_titles_complete = _blocked_titles(
-                result.plan.delete, bodies
-            )
             blocked = frozenset(a.object_id for a in result.plan.delete)
+            last = self._last_blocked.get(rule.name)
+            bodies: Bodies | None = None
+            if last is not None and last.ids == blocked and last.read:
+                # The block the last cycle recorded: same titles, no new rows, nothing to read.
+                result.blocked_titles, result.blocked_titles_complete = list(last.titles), last.complete
+                read = True
+            else:
+                bodies = await self._bodies(rule, cal, result.plan.delete)
+                result.blocked_titles, result.blocked_titles_complete = _blocked_titles(
+                    result.plan.delete, bodies
+                )
+                read = bodies is not None
             if not dry_run:
-                result.seen_blocked = blocked
-                if self._last_blocked.get(rule.name) != blocked:  # a guard decision covers the set
+                result.seen_blocked, result.seen_blocked_read = blocked, read
+                if last is None or last.ids != blocked:  # a guard decision covers the set
                     now = self._clock()
                     result.changes.extend(
                         ChangeRecord(rule.name, a.object_id, "blocked", now, _body_title(bodies, a.href))
@@ -792,5 +813,10 @@ class Engine:
                 if r.seen_protected is not None:
                     self._last_protected[r.rule] = r.seen_protected
                 if r.seen_blocked is not None:
-                    self._last_blocked[r.rule] = r.seen_blocked
+                    self._last_blocked[r.rule] = _Blocked(
+                        r.seen_blocked,
+                        tuple(r.blocked_titles),
+                        r.blocked_titles_complete,
+                        r.seen_blocked_read,
+                    )
         return CycleResult(started, finished, results, requests)
