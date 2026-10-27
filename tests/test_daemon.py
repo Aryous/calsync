@@ -64,7 +64,7 @@ class World:
         self.logs: list[RequestLog] = []
         self.clients: list[httpx.AsyncClient] = []
         self.deny: set[str] = set()  # google accounts built with a revoked credential, once
-        self.on_google: Callable[[], None] | None = None  # called on the next Google request, once
+        self.on_google: Callable[[], None] | None = None  # called on a cycle's next Google request, once
         self.before_sleep: Callable[[], None] | None = None  # called as each wait starts
         self.after_sleep: Callable[[], None] | None = None  # called as each timed-out wait ends
 
@@ -84,9 +84,11 @@ class World:
             self.after_sleep()
 
     def _google(self, request: httpx.Request) -> httpx.Response:
-        hook, self.on_google = self.on_google, None
-        if hook is not None:
-            hook()
+        # A cycle's request: the calendar-cache listing (at start, before the first cycle) is not.
+        if "accessRole" not in request.url.params.get("fields", ""):
+            hook, self.on_google = self.on_google, None
+            if hook is not None:
+                hook()
         return self.fake.handler(request)
 
     async def factory(self, config: Config, names: set[str], *, log: RequestLog | None = None) -> Adapters:

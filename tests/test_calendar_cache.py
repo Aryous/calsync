@@ -352,3 +352,91 @@ def test_calendars_while_another_calsync_holds_the_lock(
     with RunLock(state / "run.lock"):
         code, text = run(config_file, state, "calendars", "me")
     assert code == EXIT_RUNNING and "try again once it has finished" in text and "trigger" not in text
+
+
+# ----- fix round 1: bounded listings, refreshed before the first cycle -------------------------------
+
+
+class SlowList:
+    """An adapter whose calendar listing never answers; everything else is the real one's."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def list_calendars(self) -> Any:
+        await asyncio.Event().wait()
+
+
+async def test_refresh_of_an_account_that_never_answers_times_out(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from calsync.store import AccountCalendar
+
+    monkeypatch.setattr(ops, "REFRESH_TIMEOUT", 0.05)
+    accounts = Accounts()
+    adapters = await accounts.build(config_for([rule()]), {"me", "dav"})
+    adapters.targets["dav"] = SlowList(adapters.targets["dav"])  # type: ignore[assignment]
+    with Store(tmp_path / "state.db") as store:
+        store.save_account_calendars("dav", [AccountCalendar("dav", "/dav/home/old/", "Old", None, NOW)], NOW)
+        with caplog.at_level(logging.WARNING):
+            done = await ops.refresh_calendars(store, adapters, ["dav", "me"], NOW + timedelta(hours=6))
+    await adapters.aclose()
+    assert isinstance(done.errors["dav"], TimeoutError) and done.counts == {"me": 2}
+    assert cached(tmp_path, "dav") == [("/dav/home/old/", "Old", None)]  # the old rows
+    assert any("dav" in r.getMessage() and "TimeoutError" in r.getMessage() for r in caplog.records)
+
+
+def test_refresh_op_of_an_account_that_never_answers_reports_it(
+    tmp_path: Path, accounts: Accounts, config_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ops, "REFRESH_TIMEOUT", 0.05)
+    real = accounts.build
+
+    async def build(config: Config, names: set[str], **kw: Any) -> wiring.Adapters:
+        adapters = await real(config, names, **kw)
+        if "dav" in adapters.targets:
+            adapters.targets["dav"] = SlowList(adapters.targets["dav"])  # type: ignore[assignment]
+        return adapters
+
+    monkeypatch.setattr(wiring, "build_adapters", build)
+    with Store(tmp_path / "state.db") as store:
+        result = ops.run_op(op_context(tmp_path, store, config_file), "calendars.refresh", {}, False)
+    assert result.data["accounts"]["dav"]["refreshed"] is False
+    assert result.data["accounts"]["dav"]["error"] == 'TimeoutError: account "dav" did not answer in time'
+    assert result.data["accounts"]["me"]["refreshed"] is True
+
+
+async def test_daemon_refreshes_before_the_first_cycle_and_bounds_each_listing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The GUI's map is filled before a (possibly long) first sync; an account whose listing
+    never answers gives up after ``REFRESH_TIMEOUT`` and the cycle still runs."""
+    monkeypatch.setattr(ops, "REFRESH_TIMEOUT", 0.05)
+    world = World(stop_after=1)
+    world.target.add_calendar("Family")
+    seen: list[list[tuple[str, str, str | None]]] = []
+
+    class Watched(SlowList):
+        async def pull(self, refs: Any, state: Any) -> Any:
+            seen.append(cached(tmp_path, "dav"))  # what the cache held as the first cycle pulls
+            return await self._inner.pull(refs, state)
+
+        async def list_calendars(self) -> Any:  # this account's listing never answers
+            await asyncio.Event().wait()
+
+    async def factory(config: Config, names: set[str], **kw: Any) -> wiring.Adapters:
+        adapters = await world.factory(config, names, **kw)
+        if "me" in adapters.sources:
+            adapters.sources["me"] = Watched(adapters.sources["me"])  # type: ignore[assignment]
+        return adapters
+
+    daemon = world.daemon(config_for([rule()]), tmp_path, adapters_factory=factory)
+    with caplog.at_level(logging.WARNING):
+        await daemon.run(world.stop)
+    assert seen and seen[0] == [("/dav/home/family/", "Family", None)]
+    assert daemon.snapshot().cycles == 1
+    assert cached(tmp_path, "me") == []
+    assert any("me" in r.getMessage() and "TimeoutError" in r.getMessage() for r in caplog.records)

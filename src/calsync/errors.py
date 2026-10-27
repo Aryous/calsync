@@ -99,6 +99,8 @@ def plain_error(exc: BaseException, subject: str, *, account: str | None = None,
         sentence = f"{subject} refused access"
     elif isinstance(exc, CursorExpired):
         sentence = f"{subject} needs a full resync"
+    elif isinstance(exc, TimeoutError):
+        sentence = f"{subject} did not answer in time"
     else:
         sentence = f"{subject} failed"
     return f"{public_name(exc)}: {sentence}"

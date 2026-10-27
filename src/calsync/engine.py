@@ -272,7 +272,7 @@ class Engine:
         # reading every planned delete each time would cost a multiget per cycle.
         self._last_protected: dict[str, frozenset[str]] = {}
         self._last_blocked: dict[str, _Blocked] = {}
-        # What detection read in copies edited on the target (``Inspected.fields``), by (account,
+        # What detection read in copies edited on the target (``Inspected.fields``), by (rule tag,
         # href), until the revert is written (its ``change.detail``: what the phone changed) or the
         # copy turns out not to be an edit. In memory only: the body is read once (request budget),
         # so a revert written by another process has no detail.
@@ -283,7 +283,8 @@ class Engine:
 
         Mirrors, calendar metadata, resolved ids, target calendars and caches are kept: they
         belong to calendars, not rules. The per-rule memories (the last recorded blocked and
-        protected sets, the degraded warnings) are dropped for a rule that is gone or whose
+        protected sets, the degraded warnings, the edited copies kept for a revert's detail) are
+        dropped for a rule that is gone or whose
         source or target calendar changed, so its sets are recorded afresh; every other rule
         keeps them, so a blocked rule is not read and recorded again because of an unrelated
         edit."""
@@ -296,6 +297,8 @@ class Engine:
         for name in stale:
             self._last_blocked.pop(name, None)
             self._last_protected.pop(name, None)
+        stale_tags = {rule_tag(name) for name in stale}
+        self._edited = {key: fields for key, fields in self._edited.items() if key[0] not in stale_tags}
         self._warned_degraded = {key for key in self._warned_degraded if key[0] not in stale}
         self._config = config
 
@@ -400,9 +403,9 @@ class Engine:
             # Changed by someone else (or unknown to us): its rule compares it with the source
             # version when it next runs, which need not be this cycle (see _classify_reads).
             if found is not None and found.fields is not None and known is not None and known.summary:
-                self._edited[(account, obj.href)] = found.fields
+                self._edited[(name[0], obj.href)] = found.fields
             else:
-                self._edited.pop((account, obj.href), None)
+                self._edited.pop((name[0], obj.href), None)
             cache.objects[obj.href] = CachedObject(
                 etag=obj.etag,
                 rule_tag=name[0],
@@ -680,7 +683,7 @@ class Engine:
                 # ordinary update.
                 cache.objects[have.href] = replace(obj, verify_digest=None)
             if not cache.objects[have.href].reverting:  # not an edit to write back: no revert detail
-                self._edited.pop((rule.target.account, have.href), None)
+                self._edited.pop((rule_tag(rule.name), have.href), None)
         if unrenderable:
             log.warning(
                 "rule %s: %d copy(ies) could not be compared with the source version", rule.name, unrenderable
@@ -753,7 +756,7 @@ class Engine:
             """After a successful write: nothing pending, nothing left to revert. The loop
             breaker's record is kept, plus this write if it was a revert; the summary is what
             was written."""
-            self._edited.pop((rule.target.account, href), None)
+            self._edited.pop((tag, href), None)
             prior = cache.objects.get(href)
             times = prior.revert_times if prior else ()
             if reverted:
@@ -800,9 +803,7 @@ class Engine:
             before = prior.summary if prior is not None else None
             # A revert: what the phone changed (the stored summary against the edited copy as
             # detection read it). An update: what the source changed.
-            after = (
-                self._edited.get((rule.target.account, have.href)) if reverting else summary_of(want.series)
-            )
+            after = self._edited.get((tag, have.href)) if reverting else summary_of(want.series)
             detail = _detail(before, after)
             data = body(want)
             try:
@@ -831,7 +832,7 @@ class Engine:
                 if found is not None:
                     await target.delete(have.href, found.etag)
             cache.objects.pop(have.href, None)
-            self._edited.pop((rule.target.account, have.href), None)
+            self._edited.pop((tag, have.href), None)
             result.deleted += 1
             result.changes.append(ChangeRecord(rule.name, have.object_id, "deleted", now, title))
 

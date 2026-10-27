@@ -327,6 +327,12 @@ def _error_kind(exc: BaseException) -> str:
     return "error"
 
 
+# Operations that report an account they could not reach in their result (``error_kind`` in
+# ``data``) instead of raising; the CLI exits by that kind. Named here, never inferred from a
+# ``data`` key another operation might also carry.
+EXITS_BY_UNREACHED_ACCOUNT = frozenset({"rule.preview"})
+
+
 def _ops_command(args: argparse.Namespace, out: TextIO, name: str, op_args: dict[str, object]) -> int:
     """Run one operation (through the daemon if it runs, else here with the lock) and print it:
     the summary, the diff with ``--dry-run``, and the command a person runs next, if any."""
@@ -345,9 +351,9 @@ def _ops_command(args: argparse.Namespace, out: TextIO, name: str, op_args: dict
             error["problems"] = exc.problems
         _dump({"error": error}, out)
         return exit_code_for(exc)
-    # An operation that reports an account it could not reach (``rule.preview``) exits by kind.
-    kind = result.data.get("error_kind")
-    code = {"auth": EXIT_AUTH, "config": EXIT_CONFIG}.get(kind, EXIT_FAILED) if kind else EXIT_OK
+    code = EXIT_OK
+    if result.op in EXITS_BY_UNREACHED_ACCOUNT and (kind := result.data.get("error_kind")):
+        code = {"auth": EXIT_AUTH, "config": EXIT_CONFIG}.get(kind, EXIT_FAILED)
     if args.json:
         _dump(result.to_json(), out)
         return code

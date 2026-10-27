@@ -249,3 +249,72 @@ async def test_preview_through_the_daemon_uses_its_adapters(tmp_path: Path) -> N
     finally:
         world.stop.set()
         await task
+
+
+# ----- fix round 1 -------------------------------------------------------------------------
+
+
+class Hanging:
+    """A source that never answers (a server that accepted the connection and went quiet)."""
+
+    async def pull(self, refs: Any, state: Any) -> Any:
+        await asyncio.Event().wait()
+
+    async def list_calendars(self) -> Any:
+        await asyncio.Event().wait()
+
+
+def test_preview_of_a_source_that_never_answers_times_out(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live pull is bounded (``PREVIEW_TIMEOUT``): under the daemon's lock a hung server would
+    otherwise hold every cycle. Reported like any unreachable account, by type only."""
+    monkeypatch.setattr(ops, "PREVIEW_TIMEOUT", 0.05)
+    real = setup.accounts.build
+
+    async def build(config: Any, names: set[str], **kw: Any) -> wiring.Adapters:
+        adapters = await real(config, names, **kw)
+        if "me" in adapters.sources:
+            adapters.sources["me"] = Hanging()  # type: ignore[assignment]
+        return adapters
+
+    monkeypatch.setattr(wiring, "build_adapters", build)
+    result = setup.preview(source="me:Work", target="dav:Work")
+    assert result.summary == 'could not preview: TimeoutError: account "me" did not answer in time'
+    assert (result.data["error_kind"], result.data["error_account"]) == ("other", "me")
+    assert result.data["series"] is None and result.needs_human is None
+    unchanged(setup)
+
+
+def account_calendar_rows(setup: Setup) -> int:
+    with StateReader(setup.state / "state.db") as reader:
+        return len(reader.account_calendars("dav"))
+
+
+def test_rule_add_preview_dry_run_writes_nothing_not_even_the_calendar_cache(setup: Setup) -> None:
+    code, text = setup.cli(
+        "rule", "add", "kids", "--source", "me:Family", "--target", "dav:Home", "--preview", "--dry-run"
+    )
+    assert code == EXIT_OK
+    assert text == 'would create 3 series in "Home" (calendar exists)\n'  # the listing was read
+    assert account_calendar_rows(setup) == 0
+    unchanged(setup)
+    code, _ = setup.cli("rule", "add", "kids", "--source", "me:Family", "--target", "dav:Home", "--preview")
+    assert code == EXIT_OK and account_calendar_rows(setup) == 1  # without --dry-run: cached
+
+
+@pytest.mark.parametrize(("op", "expected"), [("rule.add", EXIT_OK), ("rule.preview", EXIT_AUTH)])
+def test_only_named_operations_exit_by_their_error_kind(
+    setup: Setup, monkeypatch: pytest.MonkeyPatch, op: str, expected: int
+) -> None:
+    """An ``error_kind`` in another operation's data (a key it may carry for its own reasons) does
+    not change the exit code."""
+    from calsync import opsclient
+
+    def call(name: str, args: Any, **_: Any) -> ops.OpResult:
+        return ops.OpResult(op, False, "s", data={"error_kind": "auth"})
+
+    monkeypatch.setattr(opsclient, "call", call)
+    preview = ["--preview"] if op == "rule.preview" else []
+    code, _ = setup.cli("rule", "add", "kids", "--source", "me:Family", "--target", "dav:Home", *preview)
+    assert code == expected

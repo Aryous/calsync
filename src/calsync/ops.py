@@ -30,7 +30,7 @@ import tomlkit
 from calsync import configfile, credentials, debug
 from calsync.config import Config, CredentialRef
 from calsync.errors import AuthError, CalsyncError, ConfigError, plain_error
-from calsync.store import CONFIG_CHANGE_RETENTION, Store
+from calsync.store import CONFIG_CHANGE_RETENTION, AccountCalendar, Store
 
 if TYPE_CHECKING:
     from calsync.engine import CycleResult, RuleResult
@@ -804,32 +804,41 @@ async def _adapters(ctx: OpContext, config: Config, names: set[str]) -> AsyncIte
         await adapters.aclose()
 
 
+# Operations that talk to the accounts hold the daemon's ``_cycle_lock`` (no cycle runs
+# meanwhile), so each network wait is bounded: a server that never answers must not stop the
+# sync. Read when used (tests patch them). A timeout is a ``TimeoutError``, reported as any
+# failure of that account.
+PREVIEW_TIMEOUT = 120.0  # seconds: the preview's live pull of a source calendar
+REFRESH_TIMEOUT = 120.0  # seconds: one account's calendar listing (ops and the daemon's refresh)
+
+
 @dataclass(frozen=True)
 class Refreshed:
-    """What ``refresh_calendars`` did: calendars stored per account, and the accounts that failed."""
+    """What ``refresh_calendars`` did: the calendars listed per account (stored unless
+    ``save=False``) and their count, and the accounts that failed."""
 
     counts: dict[str, int] = field(default_factory=dict)
     errors: dict[str, Exception] = field(default_factory=dict)
+    rows: dict[str, list[AccountCalendar]] = field(default_factory=dict)
 
 
 async def refresh_calendars(
-    store: Store, adapters: "Adapters", names: Sequence[str], at: datetime
+    store: Store, adapters: "Adapters", names: Sequence[str], at: datetime, *, save: bool = True
 ) -> Refreshed:
-    """Fetch each account's calendar list into the cache (``account_calendar``), stamped ``at``.
+    """Fetch each account's calendar list into the cache (``account_calendar``), stamped ``at``;
+    with ``save=False`` only list it (a dry run). Each listing waits at most ``REFRESH_TIMEOUT``.
     A failing account keeps its old rows; its failure is logged by type (the text can carry a
     URL: ``debug.details``). Google rows carry calendarList's ``accessRole``; CalDAV rows no role
     (discovery reads no privilege set, and no request is added just for it)."""
-    from calsync.store import AccountCalendar
-
     done = Refreshed()
     for name in names:
         try:
             adapters.adapter(name)  # its setup error, if any
             if name in adapters.sources:
-                found = await adapters.sources[name].list_calendars()
+                found = await asyncio.wait_for(adapters.sources[name].list_calendars(), REFRESH_TIMEOUT)
                 rows = [AccountCalendar(name, c.id, c.name, c.role, at) for c in found]
             else:
-                listed = await adapters.targets[name].list_calendars()
+                listed = await asyncio.wait_for(adapters.targets[name].list_calendars(), REFRESH_TIMEOUT)
                 rows = [AccountCalendar(name, c.href, c.name, None, at) for c in listed]
         except Exception as exc:
             log.warning(
@@ -838,8 +847,10 @@ async def refresh_calendars(
             debug.details(log, f"the calendar list of account {name} could not be refreshed", exc)
             done.errors[name] = exc
             continue
-        store.save_account_calendars(name, rows, at)
+        if save:
+            store.save_account_calendars(name, rows, at)
         done.counts[name] = len(rows)
+        done.rows[name] = rows
     return done
 
 
@@ -915,19 +926,9 @@ class _Unreachable(Exception):
         self.exc, self.account, self.setup = exc, account, setup
 
 
-def _same_calendar(cal_id: str, ref: str) -> bool:
-    """``cal_id`` (a CalDAV href, absolute) is the calendar ``ref`` names by URL or by path (as
-    ``CalDavTarget.ensure_calendar`` matches)."""
-    from urllib.parse import urlsplit
-
-    if "://" not in ref:
-        cal_id = urlsplit(cal_id).path
-    return cal_id.rstrip("/") == ref.rstrip("/")
-
-
 def _cached_calendar(state_dir: Path, account: str, ref: str) -> tuple[str, str] | None:
-    """The cached calendar of ``account`` that ``ref`` names, as (id, name): by href first, then by
-    name; None if the cache has none. Several by name: ``ConfigError`` (the sync would refuse too)."""
+    """The cached calendar of ``account`` that ``ref`` names (``_match_calendar``); None if the
+    cache has none."""
     from calsync import views
     from calsync.wiring import state_paths
 
@@ -936,7 +937,16 @@ def _cached_calendar(state_dir: Path, account: str, ref: str) -> tuple[str, str]
             rows = [(c.id, c.name) for c in reader.account_calendars(account)]
     except views.StateUnavailable:
         return None
-    matches = [r for r in rows if _same_calendar(r[0], ref)] or [r for r in rows if r[1] == ref]
+    return _match_calendar(rows, account, ref)
+
+
+def _match_calendar(rows: Sequence[tuple[str, str]], account: str, ref: str) -> tuple[str, str] | None:
+    """The calendar among ``rows`` (id, name) that ``ref`` names: by href first (``same_href``, as
+    ``CalDavTarget.ensure_calendar`` matches), then by name; None if none does. Several by name:
+    ``ConfigError`` (the sync would refuse too)."""
+    from calsync.naming import same_href
+
+    matches = [r for r in rows if same_href(r[0], ref)] or [r for r in rows if r[1] == ref]
     if len(matches) > 1:
         raise ConfigError(
             [f'calendar "{ref}" matches {len(matches)} calendars of account "{account}"; use its href']
@@ -971,7 +981,7 @@ async def _preview_source(
         setup = account in adapters.errors
         try:
             adapters.adapter(account)
-            pull = await adapters.sources[account].pull([ref], {})
+            pull = await asyncio.wait_for(adapters.sources[account].pull([ref], {}), PREVIEW_TIMEOUT)
         except Exception as exc:
             raise _Unreachable(exc, account, setup) from exc
     failure = pull.errors.get(ref)
@@ -985,18 +995,20 @@ async def _preview_source(
     return found.upserts, found.meta, False
 
 
-async def _preview_target(ctx: OpContext, config: Config, account: str, ref: str) -> tuple[str, str] | None:
+async def _preview_target(
+    ctx: OpContext, config: Config, account: str, ref: str, dry_run: bool
+) -> tuple[str, str] | None:
     """The target calendar ``ref`` names, from the calendar cache, which is refreshed once if
-    it does not have it; None: not there."""
+    it does not have it (``dry_run``: listed only, the cache is not written); None: not there."""
     found = _cached_calendar(ctx.state_dir, account, ref)
     if found is not None:
         return found
     async with _adapters(ctx, config, {account}) as adapters:
-        done = await refresh_calendars(ctx.store, adapters, [account], ctx.clock())
+        done = await refresh_calendars(ctx.store, adapters, [account], ctx.clock(), save=not dry_run)
         setup = account in adapters.errors
     if account in done.errors:
         raise _Unreachable(done.errors[account], account, setup)
-    return _cached_calendar(ctx.state_dir, account, ref)
+    return _match_calendar([(c.id, c.name) for c in done.rows[account]], account, ref)
 
 
 def _preview_summary(data: dict[str, Any], target: str) -> str:
@@ -1012,7 +1024,8 @@ def _preview_summary(data: dict[str, Any], target: str) -> str:
 
 async def _rule_preview(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
     """What ``rule.add`` with these arguments would sync, writing nothing (no config, no history;
-    at most the calendar cache is refreshed). Validated like ``rule.add`` (``ConfigError``).
+    at most the calendar cache is refreshed, and not even that with ``dry_run``). The live pull
+    waits at most ``PREVIEW_TIMEOUT``, the target's listing ``REFRESH_TIMEOUT``. Validated like ``rule.add`` (``ConfigError``).
     ``data``: ``series`` (the series the first cycle would create; in the window when the rule
     has one), ``instances_in_window`` (None: the rule syncs everything), ``target_exists``,
     ``target_would_be_created``, ``source_mirrored``. An account that cannot be reached is
@@ -1033,7 +1046,7 @@ async def _rule_preview(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> 
         raw, meta, data["source_mirrored"] = await _preview_source(
             ctx, config, rule.source.account, rule.source.calendar
         )
-        found = await _preview_target(ctx, config, rule.target.account, rule.target.calendar)
+        found = await _preview_target(ctx, config, rule.target.account, rule.target.calendar, dry_run)
     except _Unreachable as failure:
         error = plain_error(
             failure.exc, f'account "{failure.account}"', account=failure.account, setup=failure.setup

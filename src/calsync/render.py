@@ -4,7 +4,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from icalendar import Alarm as IcalAlarm
@@ -119,26 +119,44 @@ def summary_of(series: Series) -> dict[str, Any]:
     fields. For a recurring series that is the series as written (DTSTART is its first instance
     by RFC 5545), not an expanded instance: an override or EXDATE on the first instance would
     otherwise read as a change of the whole series. Times are ISO strings, as ``views`` shows them;
-    an empty title or location is None.
+    title and location are trimmed (as ``inspect`` and ``content_digest`` read them), empty: None.
 
     Event content: stored in the 0600 state DB and shown by the API, never logged."""
     return {
-        "title": series.title or None,
+        "title": (series.title or "").strip() or None,
         "start": series.start.value.isoformat(),
         "end": series.end.value.isoformat(),
         "all_day": series.start.all_day,
-        "location": series.location or None,
+        "location": (series.location or "").strip() or None,
         "alarms_minutes_before": _minutes_before([a.offset for a in series.alarms]),
         "recurring": bool(series.recurrence),
     }
 
 
+def _comparable(name: str, value: Any) -> Any:
+    """A summary value as it is compared: start and end as instants (a timed value in UTC, an
+    all-day date as a date), so a phone that rewrites DTSTART in another zone, or with a VTIMEZONE
+    of its own, changes nothing a person sees. Anything unreadable compares as it is."""
+    if name not in ("start", "end") or not isinstance(value, str):
+        return value
+    try:
+        if "T" not in value:
+            return ("date", date.fromisoformat(value))
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if moment.tzinfo is None:
+        return ("floating", moment)
+    return ("instant", moment.astimezone(UTC))
+
+
 def changed_fields(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str, list[Any]]:
-    """``{field: [old, new]}`` for each summary field present in both that differs."""
+    """``{field: [old, new]}`` for each summary field present in both that differs (start and
+    end as instants: ``_comparable``). The values shown are the summaries' own."""
     return {
         name: [old[name], new[name]]
         for name in SUMMARY_FIELDS
-        if name in old and name in new and old[name] != new[name]
+        if name in old and name in new and _comparable(name, old[name]) != _comparable(name, new[name])
     }
 
 
