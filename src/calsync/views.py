@@ -121,6 +121,29 @@ class ChangeView:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ConfigChangeView:
+    id: int
+    at: datetime
+    source: str
+    summary: str
+    before: str | None
+    after_fingerprint: str
+    undoes: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class AccountCalendarView:
+    account: str
+    id: str
+    name: str
+    role: str | None
+    fetched_at: datetime
+
+
+# Change actions that put the source version on the target (what the engine records for writes).
+_DELIVERY_ACTIONS = ("created", "updated", "reverted")
+
 _RUN_COLUMNS: tuple[str, ...] = (
     "id",
     "rule",
@@ -278,6 +301,42 @@ class StateReader:
         ).fetchone()
         return int(row[0])
 
+    def delivered_at(self, rule: str, object_id: str) -> datetime | None:
+        """When the rule last wrote the object to its target (the newest create, update or
+        revert); ``None``: never recorded."""
+        if not {"id", "rule", "object_id", "action", "at"} <= self.columns("change"):
+            return None
+        placeholders = ", ".join("?" * len(_DELIVERY_ACTIONS))
+        row = self._db.execute(
+            f"SELECT at FROM change WHERE rule = ? AND object_id = ? AND action IN ({placeholders}) "
+            "ORDER BY id DESC LIMIT 1",
+            (rule, object_id, *_DELIVERY_ACTIONS),
+        ).fetchone()
+        return _parse_time(row[0]) if row else None
+
+    # ----- config history and the calendar cache ----------------------------------
+    def config_changes(self, limit: int = 50) -> list[ConfigChangeView]:
+        """Config writes, newest first (no ``config_change`` table: none)."""
+        columns = ("id", "at", "source", "summary", "before", "after_fingerprint", "undoes")
+        if not set(columns) <= self.columns("config_change"):
+            return []
+        rows = self._db.execute(
+            f"SELECT {', '.join(columns)} FROM config_change ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [ConfigChangeView(r[0], _parse_time(r[1]), *r[2:]) for r in rows]
+
+    def account_calendars(self, account: str) -> list[AccountCalendarView]:
+        """The account's cached calendar list, by id (none cached: empty)."""
+        if not {"account", "id", "name", "role", "fetched_at"} <= self.columns("account_calendar"):
+            return []
+        return [
+            AccountCalendarView(account, cid, name, role, _parse_time(fetched_at))
+            for cid, name, role, fetched_at in self._db.execute(
+                "SELECT id, name, role, fetched_at FROM account_calendar WHERE account = ? ORDER BY id",
+                (account,),
+            )
+        ]
+
     # ----- source and target state ----------------------------------------------
     def source_state(self, account: str) -> dict[str, Any]:
         if not {"account", "state"} <= self.columns("source_state"):
@@ -304,6 +363,15 @@ class StateReader:
                 events.append(event)
         return events
 
+    def series_count(self, account: str, calendar: str) -> int:
+        """Mirrored source events of a calendar (``calendar``: the resolved Google calendar id)."""
+        if not {"account", "calendar"} <= self.columns("source_event"):
+            return 0
+        row = self._db.execute(
+            "SELECT COUNT(*) FROM source_event WHERE account = ? AND calendar = ?", (account, calendar)
+        ).fetchone()
+        return int(row[0])
+
     def target_calendar_name(self, account: str, ref: str) -> str | None:
         if not {"account", "ref", "name"} <= self.columns("target_calendar"):
             return None
@@ -318,6 +386,24 @@ class StateReader:
         return int(
             self._db.execute("SELECT COUNT(*) FROM target_object WHERE rule_tag = ?", (tag,)).fetchone()[0]
         )
+
+    def copy_summary(self, tag: str, object_id: str) -> dict[str, Any] | None:
+        """What calsync last wrote for the object (the stored summary JSON); ``None``: none
+        stored or unreadable."""
+        if not {"rule_tag", "object_id", "summary"} <= self.columns("target_object"):
+            return None
+        row = self._db.execute(
+            "SELECT summary FROM target_object WHERE rule_tag = ? AND object_id = ? AND summary IS NOT NULL "
+            "LIMIT 1",
+            (tag, object_id),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            summary = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        return summary if isinstance(summary, dict) else None
 
     def delivered_hashes(self, tag: str) -> dict[str, str | None]:
         """Object id → recorded content hash of the rule's copies; ``None`` while a revert is pending."""

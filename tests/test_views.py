@@ -12,8 +12,12 @@ import pytest
 
 from calsync.config import Config
 from calsync.naming import object_id, rule_tag
-from calsync.store import SCHEMA_VERSION, ChangeRecord, RunRecord, Store
+from calsync.sources.base import CalendarPull
+from calsync.store import SCHEMA_VERSION, AccountCalendar, ChangeRecord, RunRecord, Store
+from calsync.targets.base import CachedObject, TargetCache
 from calsync.views import (
+    AccountCalendarView,
+    ConfigChangeView,
     StateReader,
     StateUnavailable,
     build_changes,
@@ -646,3 +650,124 @@ def test_changes_of_one_run(tmp_path: Path) -> None:
         assert build_changes(family(), r, rule="other", run_id=2).to_json()["changes"] == []
         assert build_changes(family(), r, run_id=99).to_json()["changes"] == []
     assert [(c["run_id"], c["object_id"]) for c in second] == [(2, "b")]
+
+
+# ----- schema v5 accessors ------------------------------------------------------
+
+SUMMARY = {
+    "title": "Lunch",
+    "start": "2026-10-25T12:00:00+08:00",
+    "end": "2026-10-25T13:00:00+08:00",
+    "all_day": False,
+    "location": "Cafe",
+    "alarms_minutes_before": [10, 0],
+    "recurring": False,
+}
+
+
+def test_v5_accessors_read_what_the_store_wrote(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    t = [NOW + timedelta(minutes=i) for i in range(6)]
+    with Store(db) as store:
+        first = store.record_config_change(
+            at=t[0], source="cli", summary='rule "family" paused', before="x = 1\n", after_fingerprint="f1"
+        )
+        store.record_config_change(
+            at=t[1], source="ui", summary="undo", before=None, after_fingerprint="f2", undoes=first
+        )
+        store.save_account_calendars(
+            "me",
+            [
+                AccountCalendar("me", GCAL, "Family", "owner", t[0]),
+                AccountCalendar("me", "c2", "Work", None, t[0]),
+            ],
+            t[0],
+        )
+        store.save_source(
+            "me",
+            {},
+            [
+                CalendarPull(GCAL, full=True, upserts=[{"id": "a"}, {"id": "b"}]),
+                CalendarPull("c2", full=True),
+            ],
+        )
+        cache = TargetCache(cursor=None)
+        cache.objects["/cal/family/x.ics"] = CachedObject(
+            '"e"', rule_tag("family"), "o1", "h", None, None, False
+        )
+        cache.objects["/cal/family/y.ics"] = CachedObject(
+            '"e"', rule_tag("family"), "o2", "h", None, None, False
+        )
+        store.save_target_cache("dav", "/cal/family/", cache)
+        for i, action in enumerate(("created", "updated", "reverted", "deleted", "blocked"), start=1):
+            store.record_runs(
+                [RunRecord("family", t[i], t[i], "ok", 0, 0, 0, 0, 1, None)],
+                [ChangeRecord("family", "o1", action, t[i], "Lunch")],
+            )
+    with closing(sqlite3.connect(db)) as conn:  # Task 6 writes summaries; here by hand
+        conn.execute("UPDATE target_object SET summary = ? WHERE object_id = 'o1'", (json.dumps(SUMMARY),))
+        conn.commit()
+
+    with reader(tmp_path) as r:
+        assert r.schema_current()
+        changes = r.config_changes()
+        assert changes == [
+            ConfigChangeView(first + 1, t[1], "ui", "undo", None, "f2", first),
+            ConfigChangeView(first, t[0], "cli", 'rule "family" paused', "x = 1\n", "f1", None),
+        ]
+        assert r.config_changes(limit=1) == changes[:1]
+        assert r.account_calendars("me") == [
+            AccountCalendarView("me", "c2", "Work", None, t[0]),
+            AccountCalendarView("me", GCAL, "Family", "owner", t[0]),
+        ]
+        assert r.account_calendars("other") == []
+        assert r.copy_summary(rule_tag("family"), "o1") == SUMMARY
+        assert r.copy_summary(rule_tag("family"), "o2") is None  # no summary written
+        assert r.copy_summary(rule_tag("other"), "o1") is None
+        # The newest create/update/revert: a later delete or block is not a delivery.
+        assert r.delivered_at("family", "o1") == t[3]
+        assert r.delivered_at("family", "o2") is None
+        assert r.series_count("me", GCAL) == 2
+        assert r.series_count("me", "c2") == 0
+        assert r.series_count("other", GCAL) == 0
+
+
+def test_copy_summary_ignores_unreadable_json(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    with Store(db) as store:
+        cache = TargetCache(cursor=None)
+        cache.objects["/cal/x.ics"] = CachedObject(None, "tag", "o1", None, None, None, False)
+        cache.objects["/cal/y.ics"] = CachedObject(None, "tag", "o2", None, None, None, False)
+        store.save_target_cache("dav", "/cal/", cache)
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("UPDATE target_object SET summary = '{broken' WHERE object_id = 'o1'")
+        conn.execute("UPDATE target_object SET summary = '[1, 2]' WHERE object_id = 'o2'")
+        conn.commit()
+    with reader(tmp_path) as r:
+        assert r.copy_summary("tag", "o1") is None
+        assert r.copy_summary("tag", "o2") is None
+
+
+def test_v5_accessors_tolerate_an_older_database(tmp_path: Path) -> None:
+    """A v1 database: no config history, no calendar cache, no summaries, no change log."""
+    make_v1(tmp_path / "state.db")
+    before = snapshot(tmp_path)
+    with reader(tmp_path) as r:
+        assert not r.schema_current()
+        assert r.config_changes() == []
+        assert r.account_calendars("me") == []
+        assert r.copy_summary(rule_tag("family"), object_id("family", GCAL, "lunch")) is None
+        assert r.delivered_at("family", "o1") is None
+        assert r.series_count("me", GCAL) == 2
+    assert snapshot(tmp_path) == before
+
+
+def test_v5_accessors_on_a_database_without_tables(tmp_path: Path) -> None:
+    with closing(sqlite3.connect(tmp_path / "state.db")) as db:
+        db.execute("CREATE TABLE unrelated (x)")
+    with reader(tmp_path) as r:
+        assert r.config_changes() == []
+        assert r.account_calendars("me") == []
+        assert r.copy_summary("tag", "o1") is None
+        assert r.delivered_at("family", "o1") is None
+        assert r.series_count("me", GCAL) == 0
