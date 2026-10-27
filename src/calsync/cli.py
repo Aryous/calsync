@@ -37,6 +37,61 @@ def _parser() -> argparse.ArgumentParser:
     config = sub.add_parser("config", help="configuration commands")
     config_sub = config.add_subparsers(dest="config_command", required=True)
     config_sub.add_parser("check", help="validate the configuration file")
+    get = config_sub.add_parser("get", help="print the parsed configuration as JSON")
+    get.add_argument("--reveal", action="store_true", help="show URLs, usernames and credential refs in full")
+    get.add_argument("--json", action="store_true", help="print JSON (the default for this command)")
+    history = config_sub.add_parser("history", help="recorded config changes, newest first")
+    history.add_argument("--limit", type=_positive_int, default=50, help="at most this many (default: 50)")
+    history.add_argument("--json", action="store_true", help="print JSON")
+    setting = _writer(config_sub, "set", "set one setting (an empty VALUE removes it)")
+    setting.add_argument("key", help="e.g. runtime.interval, notify.bark_url, web.allowed_hosts")
+    setting.add_argument("value", help='e.g. 2m, https://..., "a.local,b.local"')
+    _writer(config_sub, "undo", "undo the newest config change not yet undone")
+
+    rule_cmd = sub.add_parser("rule", help="add, change or remove a rule")
+    rule_sub = rule_cmd.add_subparsers(dest="rule_command", required=True)
+    add = _writer(rule_sub, "add", "add a rule")
+    add.add_argument("name")
+    add.add_argument("--source", required=True, metavar="ACCOUNT:CALENDAR", help="the Google calendar")
+    add.add_argument("--target", required=True, metavar="ACCOUNT:CALENDAR", help="the CalDAV calendar")
+    add.add_argument("--create-target", action="store_true", help="create the target calendar if missing")
+    add.add_argument("--window", metavar="all|PAST:FUTURE", help="e.g. 30d:365d (default: all of time)")
+    add.add_argument(
+        "--alarms",
+        metavar="copy|strip|-10m,0m",
+        help="alerts on the copies (default: copy); offsets as --alarms=-10m,0m",
+    )
+    add.add_argument("--content", choices=("full", "busy"), help="busy: copies show only Busy")
+    add.add_argument("--attendees", choices=("none", "notes"), help="attendees into the notes or dropped")
+    add.add_argument("--conference", choices=("copy", "none"), help="the meeting link")
+    change = _writer(rule_sub, "set", "change one setting of a rule")
+    change.add_argument("name")
+    change.add_argument(
+        "key", help="window, alarms, paused, retire, fields.content, delete_guard.max_count, ..."
+    )
+    change.add_argument(
+        "value", help="window all|PAST:FUTURE; alarms copy|strip|-10m,0m; true|false; numbers"
+    )
+    remove = _writer(rule_sub, "remove", "remove a rule (its copies stay unless --delete-copies)")
+    remove.add_argument("name")
+    remove.add_argument(
+        "--delete-copies", action="store_true", help="delete its copies first, then remove the rule"
+    )
+    for name, text in (("pause", "pause a rule: no cycle syncs it"), ("resume", "resume a paused rule")):
+        _writer(sub, name, text).add_argument("rule")
+
+    account = sub.add_parser("account", help="add or remove an account")
+    account_sub = account.add_subparsers(dest="account_command", required=True)
+    add_account = _writer(account_sub, "add", "add an account; then a person runs calsync auth NAME")
+    add_account.add_argument("name")
+    add_account.add_argument("--provider", required=True, choices=("google", "caldav"))
+    add_account.add_argument("--server-url", help='caldav: "icloud" or the server URL')
+    add_account.add_argument("--username", help="caldav: the login name")
+    remove_account = _writer(account_sub, "remove", "remove an account no rule uses")
+    remove_account.add_argument("name")
+    remove_account.add_argument(
+        "--delete-credential", action="store_true", help="also delete its keychain entry"
+    )
 
     calendars = sub.add_parser("calendars", help="list calendars of an account")
     calendars.add_argument("account")
@@ -102,6 +157,17 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _writer(
+    sub: "argparse._SubParsersAction[argparse.ArgumentParser]", name: str, text: str
+) -> argparse.ArgumentParser:
+    """A state-changing command: ``--dry-run`` and ``--json``."""
+    command = sub.add_parser(name, help=text)
+    command.add_argument("--dry-run", action="store_true", help="validate and show the diff; write nothing")
+    command.add_argument("--json", action="store_true", help="print JSON")
+    command.set_defaults(op_command=True)
+    return command
+
+
 def _listen(text: str) -> tuple[str, int]:
     from calsync.config import parse_listen
 
@@ -132,10 +198,16 @@ def _instant(text: str) -> datetime:
     return value if value.tzinfo is not None else value.astimezone()
 
 
-def _load(args: argparse.Namespace) -> "Config":
-    from calsync.config import default_config_path, load_config
+def _config_path(args: argparse.Namespace) -> Path:
+    from calsync.config import default_config_path
 
-    return load_config(args.config or default_config_path())
+    return args.config or default_config_path()
+
+
+def _load(args: argparse.Namespace) -> "Config":
+    from calsync.config import load_config
+
+    return load_config(_config_path(args))
 
 
 def _state_dir(args: argparse.Namespace) -> Path:
@@ -181,6 +253,8 @@ def _describe(exc: BaseException, args: argparse.Namespace | None = None) -> str
     if isinstance(exc, DaemonServing):
         return f"{exc}; use a copy of the state directory to serve a second one\n"
     if isinstance(exc, AlreadyRunning):
+        if getattr(args, "op_command", False):  # the daemon would have run it: not the daemon
+            return f"{exc}; try again once it has finished\n"
         command = getattr(args, "command", None)
         if command == "daemon":
             return f"{exc}; wait for it to finish, or stop the other daemon\n"
@@ -201,6 +275,145 @@ def cmd_config_check(args: argparse.Namespace, out: TextIO) -> int:
     config = _load(args)
     out.write(f"ok: {len(config.accounts)} accounts, {len(config.rules)} rules\n")
     return EXIT_OK
+
+
+def _dump(body: object, out: TextIO) -> None:
+    out.write(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
+
+
+def _error_kind(exc: BaseException) -> str:
+    from calsync.configfile import ConfigConflict
+    from calsync.errors import ConfigError
+    from calsync.lock import AlreadyRunning
+
+    if isinstance(exc, ConfigConflict):
+        return "conflict"
+    if isinstance(exc, ConfigError):
+        return "config"
+    if isinstance(exc, AlreadyRunning):
+        return "locked"
+    return "error"
+
+
+def _ops_command(args: argparse.Namespace, out: TextIO, name: str, op_args: dict[str, object]) -> int:
+    """Run one operation (through the daemon if it runs, else here with the lock) and print it:
+    the summary, the diff with ``--dry-run``, and the command a person runs next, if any."""
+    from calsync import opsclient
+    from calsync.errors import CalsyncError, ConfigError
+
+    try:
+        result = opsclient.call(
+            name, op_args, dry_run=args.dry_run, config_path=_config_path(args), state_dir=_state_dir(args)
+        )
+    except CalsyncError as exc:
+        if not args.json:
+            raise
+        error: dict[str, object] = {"kind": _error_kind(exc), "message": str(exc)}
+        if isinstance(exc, ConfigError):
+            error["problems"] = exc.problems
+        _dump({"error": error}, out)
+        return exit_code_for(exc)
+    if args.json:
+        _dump(result.to_json(), out)
+        return EXIT_OK
+    out.write(result.summary + "\n")
+    if args.dry_run and result.diff:
+        out.write(result.diff)
+    if result.needs_human:
+        out.write(f"next: {result.needs_human['command']}  ({result.needs_human['reason']})\n")
+    return EXIT_OK
+
+
+def _op_for(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
+    """The operation and its arguments for a write command."""
+    if args.command == "config":
+        if args.config_command == "set":
+            return "config.set", {"key": args.key, "value": args.value}
+        return "config.undo", {}
+    if args.command in ("pause", "resume"):
+        return f"rule.{args.command}", {"name": args.rule}
+    if args.command == "rule":
+        if args.rule_command == "add":
+            names = (
+                "source",
+                "target",
+                "create_target",
+                "window",
+                "alarms",
+                "content",
+                "attendees",
+                "conference",
+            )
+            given = {n: getattr(args, n) for n in names if getattr(args, n) not in (None, False)}
+            return "rule.add", {"name": args.name, **given}
+        if args.rule_command == "set":
+            return "rule.set", {"name": args.name, "key": args.key, "value": args.value}
+        op_args: dict[str, object] = {"name": args.name}
+        if args.delete_copies:
+            op_args["delete_copies"] = True
+        return "rule.remove", op_args
+    assert args.command == "account"
+    if args.account_command == "add":
+        given = {n: getattr(args, n) for n in ("server_url", "username") if getattr(args, n) is not None}
+        return "account.add", {"name": args.name, "provider": args.provider, **given}
+    op_args = {"name": args.name}
+    if args.delete_credential:
+        op_args["delete_credential"] = True
+    return "account.remove", op_args
+
+
+def cmd_config_get(args: argparse.Namespace, out: TextIO) -> int:
+    from calsync.views import config_json
+
+    _dump(config_json(_load(args), reveal=args.reveal), out)
+    return EXIT_OK
+
+
+def cmd_config_history(args: argparse.Namespace, out: TextIO) -> int:
+    """Recorded config changes. Never their ``before`` text: a whole config, URLs included."""
+    from calsync.views import StateReader, StateUnavailable
+    from calsync.wiring import state_paths
+
+    db_path, _ = state_paths(_state_dir(args))
+    try:
+        with StateReader(db_path) as reader:
+            changes = reader.config_changes(args.limit)
+    except StateUnavailable:
+        changes = []
+    if args.json:
+        _dump(
+            {
+                "changes": [
+                    {
+                        "id": c.id,
+                        "at": c.at.isoformat(),
+                        "source": c.source,
+                        "summary": c.summary,
+                        "after_fingerprint": c.after_fingerprint,
+                        "undoes": c.undoes,
+                    }
+                    for c in changes
+                ]
+            },
+            out,
+        )
+        return EXIT_OK
+    if not changes:
+        out.write("no config changes recorded\n")
+    for c in changes:
+        undoes = f" (undoes {c.undoes})" if c.undoes is not None else ""
+        out.write(f"{c.id} {c.at.isoformat()} {c.source} {c.summary}{undoes}\n")
+    return EXIT_OK
+
+
+def cmd_config(args: argparse.Namespace, out: TextIO) -> int:
+    if args.config_command == "get":
+        return cmd_config_get(args, out)
+    if args.config_command == "history":
+        return cmd_config_history(args, out)
+    if args.config_command in ("set", "undo"):
+        return _ops_command(args, out, *_op_for(args))
+    return cmd_config_check(args, out)
 
 
 async def _calendars(args: argparse.Namespace, out: TextIO) -> int:
@@ -406,7 +619,7 @@ async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
     listen = _web_listen(args, config)
     if listen is None:
         logger.info("web UI off")
-    daemon = Daemon(config, _state_dir(args), sync=sync, listen=listen)
+    daemon = Daemon(config, _state_dir(args), sync=sync, listen=listen, config_path=_config_path(args))
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     handlers = {signal.SIGTERM: stop.set, signal.SIGINT: stop.set, signal.SIGUSR1: daemon.request_cycle}
@@ -422,22 +635,11 @@ async def _daemon(args: argparse.Namespace, out: TextIO) -> int:
     return EXIT_OK
 
 
-def _root_os_error(exc: BaseException) -> OSError | None:
-    """The ``OSError`` that httpx wrapped (it chains it as the cause or the context)."""
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        if isinstance(current, OSError):
-            return current
-        seen.add(id(current))
-        current = current.__cause__ or current.__context__
-    return None
-
-
 async def _trigger(args: argparse.Namespace, out: TextIO) -> int:
     """Ask the daemon, over its socket, for a cycle now."""
     import httpx
 
+    from calsync.opsclient import root_os_error
     from calsync.wiring import socket_path
 
     transport = httpx.AsyncHTTPTransport(uds=str(socket_path(_state_dir(args))))
@@ -446,7 +648,7 @@ async def _trigger(args: argparse.Namespace, out: TextIO) -> int:
         async with httpx.AsyncClient(transport=transport, base_url="http://calsync", timeout=10) as client:
             response = await client.post("/api/trigger", json=body)
     except httpx.ConnectError as exc:
-        cause = _root_os_error(exc)
+        cause = root_os_error(exc)
         if cause is None or isinstance(cause, FileNotFoundError | ConnectionRefusedError):
             # No socket file, or one nobody listens on (left by a daemon that died).
             out.write("the daemon is not running; use calsync run\n")
@@ -631,7 +833,9 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
 
     try:
         if args.command == "config":
-            return cmd_config_check(args, out)
+            return cmd_config(args, out)
+        if args.command in ("rule", "pause", "resume", "account"):
+            return _ops_command(args, out, *_op_for(args))
         if args.command == "calendars":
             return asyncio.run(_calendars(args, out))
         if args.command == "auth":

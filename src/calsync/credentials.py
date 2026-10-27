@@ -63,3 +63,20 @@ def write_secret(ref: CredentialRef, value: str) -> None:
         _keyring().set_password(ref.ref, KEYRING_USER, value)
     except _keyring_error() as exc:
         raise ConfigError([f"could not store keychain entry {ref.ref!r}: {exc}"]) from exc
+
+
+def delete_secret(ref: CredentialRef) -> bool:
+    """Delete a keychain entry (one that is already gone is fine). True when calsync deleted it;
+    False for the ``env`` and ``file`` backends, which a person manages: calsync deletes neither
+    an environment variable nor a file it did not necessarily create."""
+    if ref.backend != "keychain":
+        return False
+    from keyring.errors import PasswordDeleteError  # lazy, like _keyring()
+
+    try:
+        _keyring().delete_password(ref.ref, KEYRING_USER)
+    except PasswordDeleteError:
+        return True  # no such entry: nothing left to delete
+    except _keyring_error() as exc:
+        raise ConfigError([f"could not delete keychain entry {ref.ref!r}: {exc}"]) from exc
+    return True

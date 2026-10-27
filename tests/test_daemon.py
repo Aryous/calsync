@@ -791,3 +791,95 @@ async def test_a_service_raising_system_exit_lets_the_running_cycle_finish(
     assert daemon.snapshot().cycles == 1
     with RunLock(short_dir / "run.lock"):
         pass
+
+
+# ----- operations over the socket ----------------------------------------------------------
+
+OPS_CONFIG = """\
+[google]
+client_secret_file = "unused.json"
+
+[accounts.me]
+provider = "google"
+credential = { backend = "env", ref = "UNUSED" }
+
+[accounts.dav]
+provider = "caldav"
+server_url = "http://unused/"
+username = "u"
+credential = { backend = "env", ref = "UNUSED" }
+
+[[rules]]
+name = "family"  # synced to the family calendar
+source = { account = "me", calendar = "Family" }
+target = { account = "dav", calendar = "Family", create_if_missing = true }
+"""
+
+
+async def test_an_op_over_the_socket_waits_for_the_running_cycle(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import anyio.to_thread
+
+    from calsync import daemon as daemon_module
+    from calsync import opsclient
+
+    config_path = short_dir / "config.toml"
+    config_path.write_text(OPS_CONFIG)
+    world = World(block=True)
+    in_cycle = asyncio.Event()
+    release = asyncio.Event()
+    real = daemon_module.run_cycle
+
+    async def held_cycle(*args: Any, **kwargs: Any) -> Any:
+        in_cycle.set()
+        await release.wait()
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(daemon_module, "run_cycle", held_cycle)
+    caplog.set_level(logging.INFO, logger="calsync.daemon")
+    daemon = world.daemon(two_rules(), short_dir, serve=True, config_path=config_path)
+    task = asyncio.create_task(daemon.run(world.stop))
+    await in_cycle.wait()
+    await eventually(lambda: (short_dir / "calsync.sock").is_socket())
+    call = asyncio.ensure_future(
+        anyio.to_thread.run_sync(
+            lambda: opsclient.call(
+                "rule.pause", {"name": "family"}, dry_run=False, config_path=config_path, state_dir=short_dir
+            )
+        )
+    )
+    await asyncio.sleep(0.3)
+    assert not call.done() and config_path.read_text() == OPS_CONFIG  # waits for the cycle
+    release.set()
+    result = await asyncio.wait_for(call, 10)
+    assert (result.changed, result.summary) == (True, 'rule "family" paused')
+    assert "# synced to the family calendar" in config_path.read_text()
+    assert "paused = true" in config_path.read_text()
+    assert "config changed; applied at restart" in caplog.messages
+    world.stop.set()
+    await asyncio.wait_for(task, 5)
+    with StateReader(short_dir / "state.db") as reader:
+        [change] = reader.config_changes()
+        assert len(reader.runs()) == 2  # the cycle finished and recorded before the op ran
+    assert (change.source, change.summary) == ("cli", 'rule "family" paused')
+
+
+async def test_ops_on_a_daemon_without_sync_are_refused(short_dir: Path) -> None:
+    import anyio.to_thread
+
+    from calsync import opsclient
+    from calsync.ops import OpsUnavailable
+
+    config_path = short_dir / "config.toml"
+    config_path.write_text(OPS_CONFIG)
+    _, stop, task = await run_viewer(short_dir)
+    with pytest.raises(OpsUnavailable, match="--no-sync"):
+        await anyio.to_thread.run_sync(
+            lambda: opsclient.call(
+                "rule.pause", {"name": "family"}, dry_run=False, config_path=config_path, state_dir=short_dir
+            )
+        )
+    assert config_path.read_text() == OPS_CONFIG
+    stop.set()
+    await asyncio.wait_for(task, 5)

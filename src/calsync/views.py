@@ -431,6 +431,94 @@ def host_for(provider: str, server_url: str | None) -> str:
     return urlparse(url).hostname or url
 
 
+HIDDEN = "(hidden)"
+
+
+def _scheme_host(url: str) -> str:
+    """``https://host[:port]`` of a URL: a push URL's path carries its device key."""
+    parts = urlparse(url)
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else HIDDEN
+
+
+def config_json(config: Config, *, reveal: bool = False) -> dict[str, Any]:
+    """The parsed config as JSON (``calsync config get``). Unless ``reveal``: push, webhook and
+    public URLs are cut to scheme and host, a CalDAV URL too, and each account's username (an
+    Apple ID) and credential ref read ``"(hidden)"``."""
+    from calsync.durations import format_duration
+
+    def url(value: str | None) -> str | None:
+        return value if reveal or value is None or value == "icloud" else _scheme_host(value)
+
+    def hidden(value: str | None) -> str | None:
+        return value if reveal or value is None else HIDDEN
+
+    def alarms(rule: Rule) -> str | list[str]:
+        policy = rule.alarms
+        return policy if isinstance(policy, str) else [format_duration(o) for o in policy]
+
+    accounts = {
+        a.name: {
+            "provider": a.provider,
+            "host": host_for(a.provider, a.server_url),
+            "server_url": url(a.server_url),
+            "username": hidden(a.username),
+            "credential": {"backend": a.credential.backend, "ref": hidden(a.credential.ref)},
+            "max_concurrency": a.max_concurrency,
+        }
+        for a in config.accounts.values()
+    }
+    rules = [
+        {
+            "name": r.name,
+            "source": {"account": r.source.account, "calendar": r.source.calendar},
+            "target": {
+                "account": r.target.account,
+                "calendar": r.target.calendar,
+                "create_if_missing": r.target.create_if_missing,
+            },
+            "window": None
+            if r.window is None
+            else {"past": format_duration(r.window.past), "future": format_duration(r.window.future)},
+            "alarms": alarms(r),
+            "fields": {
+                "content": r.fields.content,
+                "attendees": r.fields.attendees,
+                "conference": r.fields.conference,
+            },
+            "delete_guard": {"max_count": r.delete_guard.max_count, "max_ratio": r.delete_guard.max_ratio},
+            "paused": r.paused,
+            "retire": r.retire,
+        }
+        for r in config.rules
+    ]
+    web = config.web
+    host = f"[{web.host}]" if ":" in web.host else web.host
+    return {
+        "revealed": reveal,
+        "google": {
+            "client_secret_file": None
+            if config.google_client_secret_file is None
+            else str(config.google_client_secret_file)
+        },
+        "accounts": accounts,
+        "rules": rules,
+        "notify": {
+            "bark_url": url(config.notify.bark_url),
+            "webhook_url": url(config.notify.webhook_url),
+            "public_url": url(config.notify.public_url),
+            "failure_threshold": config.notify.failure_threshold,
+        },
+        "runtime": {
+            "interval": format_duration(config.runtime.interval),
+            "jitter": config.runtime.jitter,
+        },
+        "web": {
+            "listen": f"{host}:{web.port}" if web.enabled else "off",
+            "allowed_hosts": list(web.allowed_hosts),
+        },
+    }
+
+
 def _schema_json(reader: StateReader) -> dict[str, Any]:
     return {"version": reader.schema_version(), "current": reader.schema_current()}
 

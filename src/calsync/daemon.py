@@ -19,6 +19,10 @@ with and without sync. Each service catches its own failure, logs it and sets ``
 a failing server never cancels a cycle in progress. Once every service has ended (the cycle
 finished), ``run`` raises the first failure.
 
+Operations (``calsync.ops``) posted to the socket run inside the daemon, under ``_cycle_lock``:
+never during a cycle, and the store keeps one writer. In this version a config the daemon
+writes takes effect when it restarts.
+
 Without sync (``--no-sync``) the daemon takes no lock, reads no credential, opens no store and
 runs no cycle: it only serves the API. It cannot run beside another daemon in the same state
 directory (that one's socket is live: exit 4), only beside ``calsync run``; to show a running
@@ -37,8 +41,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
-from calsync import api, debug, wiring
+from calsync import api, debug, ops, wiring
 from calsync.config import Config
+from calsync.configfile import Snapshot
 from calsync.cycle import counts_line, run_cycle
 from calsync.engine import CycleResult, Engine, RuleResult
 from calsync.http import RequestLog
@@ -115,8 +120,11 @@ class Daemon:
         sleep: Sleep = asyncio.sleep,
         rng: Callable[[], float] = random.random,
         adapters_factory: AdaptersFactory | None = None,
+        config_path: Path | None = None,
     ) -> None:
         self._config = config
+        self._config_path = config_path  # the file operations edit; None: no operations
+        self._written: Snapshot | None = None  # the config last written by an operation
         self._state_dir = state_dir
         self._db_path, self._lock_path = wiring.state_paths(state_dir)
         self._sync = sync
@@ -146,6 +154,10 @@ class Daemon:
         self._parts: dict[str, wiring.Adapters] = {}
         self._store: Store | None = None
         self._engine: Engine | None = None
+        # The one mutual-exclusion point: held by a whole cycle (recording included) and by
+        # every operation, so nothing changes the config, the adapters or the store under a
+        # running cycle, and the store has one writer.
+        self._cycle_lock = asyncio.Lock()
 
     # ----- interface ----------------------------------------------------------
     async def run(self, stop: asyncio.Event) -> None:
@@ -221,6 +233,36 @@ class Daemon:
             self._pending.add(rule)
         self._wake.set()
         return True
+
+    async def run_op(
+        self, name: str, args: dict[str, Any], dry_run: bool, *, source: ops.Source
+    ) -> ops.OpResult:
+        """Run one operation between cycles (an operation that arrives during a cycle waits for
+        it). ``OpsUnavailable`` without sync (no lock, no store) or without a config path.
+
+        The operation runs on the event loop's thread: the store's sqlite connection belongs to
+        it, and an operation is one small file write and one row; the lock keeps cycles out."""
+        if self._store is None:
+            raise ops.OpsUnavailable("The daemon runs with --no-sync: it changes no configuration.")
+        if self._config_path is None:
+            raise ops.OpsUnavailable("The daemon was started without a config file path.")
+        async with self._cycle_lock:
+            store = self._store
+            if store is None:  # stopped while waiting
+                raise ops.OpsUnavailable("The daemon is stopping.")
+            ctx = ops.OpContext(
+                config_path=self._config_path,
+                state_dir=self._state_dir,
+                store=store,
+                source=source,
+                clock=self._clock,
+                on_config_written=self._config_written,
+            )
+            return ops.run_op(ctx, name, args, dry_run)
+
+    def _config_written(self, snapshot: Snapshot) -> None:
+        self._written = snapshot
+        log.info("config changed; applied at restart")
 
     def snapshot(self) -> DaemonInfo:
         return DaemonInfo(
@@ -364,6 +406,10 @@ class Daemon:
 
     # ----- one cycle ----------------------------------------------------------
     async def _cycle(self, rules: list[str]) -> None:
+        async with self._cycle_lock:
+            await self._locked_cycle(rules)
+
+    async def _locked_cycle(self, rules: list[str]) -> None:
         assert self._engine is not None and self._store is not None
         try:
             reauth = [r for r in rules if r in self._reauth]

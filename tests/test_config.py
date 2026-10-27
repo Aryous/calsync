@@ -418,3 +418,10 @@ def test_web_must_be_a_table() -> None:
     with pytest.raises(ConfigError) as info:
         parse_config({**VALID, "web": "127.0.0.1:8766"}, base_dir=Path("/cfg"))
     assert "web: must be a table" in info.value.problems
+
+
+def test_format_duration_round_trips() -> None:
+    from calsync.durations import format_duration
+
+    for text in ("7d", "180d", "36h", "90m", "-10m", "0s", "45s", "14d"):
+        assert format_duration(parse_duration(text)) == text

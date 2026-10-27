@@ -20,7 +20,7 @@ import logging
 import os
 import socket
 import sqlite3
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -35,9 +35,10 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from calsync import __version__, debug, views
+from calsync import __version__, debug, ops, views
 from calsync.config import Config
-from calsync.errors import ListenError
+from calsync.configfile import ConfigConflict
+from calsync.errors import ConfigError, ListenError
 from calsync.lock import DaemonServing
 from calsync.wiring import state_paths
 
@@ -64,13 +65,18 @@ class DaemonControl(Protocol):
 
     def snapshot(self) -> "DaemonInfo": ...
 
+    async def run_op(
+        self, name: str, args: dict[str, Any], dry_run: bool, *, source: ops.Source
+    ) -> ops.OpResult: ...
+
 
 class ApiError(Exception):
-    def __init__(self, status: int, kind: str, message: str) -> None:
+    def __init__(self, status: int, kind: str, message: str, problems: Sequence[str] | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.kind = kind
         self.message = message
+        self.problems = problems
 
 
 def _now() -> datetime:
@@ -78,9 +84,16 @@ def _now() -> datetime:
 
 
 def error_response(
-    status: int, kind: str, message: str, headers: Mapping[str, str] | None = None
+    status: int,
+    kind: str,
+    message: str,
+    headers: Mapping[str, str] | None = None,
+    problems: Sequence[str] | None = None,
 ) -> Response:
-    return JSONResponse({"error": {"kind": kind, "message": message}}, status_code=status, headers=headers)
+    error: dict[str, Any] = {"kind": kind, "message": message}
+    if problems is not None:
+        error["problems"] = list(problems)
+    return JSONResponse({"error": error}, status_code=status, headers=headers)
 
 
 # ----- request parameters ---------------------------------------------------------------
@@ -128,6 +141,29 @@ async def _trigger_rule(request: Request) -> str | None:
     if rule is not None and not isinstance(rule, str):
         raise ApiError(400, "bad_request", "rule: expected a string or null")
     return rule
+
+
+async def _op_body(request: Request) -> tuple[dict[str, Any], bool]:
+    """The ``{"args": {...}, "dry_run": bool}`` body; no body means no arguments."""
+    raw = await request.body()
+    if not raw.strip():
+        return {}, False
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        raise ApiError(400, "bad_request", "body: expected JSON") from None
+    if not isinstance(body, dict):
+        raise ApiError(400, "bad_request", 'body: expected an object such as {"args": {}, "dry_run": false}')
+    unknown = sorted(set(body) - {"args", "dry_run"})
+    if unknown:
+        raise ApiError(400, "bad_request", f"{unknown[0]}: unknown field")
+    args: Any = body.get("args", {})
+    dry_run: Any = body.get("dry_run", False)
+    if not isinstance(args, dict):
+        raise ApiError(400, "bad_request", "args: expected an object")
+    if not isinstance(dry_run, bool):
+        raise ApiError(400, "bad_request", "dry_run: expected true or false")
+    return args, dry_run
 
 
 # ----- routes ---------------------------------------------------------------------------
@@ -217,6 +253,28 @@ class _Endpoints:
             raise ApiError(409, "read_only", "The daemon runs with --no-sync: it runs no sync cycles.")
         return JSONResponse({"accepted": True, "rule": rule}, status_code=202)
 
+    def op(self, source: ops.Source) -> "Endpoint":
+        """``POST /api/ops/{name}``: one operation, run by the daemon between its cycles."""
+
+        async def endpoint(request: Request) -> Response:
+            name = request.path_params["name"]
+            args, dry_run = await _op_body(request)
+            if self._daemon is None:
+                raise ApiError(409, "read_only", "No daemon runs operations here.")
+            if name not in ops.OPS:
+                raise ApiError(404, "unknown_op", f"Unknown operation {name!r}.")
+            try:
+                result = await self._daemon.run_op(name, args, dry_run, source=source)
+            except ConfigConflict as exc:
+                raise ApiError(422, "config_conflict", str(exc), exc.problems) from None
+            except ConfigError as exc:
+                raise ApiError(422, "config", str(exc), exc.problems) from None
+            except ops.OpsUnavailable as exc:
+                raise ApiError(409, "read_only", str(exc)) from None
+            return JSONResponse(result.to_json())
+
+        return endpoint
+
 
 def _internal(exc: Exception) -> ApiError:
     """A bug: logged by type only (its text can carry a title or a URL), answered with a fixed
@@ -279,21 +337,28 @@ def api_routes(
     state_dir: Path,
     daemon: DaemonControl | None,
     clock: Clock = _now,
+    ops_source: ops.Source | None = None,
 ) -> list[Route]:
-    """The ``/api`` routes. Their errors are ``ApiError``: install ``exception_handlers`` too."""
+    """The ``/api`` routes. Their errors are ``ApiError``: install ``exception_handlers`` too.
+
+    ``ops_source``: also ``POST /api/ops/{name}``, recording changes as made from there. The
+    unix-socket app passes ``"cli"``; the web UI does not have the operations yet."""
     endpoints = _Endpoints(config_provider, state_dir, daemon, clock)
-    return [
+    routes = [
         Route("/api/status", guarded(endpoints.status), methods=["GET"]),
         Route("/api/upcoming", guarded(endpoints.upcoming), methods=["GET"]),
         Route("/api/runs", guarded(endpoints.runs), methods=["GET"]),
         Route("/api/changes", guarded(endpoints.changes), methods=["GET"]),
         Route("/api/trigger", guarded(endpoints.trigger), methods=["POST"]),
     ]
+    if ops_source is not None:
+        routes.append(Route("/api/ops/{name}", guarded(endpoints.op(ops_source)), methods=["POST"]))
+    return routes
 
 
 async def _api_error(request: Request, exc: Exception) -> Response:
     assert isinstance(exc, ApiError)
-    return error_response(exc.status, exc.kind, exc.message)
+    return error_response(exc.status, exc.kind, exc.message, problems=exc.problems)
 
 
 async def _http_error(request: Request, exc: Exception) -> Response:
@@ -320,7 +385,10 @@ def create_app(
     daemon: DaemonControl | None,
     clock: Clock = _now,
 ) -> Starlette:
-    routes = api_routes(config_provider=config_provider, state_dir=state_dir, daemon=daemon, clock=clock)
+    # The socket's app: only this user reaches it (0600), so the CLI's operations run here.
+    routes = api_routes(
+        config_provider=config_provider, state_dir=state_dir, daemon=daemon, clock=clock, ops_source="cli"
+    )
     return Starlette(
         routes=routes, middleware=[Middleware(ContainErrors)], exception_handlers=exception_handlers
     )

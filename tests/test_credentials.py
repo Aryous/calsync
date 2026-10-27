@@ -82,3 +82,36 @@ def test_keychain_errors_are_classified(monkeypatch: pytest.MonkeyPatch) -> None
         read_secret(ref)
     with pytest.raises(ConfigError, match=r"could not store.*calsync/test.*locked"):
         write_secret(ref, "pw")
+
+
+def test_delete_secret(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from calsync.credentials import delete_secret
+
+    class Deleting(FakeKeyring):
+        def delete_password(self, service: str, user: str) -> None:
+            if (service, user) not in self.store:
+                raise keyring.errors.PasswordDeleteError("not found")
+            del self.store[(service, user)]
+
+    fake = Deleting()
+    monkeypatch.setattr(credentials, "_keyring", lambda: fake)
+    ref = CredentialRef("keychain", "calsync:test")
+    write_secret(ref, "pw")
+    assert delete_secret(ref) is True and fake.store == {}
+    assert delete_secret(ref) is True  # already gone
+    secret = tmp_path / "secret"
+    secret.write_text("pw")
+    assert delete_secret(CredentialRef("file", str(secret))) is False and secret.exists()
+    assert delete_secret(CredentialRef("env", "PW")) is False
+
+
+def test_delete_secret_keychain_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from calsync.credentials import delete_secret
+
+    class Locked(BrokenKeyring):
+        def delete_password(self, service: str, user: str) -> None:
+            raise keyring.errors.KeyringLocked("locked")
+
+    monkeypatch.setattr(credentials, "_keyring", lambda: Locked())
+    with pytest.raises(ConfigError, match=r"could not delete keychain entry 'calsync:test': locked"):
+        delete_secret(CredentialRef("keychain", "calsync:test"))

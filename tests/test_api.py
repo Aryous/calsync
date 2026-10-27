@@ -293,6 +293,91 @@ async def test_trigger_rejects_a_bad_body(tmp_path: Path, body: bytes) -> None:
     assert daemon.calls == []
 
 
+# ----- operations (the socket app only) --------------------------------------------------
+
+
+class OpsDaemon(FakeDaemon):
+    def __init__(self, answer: Any) -> None:
+        super().__init__()
+        self.op_answer = answer
+        self.ops: list[tuple[str, dict[str, Any], bool, str]] = []
+
+    async def run_op(self, name: str, args: dict[str, Any], dry_run: bool, *, source: str) -> Any:
+        self.ops.append((name, args, dry_run, source))
+        if isinstance(self.op_answer, Exception):
+            raise self.op_answer
+        return self.op_answer
+
+
+async def test_an_op_runs_in_the_daemon(tmp_path: Path) -> None:
+    from calsync.ops import OpResult
+
+    daemon = OpsDaemon(OpResult("rule.pause", True, 'rule "family" paused', diff="d"))
+    async with client(tmp_path, daemon) as c:
+        response = await c.post("/api/ops/rule.pause", json={"args": {"name": "family"}, "dry_run": True})
+        bare = await c.post("/api/ops/rule.pause")
+    assert response.status_code == 200 and response.json()["summary"] == 'rule "family" paused'
+    assert bare.status_code == 200
+    assert daemon.ops == [("rule.pause", {"name": "family"}, True, "cli"), ("rule.pause", {}, False, "cli")]
+
+
+async def test_op_errors(tmp_path: Path) -> None:
+    from calsync.configfile import ConfigConflict
+    from calsync.errors import ConfigError
+    from calsync.ops import OpsUnavailable
+
+    cases: list[tuple[Any, int, dict[str, Any]]] = [
+        (ConfigError(["a", "b"]), 422, {"kind": "config", "message": "a; b", "problems": ["a", "b"]}),
+        (
+            ConfigConflict(),
+            422,
+            {
+                "kind": "config_conflict",
+                "message": "the file was changed outside calsync; reload and try again",
+                "problems": ["the file was changed outside calsync; reload and try again"],
+            },
+        ),
+        (OpsUnavailable("no ops here"), 409, {"kind": "read_only", "message": "no ops here"}),
+    ]
+    for answer, status, error in cases:
+        async with client(tmp_path, OpsDaemon(answer)) as c:
+            response = await c.post("/api/ops/rule.pause", json={"args": {"name": "family"}})
+        assert (response.status_code, response.json()) == (status, {"error": error})
+    async with client(tmp_path, None) as c:
+        response = await c.post("/api/ops/rule.pause", json={})
+    assert response.status_code == 409 and response.json()["error"]["kind"] == "read_only"
+
+
+async def test_an_unknown_op_is_404(tmp_path: Path) -> None:
+    daemon = OpsDaemon(None)
+    async with client(tmp_path, daemon) as c:
+        response = await c.post("/api/ops/rule.explode", json={})
+    assert response.status_code == 404 and response.json()["error"]["kind"] == "unknown_op"
+    assert daemon.ops == []
+
+
+@pytest.mark.parametrize(
+    "body", [b"{not json", b"[1]", b'{"args": [1]}', b'{"dry_run": "yes"}', b'{"args": {}, "extra": 1}']
+)
+async def test_an_op_rejects_a_bad_body(tmp_path: Path, body: bytes) -> None:
+    daemon = OpsDaemon(None)
+    async with client(tmp_path, daemon) as c:
+        response = await c.post(
+            "/api/ops/rule.pause", content=body, headers={"content-type": "application/json"}
+        )
+    assert response.status_code == 400 and response.json()["error"]["kind"] == "bad_request"
+    assert daemon.ops == []
+
+
+def test_ops_are_not_among_the_shared_routes(tmp_path: Path) -> None:
+    """The web UI mounts ``api_routes``: the operations reach it only in a later task, with its
+    own source and checks."""
+    routes = api.api_routes(config_provider=config, state_dir=tmp_path, daemon=None)
+    assert all("/api/ops" not in getattr(r, "path", "") for r in routes)
+    app_routes = api.create_app(config_provider=config, state_dir=tmp_path, daemon=None).routes
+    assert any(getattr(r, "path", "") == "/api/ops/{name}" for r in app_routes)
+
+
 async def test_responses_are_utf8_json(state: Path) -> None:
     with Store(state / "state.db") as store:
         at = datetime(2026, 10, 24, 9, tzinfo=UTC)

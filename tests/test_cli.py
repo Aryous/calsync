@@ -1040,7 +1040,7 @@ def test_daemon_with_its_port_in_use_exits_2_and_says_why(tmp_path: Path, short_
 class _RecordingDaemon:
     listens: ClassVar[list[tuple[str, int] | None]] = []
 
-    def __init__(self, config: Any, state_dir: Path, *, sync: bool, listen: Any) -> None:
+    def __init__(self, config: Any, state_dir: Path, *, sync: bool, listen: Any, config_path: Path) -> None:
         self.listens.append(listen)
 
     def snapshot(self) -> Any:
