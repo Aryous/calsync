@@ -339,32 +339,141 @@ def test_last_title_is_the_newest_known_title(tmp_path: Path) -> None:
         assert store.last_title("a", "o2") is None
 
 
-V3_RUN = """
+# The version-3 schema, verbatim from cb0a063 (main before block 2): what real databases hold.
+V3_SCHEMA = """
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE source_state (account TEXT PRIMARY KEY, state TEXT NOT NULL);
+CREATE TABLE source_event (
+    account TEXT NOT NULL, calendar TEXT NOT NULL, event_id TEXT NOT NULL, raw TEXT NOT NULL,
+    PRIMARY KEY (account, calendar, event_id)
+);
+CREATE TABLE target_calendar (
+    account TEXT NOT NULL, ref TEXT NOT NULL, href TEXT NOT NULL, name TEXT NOT NULL,
+    mode TEXT NOT NULL, cursor TEXT,
+    PRIMARY KEY (account, ref)
+);
+CREATE TABLE target_object (
+    account TEXT NOT NULL, calendar_href TEXT NOT NULL, href TEXT NOT NULL, etag TEXT,
+    rule_tag TEXT NOT NULL, object_id TEXT NOT NULL, content_hash TEXT,
+    span_start TEXT, span_end TEXT, verify_digest TEXT, reverting INTEGER NOT NULL,
+    revert_times TEXT NOT NULL, hold_until TEXT,
+    PRIMARY KEY (account, calendar_href, href)
+);
 CREATE TABLE run (
     id INTEGER PRIMARY KEY AUTOINCREMENT, rule TEXT NOT NULL, started_at TEXT NOT NULL,
     finished_at TEXT NOT NULL, status TEXT NOT NULL, created INTEGER NOT NULL,
     updated INTEGER NOT NULL, deleted INTEGER NOT NULL, failed INTEGER NOT NULL,
     requests INTEGER NOT NULL, error TEXT
-)
+);
+CREATE INDEX run_rule ON run (rule, id);
+CREATE TABLE alert (key TEXT PRIMARY KEY, state TEXT NOT NULL, last_sent_at TEXT);
 """
 
+V3_HREF = "/dav/home/family/calsync-0123abcd-0123456789abcdef01234567.ics"
 
-def test_v3_database_is_rebuilt_to_v4(tmp_path: Path) -> None:
-    db = tmp_path / "s.db"
+
+def _v3_database(db: Path, version: str = "3") -> None:
+    """A version-3 database with a row in every table the upgrade must keep."""
     with closing(sqlite3.connect(db)) as conn:
-        conn.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        conn.execute("INSERT INTO meta VALUES ('schema_version', '3')")
-        conn.execute(V3_RUN)
-        conn.execute("INSERT INTO run VALUES (1, 'a', 't', 't', 'ok', 0, 0, 0, 0, 1, NULL)")
-        conn.commit()
-    with Store(db) as store:
-        assert store.latest_runs() == []
-        store.record_runs(
-            [RunRecord("a", T0, T0, "ok", 1, 0, 0, 0, 1, None)],
-            [ChangeRecord("a", "o1", "created", T0, "Lunch")],
+        conn.executescript(V3_SCHEMA)
+        conn.execute("INSERT INTO meta VALUES ('schema_version', ?)", (version,))
+        conn.execute("INSERT INTO source_state VALUES ('g', '{\"token\": \"t1\"}')")
+        conn.execute("INSERT INTO source_event VALUES ('g', 'cal', 'e1', '{\"id\": \"e1\"}')")
+        conn.execute(
+            "INSERT INTO target_calendar VALUES ('d', 'Family', '/dav/home/family/', 'Family', 'sync', 'c7')"
         )
+        conn.execute(
+            "INSERT INTO target_object VALUES ('d', '/dav/home/family/', ?, '\"e1\"', '0123abcd', "
+            "'0123456789abcdef01234567', 'h1', NULL, NULL, NULL, 0, '[]', NULL)",
+            (V3_HREF,),
+        )
+        conn.execute(
+            "INSERT INTO run (rule, started_at, finished_at, status, created, updated, deleted, failed, "
+            "requests, error) VALUES ('a', ?, ?, 'partial', 2, 1, 0, 1, 5, 'TransientError')",
+            (T0.isoformat(), T0.isoformat()),
+        )
+        conn.commit()
+
+
+def test_v3_database_is_upgraded_in_place(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    _v3_database(db)
+    with Store(db) as store:
+        assert store.load_source("g") == ({"token": "t1"}, {"cal": {"e1": {"id": "e1"}}})
+        assert store.load_target_calendar("d", "Family") == TargetCalendar(
+            "/dav/home/family/", "Family", "sync"
+        )
+        cache = store.load_target_cache("d", "/dav/home/family/")
+        # The cursor and the cached object survive: no cold start, no heavy first cycle.
+        assert cache.cursor == "c7" and list(cache.objects) == [V3_HREF]
+        assert cache.objects[V3_HREF].content_hash == "h1"
+        [run] = store.latest_runs()
+        assert (run.rule, run.status, run.created, run.updated, run.failed, run.requests, run.error) == (
+            "a",
+            "partial",
+            2,
+            1,
+            1,
+            5,
+            "TransientError",
+        )
+        assert (run.reverted, run.protected, run.out_of_window, run.error_kind) == (0, 0, 0, None)
+        store.record_runs(
+            [RunRecord("a", T1, T1, "ok", 1, 0, 0, 0, 1, None, reverted=1)],
+            [ChangeRecord("a", "o1", "created", T1, "Lunch")],
+        )
+        assert store.last_title("a", "o1") == "Lunch"
     assert store_mod.SCHEMA_VERSION == 4
     assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("4",)]
     run_columns = [r[1] for r in _rows(db, "PRAGMA table_info(run)")]
     assert run_columns[-4:] == ["reverted", "protected", "out_of_window", "error_kind"]
+    assert _rows(db, "SELECT rule, reverted, protected, out_of_window, error_kind FROM run ORDER BY id") == [
+        ("a", 0, 0, 0, None),
+        ("a", 1, 0, 0, None),
+    ]
     assert _count(db, "SELECT COUNT(*) FROM change") == 1
+    indexes = {r[0] for r in _rows(db, "SELECT name FROM sqlite_master WHERE type = 'index'")}
+    assert {"run_rule", "change_rule", "change_at"} <= indexes
+
+
+def test_upgraded_schema_equals_a_fresh_one(tmp_path: Path) -> None:
+    """The upgrade step and a fresh schema describe the same tables and columns."""
+    _v3_database(tmp_path / "old.db")
+    Store(tmp_path / "old.db").close()
+    Store(tmp_path / "new.db").close()
+
+    def shape(db: Path) -> dict[str, list[tuple[Any, ...]]]:
+        tables = [r[0] for r in _rows(db, "SELECT name FROM sqlite_master WHERE type = 'table'")]
+        return {t: _rows(db, f"PRAGMA table_info({t})") for t in sorted(tables)}
+
+    assert shape(tmp_path / "old.db") == shape(tmp_path / "new.db")
+
+
+def test_failed_upgrade_leaves_the_v3_database_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = tmp_path / "s.db"
+    _v3_database(db)
+
+    def broken(conn: sqlite3.Connection) -> None:
+        conn.execute("ALTER TABLE run ADD COLUMN reverted INTEGER NOT NULL DEFAULT 0")
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setitem(store_mod._UPGRADES, 3, broken)  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+        Store(db)
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("3",)]
+    assert "reverted" not in [r[1] for r in _rows(db, "PRAGMA table_info(run)")]
+    assert _count(db, "SELECT COUNT(*) FROM run") == 1
+
+
+@pytest.mark.parametrize("version", ["2", "5"])
+def test_version_without_an_upgrade_path_is_rebuilt(tmp_path: Path, version: str) -> None:
+    """Older than the first step or newer than this code: dropped and rebuilt, as before."""
+    db = tmp_path / "s.db"
+    _v3_database(db, version)
+    with Store(db) as store:
+        assert store.latest_runs() == []
+        assert store.load_source("g") == ({}, {})
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("4",)]
+    assert _count(db, "SELECT COUNT(*) FROM change") == 0

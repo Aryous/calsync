@@ -1,11 +1,22 @@
-"""SQLite persistence. Every table is a rebuildable cache, so a schema change
-simply drops and recreates everything instead of migrating."""
+"""SQLite persistence.
+
+Most tables are caches that can be rebuilt from both ends (the source mirror and cursors, the
+target objects and cursors): losing them costs one heavy cycle, never data. History is not: the
+``run`` rows and the ``change`` audit log (the only place a deleted event's title survives)
+cannot be rebuilt, so a schema change keeps them.
+
+Schema versions: an older database is upgraded in place, one ``_UPGRADES`` step per version,
+in one transaction. A version with no path to ``SCHEMA_VERSION`` (older than the first step,
+newer than this code, or unreadable) is dropped and rebuilt. To add version N+1: bump
+``SCHEMA_VERSION``, change ``_SCHEMA`` (a fresh database), and add an ``N: _upgrade_N`` step
+that turns a version-N database into exactly that, keeping ``run`` and ``change``; a step may
+still empty a cache table if that is simpler."""
 
 import json
 import os
 import sqlite3
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -47,14 +58,17 @@ CREATE TABLE run (
     error_kind TEXT
 );
 CREATE INDEX run_rule ON run (rule, id);
-CREATE TABLE change (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, rule TEXT NOT NULL,
-    object_id TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL, title TEXT
-);
-CREATE INDEX change_rule ON change (rule, id);
-CREATE INDEX change_at ON change (at);
 CREATE TABLE alert (key TEXT PRIMARY KEY, state TEXT NOT NULL, last_sent_at TEXT);
 """
+# Version 4: the change log. Shared by a fresh schema and the 3 -> 4 upgrade, so they cannot drift.
+_CHANGE_SCHEMA = (
+    """CREATE TABLE change (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, rule TEXT NOT NULL,
+    object_id TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL, title TEXT
+)""",
+    "CREATE INDEX change_rule ON change (rule, id)",
+    "CREATE INDEX change_at ON change (at)",
+)
 _TABLES = (
     "meta",
     "source_state",
@@ -159,15 +173,25 @@ class Store:
                 raise
             row = None
         try:
-            if row and int(row[0]) == SCHEMA_VERSION:
-                return
+            version = int(row[0]) if row else None
         except (TypeError, ValueError):
-            pass  # unreadable version: rebuild
+            version = None  # unreadable version: rebuild
+        if version == SCHEMA_VERSION:
+            return
         with _Transaction(db):
+            if version is not None and _upgradable(version):
+                while version != SCHEMA_VERSION:
+                    _UPGRADES[version](db)
+                    version += 1
+                db.execute(
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+                    (str(SCHEMA_VERSION),),
+                )
+                return
             for table in _TABLES:
                 db.execute(f"DROP TABLE IF EXISTS {table}")
             # executescript() would commit our open transaction, so run statements one by one.
-            for statement in _SCHEMA.split(";"):
+            for statement in (*_SCHEMA.split(";"), *_CHANGE_SCHEMA):
                 if statement.strip():
                     db.execute(statement)
             db.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
@@ -387,6 +411,26 @@ class Store:
         return [
             RunRecord(r[0], datetime.fromisoformat(r[1]), datetime.fromisoformat(r[2]), *r[3:]) for r in rows
         ]
+
+
+def _upgrade_3(db: sqlite3.Connection) -> None:
+    """3 -> 4: the richer run rows and the change log; every row is kept."""
+    for column in ("reverted", "protected", "out_of_window"):
+        db.execute(f"ALTER TABLE run ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+    db.execute("ALTER TABLE run ADD COLUMN error_kind TEXT")
+    for statement in _CHANGE_SCHEMA:
+        db.execute(statement)
+
+
+# version -> the step that turns a database of that version into the next one
+_UPGRADES: dict[int, Callable[[sqlite3.Connection], None]] = {3: _upgrade_3}
+
+
+def _upgradable(version: int) -> bool:
+    """Whether the steps lead from ``version`` to ``SCHEMA_VERSION`` (never downwards)."""
+    while version < SCHEMA_VERSION and version in _UPGRADES:
+        version += 1
+    return version == SCHEMA_VERSION
 
 
 class _Transaction:
