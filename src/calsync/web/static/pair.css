@@ -1,0 +1,26 @@
+/* The pair page (pair.html), on top of styles.css. */
+/* Without JavaScript the theme follows the system. */
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme]) {
+    --ground: #060b18; --coupon: #0f1a33; --ink: #e8ecf5; --navy: #c8d3ee; --mute: #9ba6bf;
+    --rule: rgba(200, 211, 238, 0.14); --perf: rgba(200, 211, 238, 0.28); --red: #ff5d62; --focus: #b9a6f5;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 22px -12px rgba(0, 0, 0, 0.7);
+    color-scheme: dark;
+  }
+}
+html[lang="en"] [lang="zh-CN"], html:not([lang="en"]) [lang="en"] { display: none; }
+.pair { max-width: 440px; margin: 0 auto; padding: 32px max(var(--gutter), env(safe-area-inset-right)) 48px max(var(--gutter), env(safe-area-inset-left)); }
+.pair__card { background: var(--coupon); border-radius: var(--radius); box-shadow: var(--shadow); overflow: hidden; }
+.pair__top { padding: 22px 20px 18px; border-bottom: 1.5px dashed var(--perf); position: relative; }
+.pair__top::before, .pair__top::after { content: ""; position: absolute; bottom: -7px; width: 13px; height: 13px; border-radius: 50%; background: var(--ground); }
+.pair__top::before { left: -7px; } .pair__top::after { right: -7px; }
+.pair h1 { font-family: var(--font-display); font-size: 26px; font-weight: 700; color: var(--navy); line-height: 1.2; margin-bottom: 8px; }
+.pair__lede { color: var(--mute); font-size: 15px; }
+.pair__lede code { color: var(--ink); background: var(--ground); padding: 1px 5px; border-radius: 4px; }
+.pair form { padding: 18px 20px 22px; display: grid; gap: 10px; }
+.pair label { font-size: 14px; font-weight: 600; color: var(--navy); }
+.pair input { width: 100%; min-height: 48px; padding: 0 12px; font: 16px/1.2 var(--font-code); color: var(--ink); background: var(--ground); border: 1px solid var(--perf); border-radius: 8px; }
+.pair input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; border-color: transparent; }
+.pair button { min-height: 48px; border: 0; border-radius: 8px; background: var(--carrier); color: #fff; font-size: 16px; font-weight: 600; cursor: pointer; }
+.pair button:hover { background: #1a2b57; }
+.pair .notice { margin: 0 0 14px; padding: 10px 14px; border: 1px solid var(--red); border-radius: 8px; background: var(--coupon); color: var(--red); font-weight: 600; font-size: 14px; }

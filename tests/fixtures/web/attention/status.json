@@ -1,0 +1,152 @@
+{
+  "generated_at": "@+0m",
+  "schema": {
+    "version": 4,
+    "current": true
+  },
+  "summary": {
+    "health": "auth",
+    "rules": 2,
+    "attention": 2,
+    "last_sync_at": "@-21m",
+    "changes_24h": 5
+  },
+  "accounts": [
+    {
+      "name": "me-google",
+      "provider": "google",
+      "host": "Google Calendar"
+    },
+    {
+      "name": "me-icloud",
+      "provider": "caldav",
+      "host": "iCloud"
+    }
+  ],
+  "rules": [
+    {
+      "name": "family",
+      "source": {
+        "account": "me-google",
+        "calendar": "c_family01@group.calendar.google.com",
+        "calendar_name": "家庭日程"
+      },
+      "target": {
+        "account": "me-icloud",
+        "calendar": "/12345678/calendars/home-family/",
+        "calendar_name": "家庭日程"
+      },
+      "scope": {
+        "kind": "all"
+      },
+      "alarms": "copy",
+      "fields": {
+        "attendees": "notes",
+        "conference": "copy",
+        "content": "full"
+      },
+      "health": "auth",
+      "last_run": {
+        "id": 80,
+        "rule": "family",
+        "started_at": "@-60s",
+        "finished_at": "@-59s",
+        "duration_ms": 420,
+        "status": "failed",
+        "created": 0,
+        "updated": 0,
+        "deleted": 0,
+        "failed": 0,
+        "reverted": 0,
+        "protected": 0,
+        "out_of_window": 0,
+        "requests": 1,
+        "error": "AuthError: invalid_grant from Google OAuth",
+        "error_kind": "auth"
+      },
+      "last_ok_at": "@-21m",
+      "consecutive_failures": 20,
+      "copies": 17,
+      "out_of_window": 0,
+      "protected": 0
+    },
+    {
+      "name": "activities",
+      "source": {
+        "account": "me-google",
+        "calendar": "c_activities02@group.calendar.google.com",
+        "calendar_name": "课外活动"
+      },
+      "target": {
+        "account": "me-icloud",
+        "calendar": "/12345678/calendars/activities/",
+        "calendar_name": "课外活动"
+      },
+      "scope": {
+        "kind": "window",
+        "past_days": 7,
+        "future_days": 30
+      },
+      "alarms": {
+        "minutes_before": [
+          60,
+          0
+        ]
+      },
+      "fields": {
+        "attendees": "drop",
+        "conference": "copy",
+        "content": "full"
+      },
+      "health": "blocked",
+      "last_run": {
+        "id": 79,
+        "rule": "activities",
+        "started_at": "@-60s",
+        "finished_at": "@-59s",
+        "duration_ms": 910,
+        "status": "blocked",
+        "created": 0,
+        "updated": 0,
+        "deleted": 0,
+        "failed": 0,
+        "reverted": 0,
+        "protected": 0,
+        "out_of_window": 0,
+        "requests": 3,
+        "error": null,
+        "error_kind": null
+      },
+      "last_ok_at": "@-21m",
+      "consecutive_failures": 20,
+      "copies": 9,
+      "out_of_window": 3,
+      "protected": 1
+    }
+  ],
+  "attention": [
+    {
+      "kind": "auth",
+      "rule": "family",
+      "account": "me-google",
+      "message": "The me-google account needs to be connected again.",
+      "command": "calsync auth me-google"
+    },
+    {
+      "kind": "blocked",
+      "rule": "activities",
+      "account": null,
+      "message": "Sync paused: 4 deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again.",
+      "command": "calsync run --rule activities --allow-deletes"
+    }
+  ],
+  "daemon": {
+    "running": true,
+    "sync": true,
+    "pid": 48213,
+    "started_at": "@-3h",
+    "last_cycle_at": "@-60s",
+    "next_cycle_at": "@+1m",
+    "cycles": 181
+  }
+}

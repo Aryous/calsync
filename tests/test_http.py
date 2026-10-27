@@ -81,3 +81,19 @@ async def test_transport_errors_are_retried() -> None:
     async with make_client(RequestLog(), transport=httpx.MockTransport(handler)) as client:
         response = await request_with_retry(client, "GET", "https://x.test/a", kind="k", sleep=no_sleep)
     assert response.status_code == 200 and calls["n"] == 2
+
+
+def test_request_log_clear_drops_entries_but_keeps_marks() -> None:
+    # A long-lived daemon clears the log every cycle; marks taken around it stay comparable.
+    log = RequestLog()
+    for path in ("/a", "/b", "/c"):
+        log.record(httpx.Request("GET", f"https://x.test{path}", extensions={"calsync_kind": "probe"}))
+    before = log.mark()
+    log.clear()
+    assert log.entries == [] and log.mark() == before == 3
+    for path in ("/d", "/e"):
+        log.record(httpx.Request("GET", f"https://x.test{path}", extensions={"calsync_kind": "list"}))
+    assert log.mark() - before == 2
+    assert [e.path for e in log.since(before)] == ["/d", "/e"]
+    assert [e.path for e in log.since(0)] == ["/d", "/e"]  # what was cleared is gone
+    assert log.count() == 2 and log.kinds() == ["list", "list"]

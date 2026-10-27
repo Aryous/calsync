@@ -17,6 +17,14 @@ class ConfigError(CalsyncError):
         super().__init__("; ".join(self.problems))
 
 
+class ListenError(ConfigError):
+    """The web UI's TCP address cannot be listened on (in use, not allowed, not this
+    computer's): a configuration problem, exit code 2, so the reason reaches launchd's log."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__([message])
+
+
 class AuthError(CalsyncError):
     """Credentials are missing, revoked or rejected. Never retried automatically."""
 

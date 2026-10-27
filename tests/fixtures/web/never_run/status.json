@@ -1,0 +1,67 @@
+{
+  "generated_at": "@+0m",
+  "schema": {
+    "version": 4,
+    "current": true
+  },
+  "summary": {
+    "health": "never_run",
+    "rules": 1,
+    "attention": 0,
+    "last_sync_at": null,
+    "changes_24h": 0
+  },
+  "accounts": [
+    {
+      "name": "me-google",
+      "provider": "google",
+      "host": "Google Calendar"
+    },
+    {
+      "name": "me-icloud",
+      "provider": "caldav",
+      "host": "iCloud"
+    }
+  ],
+  "rules": [
+    {
+      "name": "family",
+      "source": {
+        "account": "me-google",
+        "calendar": "c_family01@group.calendar.google.com",
+        "calendar_name": "家庭日程"
+      },
+      "target": {
+        "account": "me-icloud",
+        "calendar": "/12345678/calendars/home-family/",
+        "calendar_name": "家庭日程"
+      },
+      "scope": {
+        "kind": "all"
+      },
+      "alarms": "copy",
+      "fields": {
+        "attendees": "notes",
+        "conference": "copy",
+        "content": "full"
+      },
+      "health": "never_run",
+      "last_run": null,
+      "last_ok_at": null,
+      "consecutive_failures": 0,
+      "copies": 0,
+      "out_of_window": 0,
+      "protected": 0
+    }
+  ],
+  "attention": [],
+  "daemon": {
+    "running": true,
+    "sync": true,
+    "pid": 48213,
+    "started_at": "@-0m",
+    "last_cycle_at": null,
+    "next_cycle_at": "@+0m",
+    "cycles": 0
+  }
+}

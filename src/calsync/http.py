@@ -34,6 +34,7 @@ class LoggedRequest:
 @dataclass(slots=True)
 class RequestLog:
     entries: list[LoggedRequest] = field(default_factory=list)
+    cleared: int = 0  # entries dropped by clear(); marks count them, so they stay comparable
 
     def record(self, request: httpx.Request) -> None:
         kind = str(request.extensions.get("calsync_kind", ""))
@@ -46,10 +47,17 @@ class RequestLog:
         return [e.kind for e in self.entries]
 
     def mark(self) -> int:
-        return len(self.entries)
+        """The number of requests recorded so far, cleared ones included."""
+        return self.cleared + len(self.entries)
 
     def since(self, mark: int) -> list[LoggedRequest]:
-        return self.entries[mark:]
+        """The kept entries recorded after ``mark`` (cleared ones are gone)."""
+        return self.entries[max(mark - self.cleared, 0) :]
+
+    def clear(self) -> None:
+        """Drop the kept entries (a long-lived process clears it every cycle); marks keep counting."""
+        self.cleared += len(self.entries)
+        self.entries.clear()
 
 
 def make_client(

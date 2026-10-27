@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#0D1B3D">
+<meta name="referrer" content="no-referrer">
+<title>calsync · 配对 Pair</title>
+<script src="/static/theme.js"></script>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/styles.css">
+<link rel="stylesheet" href="/static/pair.css">
+</head>
+<body>
+<header class="bar"><div class="bar__in"><span class="wordmark">calsync</span></div></header>
+<main class="pair">
+  <!-- calsync:notice -->
+  <div class="pair__card">
+    <div class="pair__top">
+      <h1><span lang="zh-CN">连接这个浏览器</span><span lang="en">Pair this browser</span></h1>
+      <p class="pair__lede">
+        <span lang="zh-CN">在运行 calsync 的电脑上执行 <code>calsync web pair</code>，打开它给出的链接；或者把链接里 <code>k=</code> 后面的密钥粘贴到下面。</span>
+        <span lang="en">On the computer that runs calsync, run <code>calsync web pair</code> and open the link it prints, or paste the key after <code>k=</code> below.</span>
+      </p>
+    </div>
+    <form method="post" action="/pair">
+      <label for="key"><span lang="zh-CN">配对密钥</span><span lang="en">Pairing key</span></label>
+      <input id="key" name="key" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" required>
+      <button type="submit"><span lang="zh-CN">配对</span><span lang="en">Pair</span></button>
+    </form>
+  </div>
+</main>
+</body>
+</html>

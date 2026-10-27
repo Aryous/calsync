@@ -8,11 +8,12 @@ up exactly where the last one stopped.
 import asyncio
 import logging
 from collections import defaultdict
-from collections.abc import Callable, Coroutine, Mapping, Sequence, Set
+from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
+from calsync import debug
 from calsync.config import Config, Rule
 from calsync.errors import AuthError, CalsyncError, ConfigError, ConflictError, NotFoundError
 from calsync.http import RequestLog
@@ -20,9 +21,9 @@ from calsync.mirror import Mirror, apply_pull
 from calsync.model import Window, apply_alarm_policy, apply_field_policy, series_hash, series_span
 from calsync.naming import object_id, parse_resource_name, resource_name, rule_tag, uid_for
 from calsync.planner import Actual, Desired, Plan, check_delete_guard, plan
-from calsync.render import content_digest, inspect, render
+from calsync.render import Inspected, content_digest, inspect, render
 from calsync.sources.base import CalendarMeta, Source
-from calsync.store import RunRecord, Store
+from calsync.store import ChangeRecord, RunRecord, Store
 from calsync.targets.base import (
     CachedObject,
     FetchedObject,
@@ -70,6 +71,12 @@ class RuleResult:
     out_of_window: int = 0  # desired series skipped by the rule's time window
     blocked_titles: list[str] = field(default_factory=list)  # planned deletes, for the guard alert
     blocked_titles_complete: bool = True  # False: the lookup failed or some bodies were unreadable
+    changes: list[ChangeRecord] = field(default_factory=list)  # carries titles: never log
+    # This cycle's protected / blocked object ids, for the engine's dedup memory: committed only
+    # once ``changes`` is written. None: not reached (dry run, or the rule failed earlier).
+    seen_protected: frozenset[str] | None = None
+    seen_blocked: frozenset[str] | None = None
+    seen_blocked_read: bool = False  # the title lookup for ``seen_blocked`` succeeded
 
     def fail(self, exc: BaseException) -> None:
         self.status = "failed"
@@ -108,7 +115,49 @@ def apply_target_delta(cache: TargetCache, delta: TargetDelta) -> list[str]:
     return need
 
 
+def _title(text: str | None) -> str | None:
+    """A title as the history stores it: an empty or missing one is None, never a placeholder."""
+    return text if text and text.strip() else None
+
+
+Bodies = dict[str, Inspected | None]  # parsed target bodies by href; None: unreadable
+
+
+def _body_title(bodies: Bodies | None, href: str) -> str | None:
+    """The SUMMARY of a fetched body as read; None if it is empty, unreadable or was not fetched."""
+    found = bodies.get(href) if bodies is not None else None
+    return _title(found.summary) if found is not None else None
+
+
+def _blocked_titles(deletes: Sequence[Actual], bodies: Bodies | None) -> tuple[list[str], bool]:
+    """Titles of the planned deletes for the guard alert, and whether every one was read."""
+    if bodies is None:
+        return [], False
+    listed = [
+        "(unreadable)" if (found := bodies[a.href]) is None else found.summary or "(untitled)"
+        for a in deletes
+        if a.href in bodies
+    ]
+    return listed, len(listed) == len(deletes) and None not in bodies.values()
+
+
 TargetKey = tuple[str, str]  # (account, calendar ref from config)
+
+
+@dataclass(frozen=True, slots=True)
+class _Blocked:
+    """The last recorded blocked set of a rule, with the titles its lookup found."""
+
+    ids: frozenset[str]
+    titles: tuple[str, ...] = ()
+    complete: bool = True
+    read: bool = False  # the lookup succeeded: the same set need not be read again
+
+
+def _rule_names(rules: Iterable[Rule]) -> str:
+    """Rule names for a log line. A calendar ref is never logged: it may be a Google calendar ID
+    (an address) or a CalDAV URL."""
+    return ", ".join(sorted(r.name for r in rules))
 
 
 class Engine:
@@ -135,6 +184,13 @@ class Engine:
         self._calendars: dict[TargetKey, TargetCalendar] = {}
         self._caches: dict[tuple[str, str], TargetCache] = {}
         self._warned_degraded: set[tuple[str, str]] = set()  # (rule, source id), once per process
+        # Last recorded protected / blocked object ids per rule, updated only after the cycle's
+        # history is written: protected ids are recorded when they join the set, a blocked set
+        # when it differs. In memory: a fresh process records the current sets once. A blocked
+        # set keeps its titles: a rule stays blocked cycle after cycle until someone acts, and
+        # reading every planned delete each time would cost a multiget per cycle.
+        self._last_protected: dict[str, frozenset[str]] = {}
+        self._last_blocked: dict[str, _Blocked] = {}
 
     # ----- phase 1: ingest ---------------------------------------------
     async def _ingest(self, account: str, rules: list[Rule]) -> dict[str, Exception]:
@@ -151,7 +207,13 @@ class Engine:
                     "(source contract violation)"
                 )
         for ref, exc in errors.items():
-            log.warning("source %s calendar %r failed: %s", account, ref, exc)
+            # Never the calendar ref (it may be a Google calendar ID, an address) nor the error's
+            # text (it carries the request URL): the rules it feeds and the type.
+            names = _rule_names(r for r in rules if r.source.calendar == ref)
+            log.warning(
+                "source %s: the calendar of rule(s) %s failed (%s)", account, names, type(exc).__name__
+            )
+            debug.details(log, f"source {account}: the calendar of rule(s) {names} failed", exc)
         # Failed calendars are absent from ``calendars`` and keep their old cursor in ``state``.
         unique = {p.calendar_id: p for p in pull.calendars.values()}
         self._store.save_source(account, pull.state, unique.values())
@@ -237,18 +299,19 @@ class Engine:
         if marker_lost:
             # Counts only: tells whether the target keeps the marker (the real-device check).
             log.info(
-                "target %s %r: %d copy(ies) read back with no calsync marker; judged by visible content",
+                "target %s (rule(s) %s): %d copy(ies) read back with no calsync marker; judged by "
+                "visible content",
                 account,
-                ref,
+                _rule_names(rules),
                 marker_lost,
             )
         if unread:
             # Keep the previous cursor: sync-collection replays (ctag re-lists) these hrefs
             # next cycle; advancing would orphan them until they change on the target again.
             log.warning(
-                "target %s %r: %d changed resource(s) could not be read; re-detecting next cycle",
+                "target %s (rule(s) %s): %d changed resource(s) could not be read; re-detecting next cycle",
                 account,
-                ref,
+                _rule_names(rules),
                 len(unread),
             )
         else:
@@ -314,6 +377,21 @@ class Engine:
         # delete); a degraded one without a copy is still created from its parseable part.
         protected = (unparsed | incomplete) & actual.keys()
         result.protected = len(protected)
+        if not dry_run:
+            result.seen_protected = frozenset(protected)
+            # Only ids that joined the set: a series protected for days is one row, not one a cycle.
+            if joined := sorted(protected - self._last_protected.get(rule.name, frozenset())):
+                now = self._clock()
+                result.changes.extend(
+                    ChangeRecord(
+                        rule.name,
+                        oid,
+                        "protected",
+                        now,
+                        _title(desired[oid].series.title) if oid in desired else None,
+                    )
+                    for oid in joined
+                )
         if self._classify_reads(rule, cache, actual, desired, protected, window):
             # Saved now (also in a dry run): detection has already consumed the change, so a
             # dry run or a failed write must not forget the edit.
@@ -336,10 +414,30 @@ class Engine:
         reason = None if allow_deletes else check_delete_guard(result.plan, deletable, rule.delete_guard)
         if reason:
             result.status, result.error, result.error_kind = "blocked", reason, "guard"
-            result.blocked_titles, result.blocked_titles_complete = await self._titles(
-                rule, cal, result.plan.delete
-            )
+            blocked = frozenset(a.object_id for a in result.plan.delete)
+            last = self._last_blocked.get(rule.name)
+            bodies: Bodies | None = None
+            if last is not None and last.ids == blocked and last.read:
+                # The block the last cycle recorded: same titles, no new rows, nothing to read.
+                result.blocked_titles, result.blocked_titles_complete = list(last.titles), last.complete
+                read = True
+            else:
+                bodies = await self._bodies(rule, cal, result.plan.delete)
+                result.blocked_titles, result.blocked_titles_complete = _blocked_titles(
+                    result.plan.delete, bodies
+                )
+                read = bodies is not None
+            if not dry_run:
+                result.seen_blocked, result.seen_blocked_read = blocked, read
+                if last is None or last.ids != blocked:  # a guard decision covers the set
+                    now = self._clock()
+                    result.changes.extend(
+                        ChangeRecord(rule.name, a.object_id, "blocked", now, _body_title(bodies, a.href))
+                        for a in result.plan.delete
+                    )
             return
+        if not dry_run:
+            result.seen_blocked = frozenset()  # a later block of the same set is new again
         if not dry_run and not result.plan.empty:
             await self._push(rule, cal, cache, result.plan, result)
 
@@ -475,21 +573,17 @@ class Engine:
             )
         return changed > 0
 
-    async def _titles(self, rule: Rule, cal: TargetCalendar, deletes: list[Actual]) -> tuple[list[str], bool]:
-        """SUMMARY of each planned delete and whether every one was read; only blocked rules pay."""
+    async def _bodies(self, rule: Rule, cal: TargetCalendar, deletes: list[Actual]) -> Bodies | None:
+        """The parsed body of each planned delete; None if the fetch failed. Only blocked rules pay."""
         try:
             fetched = await self._targets[rule.target.account].fetch(cal, [a.href for a in deletes])
         except Exception as exc:  # the alert loses detail, but the rule stays blocked
-            log.warning("rule %s: could not read the titles of planned deletes: %s", rule.name, exc)
-            return [], False
-        titles: dict[str, str] = {}
-        unreadable = 0
-        for obj in fetched:
-            found = inspect(obj.data)
-            unreadable += found is None
-            titles[obj.href] = "(unreadable)" if found is None else found.summary or "(untitled)"
-        listed = [titles[a.href] for a in deletes if a.href in titles]
-        return listed, len(listed) == len(deletes) and not unreadable
+            log.warning(
+                "rule %s: could not read the titles of planned deletes (%s)", rule.name, type(exc).__name__
+            )
+            debug.details(log, f"rule {rule.name}: could not read the titles of planned deletes", exc)
+            return None
+        return {obj.href: inspect(obj.data) for obj in fetched}
 
     async def _push(
         self,
@@ -559,6 +653,9 @@ class Engine:
                     etag = await target.update(href, found.etag, data)
             remember(href, etag, want)
             result.created += 1
+            result.changes.append(
+                ChangeRecord(rule.name, want.object_id, "created", now, _title(want.series.title))
+            )
 
         async def update(want: Desired, have: Actual) -> None:
             prior = cache.objects.get(have.href)
@@ -575,8 +672,14 @@ class Engine:
             remember(have.href, etag, want, reverted=reverting)
             result.updated += 1
             result.reverted += reverting
+            action = "reverted" if reverting else "updated"
+            result.changes.append(
+                ChangeRecord(rule.name, want.object_id, action, now, _title(want.series.title))
+            )
 
         async def delete(have: Actual) -> None:
+            # The source event is gone: the last recorded title is the only one left.
+            title = self._store.last_title(rule.name, have.object_id)
             try:
                 await target.delete(have.href, have.etag)
             except ConflictError:
@@ -585,6 +688,7 @@ class Engine:
                     await target.delete(have.href, found.etag)
             cache.objects.pop(have.href, None)
             result.deleted += 1
+            result.changes.append(ChangeRecord(rule.name, have.object_id, "deleted", now, title))
 
         # Coroutines are created per phase, so a cancelled cycle leaves none un-awaited.
         phases: list[Callable[[], list[Coroutine[Any, Any, None]]]] = [
@@ -599,7 +703,8 @@ class Engine:
                     if not isinstance(outcome, Exception):
                         raise outcome
                     errors.append(outcome)
-                    log.warning("rule %s: write failed: %s", rule.name, outcome)
+                    log.warning("rule %s: write failed (%s)", rule.name, type(outcome).__name__)
+                    debug.details(log, f"rule {rule.name}: write failed", outcome)
         if errors:
             result.failed = len(errors)
             first = errors[0]
@@ -661,7 +766,8 @@ class Engine:
             try:
                 await self._run_rule(rule, results[rule.name], dry_run=dry_run, allow_deletes=allow_deletes)
             except Exception as exc:  # isolate rules from each other
-                log.exception("rule %s failed", rule.name)
+                log.error("rule %s failed (%s)", rule.name, type(exc).__name__)
+                debug.details(log, f"rule {rule.name} failed", exc)
                 results[rule.name].fail(exc)
 
         await asyncio.gather(*(guarded(r) for r in selected if results[r.name].status == "ok"))
@@ -693,8 +799,24 @@ class Engine:
                         r.failed,
                         requests,
                         r.error,
+                        reverted=r.reverted,
+                        protected=r.protected,
+                        out_of_window=r.out_of_window,
+                        error_kind=r.error_kind,
                     )
                     for r in results.values()
-                ]
+                ],
+                [c for r in results.values() for c in r.changes],
             )
+            # Only now: a failed write must not make the next cycle skip these rows.
+            for r in results.values():
+                if r.seen_protected is not None:
+                    self._last_protected[r.rule] = r.seen_protected
+                if r.seen_blocked is not None:
+                    self._last_blocked[r.rule] = _Blocked(
+                        r.seen_blocked,
+                        tuple(r.blocked_titles),
+                        r.blocked_titles_complete,
+                        r.seen_blocked_read,
+                    )
         return CycleResult(started, finished, results, requests)

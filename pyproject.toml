@@ -9,6 +9,9 @@ dependencies = [
     "icalendar>=7.3,<8",
     "python-dateutil>=2.9",
     "keyring>=25",
+    "anyio>=4.6",
+    "starlette>=1.10,<2",
+    "uvicorn>=0.54,<1",
 ]
 
 [project.scripts]

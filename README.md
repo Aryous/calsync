@@ -10,10 +10,9 @@ Google Calendar ──► calsync (your machine) ──► iCloud / any CalDAV �
    you write here       incremental, safe         people read here
 ```
 
-> **Status: early.** The sync engine and the `calsync` command line are
-> complete and tested; a background service, alerts and a web UI are next
-> (see [Roadmap](docs/ROADMAP.md)). Today you run `calsync run` yourself or
-> from a scheduler.
+> **Status: early.** The sync engine, the `calsync` command line and the
+> `calsync daemon` background process are complete and tested; alerts, a
+> service installer and a web UI are next (see [Roadmap](docs/ROADMAP.md)).
 
 ---
 
@@ -26,6 +25,8 @@ Google Calendar ──► calsync (your machine) ──► iCloud / any CalDAV �
 - [Quick start](#quick-start)
 - [Upgrading](#upgrading)
 - [Configuration](#configuration)
+- [Running as a daemon](#running-as-a-daemon)
+- [Web UI](#web-ui)
 - [Command line](#command-line)
 - [Safety guarantees](#safety-guarantees)
 - [Privacy and security](#privacy-and-security)
@@ -237,30 +238,41 @@ calsync run                    # one sync cycle
 
 ### 7. Keep it running
 
-Until the built-in service ships, schedule `calsync run`, for example every
-five minutes with a launchd agent on macOS
-(`~/Library/LaunchAgents/dev.calsync.run.plist`):
+```sh
+calsync daemon                 # syncs now, then every minute, until Ctrl-C
+```
+
+See [Running as a daemon](#running-as-a-daemon). `calsync service install`
+is not implemented yet; until it is, start the daemon at login with a launchd
+agent you write yourself. An example
+(`~/Library/LaunchAgents/dev.calsync.daemon.plist`):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>dev.calsync.run</string>
+  <key>Label</key><string>dev.calsync.daemon</string>
   <key>ProgramArguments</key>
-  <array><string>/Users/YOU/.local/bin/calsync</string><string>run</string></array>
-  <key>StartInterval</key><integer>300</integer>
+  <array><string>/Users/YOU/.local/bin/calsync</string><string>daemon</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>/Users/YOU/Library/Logs/calsync.log</string>
   <key>StandardErrorPath</key><string>/Users/YOU/Library/Logs/calsync.log</string>
 </dict></plist>
 ```
 
 ```sh
-launchctl load ~/Library/LaunchAgents/dev.calsync.run.plist
+launchctl load ~/Library/LaunchAgents/dev.calsync.daemon.plist
 ```
 
-The keychain backend needs a logged-in user session; on a machine that sits
-at the login screen use the `file` backend instead. Watch the exit code in
-the log — there are no notifications yet.
+`KeepAlive` restarts the daemon whenever it exits, so stop it with
+`launchctl unload ~/Library/LaunchAgents/dev.calsync.daemon.plist`, not with
+SIGTERM (launchd would start it again). A daemon that fails to start (a
+configuration error, a held lock) is retried about every 10 seconds; the log
+says why. If you used a `StartInterval` agent running `calsync run` before,
+unload it first: while the daemon runs, `calsync run` exits with code 4. The keychain backend needs a logged-in user
+session; on a machine that sits at the login screen use the `file` backend
+instead. There are no notifications yet: check `calsync status`.
 
 ## Upgrading
 
@@ -269,6 +281,17 @@ uv tool install --reinstall git+https://github.com/Aryous/calsync
 calsync config check
 calsync run --dry-run          # review before the first real cycle
 ```
+
+### Upgrading to the version with the daemon and the web UI
+
+- **The state database is migrated in place.** Run history, cursors and the
+  cached copies are kept, so the first cycle after the upgrade costs no more
+  than any other. Change history (`calsync changes`) starts with the upgrade:
+  an event synced before it and deleted later is listed without its title.
+- **The daemon replaces a scheduled `calsync run`.** If a `StartInterval`
+  agent ran `calsync run` before, unload it before you load the daemon (see
+  [Keep it running](#7-keep-it-running)): while the daemon runs, `calsync run`
+  exits with code 4.
 
 ### Upgrading to the version with full sync and reverts
 
@@ -353,9 +376,18 @@ next cycle.
 
 Durations are written as `30s`, `5m`, `2h`, `7d`, `1w`, with an optional sign.
 
-`[runtime]` (`interval`, `jitter`) and `[notify]` (`bark_url`, `webhook_url`,
-`failure_threshold`) are validated today and will be used by the background
-service and alerts.
+`[runtime]` sets the daemon's schedule: `interval` (default `60s`) and
+`jitter` (default `0.1`, so each wait is 54–66 s). `[notify]` (`bark_url`,
+`webhook_url`, `failure_threshold`) is validated today and will be used by
+alerts.
+
+`[web]` sets where the daemon serves the [web UI](#web-ui):
+
+```toml
+[web]
+listen = "127.0.0.1:8766"              # HOST:PORT (default); an IPv6 host in brackets: "[::]:8766"; "off": no web UI
+allowed_hosts = ["mac-mini.local"]     # other names the browser may use for this machine
+```
 
 ### Files calsync creates
 
@@ -364,7 +396,108 @@ service and alerts.
 | `~/.config/calsync/` | your configuration and OAuth client file |
 | macOS Keychain, service `calsync/<ref>` | refresh tokens and app-specific passwords (keychain backend) |
 | `~/.local/state/calsync/state.db` (or `$CALSYNC_STATE_DIR`, `--state-dir`) | rebuildable cache and run history, mode 0600 |
-| `~/.local/state/calsync/run.lock` | prevents two `calsync run` at once |
+| `~/.local/state/calsync/run.lock` | prevents two syncing processes (`calsync run`, `calsync daemon`) at once |
+| `~/.local/state/calsync/calsync.sock` | the daemon's local API socket, mode 0600, removed when it stops |
+| `~/.local/state/calsync/web.key` | the web UI's pairing key, mode 0600 (`calsync web pair` creates it) |
+
+## Running as a daemon
+
+```sh
+calsync daemon                 # sync on a schedule until SIGTERM or Ctrl-C
+calsync trigger                # ask it for a cycle now (all rules)
+calsync trigger --rule family  # just this rule
+```
+
+`calsync daemon` runs one cycle at once, then one after every wait of
+`[runtime] interval` ± `jitter`. It holds the run lock for its whole life, so
+a `calsync run` meanwhile exits with code 4: use `calsync trigger` instead
+(or send the daemon `SIGUSR1`).
+
+- **Backoff.** A rule that keeps failing is skipped for 1, 2, 4, 8 and then
+  15 minutes after its latest failure; the other rules keep their schedule. A
+  triggered rule runs regardless. A cycle blocked by the mass-delete guard
+  neither adds to nor clears a rule's failure streak, so a backoff earned by
+  earlier failures still applies. The rule stays blocked until you run
+  `calsync run --rule NAME --allow-deletes`; stop the daemon first (under
+  launchd: `launchctl unload` the agent, then load it again afterwards).
+- **Authentication.** After `calsync auth <account>` the daemon picks up the
+  new credential at the rule's next attempt; `calsync trigger --rule NAME`
+  makes that now.
+- **Stopping.** SIGTERM or Ctrl-C lets the current cycle finish, then exits.
+  A second Ctrl-C does not force-quit; `kill -9` does. Under launchd with
+  `KeepAlive`, use `launchctl unload` instead: launchd restarts a daemon that
+  exits.
+- **Logs** go to stderr: one line per cycle with counts only (no titles, no
+  URLs).
+- **The socket.** The daemon serves a small JSON API on
+  `<state-dir>/calsync.sock` (mode 0600, so only your user can reach it).
+  `calsync trigger` uses it.
+  `trigger` says `the daemon is not running; use calsync run` when there is
+  no daemon.
+- **`--no-sync`** serves the API without syncing: no lock, no credentials, no
+  cycles (`trigger` is refused). It cannot share a state directory with a
+  running daemon (whose socket is live: exit 4, `another calsync daemon is
+  serving …`): point `--state-dir` at a copy of the state directory to show
+  the data without touching the live one.
+
+## Web UI
+
+The daemon also serves a web page with the sync status, the events due in the
+next 24 hours, recent changes and the run history, and a "sync now" button. By
+default it listens on `127.0.0.1:8766` (only this computer); set `[web]
+listen` or pass `calsync daemon --listen HOST:PORT` to change that. To turn
+the web UI off, set `listen = "off"` or pass `calsync daemon --no-web`; the
+local API socket (and `calsync trigger`) keeps working. If the daemon cannot
+listen on the address (the port is taken, say), it exits with code 2 before
+any sync and says why (`cannot listen on 127.0.0.1:8766: address already in
+use; …`): pick another port or turn the web UI off.
+
+A browser has to be paired once:
+
+```sh
+calsync web pair               # prints the pair link(s), creating the key if needed
+calsync web reset-key          # new key: every paired browser has to pair again
+```
+
+`web pair` prints one link per address (`localhost`, each `allowed_hosts`
+entry, and the listen host when it is a specific address). Opening a link
+stores a cookie in that browser for 400 days; you can also paste the key
+(or the whole link) into the page at `/`. **Anyone with the link can see your
+calendar sync status, titles included**, so treat it like a password and
+reset the key if it leaks. A reset takes effect at once, without restarting
+the daemon. The session cookie is a long-lived credential of the same kind,
+and browsers send it to every service on the same host name (whatever the
+port): if you suspect it leaked, run `calsync web reset-key`.
+
+- To reach it from a phone on your network, listen on every address
+  (`listen = "0.0.0.0:8766"`) and open `http://<the computer's IP>:8766/…`;
+  to use a name such as `mac-mini.local`, add it to `allowed_hosts`. Other
+  names are refused (protection against DNS rebinding).
+- It is plain HTTP: use it on networks you trust, or put it behind a TLS
+  proxy or a VPN such as Tailscale.
+- A reverse proxy must pass the original `Host` header through (nginx:
+  `proxy_set_header Host $http_host;`, with that name in `allowed_hosts`);
+  otherwise pairing and "sync now" get 403.
+- After 10 wrong keys in 10 minutes from one address, further wrong keys from
+  it are refused for a while (HTTP 429); the right key always pairs.
+- The page loads nothing from the internet, and the daemon keeps no access
+  log (a URL can carry the key).
+
+### Looking at the state
+
+These commands only read the state database, so they work whether or not the
+daemon runs:
+
+```sh
+calsync status                 # health per rule, and what needs attention
+calsync upcoming --hours 48    # events due soon and whether they reached the target
+calsync runs --limit 20        # recorded sync runs, newest first
+calsync changes --since 2026-10-24T08:00   # copies created, updated, deleted, …
+```
+
+Each one takes `--json` for scripts and agents. **`--json` output (and the
+API) contains event titles and locations**, so treat it like the calendar
+itself; the text output of `upcoming` and `changes` shows titles too.
 
 ## Command line
 
@@ -378,6 +511,19 @@ calsync [--config PATH] [--state-dir DIR] <command>
   run [--rule NAME]…               one sync cycle (all rules, or the named ones)
       [--dry-run]                  show the plan, write nothing
       [--allow-deletes]            let this cycle through the mass-delete guard
+  daemon [--no-sync]               sync on a schedule until stopped (SIGUSR1: sync now)
+         [--listen HOST:PORT]      serve the web UI there (default: [web] listen)
+         [--no-web]                no web UI (the local API socket stays)
+  trigger [--rule NAME]            ask the running daemon for a cycle now
+  web pair [--listen HOST:PORT]    print the web UI's pair link(s)
+  web reset-key [--listen …]       replace the pairing key (unpairs every browser)
+  status [--json]                  sync health per rule
+  upcoming [--hours N] [--rule NAME] [--json]
+                                   events due soon and their delivery state
+  runs [--rule NAME] [--limit N] [--json]
+                                   recorded sync runs, newest first
+  changes [--rule NAME] [--since TIME] [--limit N] [--json]
+                                   recorded changes to target copies, newest first
   --version
 ```
 
@@ -398,7 +544,7 @@ not zero:
 | 1 | a rule failed, partly failed or was blocked by the mass-delete guard; also network, database or filesystem errors and a server refusing a request (HTTP 403) |
 | 2 | configuration error, including one found while setting up an account |
 | 3 | authentication error — run `calsync auth <account>` |
-| 4 | another calsync process is running |
+| 4 | another calsync process is running (for `run` while the daemon runs: use `calsync trigger`) |
 
 With several rules the most actionable code wins: 3, then 2, then 1.
 
@@ -439,6 +585,10 @@ stale one.
   the keychain or a 0600 file. They are never printed or logged.
 - Logs and error messages never contain event titles, descriptions,
   locations, attendees or links.
+- `--json` output, the text of `upcoming` and `changes`, and the daemon's
+  local API do contain titles and locations. The API listens on a 0600 unix
+  socket in the state directory and, for the web UI, on TCP behind a pairing
+  cookie (see [Web UI](#web-ui)); by default only on `127.0.0.1`.
 - The state database holds a copy of your calendar data and is created with
   mode 0600.
 - Redirects are followed manually (credentials are re-sent to the new host, as
@@ -482,13 +632,16 @@ stale one.
 | sync stops after about a week with exit code 3 | the Google OAuth consent screen is still in "Testing"; publish it, then `calsync auth` again |
 | Google sign-in says "access blocked" | your account is not a test user of a "Testing" consent screen; publish it or add yourself |
 | `status=blocked` | the mass-delete guard fired; check the printed titles, then `calsync run --rule NAME --allow-deletes` if intended |
-| exit code 4 | another `calsync run` holds the lock; wait for it |
+| the daemon exits with code 2: `cannot listen on 127.0.0.1:8766: address already in use` | another program (or a second daemon) has the web UI's port. Set `[web] listen` to another port, or to `"off"` (or run `calsync daemon --no-web`) if you don't use the web UI |
+| exit code 4 | another `calsync run` or the daemon holds the lock; wait for it, or use `calsync trigger` while the daemon runs |
+| `trigger`: the daemon is not running | no daemon serves the socket in this state directory (check `--state-dir`); start it, or use `calsync run` |
 | an event changed on the iPhone snaps back (`reverted=1`) | expected: sync is one way, the Google version wins. Make the change in Google |
 | log says an object "was reverted 3 times within 6:00:00 … not reverting it until …; the source version will be written back then" | something on the target rewrites that event after every write (the loop breaker stepped in). calsync leaves it alone for 24 hours (changes made in Google still sync), then writes the Google version back once ("the hold on 1 copy(ies) ended"). If it keeps happening, look for another app or sync service editing that calendar |
 | log says "copy(ies) read back with no calsync marker" | information only: the target (e.g. iOS) dropped calsync's hidden `X-CALSYNC-HASH` from those copies (a copy that keeps an older marker is not reported). Edits are still judged by visible content and reverted as usual |
 | events arrive on a family member's iPhone but no alert fires | check, in order: notifications for the Calendar app are on (Settings → Notifications → Calendar); the calendar's own Event Alerts switch is on; the calendar is shared rather than in their account, in which case only their Default Alert Time applies (see Known limitations) |
 | no alert while the Calendar app is open | expected: iOS shows the alert inside the app instead of as a notification |
 | behind a proxy | set `HTTPS_PROXY`; calsync honours the standard proxy variables |
+| the log says only `sync cycle failed (SomeError)` or `an API request failed (SomeError)` | by design the log names only the error's type: its text can carry an event title or a URL. To see the traceback, run the daemon once with `CALSYNC_DEBUG=1` (for example `CALSYNC_DEBUG=1 calsync daemon`), which logs it at DEBUG level and turns on calsync's own debug lines (never the HTTP library's). **Debug logs may contain event titles and URLs**: don't share them unedited, and turn it off again afterwards |
 
 ## Development
 

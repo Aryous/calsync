@@ -1,7 +1,12 @@
 import io
+import os
+import signal
 import stat
+import subprocess
+import sys
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
@@ -173,7 +178,35 @@ def test_lock_busy_mentions_trigger(tmp_path: Path) -> None:
     state = tmp_path / "s"
     with RunLock(state / "run.lock"):
         code, text = run(["--config", str(cfg), "--state-dir", str(state), "run"])
-    assert code == EXIT_RUNNING and "calsync trigger" in text
+    assert code == EXIT_RUNNING
+    assert text == (
+        f"another calsync process (pid {os.getpid()}) holds the lock; if it is the daemon, use `calsync trigger`\n"
+    )
+
+
+def test_lock_busy_with_allow_deletes_says_to_stop_the_daemon(tmp_path: Path) -> None:
+    """`trigger` cannot let blocked deletes through: the advice must not loop back to it."""
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(CONFIG.format(url="https://dav.example.com/", user="u", secret=tmp_path / "pw"))
+    state = tmp_path / "s"
+    with RunLock(state / "run.lock"):
+        code, text = run(["--config", str(cfg), "--state-dir", str(state), "run", "--allow-deletes"])
+    assert code == EXIT_RUNNING
+    assert text == (
+        f"another calsync process (pid {os.getpid()}) holds the lock. If it is the daemon: deletes "
+        "blocked by the mass-delete guard can only be allowed with the daemon stopped. Stop the "
+        "daemon, run this command again, then start the daemon again.\n"
+    )
+    assert "trigger" not in text
+
+
+def test_lock_message_without_a_pid(tmp_path: Path) -> None:
+    from calsync.cli import _describe  # pyright: ignore[reportPrivateUsage]
+    from calsync.lock import AlreadyRunning
+
+    assert _describe(AlreadyRunning(None)) == (
+        "another calsync process holds the lock; if it is the daemon, use `calsync trigger`\n"
+    )
 
 
 # ----- _print_cycle -----------------------------------------------------------
@@ -587,3 +620,690 @@ def test_auth_google_browser_failure_keeps_existing_credential(
     code, text = run(["--config", str(cfg), "auth", "g"])
     assert code == EXIT_AUTH and "sign-in failed" in text and "access_denied" in text
     assert secret.read_text() == '{"refresh_token": "old"}'
+
+
+# ----- read-only views: status, upcoming, runs, changes ------------------------------
+
+VIEWS_CONFIG = """
+[google]
+client_secret_file = "unused.json"
+
+[accounts.me]
+provider = "google"
+credential = { backend = "env", ref = "CALSYNC_TEST_UNSET" }
+
+[accounts.dav]
+provider = "caldav"
+server_url = "https://dav.example.com/"
+username = "u"
+credential = { backend = "env", ref = "CALSYNC_TEST_UNSET" }
+
+[[rules]]
+name = "family"
+alarms = ["-10m", "0m"]
+source = { account = "me", calendar = "Family" }
+target = { account = "dav", calendar = "Family", create_if_missing = true }
+"""
+
+
+@pytest.fixture
+def synced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Global CLI args for a config plus a state directory after one real cycle at harness NOW."""
+    import anyio
+
+    from calsync.config import load_config
+    from tests.factories import google_event
+    from tests.fakes.google import FakeGoogle
+    from tests.harness import GCAL, NOW, build_fake
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "state"
+    state.mkdir()
+    fake = FakeGoogle()
+    fake.add_calendar(GCAL, "Family")
+    fake.put_event(
+        GCAL,
+        google_event(
+            "standup",
+            "Standup",
+            "2026-10-23T18:00:00+08:00",
+            "2026-10-23T18:15:00+08:00",
+            recurrence=["RRULE:FREQ=DAILY;COUNT=10"],
+        ),
+    )
+    fake.put_event(
+        GCAL, google_event("lunch", "Lunch\nbreak", "2026-10-25T12:00:00+08:00", "2026-10-25T13:00:00+08:00")
+    )
+    holiday = google_event("holiday", "Holiday", "", "")
+    holiday.update(start={"date": "2026-11-05"}, end={"date": "2026-11-06"})
+    fake.put_event(GCAL, holiday)
+    h = build_fake(state, fake, load_config(cfg))
+    anyio.run(h.engine.cycle)
+    h.store.close()
+    monkeypatch.setattr("calsync.cli._now", lambda: NOW)
+    return ["--config", str(cfg), "--state-dir", str(state)]
+
+
+def _local_hhmm(iso: str) -> str:
+    from datetime import datetime
+
+    return datetime.fromisoformat(iso).astimezone().strftime("%H:%M")
+
+
+def test_status_json_has_the_exact_top_level_keys(synced: list[str]) -> None:
+    import json
+
+    code, text = run([*synced, "status", "--json"])
+    assert code == EXIT_OK
+    view = json.loads(text)
+    assert list(view) == ["generated_at", "schema", "summary", "accounts", "rules", "attention"]
+    assert view["summary"]["health"] == "ok" and view["rules"][0]["copies"] == 3
+    assert text == json.dumps(view, ensure_ascii=False, indent=2) + "\n"
+
+
+def test_status_text(synced: list[str]) -> None:
+    code, text = run([*synced, "status"])
+    assert code == EXIT_OK
+    assert text == "rule=family health=ok last_sync=2026-10-24T08:00:00+00:00 copies=3\n"
+
+
+def test_status_text_lists_attention_items(synced: list[str], tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from calsync.store import RunRecord, Store
+
+    at = datetime(2026, 10, 24, 8, 1, tzinfo=UTC)
+    with Store(tmp_path / "state" / "state.db") as store:
+        store.record_runs(
+            [RunRecord("family", at, at, "failed", 0, 0, 0, 0, 1, "Google API 401", error_kind="auth")]
+        )
+    code, text = run([*synced, "status"])
+    assert code == EXIT_OK
+    assert text == (
+        "rule=family health=auth last_sync=2026-10-24T08:00:00+00:00 copies=3\n"
+        "  auth: The me account needs to be connected again. Run: calsync auth me\n"
+    )
+
+
+def test_upcoming_json_48_hours(synced: list[str]) -> None:
+    import json
+
+    code, text = run([*synced, "upcoming", "--json", "--hours", "48"])
+    assert code == EXIT_OK
+    view = json.loads(text)
+    assert view["hours"] == 48
+    assert [(e["title"], e["start"], e["delivery"]) for e in view["events"]] == [
+        ("Standup", "2026-10-24T18:00:00+08:00", "delivered"),
+        ("Lunch\nbreak", "2026-10-25T12:00:00+08:00", "delivered"),
+        ("Standup", "2026-10-25T18:00:00+08:00", "delivered"),
+    ]
+    assert view["events"][0]["alarms_minutes_before"] == [10, 0]
+
+
+def test_upcoming_text(synced: list[str]) -> None:
+    code, text = run([*synced, "upcoming", "--rule", "family"])
+    assert code == EXIT_OK
+    assert text == (
+        f"{_local_hhmm('2026-10-24T18:00:00+08:00')}  Standup  [Family]  alarms=10,0  delivered\n"
+        f"{_local_hhmm('2026-10-25T12:00:00+08:00')}  Lunch break  [Family]  alarms=10,0  delivered\n"
+    )
+
+
+def test_upcoming_text_all_day_and_empty(synced: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+    from datetime import UTC, datetime
+
+    monkeypatch.setattr("calsync.cli._now", lambda: datetime(2026, 11, 4, 12, tzinfo=UTC))
+    assert run([*synced, "upcoming"]) == (EXIT_OK, "all day  Holiday  [Family]  alarms=10,0  delivered\n")
+    monkeypatch.setattr("calsync.cli._now", lambda: datetime(2030, 1, 1, tzinfo=UTC))
+    assert run([*synced, "upcoming"]) == (EXIT_OK, "no events in the next 24 hours\n")
+
+
+def test_runs_text_and_json(synced: list[str]) -> None:
+    import json
+
+    code, text = run([*synced, "runs"])
+    assert code == EXIT_OK
+    assert text == (
+        "1 2026-10-24T08:00:00+00:00 rule=family status=ok created=3 updated=0 deleted=0 failed=0 "
+        "duration_ms=0\n"
+    )
+    code, text = run([*synced, "runs", "--json", "--limit", "1", "--rule", "family"])
+    assert code == EXIT_OK and [r["id"] for r in json.loads(text)["runs"]] == [1]
+
+
+def test_changes_text_and_json(synced: list[str]) -> None:
+    import json
+
+    from calsync.naming import object_id
+    from tests.harness import GCAL
+
+    code, text = run([*synced, "changes"])
+    assert code == EXIT_OK
+    lines = text.splitlines()
+    assert len(lines) == 3
+    assert (
+        f"2026-10-24T08:00:00+00:00 rule=family created Lunch break object={object_id('family', GCAL, 'lunch')}"
+        in lines
+    )
+    code, text = run([*synced, "changes", "--json", "--since", "2026-10-24T09:00:00+00:00"])
+    assert code == EXIT_OK and json.loads(text) == {"changes": []}
+    code, text = run([*synced, "changes", "--json", "--limit", "1"])
+    assert len(json.loads(text)["changes"]) == 1
+
+
+def test_view_commands_without_state_exit_1(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    for command in (["status"], ["upcoming", "--json"], ["runs"], ["changes"]):
+        code, text = run(["--config", str(cfg), "--state-dir", str(tmp_path / "none"), *command])
+        assert (code, text) == (EXIT_FAILED, "no state yet: run `calsync run` or start the daemon\n")
+    assert not (tmp_path / "none").exists()
+
+
+def test_view_commands_reject_unknown_rules_and_bad_config(synced: list[str], tmp_path: Path) -> None:
+    code, text = run([*synced, "upcoming", "--rule", "nope"])
+    assert code == EXIT_CONFIG and "unknown rule" in text
+    code, text = run(["--config", str(tmp_path / "missing.toml"), "status"])
+    assert code == EXIT_CONFIG and "config file not found" in text
+
+
+def test_history_commands_accept_a_removed_rule(synced: list[str], tmp_path: Path) -> None:
+    import json
+    from datetime import UTC, datetime
+
+    from calsync.store import ChangeRecord, RunRecord, Store
+
+    at = datetime(2026, 10, 24, 8, 1, tzinfo=UTC)
+    with Store(tmp_path / "state" / "state.db") as store:
+        store.record_runs(
+            [RunRecord("retired", at, at, "ok", 1, 0, 0, 0, 1, None)],
+            [ChangeRecord("retired", "o1", "created", at, "Standup")],
+        )
+    code, text = run([*synced, "runs", "--rule", "retired", "--json"])
+    assert code == EXIT_OK and [r["rule"] for r in json.loads(text)["runs"]] == ["retired"]
+    code, text = run([*synced, "changes", "--rule", "retired", "--json"])
+    assert code == EXIT_OK and [c["object_id"] for c in json.loads(text)["changes"]] == ["o1"]
+    code, text = run([*synced, "runs", "--rule", "nope"])
+    assert (code, text) == (EXIT_OK, "")
+
+
+def test_view_commands_report_an_unreadable_database(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "state.db").write_bytes(b"not a database, just some text " * 64)
+    for command in (["status"], ["upcoming"], ["runs"], ["changes", "--json"]):
+        code, text = run(["--config", str(cfg), "--state-dir", str(state), *command])
+        assert (code, text) == (EXIT_FAILED, "error: the state database could not be read: DatabaseError\n")
+
+
+def test_light_commands_import_no_heavy_modules(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    script = (
+        "import io, sys\n"
+        "from calsync.cli import main\n"
+        "assert main(sys.argv[1:], out=io.StringIO()) == 0\n"
+        "heavy = sorted(m for m in ('starlette', 'uvicorn', 'httpx', 'icalendar') if m in sys.modules)\n"
+        "print(','.join(heavy))\n"
+    )
+    for argv in (
+        ["--version"],
+        ["--config", str(cfg), "config", "check"],
+        ["--config", str(cfg), "--state-dir", str(tmp_path / "s"), "web", "pair"],
+    ):
+        done = subprocess.run(
+            [sys.executable, "-c", script, *argv], capture_output=True, text=True, check=True
+        )
+        assert done.stdout == "\n", (argv, done.stdout, done.stderr)
+
+
+# ----- daemon -------------------------------------------------------------------
+
+
+def test_daemon_without_rules_exits_2(tmp_path: Path) -> None:
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(CONFIG.format(url="https://dav.example.com/", user="u", secret=tmp_path / "pw"))
+    state = tmp_path / "s"
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "daemon"])
+    assert (code, text) == (EXIT_CONFIG, "no rules configured: nothing to sync\n")
+    assert not state.exists()
+
+
+def test_daemon_refuses_a_held_lock(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "s"
+    with RunLock(state / "run.lock"):
+        code, text = run(["--config", str(cfg), "--state-dir", str(state), "daemon"])
+    assert code == EXIT_RUNNING and "holds the lock" in text
+    assert "trigger" not in text  # the daemon itself was refused: triggering it means nothing
+    assert not (state / "state.db").exists()
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+DAEMON_SCRIPT = "import sys\nfrom calsync.cli import main\nsys.exit(main(sys.argv[1:]))\n"
+
+
+def _daemon_process(
+    tmp_path: Path, state: Path, *extra: str, port: int | None = None
+) -> "subprocess.Popen[str]":
+    """``calsync daemon`` with a config in ``tmp_path`` and the state (and its socket) in
+    ``state``, which must be short: a unix socket path is limited to 104 bytes on macOS."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)  # env credentials that are never set: no network, no secret read
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CALSYNC_")}
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            DAEMON_SCRIPT,
+            "--config",
+            str(cfg),
+            "--state-dir",
+            str(state),
+            "daemon",
+            "--listen",
+            f"127.0.0.1:{port or _free_port()}",  # never the default port
+            *extra,
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _wait_for(condition: "Any", proc: "subprocess.Popen[str]") -> None:
+    deadline = time.monotonic() + 20
+    while not condition():
+        if proc.poll() is not None or time.monotonic() > deadline:
+            proc.kill()
+            out, err = proc.communicate()
+            pytest.fail(f"daemon did not get there: {out}{err}")
+        time.sleep(0.05)
+
+
+def _run_count(db: Path) -> int:
+    from calsync.views import StateReader
+
+    if not db.exists():
+        return 0
+    with StateReader(db) as reader:
+        return len(reader.runs())
+
+
+def _serving(state: Path) -> bool:
+    """The daemon's socket accepts connections."""
+    import socket
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+        try:
+            probe.connect(str(state / "calsync.sock"))
+        except OSError:
+            return False
+    return True
+
+
+def test_daemon_signals_and_trigger(tmp_path: Path, short_dir: Path) -> None:
+    state = short_dir / "s"
+    db = state / "state.db"
+    proc = _daemon_process(tmp_path, state)
+    try:
+        _wait_for(lambda: _run_count(db) >= 1, proc)  # the first cycle starts at once
+        proc.send_signal(signal.SIGUSR1)  # a cycle now, despite the backoff of the failed rule
+        _wait_for(lambda: _run_count(db) >= 2, proc)
+        _wait_for(lambda: _serving(state), proc)
+        assert run(["--state-dir", str(state), "trigger"]) == (EXIT_OK, "ok: cycle requested\n")
+        _wait_for(lambda: _run_count(db) >= 3, proc)
+        assert run(["--state-dir", str(state), "trigger", "--rule", "family"]) == (
+            EXIT_OK,
+            "ok: cycle requested\n",
+        )
+        _wait_for(lambda: _run_count(db) >= 4, proc)
+        assert run(["--state-dir", str(state), "trigger", "--rule", "nope"]) == (
+            EXIT_CONFIG,
+            "unknown rule(s): nope\n",
+        )
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    assert proc.returncode == EXIT_OK and out == ""
+    assert err.count("INFO calsync.daemon: rule=family status=failed ") == 4
+    assert "error_kind=auth" in err and "Traceback" not in err
+    logged = [line for line in err.splitlines() if "web UI on http://127.0.0.1:" not in line]
+    assert "http" not in "\n".join(logged).replace("httpx", "")  # no request URL in the log
+    with RunLock(state / "run.lock"):  # released
+        pass
+    assert not (state / "calsync.sock").exists()
+
+
+def test_daemon_no_sync_serves_and_stops_on_sigint(tmp_path: Path, short_dir: Path) -> None:
+    state = short_dir / "s"
+    import httpx
+
+    port = _free_port()
+    proc = _daemon_process(tmp_path, state, "--no-sync", port=port)
+    try:
+        _wait_for(lambda: _serving(state), proc)
+        assert run(["--state-dir", str(state), "trigger"]) == (
+            EXIT_FAILED,
+            "the daemon runs with --no-sync\n",
+        )
+        unpaired = httpx.get(f"http://127.0.0.1:{port}/api/status", trust_env=False)  # the web UI, TCP
+        assert unpaired.status_code == 401 and unpaired.json()["error"]["kind"] == "unpaired"
+        proc.send_signal(signal.SIGINT)  # reaches the daemon's own handler, not uvicorn's
+        _, err = proc.communicate(timeout=20)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    assert proc.returncode == EXIT_OK and "Traceback" not in err and "daemon stopped" in err
+    assert f"web UI on http://127.0.0.1:{port}/" in err and "/api/status" not in err  # no access log
+    assert sorted(p.name for p in state.iterdir()) == []  # no lock, no state database; socket removed
+
+
+def test_daemon_with_its_port_in_use_exits_2_and_says_why(tmp_path: Path, short_dir: Path) -> None:
+    import socket
+
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
+    try:
+        proc = _daemon_process(tmp_path, short_dir / "s", port=port)  # with sync, as under launchd
+        out, err = proc.communicate(timeout=20)
+    finally:
+        blocker.close()
+    assert proc.returncode == EXIT_CONFIG
+    assert out == (
+        "configuration error:\n"
+        f'  - cannot listen on 127.0.0.1:{port}: address already in use; set [web] listen to another port or "off"\n'
+    )
+    assert "Traceback" not in err and "rule=" not in err  # no cycle ran
+    with RunLock(short_dir / "s" / "run.lock"):  # released
+        pass
+
+
+class _RecordingDaemon:
+    listens: ClassVar[list[tuple[str, int] | None]] = []
+
+    def __init__(self, config: Any, state_dir: Path, *, sync: bool, listen: Any) -> None:
+        self.listens.append(listen)
+
+    def snapshot(self) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(pid=os.getpid())
+
+    def request_cycle(self, rule: str | None = None) -> bool:
+        return False
+
+    async def run(self, stop: Any) -> None:
+        return None
+
+
+@pytest.mark.parametrize(
+    ("web", "args", "listen"),
+    [
+        ("", [], ("127.0.0.1", 8766)),
+        ('[web]\nlisten = "off"\n', [], None),
+        ("", ["--no-web"], None),
+        ('[web]\nlisten = "off"\n', ["--listen", "127.0.0.1:9100"], ("127.0.0.1", 9100)),
+    ],
+)
+def test_daemon_web_listener_choice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, web: str, args: list[str], listen: Any
+) -> None:
+    from calsync import cli
+    from calsync import daemon as daemon_module
+
+    monkeypatch.setattr(daemon_module, "Daemon", _RecordingDaemon)
+    monkeypatch.setattr(cli, "_configure_daemon_logging", lambda: None)  # leave global logging alone
+    monkeypatch.setattr(_RecordingDaemon, "listens", [])
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG + web)
+    code, _ = run(["--config", str(cfg), "--state-dir", str(tmp_path / "s"), "daemon", "--no-sync", *args])
+    assert code == EXIT_OK and _RecordingDaemon.listens == [listen]
+
+
+class _FailingDaemon(_RecordingDaemon):
+    async def run(self, stop: Any) -> None:
+        raise RuntimeError("the API server stopped at https://example.com/x")
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_daemon_service_failure_is_a_type_only_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, debug: bool
+) -> None:
+    from calsync import cli
+    from calsync import daemon as daemon_module
+
+    monkeypatch.setattr(daemon_module, "Daemon", _FailingDaemon)
+    monkeypatch.setattr(cli, "_configure_daemon_logging", lambda: None)  # leave global logging alone
+    monkeypatch.setattr(_RecordingDaemon, "listens", [])
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    argv = ["--config", str(cfg), "--state-dir", str(tmp_path / "s"), "daemon", "--no-sync"]
+    if debug:
+        monkeypatch.setenv("CALSYNC_DEBUG", "1")
+        with pytest.raises(RuntimeError, match="the API server stopped"):  # the traceback, on request
+            run(argv)
+    else:
+        assert run(argv) == (EXIT_FAILED, "error: RuntimeError\n")
+
+
+def test_daemon_no_web_and_listen_exclude_each_other(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    with pytest.raises(SystemExit) as info:
+        run(["--config", str(cfg), "daemon", "--no-web", "--listen", "127.0.0.1:9100"])
+    assert info.value.code == 2
+
+
+def test_trigger_without_a_daemon(short_dir: Path) -> None:
+    import socket
+
+    not_running = (EXIT_FAILED, "the daemon is not running; use calsync run\n")
+    assert run(["--state-dir", str(short_dir / "none"), "trigger"]) == not_running  # no socket
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dead.bind(str(short_dir / "calsync.sock"))  # a socket file nobody listens on: refused
+    dead.close()
+    assert run(["--state-dir", str(short_dir), "trigger"]) == not_running
+    assert not (short_dir / "none").exists()
+
+
+def test_trigger_reports_a_socket_it_cannot_reach(tmp_path: Path, short_dir: Path) -> None:
+    import socket
+
+    long_dir = tmp_path / ("d" * 110)  # longer than a unix socket path may be
+    long_dir.mkdir()
+    (long_dir / "calsync.sock").touch()
+    assert run(["--state-dir", str(long_dir), "trigger"]) == (
+        EXIT_FAILED,
+        "error: cannot connect to the daemon socket (OSError)\n",
+    )
+    listening = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listening.bind(str(short_dir / "calsync.sock"))
+        listening.listen(1)
+        (short_dir / "calsync.sock").chmod(0)  # connect needs write permission on the socket
+        assert run(["--state-dir", str(short_dir), "trigger"]) == (
+            EXIT_FAILED,
+            "error: cannot connect to the daemon socket (PermissionError)\n",
+        )
+    finally:
+        listening.close()
+
+
+def test_a_busy_socket_has_its_own_message_and_exit_4(short_dir: Path) -> None:
+    from calsync.cli import _describe, exit_code_for  # pyright: ignore[reportPrivateUsage]
+    from calsync.lock import DaemonServing
+
+    exc = DaemonServing(short_dir / "calsync.sock")
+    assert isinstance(exc, AlreadyRunning) and exc.pid is None
+    assert exit_code_for(exc) == EXIT_RUNNING
+    text = _describe(exc)
+    assert text.startswith(f"another calsync daemon is serving {short_dir / 'calsync.sock'}")
+    assert "lock" not in text and "pid" not in text
+
+
+@pytest.mark.parametrize("debug", [False, True])
+def test_daemon_logging_keeps_request_urls_out(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, debug: bool
+) -> None:
+    import asyncio
+    import logging
+
+    import httpx
+
+    from calsync import cli
+    from calsync.http import RequestLog, make_client
+
+    if debug:  # CALSYNC_DEBUG opens calsync's own loggers, never httpx's or httpcore's
+        monkeypatch.setenv("CALSYNC_DEBUG", "1")
+    else:
+        monkeypatch.delenv("CALSYNC_DEBUG", raising=False)
+    for name in ("httpx", "httpcore"):  # restored at teardown, whatever the daemon setup does
+        caplog.set_level(logging.DEBUG, logger=name)
+    caplog.set_level(logging.INFO, logger="calsync")
+    caplog.set_level(logging.DEBUG)
+    cli._configure_daemon_logging()  # pyright: ignore[reportPrivateUsage]
+    assert logging.getLogger("calsync").level == (logging.DEBUG if debug else logging.INFO)
+    assert logging.getLogger("httpx").level == logging.getLogger("httpcore").level == logging.WARNING
+
+    async def fetch() -> None:
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, json={"items": []}))
+        async with make_client(RequestLog(), transport=transport) as client:
+            response = await client.get(
+                "https://www.googleapis.example.com/calendar/v3/calendars/someone%40example.com/events",
+                params={"syncToken": "tok123"},
+            )
+            assert response.status_code == 200
+
+    asyncio.run(fetch())
+    text = caplog.text + "".join(r.getMessage() for r in caplog.records)
+    for fragment in ("http", "googleapis", "example.com", "/calendar/", "syncToken", "tok123"):
+        assert fragment not in text, (fragment, text)
+
+
+# ----- web -------------------------------------------------------------------------
+
+WARNING = "Anyone with this link can see your calendar sync status. Reset it with `calsync web reset-key`.\n"
+
+
+@pytest.mark.parametrize(
+    ("web", "hosts"),
+    [
+        ("", ["localhost:8766", "127.0.0.1:8766"]),
+        (
+            '[web]\nlisten = "0.0.0.0:9000"\nallowed_hosts = ["mac-mini.local"]\n',
+            ["localhost:9000", "mac-mini.local:9000"],
+        ),
+        ('[web]\nlisten = "192.168.1.5:8766"\n', ["localhost:8766", "192.168.1.5:8766"]),
+        ('[web]\nlisten = "[fd00::5]:8766"\n', ["localhost:8766", "[fd00::5]:8766"]),
+        ('[web]\nlisten = "[::]:8766"\nallowed_hosts = ["localhost"]\n', ["localhost:8766"]),
+    ],
+)
+def test_web_pair_prints_one_link_per_address(tmp_path: Path, web: str, hosts: list[str]) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG + web)
+    state = tmp_path / "s"
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"])
+    key = (state / "web.key").read_text().strip()
+    assert code == EXIT_OK
+    assert text == "".join(f"http://{h}/?k={key}\n" for h in hosts) + WARNING
+    assert stat.S_IMODE((state / "web.key").stat().st_mode) == 0o600
+    assert run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"]) == (code, text)  # same key
+
+
+def test_web_pair_takes_listen(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "s"
+    code, text = run(
+        ["--config", str(cfg), "--state-dir", str(state), "web", "pair", "--listen", "0.0.0.0:9001"]
+    )
+    key = (state / "web.key").read_text().strip()
+    assert (code, text) == (EXIT_OK, f"http://localhost:9001/?k={key}\n" + WARNING)
+    with pytest.raises(SystemExit) as info:  # argparse: a usage error, exit 2
+        run(["--config", str(cfg), "web", "pair", "--listen", "nope"])
+    assert info.value.code == EXIT_CONFIG
+
+
+def test_web_reset_key(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "s"
+    run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"])
+    old = (state / "web.key").read_text().strip()
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "web", "reset-key"])
+    new = (state / "web.key").read_text().strip()
+    assert code == EXIT_OK and new != old
+    assert text == (
+        "ok: the key was replaced; every paired browser has to pair again\n"
+        f"http://localhost:8766/?k={new}\nhttp://127.0.0.1:8766/?k={new}\n" + WARNING
+    )
+    assert stat.S_IMODE((state / "web.key").stat().st_mode) == 0o600
+
+
+def test_web_pair_refuses_a_key_file_others_can_read(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    state = tmp_path / "s"
+    run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"])
+    key_file = state / "web.key"
+    key_file.chmod(0o644)
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"])
+    assert code == EXIT_FAILED
+    assert text == (
+        f"error: other users can access {key_file} (mode 0644); run `chmod 600 {key_file}`, "
+        "or replace the key with `calsync web reset-key`\n"
+    )
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "web", "reset-key"])
+    assert code == EXIT_OK and stat.S_IMODE(key_file.stat().st_mode) == 0o600
+
+
+def test_daemon_listen_is_validated(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)
+    with pytest.raises(SystemExit) as info:
+        run(["--config", str(cfg), "daemon", "--listen", "127.0.0.1:0"])
+    assert info.value.code == 2  # argparse: a usage error
+
+
+WEB_OFF = 'the web UI is off ([web] listen = "off"); set [web] listen to HOST:PORT to use it\n'
+
+
+def test_web_pair_when_the_web_ui_is_off(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG + '[web]\nlisten = "off"\n')
+    state = tmp_path / "s"
+    assert run(["--config", str(cfg), "--state-dir", str(state), "web", "pair"]) == (EXIT_CONFIG, WEB_OFF)
+    assert not (state / "web.key").exists()  # nothing to pair with: no key made
+    code, text = run(
+        ["--config", str(cfg), "--state-dir", str(state), "web", "pair", "--listen", "127.0.0.1:9100"]
+    )
+    key = (state / "web.key").read_text().strip()
+    assert (code, text) == (
+        EXIT_OK,
+        f"http://localhost:9100/?k={key}\nhttp://127.0.0.1:9100/?k={key}\n" + WARNING,
+    )
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "web", "reset-key"])  # still resets
+    assert (code, text) == (
+        EXIT_OK,
+        "ok: the key was replaced; every paired browser has to pair again\n" + WEB_OFF,
+    )
+    assert (state / "web.key").read_text().strip() != key

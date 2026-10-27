@@ -33,19 +33,40 @@ The phase-2 design is in
   First task: measure on iCloud whether phone edits keep `X-CALSYNC-HASH`
   and whether PUT returns an `ETag` (experiments E1, E2).
 - Still open from the first real run: 401 vs 403 for a bad app-specific
-  password; writing into a family member's own account (E5); `MKCALENDAR`.
+  password; `MKCALENDAR`.
+- Settled by the first real run: writing into a family member's own account
+  (E5). That run is the same situation (calsync writing with an account's own
+  app-specific password into that account's own calendar, whose alerts fire
+  on that account's iPhone) and has been in daily use since 2026-10-24, so no
+  separate experiment is needed. What is left is operational: generate the
+  family member's app-specific password, add their account and a rule, and
+  make sure Calendar notifications are on on their phone.
 - Already measured (2026-10-24, spec v3 §13 item 1): alerts on a calendar
   shared to another Apple ID do not reach the sharee.
 
 ### Plan 3 — block ②: background service and notifications
 
-- `calsync daemon` with a local control socket; the CLI acts as its client
-  (`trigger`, `status`, `upcoming`, `changes`, `approve`, `pause`/`resume`),
-  every command with `--json` for Agents.
+**Done — the daemon slice** (2026-10-25,
+[`plans/2026-10-25-block2-daemon-slice.md`](superpowers/plans/2026-10-25-block2-daemon-slice.md)):
+
+- Run and change history (`change` table, richer `run` rows, 90-day change
+  retention).
+- Read-only views: `calsync status`, `upcoming`, `runs`, `changes`, each with
+  `--json` for agents; they read the state database directly.
+- `calsync daemon`: jittered schedule, per-rule backoff, credential pickup
+  after `calsync auth`, `SIGUSR1`, and `--no-sync` for demos on a copy of the
+  state.
+- Local JSON API under `/api` on a 0600 unix socket in the state directory,
+  and `calsync trigger` as its client.
+
+**Still to do (deferred from the slice):**
+
 - Config hot reload and safe writes (comment-preserving, validated,
-  conflict-checked, atomic, backed up, attributed).
-- Change history (`change`, `config_change` tables); Bark and webhook
-  notifications; `calsync service install` for launchd; Mac mini deployment.
+  conflict-checked, atomic, backed up, attributed); the `config_change` table.
+- Bark and webhook notifications.
+- `approve` and `pause`/`resume`.
+- `calsync service install` for launchd; Mac mini deployment.
+- The TCP listener (`--listen`) belongs to block ③, with its authentication.
 
 ### Plan 4 — block ③: web UI v1
 

@@ -95,13 +95,32 @@ def _is_removal(event: Mapping[str, Any]) -> bool:
     return event.get("status") == "cancelled" and not event.get("recurringEventId")
 
 
-def _meta_from_state(entry: Mapping[str, Any] | None) -> CalendarMeta:
+def meta_from_state(entry: Mapping[str, Any] | None) -> CalendarMeta:
+    """A calendar's metadata as stored in the source state (``state["meta"][<calendar id>]``)."""
     if not entry:
         return CalendarMeta()
     return CalendarMeta(
         timezone=entry.get("timezone") or "UTC",
         default_alarms=tuple(Alarm(timedelta(seconds=s)) for s in entry.get("default_alarms", [])),
     )
+
+
+def resolve_calendar_ref(ref: str, meta: Mapping[str, Any]) -> str:
+    """The calendar ID a configured ref (an ID or a calendar name) names, given ``state["meta"]``."""
+    if ref in meta:
+        return ref
+    matches: list[str] = []
+    for field in ("summary_override", "summary"):  # the name the user sees comes first
+        matches = [cid for cid, entry in meta.items() if entry.get(field) == ref]
+        if matches:
+            break
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise ConfigError([f"Google calendar name {ref!r} is ambiguous; use its ID"])
+    if "@" in ref:
+        return ref  # an ID the user can access but has not added to their list
+    raise ConfigError([f"Google calendar {ref!r} not found; run `calsync calendars <account>`"])
 
 
 class GoogleSource:
@@ -204,22 +223,6 @@ class GoogleSource:
             }
         state["calendars_token"] = next_token
 
-    @staticmethod
-    def _resolve(ref: str, meta: Mapping[str, Any]) -> str:
-        if ref in meta:
-            return ref
-        for field in ("summary_override", "summary"):  # the name the user sees comes first
-            matches = [cid for cid, entry in meta.items() if entry.get(field) == ref]
-            if matches:
-                break
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            raise ConfigError([f"Google calendar name {ref!r} is ambiguous; use its ID"])
-        if "@" in ref:
-            return ref  # an ID the user can access but has not added to their list
-        raise ConfigError([f"Google calendar {ref!r} not found; run `calsync calendars <account>`"])
-
     async def _pull_events(
         self, calendar_id: str, sync_token: str | None
     ) -> tuple[list[dict[str, Any]], str, bool]:
@@ -250,7 +253,7 @@ class GoogleSource:
         resolved: dict[str, str] = {}
         for ref in calendar_refs:
             try:
-                resolved[ref] = self._resolve(ref, meta)
+                resolved[ref] = resolve_calendar_ref(ref, meta)
             except ConfigError as exc:
                 errors[ref] = exc
         unique_ids = sorted(set(resolved.values()))
@@ -272,7 +275,7 @@ class GoogleSource:
                 full=full,
                 upserts=[item for item in items if not _is_removal(item)],
                 deletes=[item["id"] for item in items if _is_removal(item)],
-                meta=_meta_from_state(meta.get(cid)),
+                meta=meta_from_state(meta.get(cid)),
             )
         for ref, cid in resolved.items():
             if cid in failed:

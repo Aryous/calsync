@@ -309,3 +309,68 @@ def test_bad_on_target_edit_reported_with_other_problems_of_the_rule(tmp_path: P
         parse_config(data, tmp_path)
     text = "\n".join(err.value.problems)
     assert "rules[family].on_target_edit" in text and "rules[family].fields.content" in text
+
+
+# ----- [web] ----------------------------------------------------------------------
+
+
+def test_web_defaults() -> None:
+    cfg = parse_config(VALID, base_dir=Path("/cfg"))
+    assert (cfg.web.host, cfg.web.port, cfg.web.allowed_hosts) == ("127.0.0.1", 8766, ())
+    assert cfg.web.enabled is True
+
+
+def test_web_listen_off() -> None:
+    data = {**VALID, "web": {"listen": "off", "allowed_hosts": ["nas.lan"]}}
+    cfg = parse_config(data, base_dir=Path("/cfg"))
+    assert cfg.web.enabled is False and cfg.web.allowed_hosts == ("nas.lan",)
+
+
+@pytest.mark.parametrize(
+    ("listen", "host", "port"),
+    [
+        ("0.0.0.0:9000", "0.0.0.0", 9000),
+        ("[::]:8766", "::", 8766),
+        ("[::1]:1", "::1", 1),
+        ("Mac-Mini.local:65535", "mac-mini.local", 65535),
+    ],
+)
+def test_web_listen(listen: str, host: str, port: int) -> None:
+    data = {**VALID, "web": {"listen": listen, "allowed_hosts": ["Mac-Mini.local", "nas.lan"]}}
+    cfg = parse_config(data, base_dir=Path("/cfg"))
+    assert (cfg.web.host, cfg.web.port) == (host, port)
+    assert cfg.web.allowed_hosts == ("mac-mini.local", "nas.lan")
+
+
+@pytest.mark.parametrize(
+    ("web", "problem"),
+    [
+        ({"listen": "127.0.0.1"}, "web.listen: expected HOST:PORT"),
+        ({"listen": ":8766"}, "web.listen: expected HOST:PORT"),
+        ({"listen": "127.0.0.1:0"}, "web.listen: the port must be 1 to 65535"),
+        ({"listen": "127.0.0.1:70000"}, "web.listen: the port must be 1 to 65535"),
+        ({"listen": "127.0.0.1:http"}, "web.listen: the port must be 1 to 65535"),
+        ({"listen": "::1:8766"}, "web.listen: an IPv6 address goes in brackets"),
+        ({"listen": "[::1]8766"}, "web.listen: expected HOST:PORT"),
+        ({"listen": "[nas.lan]:8766"}, "web.listen: an IPv6 address goes in brackets"),
+        ({"listen": "a b:8766"}, "web.listen: expected HOST:PORT"),
+        ({"listen": 8766}, "web.listen: expected HOST:PORT"),
+        ({"listen": "OFF"}, "web.listen: expected HOST:PORT"),
+        ({"listen": False}, 'web.listen: expected HOST:PORT such as "127.0.0.1:8766", or "off"'),
+        ({"allowed_hosts": "nas.lan"}, "web.allowed_hosts: expected a list of hostnames"),
+        ({"allowed_hosts": [""]}, "web.allowed_hosts: expected a list of hostnames"),
+        ({"allowed_hosts": ["nas.lan:8766"]}, "web.allowed_hosts: expected a list of hostnames"),
+        ({"allowed_hosts": [1]}, "web.allowed_hosts: expected a list of hostnames"),
+        ({"port": 8766}, "web.port: unknown setting"),
+    ],
+)
+def test_web_problems(web: dict[str, object], problem: str) -> None:
+    with pytest.raises(ConfigError) as info:
+        parse_config({**VALID, "web": web}, base_dir=Path("/cfg"))
+    assert any(p.startswith(problem) for p in info.value.problems), info.value.problems
+
+
+def test_web_must_be_a_table() -> None:
+    with pytest.raises(ConfigError) as info:
+        parse_config({**VALID, "web": "127.0.0.1:8766"}, base_dir=Path("/cfg"))
+    assert "web: must be a table" in info.value.problems

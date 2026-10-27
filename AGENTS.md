@@ -56,14 +56,29 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
 | `render.py` | Series → iCalendar bytes (VTIMEZONE, RRULE/EXDATE/RDATE, RECURRENCE-ID overrides each with own VALARMs, `URL`, `X-CALSYNC-RULE` / `X-CALSYNC-HASH`); `inspect()` reads them back and never raises; `content_digest()` hashes only what a person sees (ignores DTSTAMP, SEQUENCE, X- properties, property/event order, VTIMEZONE text, zone labels on RECURRENCE-ID/EXDATE/RDATE, alarm ACTION/DESCRIPTION and phone alarm bookkeeping); `None` for unreadable bodies, never raises |
 | `planner.py` | pure `plan(desired, actual, window, protected)` (counts `out_of_window`); `check_delete_guard` (ratio only from 3 deletions on) |
 | `engine.py` | one cycle; per-calendar/per-rule isolation; protected/degraded handling; cursor hold; delete-guard titles; full sync when `rule.window is None`; `_classify_reads` compares a read body's digest with the digest of what we would write: equal → adopted as current whatever the marker says (no write); different while the recorded hash (what we wrote or adopted; `_detect` keeps it for known hrefs, only a cache miss takes the body's marker) is current, or a revert is pending → `reverting` (the update that follows counts as `reverted`); different with an outdated or unknown recorded hash → ordinary update; rewrite-loop breaker: a copy reverted `REVERT_LIMIT` (3) times within `REVERT_WINDOW` (6 h) that differs again is adopted instead for `REVERT_HOLD` (24 h), one warning (rule + object id) per hold; when the hold ends the copy becomes `reverting` with an unknown hash (no body read), so the source version is written back once, counted as a revert |
-| `store.py` | SQLite (WAL, 0600): `source_state`, `source_event`, `target_calendar` (keyed by account+ref), `target_object` (incl. `verify_digest`, `reverting`, `revert_times`, `hold_until`), `run` (500 per rule), `alert`; `SCHEMA_VERSION` 3; schema mismatch → rebuild; corrupt DB → quarantined |
+| `store.py` | SQLite (WAL, 0600): `source_state`, `source_event`, `target_calendar` (keyed by account+ref), `target_object` (incl. `verify_digest`, `reverting`, `revert_times`, `hold_until`), `run` (500 per rule), `change` (90 days), `alert`; `SCHEMA_VERSION` 4; an older version with an upgrade step is migrated in place (`run` and `change` history kept), any other mismatch → rebuild; corrupt DB → quarantined |
 | `sources/google.py` | REST client: calendarList + events.list with `syncToken`, 410 → full resync, request-params fingerprint (`events_params` state key) → full resync when `EVENTS_LIST_PARAMS` change, attendees and conference data requested, per-calendar `SourcePull.errors`, 403 rate limit → transient, 401 → one refresh + retry |
 | `targets/dav.py` | PROPFIND/REPORT/PUT/DELETE/MKCALENDAR, manual redirects, absolute hrefs, error mapping (401 auth, 403 `ForbiddenError`, `valid-sync-token` → `CursorExpired`, 412 conflict) |
 | `targets/base.py` | target protocol; `TargetCache` / `CachedObject` — `verify_digest` (digest of a read body its rule has not classified yet; persisted so an edit survives a cycle the rule does not finish) `reverting` (classified as edited; cleared by the successful write-back; carried across detection reads), and the loop breaker's `revert_times` / `hold_until` (carried across detection reads and writes) |
 | `targets/caldav.py` | discovery (iCloud region detection via `server_url = "icloud"`), detection ladder sync → ctag → full, multiget, conditional writes, adaptive `Limiter` |
 | `config.py` / `credentials.py` | validated TOML (all problems at once; `Rule.window` is `None` when omitted = full sync, `window = {}` = 7d/180d; `fields` → `FieldPolicy`; `on_target_edit` accepts only `"revert"`); keychain / env / 0600-file secrets |
 | `wiring.py` | the only place account definitions become clients; one `CalDavTarget` per account; `build_adapters` is **async**; per-account setup errors in `Adapters.errors` |
+| `cycle.py` | `run_cycle`: one cycle as `calsync run` and the daemon run it (rules whose account failed to set up are recorded as failed); `counts_line` |
+| `views.py` | read-only `StateReader` (never creates or migrates; tolerates older schemas) and the `status` / `upcoming` / `runs` / `changes` views with `to_json()` — the JSON contract shared by `--json`, the API and the web UI |
+| `daemon.py` | `Daemon`: jittered schedule, per-rule backoff, auth rebuilds, `request_cycle`, `--no-sync`; runs the scheduler and the API server as services that stop each other through `stop`, never by cancelling a cycle |
+| `api.py` | Starlette routes under `/api` (`api_routes`, `create_app`), a `StateReader` per request in a worker thread; `ContainErrors` (any escaping error → fixed 500, type-only log), `unix_socket` (stale check, 0600) and `tcp_socket`, and `serve` (uvicorn without signal handlers, no proxy headers) |
+| `web/auth.py` | the pairing key (`web.key`, 0600), the session cookie token, pair links; standard library only |
+| `web/app.py` | `create_web_app`: `/`, `/pair`, `/static`, the `/api` routes behind the cookie; Host, Origin and rate-limit checks |
+| `debug.py` | `CALSYNC_DEBUG=1`: tracebacks at DEBUG for failures otherwise logged by type only |
 | `cli.py` | commands, exit codes, output; heavy imports are lazy |
+
+### Agent interface
+
+Agents use the CLI: `calsync status`, `upcoming`, `runs` and `changes` with
+`--json` (stable keys, built in `views.py`), and `calsync trigger` to ask the
+daemon for a cycle. The HTTP API on the daemon's socket is for the web UI; do
+not script against it. `--json` output contains event titles: keep it out of
+logs.
 
 ## 4. Invariants — do not break
 
@@ -86,8 +101,11 @@ cli.py ──► wiring.py ──► Engine.cycle()            (engine.py)
    (including a revert) and in a fresh process. Enforced by `tests/e2e/test_request_budget.py`;
    if it fails, fix the code, not the test.
 7. **Privacy.** Never log or print event titles, descriptions, locations,
-   attendees, URLs or secrets. Delete-guard titles go to the CLI output only. Test data is
-   synthetic (`example.com`, neutral titles).
+   attendees, URLs or secrets. Delete-guard titles go to the CLI output only;
+   titles also appear in `--json` / view output, the API responses and the
+   `change.title` column. The daemon keeps `httpx` / `httpcore` at WARNING
+   (they log request URLs at INFO). Test data is synthetic (`example.com`,
+   neutral titles).
 8. **Isolation.** A failure in one calendar, account or rule fails only what
    depends on it; `cycle()` always returns a `CycleResult`.
 9. **Error taxonomy → exit codes.** `AuthError` → 3 (only 401 / invalid_grant
@@ -198,9 +216,11 @@ calendar shared to another Apple ID do **not** reach the sharee (per-user
 `VALARM`); the sharee sees only their own iPhone default alert (spec §13
 item 1). Reverting edits made on the target is implemented and tested against
 Radicale and `FakeTarget`; the real-device check (an edit and a snooze on an
-iPhone against iCloud, experiment E1) is still pending. Also still unverified
-on iCloud: writing into the family member's own account, 401 vs 403 for a bad
-password, `MKCALENDAR` (spec §13).
+iPhone against iCloud, experiment E1) is still pending. Writing into a family
+member's own account (E5) needs no separate check: it is the situation of the
+first real run (an account's own app-specific password, alerts firing on that
+account's iPhone), in daily use since 2026-10-24. Still unverified on iCloud:
+401 vs 403 for a bad password, `MKCALENDAR` (spec §13).
 
 ## 8. Known limitations and debt
 
@@ -209,13 +229,12 @@ password, `MKCALENDAR` (spec §13).
   reverted only after the series parses again.
 - Only Google pop-up reminders are synced; attendees are never invitees.
 - Renaming or removing a rule orphans its events.
-- `RequestLog` grows forever (fine for `run`, must be reset per cycle in a
-  daemon).
-- `protected` / `degraded` / delete-guard titles live only on `RuleResult`,
-  not in run history.
+- `degraded` counts live only on `RuleResult`, not in run history (protected
+  and blocked series are recorded, with their titles, in the `change` table).
 - No byte counts in run history; no `invalid_client` → `ConfigError` mapping;
   held cursor has no cap or escalation.
-- `[runtime]` and `[notify]` are validated but unused until the daemon exists.
+- `[notify]` is validated but unused until alerts exist. The daemon reads the
+  config once at start (no hot reload).
 
 ## 9. Next work
 

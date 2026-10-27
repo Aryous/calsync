@@ -371,3 +371,144 @@ def test_policy_changes_the_hash() -> None:
     assert series_hash(apply_field_policy(rich(), FieldPolicy())) != series_hash(
         apply_field_policy(rich(), FieldPolicy(attendees="none"))
     )
+
+
+# ----- expand_instances --------------------------------------------------
+
+BERLIN = "Europe/Berlin"
+
+
+def _utc(y: int, mo: int, d: int, h: int = 0, mi: int = 0) -> datetime:
+    return datetime(y, mo, d, h, mi, tzinfo=UTC)
+
+
+def _starts(instances: "list[model.Instance]") -> list[datetime]:
+    return [i.start.utc() for i in instances]
+
+
+def test_expand_daily_keeps_wall_clock_across_dst() -> None:
+    # EU clocks go back on 2026-10-25: 09:00 Berlin is 07:00Z before, 08:00Z after.
+    s = series(start=at(2026, 10, 23, 9, 0, tz=BERLIN), recurrence=("RRULE:FREQ=DAILY;COUNT=5",))
+    got = model.expand_instances(s, _utc(2026, 10, 1), _utc(2026, 11, 1))
+    assert [i.start.value.hour for i in got] == [9] * 5
+    assert all(i.start.tzid == BERLIN and i.recurring for i in got)
+    assert _starts(got) == [
+        _utc(2026, 10, 23, 7),
+        _utc(2026, 10, 24, 7),
+        _utc(2026, 10, 25, 8),
+        _utc(2026, 10, 26, 8),
+        _utc(2026, 10, 27, 8),
+    ]
+    assert all(i.end.utc() - i.start.utc() == timedelta(minutes=5) for i in got)
+
+
+def test_expand_removes_exdates() -> None:
+    s = series(
+        start=at(2026, 10, 23, 9, 30),
+        recurrence=("RRULE:FREQ=DAILY;COUNT=3",),
+        exdates=(When(datetime(2026, 10, 24, 1, 30, tzinfo=UTC), "UTC"),),  # same instant, other zone
+    )
+    got = model.expand_instances(s, _utc(2026, 10, 1), _utc(2026, 11, 1))
+    assert _starts(got) == [_utc(2026, 10, 23, 1, 30), _utc(2026, 10, 25, 1, 30)]
+
+
+def test_expand_override_replaces_its_original() -> None:
+    moved = Occurrence(
+        original_start=at(2026, 10, 24, 9, 30),
+        start=at(2026, 10, 24, 21, 0),
+        end=at(2026, 10, 24, 21, 5),
+        title="Standup (late)",
+        description="",
+        location="Room 2",
+        alarms=(Alarm(timedelta(minutes=-10)),),
+    )
+    s = series(start=at(2026, 10, 23, 9, 30), recurrence=("RRULE:FREQ=DAILY;COUNT=3",), overrides=(moved,))
+    got = model.expand_instances(s, _utc(2026, 10, 1), _utc(2026, 11, 1))
+    assert _starts(got) == [_utc(2026, 10, 23, 1, 30), _utc(2026, 10, 24, 13), _utc(2026, 10, 25, 1, 30)]
+    late = got[1]
+    assert (late.title, late.location, late.alarms, late.recurring) == (
+        "Standup (late)",
+        "Room 2",
+        (Alarm(timedelta(minutes=-10)),),
+        True,
+    )
+    assert got[0].title == "Standup" and got[0].alarms == (Alarm(timedelta(0)),)
+
+
+def test_expand_cancelled_instance_is_an_exdate() -> None:
+    # The Google mapper turns a cancelled instance into an exdate in the instance's own zone.
+    cancelled = at(2026, 10, 24, 9, 30)
+    s = series(start=at(2026, 10, 23, 9, 30), recurrence=("RRULE:FREQ=DAILY;COUNT=3",), exdates=(cancelled,))
+    got = model.expand_instances(s, _utc(2026, 10, 1), _utc(2026, 11, 1))
+    assert cancelled.utc() not in _starts(got) and len(got) == 2
+
+
+def test_expand_all_day_series() -> None:
+    s = series(start=day(2026, 10, 23), recurrence=("RRULE:FREQ=WEEKLY;UNTIL=20261106",))
+    s = replace(s, end=day(2026, 10, 24))
+    got = model.expand_instances(s, _utc(2026, 10, 1), _utc(2026, 12, 1))
+    assert [i.start for i in got] == [day(2026, 10, 23), day(2026, 10, 30), day(2026, 11, 6)]
+    assert [i.end for i in got] == [day(2026, 10, 24), day(2026, 10, 31), day(2026, 11, 7)]
+    assert all(i.start.all_day for i in got)
+
+
+def test_expand_all_day_with_a_utc_until() -> None:
+    s = series(start=day(2026, 10, 23), recurrence=("RRULE:FREQ=DAILY;UNTIL=20261025T235959Z",))
+    got = model.expand_instances(s, _utc(2026, 10, 1), _utc(2026, 12, 1))
+    assert [i.start for i in got] == [day(2026, 10, 23), day(2026, 10, 24), day(2026, 10, 25)]
+
+
+def test_expand_count_and_until() -> None:
+    count = series(start=at(2026, 10, 23, 9, 30), recurrence=("RRULE:FREQ=DAILY;COUNT=2",))
+    assert len(model.expand_instances(count, _utc(2026, 1, 1), _utc(2027, 1, 1))) == 2
+    until = series(start=at(2026, 10, 23, 9, 30), recurrence=("RRULE:FREQ=DAILY;UNTIL=20261025T013000Z",))
+    assert _starts(model.expand_instances(until, _utc(2026, 1, 1), _utc(2027, 1, 1))) == [
+        _utc(2026, 10, 23, 1, 30),
+        _utc(2026, 10, 24, 1, 30),
+        _utc(2026, 10, 25, 1, 30),
+    ]
+    floating = series(start=at(2026, 10, 23, 9, 30), recurrence=("RRULE:FREQ=DAILY;UNTIL=20261024T093000",))
+    assert len(model.expand_instances(floating, _utc(2026, 1, 1), _utc(2027, 1, 1))) == 2
+
+
+def test_expand_rdate_adds_instances_in_their_zone() -> None:
+    s = series(
+        start=at(2026, 10, 23, 9, 30),
+        recurrence=("RRULE:FREQ=DAILY;COUNT=1", "RDATE;TZID=Asia/Shanghai:20261030T093000"),
+    )
+    got = model.expand_instances(s, _utc(2026, 10, 1), _utc(2026, 11, 1))
+    assert _starts(got) == [_utc(2026, 10, 23, 1, 30), _utc(2026, 10, 30, 1, 30)]
+    assert got[1].start.tzid == "Asia/Shanghai"
+
+
+def test_expand_only_returns_instances_in_range() -> None:
+    s = series(start=at(2026, 10, 23, 9, 30), minutes=60, recurrence=("RRULE:FREQ=DAILY",))
+    # 02:00Z on Oct 25 is inside the instance that runs 01:30Z-02:30Z: it intersects.
+    got = model.expand_instances(s, _utc(2026, 10, 25, 2), _utc(2026, 10, 27, 1, 30))
+    assert _starts(got) == [_utc(2026, 10, 25, 1, 30), _utc(2026, 10, 26, 1, 30)]
+
+
+def test_expand_finds_instances_of_an_old_series() -> None:
+    s = series(start=at(2020, 1, 1, 9, 30), recurrence=("RRULE:FREQ=DAILY",))
+    got = model.expand_instances(s, _utc(2026, 10, 24), _utc(2026, 10, 26), limit=10)
+    assert _starts(got) == [_utc(2026, 10, 24, 1, 30), _utc(2026, 10, 25, 1, 30)]
+
+
+def test_expand_unparseable_rrule_yields_the_master_only() -> None:
+    s = series(start=at(2026, 10, 23, 9, 30), recurrence=("RRULE:FREQ=BOGUS;COUNT=2",))
+    got = model.expand_instances(s, _utc(2026, 10, 1), _utc(2026, 11, 1))
+    assert _starts(got) == [_utc(2026, 10, 23, 1, 30)]
+    assert model.expand_instances(s, _utc(2026, 11, 1), _utc(2026, 12, 1)) == []
+
+
+def test_expand_respects_the_limit() -> None:
+    s = series(start=at(2026, 10, 23, 9, 30), recurrence=("RRULE:FREQ=MINUTELY",))
+    got = model.expand_instances(s, _utc(2026, 10, 1), _utc(2027, 1, 1), limit=7)
+    assert len(got) == 7
+
+
+def test_expand_non_recurring_yields_itself() -> None:
+    s = series(start=at(2026, 10, 23, 9, 30))
+    (only,) = model.expand_instances(s, _utc(2026, 10, 23), _utc(2026, 10, 24))
+    assert only == model.Instance(s.start, s.end, "Standup", "", (Alarm(timedelta(0)),), False)
+    assert model.expand_instances(s, _utc(2026, 10, 24), _utc(2026, 10, 25)) == []
