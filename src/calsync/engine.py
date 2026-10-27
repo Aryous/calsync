@@ -6,6 +6,7 @@ up exactly where the last one stopped.
 """
 
 import asyncio
+import hashlib
 import logging
 from collections import defaultdict
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence, Set
@@ -46,6 +47,12 @@ Status = Literal["ok", "partial", "failed", "blocked"]
 ErrorKind = Literal["auth", "config", "guard", "other"]
 
 
+def delete_fingerprint(object_ids: Iterable[str]) -> str:
+    """The identity of a set of planned deletes: what an approval names. The engine and
+    ``views.build_blocked`` both use it, on the plan and on the recorded ``blocked`` rows."""
+    return hashlib.sha256("\n".join(sorted(object_ids)).encode()).hexdigest()[:16]
+
+
 def error_kind_for(exc: BaseException) -> ErrorKind:
     if isinstance(exc, AuthError):
         return "auth"
@@ -71,6 +78,8 @@ class RuleResult:
     out_of_window: int = 0  # desired series skipped by the rule's time window
     blocked_titles: list[str] = field(default_factory=list)  # planned deletes, for the guard alert
     blocked_titles_complete: bool = True  # False: the lookup failed or some bodies were unreadable
+    blocked_fingerprint: str | None = None  # set when status == "blocked": the set's identity
+    approved: bool = False  # an approval named exactly this cycle's planned deletes
     changes: list[ChangeRecord] = field(default_factory=list)  # carries titles: never log
     # This cycle's protected / blocked object ids, for the engine's dedup memory: committed only
     # once ``changes`` is written. None: not reached (dry run, or the rule failed earlier).
@@ -399,7 +408,9 @@ class Engine:
         cal = self._calendars[key]
         return cal, self._caches[(rule.target.account, cal.href)]
 
-    async def _run_rule(self, rule: Rule, result: RuleResult, *, dry_run: bool, allow_deletes: bool) -> None:
+    async def _run_rule(
+        self, rule: Rule, result: RuleResult, *, dry_run: bool, allow_deletes: bool, approval: str | None
+    ) -> None:
         cal, cache = self._cache_for(rule)
         tag = rule_tag(rule.name)
         actual = {
@@ -452,11 +463,19 @@ class Engine:
             }
         result.plan = plan(desired, actual, window, frozenset(protected))
         result.out_of_window = result.plan.out_of_window
-        # The guard counts only non-protected actuals.
+        # The guard counts only non-protected actuals. An approval lets exactly the set it names
+        # through (by fingerprint); any other set is judged by the guard as always.
         deletable = len(actual.keys() - protected)
-        reason = None if allow_deletes else check_delete_guard(result.plan, deletable, rule.delete_guard)
+        fingerprint = delete_fingerprint(a.object_id for a in result.plan.delete)
+        result.approved = approval is not None and bool(result.plan.delete) and approval == fingerprint
+        reason = (
+            None
+            if allow_deletes or result.approved
+            else check_delete_guard(result.plan, deletable, rule.delete_guard)
+        )
         if reason:
             result.status, result.error, result.error_kind = "blocked", reason, "guard"
+            result.blocked_fingerprint = fingerprint
             blocked = frozenset(a.object_id for a in result.plan.delete)
             last = self._last_blocked.get(rule.name)
             bodies: Bodies | None = None
@@ -766,7 +785,11 @@ class Engine:
         rules: Sequence[str] | None = None,
         dry_run: bool = False,
         allow_deletes: bool = False,
+        approvals: Mapping[str, str] | None = None,
     ) -> CycleResult:
+        """One cycle of ``rules`` (None: every rule not paused). ``approvals``: rule -> the
+        fingerprint of the planned deletes to let through the guard this cycle."""
+        approvals = approvals or {}
         started = self._clock()
         mark = self._log.mark() if self._log else 0
         # A paused rule never runs (and records no run); a retiring one needs no source.
@@ -818,7 +841,13 @@ class Engine:
 
         async def guarded(rule: Rule) -> None:
             try:
-                await self._run_rule(rule, results[rule.name], dry_run=dry_run, allow_deletes=allow_deletes)
+                await self._run_rule(
+                    rule,
+                    results[rule.name],
+                    dry_run=dry_run,
+                    allow_deletes=allow_deletes,
+                    approval=approvals.get(rule.name),
+                )
             except Exception as exc:  # isolate rules from each other
                 log.error("rule %s failed (%s)", rule.name, type(exc).__name__)
                 debug.details(log, f"rule {rule.name} failed", exc)

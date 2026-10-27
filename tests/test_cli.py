@@ -184,8 +184,8 @@ def test_lock_busy_mentions_trigger(tmp_path: Path) -> None:
     )
 
 
-def test_lock_busy_with_allow_deletes_says_to_stop_the_daemon(tmp_path: Path) -> None:
-    """`trigger` cannot let blocked deletes through: the advice must not loop back to it."""
+def test_lock_busy_with_allow_deletes_points_to_approve(tmp_path: Path) -> None:
+    """`trigger` cannot let blocked deletes through: the advice is `approve`, through the daemon."""
     cfg = tmp_path / "c.toml"
     cfg.write_text(CONFIG.format(url="https://dav.example.com/", user="u", secret=tmp_path / "pw"))
     state = tmp_path / "s"
@@ -193,11 +193,18 @@ def test_lock_busy_with_allow_deletes_says_to_stop_the_daemon(tmp_path: Path) ->
         code, text = run(["--config", str(cfg), "--state-dir", str(state), "run", "--allow-deletes"])
     assert code == EXIT_RUNNING
     assert text == (
-        f"another calsync process (pid {os.getpid()}) holds the lock. If it is the daemon: deletes "
-        "blocked by the mass-delete guard can only be allowed with the daemon stopped. Stop the "
-        "daemon, run this command again, then start the daemon again.\n"
+        f"another calsync process (pid {os.getpid()}) holds the lock. If it is the daemon, approve the "
+        "blocked deletes through it: check `calsync blocked --rule RULE`, then `calsync approve RULE`\n"
     )
-    assert "trigger" not in text
+    assert "trigger" not in text and "stop" not in text
+    from argparse import Namespace
+
+    from calsync.cli import _describe  # pyright: ignore[reportPrivateUsage]
+
+    one = Namespace(command="run", allow_deletes=True, rules=["family"])
+    assert _describe(AlreadyRunning(None), one).endswith(
+        "check `calsync blocked --rule family`, then `calsync approve family`\n"
+    )
 
 
 def test_lock_message_without_a_pid(tmp_path: Path) -> None:

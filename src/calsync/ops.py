@@ -15,19 +15,24 @@ Arguments come from the command line or JSON: values may be the CLI's text (``"3
 names only, never a value: a value can be a push URL with a device key in it.
 """
 
+import asyncio
+import dataclasses
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import tomlkit
 
 from calsync import configfile, credentials
-from calsync.config import CredentialRef
+from calsync.config import Config, CredentialRef
 from calsync.errors import CalsyncError, ConfigError
 from calsync.store import CONFIG_CHANGE_RETENTION, Store
+
+if TYPE_CHECKING:
+    from calsync.engine import CycleResult, RuleResult
 
 log = logging.getLogger(__name__)
 
@@ -40,8 +45,17 @@ AUTH_REASON = "a person signs in (Google) or types the app-specific password (iC
 
 
 class DaemonHooks(Protocol):
-    """What operations may ask of the daemon they run in (cycles, approvals, adapters).
-    Empty until the operations that need it arrive."""
+    """What operations may ask of the daemon they run in (cycles, approvals, adapters)."""
+
+    @property
+    def config(self) -> Config: ...
+
+    def approve(
+        self, rule: str, fingerprint: str, count: int, origin: Source, *, wait: bool
+    ) -> "asyncio.Future[CycleResult | None] | None":
+        """Store the approval for the rule's next cycle and request that cycle; with ``wait``,
+        a future of that cycle's result (None: the cycle failed)."""
+        ...
 
 
 class OpsUnavailable(CalsyncError):
@@ -57,6 +71,9 @@ class OpContext:
     clock: Callable[[], datetime]
     on_config_written: Callable[[configfile.Snapshot], None] = lambda s: None  # the daemon reloads here
     daemon: DaemonHooks | None = None
+    # Set by an operation that has more to do once the daemon's lock is released (``approve``
+    # waiting for a cycle); the daemon awaits it and answers with its result.
+    followup: Callable[[], Awaitable["OpResult"]] | None = None
 
 
 @dataclass(frozen=True)
@@ -564,6 +581,168 @@ def _config_undo(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResul
     return _config_op(ctx, op, dry_run, edit, new_text=restore, undoes=target.id)
 
 
+# ----- approving blocked deletes ----------------------------------------------------------
+
+
+def _approve(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
+    """Let the deletes the guard blocked for one rule through, exactly that set (by fingerprint).
+
+    Without ``fingerprint`` it is the current block's. Through the daemon, the approval is kept
+    for the rule's next cycle (requested at once); without ``wait`` the answer is ``pending``.
+    In-process, one cycle for that rule runs here. ``data.status``: ``approved`` (the set was
+    deleted), ``stale`` (the planned deletes are another set now: nothing deleted, the new
+    fingerprint and count in ``data``), ``not_blocked`` (nothing to approve; nothing stored),
+    ``failed`` (the approval cycle failed), ``pending`` and, in a dry run, ``would_approve``."""
+    from calsync import views
+    from calsync.config import load_config
+    from calsync.wiring import state_paths
+
+    op = "approve"
+    a = _Args(op, args, {"rule", "fingerprint", "wait"})
+    name = a.text("rule")
+    wanted = a.opt_text("fingerprint")
+    wait = a.flag("wait")
+    config = ctx.daemon.config if ctx.daemon is not None else load_config(ctx.config_path)
+    rule = next((r for r in config.rules if r.name == name), None)
+    if rule is None:
+        raise ConfigError([f'unknown rule "{name}"'])
+    if rule.paused:
+        raise ConfigError([f'rule "{name}" is paused; resume it first'])
+    try:
+        with views.StateReader(state_paths(ctx.state_dir)[0]) as reader:
+            view = views.build_blocked(config, reader, name)
+    except views.StateUnavailable:
+        view = views.BlockedView(())
+    if not view.rules:
+        return OpResult(
+            op, False, f'rule "{name}" is not blocked: nothing to approve', data=_status(name, "not_blocked")
+        )
+    blocked = view.rules[0]
+    fingerprint = blocked.fingerprint
+    if fingerprint is None:
+        raise ConfigError(
+            [
+                f'rule "{name}" is blocked, but its blocked set is no longer recorded; restart the daemon '
+                f"(or run `calsync run --rule {name}` with the daemon stopped) to record it, then approve"
+            ]
+        )
+    if wanted is not None and wanted != fingerprint:
+        return _stale(op, name, fingerprint, blocked.count, wanted)
+    data = {**_status(name, "pending"), "fingerprint": fingerprint, "count": blocked.count}
+    if dry_run:
+        summary = f'{DRY_RUN}rule "{name}": {_copies(blocked.count)} would be approved for deletion'
+        return OpResult(op, False, summary, data={**data, "status": "would_approve", "would_change": True})
+    if ctx.daemon is not None:
+        try:
+            waiter = ctx.daemon.approve(name, fingerprint, blocked.count, ctx.source, wait=wait)
+        except ValueError as exc:  # unknown or paused since: the daemon's own check
+            raise ConfigError([str(exc)]) from None
+        if waiter is not None:
+
+            async def finish() -> OpResult:
+                return _outcome(op, name, fingerprint, blocked.count, (await waiter))
+
+            ctx.followup = finish
+        return OpResult(
+            op,
+            True,
+            f'rule "{name}": {_copies(blocked.count)} approved for deletion; the next cycle deletes them',
+            data=data,
+        )
+    log.info("rule %s: %d deletes approved (%s)", name, blocked.count, ctx.source)
+    result, removed = asyncio.run(_cycle_here(ctx, config, name, fingerprint))
+    outcome = _outcome(op, name, fingerprint, blocked.count, result)
+    if removed:
+        return dataclasses.replace(outcome, summary=outcome.summary + "; " + "; ".join(removed))
+    return outcome
+
+
+def _status(rule: str, status: str) -> dict[str, Any]:
+    return {"rule": rule, "status": status}
+
+
+def _copies(count: int) -> str:
+    return f"{count} {'copy' if count == 1 else 'copies'}"
+
+
+def _stale(op: str, rule: str, fingerprint: str | None, count: int, approved: str) -> OpResult:
+    summary = (
+        f'rule "{rule}": the blocked set changed ({_copies(count)} would be deleted now); nothing was '
+        f"deleted — check `calsync blocked --rule {rule}`, then approve again if intended"
+    )
+    data = {
+        **_status(rule, "stale"),
+        "fingerprint": fingerprint,
+        "count": count,
+        "approved_fingerprint": approved,
+    }
+    return OpResult(op, False, summary, data=data)
+
+
+def _outcome(op: str, rule: str, fingerprint: str, count: int, cycle: "CycleResult | None") -> OpResult:
+    """What became of an approval, from the cycle that consumed it (None: the cycle failed)."""
+    r: RuleResult | None = cycle.rules.get(rule) if cycle is not None else None
+    if r is None:
+        summary = f'rule "{rule}": the sync cycle failed; nothing was deleted — see the daemon log, then approve again'
+        return OpResult(
+            op, False, summary, data={**_status(rule, "failed"), "fingerprint": fingerprint, "count": count}
+        )
+    if r.status == "blocked":
+        planned = len(r.plan.delete) if r.plan is not None else 0
+        return _stale(op, rule, r.blocked_fingerprint, planned, fingerprint)
+    if r.approved and r.status == "ok":
+        data = {**_status(rule, "approved"), "fingerprint": fingerprint, "count": count, "deleted": r.deleted}
+        return OpResult(op, True, f'rule "{rule}": {_copies(r.deleted)} deleted', data=data)
+    if r.status != "ok":
+        summary = (
+            f'rule "{rule}": the approval cycle ended {r.status} ({r.error_kind or "other"}); '
+            f"{_copies(r.deleted)} deleted — check `calsync status`, then `calsync blocked --rule {rule}`"
+        )
+        data = {
+            **_status(rule, "failed"),
+            "fingerprint": fingerprint,
+            "count": count,
+            "deleted": r.deleted,
+            "run_status": r.status,
+            "error_kind": r.error_kind,
+        }
+        return OpResult(op, r.deleted > 0, summary, data=data)
+    # The guard no longer held anything back (the set shrank, or the guard was raised): the
+    # rule synced as usual and the approval was not needed.
+    summary = f'rule "{rule}" was no longer blocked; it synced as usual ({_copies(r.deleted)} deleted)'
+    return OpResult(op, r.deleted > 0, summary, data={**_status(rule, "not_blocked"), "deleted": r.deleted})
+
+
+async def _cycle_here(
+    ctx: OpContext, config: Config, rule: str, fingerprint: str
+) -> tuple["CycleResult", list[str]]:
+    """One cycle for ``rule`` in this process (the caller holds the run lock), with the
+    approval; then, as ``calsync run`` does, the removal of a rule that retired."""
+    from calsync import wiring
+    from calsync.cycle import remove_retired, retired, run_cycle
+
+    adapters = await wiring.build_adapters(config, wiring.accounts_in_use(config, [rule]))
+    try:
+        engine = wiring.build_engine(config, adapters, ctx.store, clock=ctx.clock)
+        result = await run_cycle(
+            engine,
+            ctx.store,
+            config,
+            adapters,
+            [rule],
+            dry_run=False,
+            allow_deletes=False,
+            approvals={rule: fingerprint},
+        )
+    finally:
+        await adapters.aclose()
+    removal = dataclasses.replace(ctx, source="daemon")
+    removed = [
+        done.summary for n in retired(config, result, ctx.store) if (done := remove_retired(removal, n))
+    ]
+    return result, removed
+
+
 OPS: dict[str, Callable[[OpContext, dict[str, Any], bool], OpResult]] = {
     "config.set": _config_set,
     "config.undo": _config_undo,
@@ -574,6 +753,7 @@ OPS: dict[str, Callable[[OpContext, dict[str, Any], bool], OpResult]] = {
     "rule.resume": _pause(False),
     "account.add": _account_add,
     "account.remove": _account_remove,
+    "approve": _approve,
 }
 
 

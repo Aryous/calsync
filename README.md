@@ -417,9 +417,9 @@ a `calsync run` meanwhile exits with code 4: use `calsync trigger` instead
   15 minutes after its latest failure; the other rules keep their schedule. A
   triggered rule runs regardless. A cycle blocked by the mass-delete guard
   neither adds to nor clears a rule's failure streak, so a backoff earned by
-  earlier failures still applies. The rule stays blocked until you run
-  `calsync run --rule NAME --allow-deletes`; stop the daemon first (under
-  launchd: `launchctl unload` the agent, then load it again afterwards).
+  earlier failures still applies. The rule stays blocked until someone acts:
+  check `calsync blocked --rule NAME`, then `calsync approve NAME` lets exactly
+  that set through in the daemon's next cycle (a different set blocks again).
 - **Authentication.** After `calsync auth <account>` the daemon picks up the
   new credential at the rule's next attempt; `calsync trigger --rule NAME`
   makes that now.

@@ -229,6 +229,7 @@ def test_unknown_op_and_bad_arguments(env: Env) -> None:
 
 def test_op_names() -> None:
     assert set(ops.OPS) == {
+        "approve",
         "config.set",
         "config.undo",
         "rule.add",

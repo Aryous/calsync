@@ -220,6 +220,14 @@ class _Endpoints:
             )
         )
 
+    async def blocked(self, request: Request) -> Response:
+        rule = request.query_params.get("rule")
+        if rule is not None and rule not in {r.name for r in self._config().rules}:
+            raise ApiError(404, "unknown_rule", f"Unknown rule {rule!r}.")
+        return JSONResponse(
+            await self._view(lambda config, reader: views.build_blocked(config, reader, rule))
+        )
+
     async def runs(self, request: Request) -> Response:
         # History outlives the config: a rule removed since is still a valid filter.
         limit = _clamped(request, "limit", 50, MAX_RUNS)
@@ -351,6 +359,7 @@ def api_routes(
     routes = [
         Route("/api/status", guarded(endpoints.status), methods=["GET"]),
         Route("/api/upcoming", guarded(endpoints.upcoming), methods=["GET"]),
+        Route("/api/blocked", guarded(endpoints.blocked), methods=["GET"]),
         Route("/api/runs", guarded(endpoints.runs), methods=["GET"]),
         Route("/api/changes", guarded(endpoints.changes), methods=["GET"]),
         Route("/api/trigger", guarded(endpoints.trigger), methods=["POST"]),

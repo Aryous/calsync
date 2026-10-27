@@ -390,17 +390,25 @@ def test_blocked_attention_counts_the_blocked_deletions(tmp_path: Path) -> None:
             "kind": "blocked",
             "rule": "family",
             "account": None,
-            "message": "Sync paused: 4 deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again.",
-            "command": "calsync run --rule family --allow-deletes",
+            "message": "4 copies would be deleted — check `calsync blocked --rule family`, then approve if intended",
+            "command": "calsync approve family",
         }
     ]
+
+
+def test_blocked_attention_for_one_copy(tmp_path: Path) -> None:
+    blocked = [ChangeRecord("family", "o1", "blocked", NOW, None)]
+    view = _status(tmp_path, [_run("blocked", error="guard", kind="guard")], blocked)
+    assert view["attention"][0]["message"] == (
+        "1 copy would be deleted — check `calsync blocked --rule family`, then approve if intended"
+    )
 
 
 def test_blocked_attention_without_rows_has_no_count(tmp_path: Path) -> None:
     view = _status(tmp_path, [_run("blocked", error="guard", kind="guard")])
     assert (
         view["attention"][0]["message"]
-        == "Sync paused: deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again."
+        == "Copies would be deleted — check `calsync blocked --rule family`, then approve if intended"
     )
 
 
@@ -431,7 +439,7 @@ async def test_blocked_count_survives_consecutive_blocked_runs(tmp_path: Path) -
     assert view["rules"][0]["consecutive_failures"] == 2
     assert (
         view["attention"][0]["message"]
-        == "Sync paused: 4 deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again."
+        == "4 copies would be deleted — check `calsync blocked --rule family`, then approve if intended"
     )
 
 
@@ -574,7 +582,7 @@ def test_v1_database_is_read_gracefully(tmp_path: Path) -> None:
     assert status["attention"][0]["account"] == "me"
     assert (
         status["attention"][1]["message"]
-        == "Sync paused: deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again."
+        == "Copies would be deleted — check `calsync blocked --rule other`, then approve if intended"
     )
     assert status["summary"]["health"] == "auth"
 

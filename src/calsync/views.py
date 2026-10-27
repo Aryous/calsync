@@ -290,19 +290,27 @@ class StateReader:
         for cid, rid, name, oid, action, at, title in self._db.execute(sql + " ORDER BY id DESC", params):
             yield ChangeView(cid, rid, name, oid, action, _parse_time(at), title)
 
-    def blocked_count(self, rule: str) -> int:
-        """Deletions in the most recently recorded blocked set (0: none recorded).
+    def latest_blocked(self, rule: str) -> tuple[int, list[tuple[str, str | None]]] | None:
+        """The most recently recorded blocked set: its run id and (object id, title) rows; None
+        if none is recorded.
 
         Blocked rows are written only when the blocked set changes, so the latest blocked run
         may have none: the newest set is the rows sharing the greatest ``run_id``."""
-        if not {"run_id", "rule", "action"} <= self.columns("change"):
-            return 0
-        row = self._db.execute(
-            "SELECT COUNT(*) FROM change WHERE rule = ? AND action = 'blocked' AND run_id = "
-            "(SELECT MAX(run_id) FROM change WHERE rule = ? AND action = 'blocked')",
+        if not {"run_id", "rule", "action", "object_id", "title"} <= self.columns("change"):
+            return None
+        rows = self._db.execute(
+            "SELECT run_id, object_id, title FROM change WHERE rule = ? AND action = 'blocked' AND run_id = "
+            "(SELECT MAX(run_id) FROM change WHERE rule = ? AND action = 'blocked') ORDER BY id",
             (rule, rule),
-        ).fetchone()
-        return int(row[0])
+        ).fetchall()
+        if not rows:
+            return None
+        return int(rows[0][0]), [(oid, title) for _, oid, title in rows]
+
+    def blocked_count(self, rule: str) -> int:
+        """Deletions in the most recently recorded blocked set (0: none recorded)."""
+        found = self.latest_blocked(rule)
+        return len(found[1]) if found is not None else 0
 
     def delivered_at(self, rule: str, object_id: str) -> datetime | None:
         """When the rule last wrote the object to its target (the newest create, update or
@@ -711,7 +719,10 @@ def _consecutive_failures(reader: StateReader, rule: str) -> int:
     return count
 
 
-BLOCKED_ADVICE = "To allow them, stop the daemon, run the command, then start the daemon again."
+def blocked_message(rule: str, count: int) -> str:
+    """What a blocked rule's attention says (``count`` 0: unknown)."""
+    what = f"{count} {'copy' if count == 1 else 'copies'}" if count else "Copies"
+    return f"{what} would be deleted — check `calsync blocked --rule {rule}`, then approve if intended"
 
 
 def _attention(reader: StateReader, status: RuleStatus) -> Attention | None:
@@ -732,17 +743,8 @@ def _attention(reader: StateReader, status: RuleStatus) -> Attention | None:
             f"calsync auth {account}",
         )
     if health == "blocked":
-        n = reader.blocked_count(rule.name)
-        waiting = f"{n} deletions are" if n else "deletions are"
-        # While the daemon runs it holds the lock, so the command can only run with it stopped
-        # (``approve`` will let the daemon do it).
-        return Attention(
-            "blocked",
-            rule.name,
-            None,
-            f"Sync paused: {waiting} waiting for your confirmation. {BLOCKED_ADVICE}",
-            f"calsync run --rule {rule.name} --allow-deletes",
-        )
+        message = blocked_message(rule.name, reader.blocked_count(rule.name))
+        return Attention("blocked", rule.name, None, message, f"calsync approve {rule.name}")
     if health == "failing":
         k = status.consecutive_failures
         return Attention("failing", rule.name, None, f"Sync has failed {k} times in a row.", None)
@@ -794,6 +796,96 @@ def build_status(config: Config, reader: StateReader, now: datetime) -> StatusVi
         rules=tuple(rules),
         attention=attention,
     )
+
+
+# ----- blocked deletes -------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedItem:
+    object_id: str
+    title: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedRule:
+    rule: str
+    since: datetime  # the first blocked run since the rule last synced ok
+    count: int
+    copies: int  # the rule's copies now (the guard's ratio is of these)
+    max_count: int
+    max_ratio: float
+    reason: str | None  # the guard's reason, as the run recorded it
+    fingerprint: str | None  # None: the blocked set is no longer recorded
+    items: tuple[BlockedItem, ...]
+
+    @property
+    def ratio(self) -> float | None:
+        return round(self.count / self.copies, 3) if self.copies else None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "rule": self.rule,
+            "since": self.since.isoformat(),
+            "count": self.count,
+            "copies": self.copies,
+            "ratio": self.ratio,
+            "limit": {"max_count": self.max_count, "max_ratio": self.max_ratio},
+            "reason": self.reason,
+            "fingerprint": self.fingerprint,
+            "items": [{"object_id": i.object_id, "title": i.title} for i in self.items],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedView:
+    rules: tuple[BlockedRule, ...]
+
+    def to_json(self) -> dict[str, Any]:
+        return {"blocked": [r.to_json() for r in self.rules]}
+
+
+def _blocked_rule(rule: Rule, reader: StateReader) -> BlockedRule | None:
+    from calsync.engine import delete_fingerprint  # light here: views must not load the engine early
+
+    runs = reader.runs(rule.name)
+    if not runs or runs[0].status != "blocked":
+        return None
+    first = runs[0]
+    for run in runs:  # newest first: back to the last ok run (a failure does not end a block)
+        if _is_ok(run.status, run.failed):
+            break
+        if run.status == "blocked":
+            first = run
+    found = reader.latest_blocked(rule.name)
+    # Rows from before this block (an older one) do not describe it: unknown, never guessed.
+    rows = found[1] if found is not None and found[0] >= first.id else []
+    items = sorted(
+        (BlockedItem(oid, title) for oid, title in rows),
+        key=lambda i: (i.title is None, (i.title or "").casefold(), i.object_id),
+    )
+    return BlockedRule(
+        rule=rule.name,
+        since=first.started_at,
+        count=len(items),
+        copies=reader.copies(rule_tag(rule.name)),
+        max_count=rule.delete_guard.max_count,
+        max_ratio=rule.delete_guard.max_ratio,
+        reason=runs[0].error,
+        fingerprint=delete_fingerprint(i.object_id for i in items) if items else None,
+        items=tuple(items),
+    )
+
+
+def build_blocked(config: Config, reader: StateReader, rule: str | None = None) -> BlockedView:
+    """The rules whose latest run is blocked by the mass-delete guard, in config order, each
+    with every planned delete (title order) and the fingerprint ``calsync approve`` names."""
+    found = [
+        entry
+        for r in config.rules
+        if (rule is None or r.name == rule) and (entry := _blocked_rule(r, reader)) is not None
+    ]
+    return BlockedView(tuple(found))
 
 
 # ----- upcoming -------------------------------------------------------------------------

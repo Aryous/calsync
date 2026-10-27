@@ -4,7 +4,7 @@ Paused rules are skipped; a retiring rule whose copies are all gone is removed a
 (``retired`` / ``remove_retired``)."""
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from calsync import debug, ops
 from calsync.config import Config
@@ -25,11 +25,13 @@ async def run_cycle(
     *,
     dry_run: bool,
     allow_deletes: bool,
+    approvals: Mapping[str, str] | None = None,
 ) -> CycleResult:
     """Run ``rules`` (None: every rule) and return their results in config order.
 
     A rule whose source or target account has a setup error (``adapters.errors``) fails on its
-    own without reaching the engine; the other rules run normally.
+    own without reaching the engine; the other rules run normally. ``approvals`` go to the
+    engine (rule -> fingerprint of the blocked deletes to let through).
     """
     selected = [r for r in config.rules if (rules is None or r.name in rules) and not r.paused]
     skipped: dict[str, RuleResult] = {}
@@ -43,6 +45,7 @@ async def run_cycle(
         rules=[r.name for r in selected if r.name not in skipped],
         dry_run=dry_run,
         allow_deletes=allow_deletes,
+        approvals=approvals,
     )
     if skipped and not dry_run:  # keep run history complete
         start, end = result.started_at, result.finished_at

@@ -136,8 +136,8 @@
       "kind": "blocked",
       "rule": "activities",
       "account": null,
-      "message": "Sync paused: 4 deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again.",
-      "command": "calsync run --rule activities --allow-deletes"
+      "message": "4 copies would be deleted — check `calsync blocked --rule activities`, then approve if intended",
+      "command": "calsync approve activities"
     }
   ],
   "daemon": {

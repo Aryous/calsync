@@ -420,9 +420,10 @@ function attentionMessage(item, status) {
   const rule = (status.rules || []).find((r) => r.name === item.rule);
   if (item.kind === "auth" && item.account) return t("The {account} account needs to be connected again.", { account: item.account });
   if (item.kind === "blocked") {
-    const m = /(\d+) deletions/.exec(item.message || "");
-    const paused = m ? t("Sync paused: {n} deletions are waiting for your confirmation.", { n: m[1] }) : t("Sync paused: deletions are waiting for your confirmation.");
-    return paused + (paused.endsWith("。") ? "" : " ") + t("To allow them, stop the daemon, run the command, then start the daemon again.");
+    const m = /^(\d+) cop(?:y|ies) would be deleted/.exec(item.message || "");
+    if (!m) return t("Copies would be deleted — check `calsync blocked --rule {rule}`, then approve if intended", { rule: item.rule });
+    if (m[1] === "1") return t("1 copy would be deleted — check `calsync blocked --rule {rule}`, then approve if intended", { rule: item.rule });
+    return t("{n} copies would be deleted — check `calsync blocked --rule {rule}`, then approve if intended", { n: m[1], rule: item.rule });
   }
   if (item.kind === "failing" && rule && rule.consecutive_failures) {
     return t("Sync has failed {n} times in a row.", { n: rule.consecutive_failures });

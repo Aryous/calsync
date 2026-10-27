@@ -19,7 +19,7 @@ if TYPE_CHECKING:  # type-only: importing these at runtime would load httpx/ical
     from calsync.config import Config
     from calsync.engine import CycleResult, RuleResult
     from calsync.store import Store
-    from calsync.views import ChangesView, RunsView, StateReader, StatusView, UpcomingView
+    from calsync.views import BlockedView, ChangesView, RunsView, StateReader, StatusView, UpcomingView
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_AUTH, EXIT_RUNNING = 0, 1, 2, 3, 4
 
@@ -84,6 +84,21 @@ def _parser() -> argparse.ArgumentParser:
     )
     for name, text in (("pause", "pause a rule: no cycle syncs it"), ("resume", "resume a paused rule")):
         _writer(sub, name, text).add_argument("rule")
+
+    blocked = sub.add_parser("blocked", help="deletes held back by the mass-delete guard (read-only)")
+    blocked.add_argument("--rule", help="only this rule")
+    blocked.add_argument("--json", action="store_true", help="print JSON")
+    approve = _writer(sub, "approve", "let a rule's blocked deletes through: exactly the listed set")
+    approve.add_argument("rule")
+    approve.add_argument(
+        "--fingerprint", help="the set to approve, as `calsync blocked` shows it (default: the current one)"
+    )
+    approve.add_argument(
+        "--yes", action="store_true", help="approve without asking (needed without a terminal)"
+    )
+    approve.add_argument(
+        "--wait", action="store_true", help="through the daemon: wait for the cycle that deletes them"
+    )
 
     account = sub.add_parser("account", help="add or remove an account")
     account_sub = account.add_subparsers(dest="account_command", required=True)
@@ -264,11 +279,11 @@ def _describe(exc: BaseException, args: argparse.Namespace | None = None) -> str
         if command == "daemon":
             return f"{exc}; wait for it to finish, or stop the other daemon\n"
         if command == "run" and getattr(args, "allow_deletes", False):
-            # `trigger` cannot let deletes through: the daemon never passes the guard itself.
+            rules = getattr(args, "rules", None) or []
+            rule = rules[0] if len(rules) == 1 else "RULE"
             return (
-                f"{exc}. If it is the daemon: deletes blocked by the mass-delete guard can only be "
-                "allowed with the daemon stopped. Stop the daemon, run this command again, then "
-                "start the daemon again.\n"
+                f"{exc}. If it is the daemon, approve the blocked deletes through it: check "
+                f"`calsync blocked --rule {rule}`, then `calsync approve {rule}`\n"
             )
         return f"{exc}; if it is the daemon, use `calsync trigger`\n"
     if isinstance(exc, CalsyncError):  # network and other expected failures
@@ -372,6 +387,96 @@ def _op_for(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
     if args.delete_credential:
         op_args["delete_credential"] = True
     return "account.remove", op_args
+
+
+YES_NEEDED = "pass --yes to approve without a prompt"
+PROMPT_TITLES = 10
+APPROVE_EXIT = {
+    "approved": EXIT_OK,
+    "pending": EXIT_OK,
+    "would_approve": EXIT_OK,
+    "stale": EXIT_FAILED,
+    "failed": EXIT_FAILED,
+    "not_blocked": EXIT_CONFIG,
+}
+
+
+def cmd_approve(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
+    """`calsync approve RULE`: on a terminal without ``--yes``, show the set and let the person
+    confirm it by typing the rule name; the set they saw (its fingerprint) is what is approved."""
+    from calsync import opsclient
+    from calsync.errors import CalsyncError, ConfigError
+
+    fingerprint = args.fingerprint
+    if not args.yes and not args.dry_run:
+        if args.json or not stdin.isatty():  # no prompt in JSON mode or without a person
+            if args.json:
+                _dump({"error": {"kind": "config", "message": YES_NEEDED, "problems": [YES_NEEDED]}}, out)
+            else:
+                out.write(YES_NEEDED + "\n")
+            return EXIT_CONFIG
+        shown = _confirm_blocked(args, out, stdin)
+        if shown is False:
+            out.write("not approved\n")
+            return EXIT_FAILED
+        if shown is not None and fingerprint is None:
+            fingerprint = shown
+    op_args: dict[str, object] = {"rule": args.rule}
+    if fingerprint is not None:
+        op_args["fingerprint"] = fingerprint
+    if args.wait:
+        op_args["wait"] = True
+    try:
+        result = opsclient.call(
+            "approve",
+            op_args,
+            dry_run=args.dry_run,
+            config_path=_config_path(args),
+            state_dir=_state_dir(args),
+        )
+    except CalsyncError as exc:
+        if not args.json:
+            raise
+        error: dict[str, object] = {"kind": _error_kind(exc), "message": str(exc)}
+        if isinstance(exc, ConfigError):
+            error["problems"] = exc.problems
+        _dump({"error": error}, out)
+        return exit_code_for(exc)
+    if args.json:
+        _dump(result.to_json(), out)
+    else:
+        out.write(result.summary + "\n")
+    return APPROVE_EXIT.get(str(result.data.get("status")), EXIT_FAILED)
+
+
+def _confirm_blocked(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> "str | bool | None":
+    """Show the rule's blocked set and ask for the rule name. Its fingerprint once confirmed,
+    False if not; None if the rule is not blocked (the operation says so)."""
+    from calsync.views import StateReader, StateUnavailable, build_blocked
+    from calsync.wiring import state_paths
+
+    config = _load(args)
+    db_path, _ = state_paths(_state_dir(args))
+    try:
+        with StateReader(db_path) as reader:
+            view = build_blocked(config, reader, args.rule)
+    except StateUnavailable:
+        return None
+    if not view.rules or view.rules[0].fingerprint is None:
+        return None
+    blocked = view.rules[0]
+    noun = "copy" if blocked.count == 1 else "copies"
+    out.write(f"rule {blocked.rule}: {blocked.count} {noun} would be deleted:\n")
+    for item in blocked.items[:PROMPT_TITLES]:
+        out.write(f"  - {_flat(item.title) if item.title else '(untitled)'}\n")
+    if blocked.count > PROMPT_TITLES:
+        out.write(f"  … and {blocked.count - PROMPT_TITLES} more (calsync blocked --rule {blocked.rule})\n")
+    out.write(f"Type the rule name ({blocked.rule}) to approve: ")
+    out.flush()
+    if stdin.readline().strip() != blocked.rule:
+        out.write("\n")
+        return False
+    return blocked.fingerprint
 
 
 def cmd_config_get(args: argparse.Namespace, out: TextIO) -> int:
@@ -755,7 +860,9 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-ViewBuilder = Callable[["Config", "StateReader"], "StatusView | UpcomingView | RunsView | ChangesView"]
+ViewBuilder = Callable[
+    ["Config", "StateReader"], "StatusView | UpcomingView | RunsView | ChangesView | BlockedView"
+]
 
 
 def _show(args: argparse.Namespace, out: TextIO, build: ViewBuilder, *, check_rule: bool = True) -> int:
@@ -789,8 +896,10 @@ def _show(args: argparse.Namespace, out: TextIO, build: ViewBuilder, *, check_ru
     return EXIT_OK
 
 
-def _print_view(view: "StatusView | UpcomingView | RunsView | ChangesView", out: TextIO) -> None:
-    from calsync.views import ChangesView, RunsView, StatusView, UpcomingView
+def _print_view(
+    view: "StatusView | UpcomingView | RunsView | ChangesView | BlockedView", out: TextIO
+) -> None:
+    from calsync.views import BlockedView, ChangesView, RunsView, StatusView, UpcomingView
 
     if isinstance(view, StatusView):
         for status in view.rules:
@@ -828,6 +937,18 @@ def _print_view(view: "StatusView | UpcomingView | RunsView | ChangesView", out:
             if run.error:
                 line += f" error={run.error!r}"
             out.write(line + "\n")
+    elif isinstance(view, BlockedView):
+        if not view.rules:
+            out.write("no rule is blocked\n")
+        for blocked in view.rules:
+            fingerprint = blocked.fingerprint or "unknown"
+            out.write(
+                f"rule={blocked.rule} since={blocked.since.isoformat()} count={blocked.count} "
+                f"fingerprint={fingerprint}\n"
+            )
+            for item in blocked.items:
+                out.write(f"  - {_flat(item.title) if item.title else '(untitled)'}\n")
+            out.write(f"  approve with: calsync approve {blocked.rule}\n")
     elif isinstance(view, ChangesView):
         for change in view.changes:
             title = _flat(change.title) if change.title else "(untitled)"
@@ -863,6 +984,12 @@ def cmd_runs(args: argparse.Namespace, out: TextIO) -> int:
     )
 
 
+def cmd_blocked(args: argparse.Namespace, out: TextIO) -> int:
+    from calsync.views import build_blocked
+
+    return _show(args, out, lambda config, reader: build_blocked(config, reader, args.rule))
+
+
 def cmd_changes(args: argparse.Namespace, out: TextIO) -> int:
     from calsync.views import build_changes
 
@@ -886,6 +1013,10 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
     try:
         if args.command == "config":
             return cmd_config(args, out)
+        if args.command == "approve":
+            return cmd_approve(args, out, stdin)
+        if args.command == "blocked":
+            return cmd_blocked(args, out)
         if args.command in ("rule", "pause", "resume", "account"):
             return _ops_command(args, out, *_op_for(args))
         if args.command == "calendars":
