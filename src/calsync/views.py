@@ -76,6 +76,7 @@ class RunView:
     requests: int
     error: str | None
     error_kind: str | None
+    error_account: str | None = None  # the account whose adapter or setup failed (schema 5)
 
     @property
     def duration_ms(self) -> int:
@@ -163,6 +164,7 @@ _RUN_COLUMNS: tuple[str, ...] = (
     "requests",
     "error",
     "error_kind",
+    "error_account",
 )
 _RUN_DEFAULTS: Mapping[str, Any] = {"reverted": 0, "protected": 0, "out_of_window": 0, "error_kind": None}
 
@@ -728,8 +730,11 @@ def _attention(reader: StateReader, status: RuleStatus) -> Attention | None:
         return None
     health = _health(status.last_run) if rule.retire else status.health
     if health == "auth":
-        error = ((status.last_run and status.last_run.error) or "").lower()
-        account = rule.source.account if "google" in error or "oauth" in error else rule.target.account
+        last = status.last_run
+        account = last.error_account if last is not None else None
+        if account is None:  # a run recorded before ``error_account`` existed: guess from its text
+            error = ((last and last.error) or "").lower()
+            account = rule.source.account if "google" in error or "oauth" in error else rule.target.account
         return Attention(
             "auth",
             rule.name,

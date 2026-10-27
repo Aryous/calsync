@@ -40,7 +40,7 @@ async def run_cycle(
         broken = [a for a in sides if a in adapters.errors]
         if broken:
             skipped[rule.name] = RuleResult(rule.name)
-            skipped[rule.name].fail(adapters.errors[broken[0]])
+            skipped[rule.name].fail(adapters.errors[broken[0]], account=broken[0], setup=True)
     result = await engine.cycle(
         rules=[r.name for r in selected if r.name not in skipped],
         dry_run=dry_run,
@@ -63,6 +63,7 @@ async def run_cycle(
                     result.requests,
                     r.error,
                     error_kind=r.error_kind,
+                    error_account=r.error_account,
                 )
                 for r in skipped.values()
             ]

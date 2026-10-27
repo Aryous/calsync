@@ -193,8 +193,10 @@ def test_unreadable_secret_fails_only_its_rules(
     with Store(tmp_path / "state" / "state.db") as store:
         runs = {r.rule: r for r in store.latest_runs()}
     assert runs["good"].status == "ok" and runs["bad"].status == "failed"
-    assert runs["bad"].error is not None and "credential file not found" in runs["bad"].error
+    # Stored: the type and config names only; the path was printed above, never stored.
+    assert runs["bad"].error == 'AuthError: account "dav2" has no usable credential'
     assert runs["bad"].error_kind == "auth" and runs["good"].error_kind is None
+    assert runs["bad"].error_account == "dav2" and runs["good"].error_account is None
 
 
 def paused(text: str) -> str:

@@ -124,6 +124,7 @@ class RunRecord:
     protected: int = 0
     out_of_window: int = 0
     error_kind: str | None = None
+    error_account: str | None = None  # the account whose adapter or setup failed
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,8 +410,8 @@ class Store:
             for r in runs:
                 cursor = self._db.execute(
                     "INSERT INTO run (rule, started_at, finished_at, status, created, updated, deleted, "
-                    "failed, requests, error, reverted, protected, out_of_window, error_kind) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "failed, requests, error, reverted, protected, out_of_window, error_kind, error_account) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         r.rule,
                         r.started_at.isoformat(),
@@ -426,6 +427,7 @@ class Store:
                         r.protected,
                         r.out_of_window,
                         r.error_kind,
+                        r.error_account,
                     ),
                 )
                 assert cursor.lastrowid is not None
@@ -518,7 +520,7 @@ class Store:
     def latest_runs(self) -> list[RunRecord]:
         rows = self._db.execute(
             "SELECT rule, started_at, finished_at, status, created, updated, deleted, failed, requests, error, "
-            "reverted, protected, out_of_window, error_kind "
+            "reverted, protected, out_of_window, error_kind, error_account "
             "FROM run WHERE id IN (SELECT MAX(id) FROM run GROUP BY rule) ORDER BY rule"
         ).fetchall()
         return [

@@ -23,6 +23,7 @@ from calsync.errors import (
     ConfigError,
     ConflictError,
     NotFoundError,
+    plain_error,
 )
 from calsync.http import RequestLog
 from calsync.mirror import Mirror, apply_pull
@@ -52,6 +53,9 @@ REVERT_HOLD = timedelta(hours=24)
 
 Status = Literal["ok", "partial", "failed", "blocked"]
 ErrorKind = Literal["auth", "config", "guard", "other"]
+# Where a rule failed, for its stored error: reading its source, its target (detection and
+# writes), or the rule's own work (planning, the store).
+Side = Literal["source", "target", "rule"]
 
 
 def delete_fingerprint(object_ids: Iterable[str]) -> str:
@@ -77,8 +81,14 @@ class RuleResult:
     reverted: int = 0  # copies edited on the target and written back (counted in updated)
     deleted: int = 0
     failed: int = 0
+    # Stored and shown (status, runs, the API): ``errors.plain_error``, never an exception's text.
     error: str | None = None
     error_kind: ErrorKind | None = None
+    error_account: str | None = None  # the account whose adapter (or its setup) failed
+    # A setup error's own text (a credential file's path or mode, a missing client secret file:
+    # what to fix), for ``calsync run``'s output only. Setup reads local files, no server, so
+    # no URL; still never stored, logged or served (run history keeps ``error``).
+    setup_detail: str | None = None
     plan: Plan | None = None
     protected: int = 0  # existing target copies held untouched this cycle (series unparsed or degraded)
     degraded: int = 0  # series in the source calendar that are unparsed or degraded, copy or not
@@ -100,10 +110,25 @@ class RuleResult:
     detection_complete: bool = False
     target_missing: bool = False
 
-    def fail(self, exc: BaseException) -> None:
+    def fail(
+        self, exc: BaseException, *, side: Side = "rule", account: str | None = None, setup: bool = False
+    ) -> None:
+        """Fail the rule with ``exc``, raised on ``side`` by ``account``'s adapter (``setup``:
+        building that adapter failed). The full text belongs in ``debug.details``, not here."""
         self.status = "failed"
-        self.error = f"{type(exc).__name__}: {exc}"
+        self.error = self.describe(exc, side=side, account=account, setup=setup)
         self.error_kind = error_kind_for(exc)
+        self.error_account = account
+        self.setup_detail = str(exc) if setup else None
+
+    def describe(
+        self, exc: BaseException, *, side: Side = "rule", account: str | None = None, setup: bool = False
+    ) -> str:
+        """The stored text for ``exc``: its type and a sentence of config names."""
+        subject = f'rule "{self.rule}"' if side == "rule" else f'the {side} of rule "{self.rule}"'
+        if isinstance(exc, _NotCreatedYet):
+            return f"NotFoundError: {subject} does not exist yet; a real run creates it"
+        return plain_error(exc, subject, account=account, setup=setup)
 
 
 @dataclass(slots=True)
@@ -169,6 +194,10 @@ TargetKey = tuple[str, str]  # (account, calendar ref from config)
 class _CalendarMissing(NotFoundError):
     """The calendar listing has no target calendar (``CalendarNotListed``) and no rule of it may
     create it."""
+
+
+class _NotCreatedYet(NotFoundError):
+    """A dry run against a target calendar that a real run would create."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,7 +324,7 @@ class Engine:
                 cal = await target.ensure_calendar(ref, create=wants_create and not dry_run)
             except CalendarNotListed as exc:
                 if dry_run and wants_create:
-                    raise NotFoundError(
+                    raise _NotCreatedYet(
                         f"target calendar {ref!r} does not exist yet; a real run creates it"
                     ) from None
                 if not wants_create:
@@ -779,14 +808,16 @@ class Engine:
                     debug.details(log, f"rule {rule.name}: write failed", outcome)
         if errors:
             result.failed = len(errors)
-            first = errors[0]
-            more = f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""
-            result.error = f"{type(first).__name__}: {first}{more}"
             done = result.created + result.updated + result.deleted
             result.status = "partial" if done else "failed"
             # The most actionable kind wins: one revoked credential means "run calsync auth".
             kinds = {error_kind_for(e) for e in errors}
             result.error_kind = "auth" if "auth" in kinds else "config" if "config" in kinds else "other"
+            first = next(e for e in errors if error_kind_for(e) == result.error_kind)
+            more = f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""
+            account = rule.target.account
+            result.error = result.describe(first, side="target", account=account) + more
+            result.error_account = account
 
     # ----- the cycle ----------------------------------------------------
     async def cycle(
@@ -815,16 +846,19 @@ class Engine:
         outcomes = await asyncio.gather(
             *(self._ingest(a, rs) for a, rs in by_source.items()), return_exceptions=True
         )
-        for (_, rs), outcome in zip(by_source.items(), outcomes, strict=True):
+        for (account, rs), outcome in zip(by_source.items(), outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 if not isinstance(outcome, Exception):
                     raise outcome
+                # The type only: the text can carry a request URL (CALSYNC_DEBUG=1 shows it).
+                log.warning("source %s failed (%s)", account, type(outcome).__name__)
+                debug.details(log, f"source {account} failed", outcome)
                 for rule in rs:
-                    results[rule.name].fail(outcome)
+                    results[rule.name].fail(outcome, side="source", account=account)
                 continue
             for rule in rs:
-                if rule.source.calendar in outcome:
-                    results[rule.name].fail(outcome[rule.source.calendar])
+                if rule.source.calendar in outcome:  # logged by _ingest
+                    results[rule.name].fail(outcome[rule.source.calendar], side="source", account=account)
 
         by_target: dict[TargetKey, list[Rule]] = defaultdict(list)
         for rule in selected:
@@ -834,17 +868,21 @@ class Engine:
         outcomes = await asyncio.gather(
             *(self._detect(k, rs, dry_run) for k, rs in by_target.items()), return_exceptions=True
         )
-        for (_, rs), outcome in zip(by_target.items(), outcomes, strict=True):
+        for ((account, _), rs), outcome in zip(by_target.items(), outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 if not isinstance(outcome, Exception):
                     raise outcome
+                if not isinstance(outcome, _CalendarMissing):
+                    names = _rule_names(rs)
+                    log.warning("target %s (rule(s) %s) failed (%s)", account, names, type(outcome).__name__)
+                    debug.details(log, f"target {account} (rule(s) {names}) failed", outcome)
                 for rule in rs:
                     if isinstance(outcome, _CalendarMissing) and rule.retire:
                         # Nothing to delete where there is no calendar: the retirement is done.
                         results[rule.name].target_missing = True
                         results[rule.name].detection_complete = True
                     else:
-                        results[rule.name].fail(outcome)
+                        results[rule.name].fail(outcome, side="target", account=account)
                 continue
             for rule in rs:
                 results[rule.name].detection_complete = outcome
@@ -902,6 +940,7 @@ class Engine:
                         protected=r.protected,
                         out_of_window=r.out_of_window,
                         error_kind=r.error_kind,
+                        error_account=r.error_account,
                     )
                     for r in results.values()
                 ],

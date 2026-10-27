@@ -341,7 +341,8 @@ async def test_unreadable_account_is_recorded_failed_every_cycle(tmp_path: Path)
         other_runs = reader.runs("other")
     assert sorted(int((r.started_at - NOW).total_seconds()) for r in other_runs) == [0, 60]
     assert {(r.status, r.error_kind) for r in other_runs} == {("failed", "auth")}
-    assert other_runs[0].error is not None and "credential file not found" in other_runs[0].error
+    assert other_runs[0].error == 'AuthError: account "broken" has no usable credential'
+    assert other_runs[0].error_account == "broken"
 
 
 # ----- request log, logging ---------------------------------------------------

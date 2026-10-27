@@ -47,7 +47,7 @@ async def test_detect_failure_fails_only_its_rule(tmp_path: Path) -> None:
     h.target.fail_changes["A"] = TransientError("sync-collection timed out")
     result = await h.engine.cycle()
     a, b = result.rules["a"], result.rules["b"]
-    assert a.status == "failed" and a.error == "TransientError: sync-collection timed out"
+    assert a.status == "failed" and a.error == 'TransientError: the target of rule "a" could not be reached'
     assert a.error_kind == "other"
     assert b.status == "ok" and b.created == 2
     assert {r.rule: r.status for r in h.store.latest_runs()} == {"a": "failed", "b": "ok"}
@@ -340,7 +340,7 @@ async def test_source_omitting_a_calendar_fails_the_rule_instead_of_reusing_data
     fake.cancel_event(GCAL, "stretch")
     source.forgetful = True  # neither in calendars nor in errors: a contract violation
     res = (await h.engine.cycle()).rules["family"]
-    assert res.status == "failed" and "contract" in (res.error or "")
+    assert res.status == "failed" and res.error == 'CalsyncError: the source of rule "family" failed'
     assert len(h.target.managed(h.target.calendars["Family"])) == 2
 
 
@@ -369,7 +369,8 @@ async def test_partial_failure_keeps_first_error_and_counts_the_rest(tmp_path: P
     h.target.before_write = flaky
     res = (await h.engine.cycle()).rules["family"]
     assert (res.status, res.created, res.failed) == ("partial", 1, 3)
-    assert res.error == "TransientError: PUT timed out (+2 more)" and res.error_kind == "other"
+    assert res.error == 'TransientError: the target of rule "family" could not be reached (+2 more)'
+    assert res.error_kind == "other"
     assert [r.status for r in h.store.latest_runs()] == ["partial"]
 
 

@@ -655,6 +655,8 @@ def _print_cycle(result: "CycleResult", out: TextIO, verbose: bool) -> None:
         if r.error:
             line += f" error={r.error!r}"
         out.write(line + "\n")
+        if r.setup_detail:  # what to fix in the account's setup (a local path or mode)
+            out.write(f"  {_flat(r.setup_detail)}\n")
         # Titles are listed in plan.delete order only when every one was read.
         titled = r.status == "blocked" and r.blocked_titles_complete
         if r.status == "blocked":
