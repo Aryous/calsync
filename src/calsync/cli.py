@@ -123,6 +123,7 @@ def _parser() -> argparse.ArgumentParser:
         "--refresh", action="store_true", help="fetch the list now (through the daemon if it runs)"
     )
     calendars.add_argument("--json", action="store_true", help="print JSON")
+    calendars.set_defaults(op_command=True)  # it may run calendars.refresh: a busy lock reads as such
 
     auth = sub.add_parser("auth", help="store credentials for an account")
     auth.add_argument("account")

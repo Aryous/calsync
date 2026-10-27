@@ -323,7 +323,9 @@ class Daemon:
         temporary build (closed afterwards) for the others. The caller holds ``_cycle_lock``, so
         no cycle uses the daemon's adapters meanwhile."""
         borrowed = wiring.Adapters(self._log)
-        own = {n for n in names if n in self._parts}
+        # An account whose setup failed is built again: its credential may have been stored since
+        # (``calsync auth`` before ``calsync calendars --refresh``).
+        own = {n for n in names if n in self._parts and n not in self._adapters.errors}
         mine = self._adapters
         borrowed.sources.update({n: a for n, a in mine.sources.items() if n in own})
         borrowed.targets.update({n: a for n, a in mine.targets.items() if n in own})
@@ -572,8 +574,9 @@ class Daemon:
             rules, every = self._select(due)
             if rules:
                 await self._cycle(rules)
-            async with self._cycle_lock:
-                await self._refresh_calendars()
+            if not stop.is_set():  # stopping: no calendar lists before shutdown
+                async with self._cycle_lock:
+                    await self._refresh_calendars()
             if every:
                 # A timed cycle, or one requested for every rule, restarts the timer. A cycle
                 # for named rules keeps the deadline, so requests for one rule never starve

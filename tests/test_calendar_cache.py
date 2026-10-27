@@ -277,6 +277,11 @@ async def test_daemon_refresh_op_uses_its_adapters_and_builds_the_unused_ones(tm
         result = await daemon.run_op("calendars.refresh", {"account": "me"}, False, source="cli")
         assert result.data["accounts"]["me"]["refreshed"] is True
         assert world.builds[builds + 1 :] == []  # the daemon's own adapter
+        # An account whose setup failed is built again (a credential may have been stored since).
+        daemon._adapters.errors["dav"] = AuthError("no credential")
+        result = await daemon.run_op("calendars.refresh", {"account": "dav"}, False, source="cli")
+        assert result.data["accounts"]["dav"]["refreshed"] is True
+        assert world.builds[builds + 1 :] == [{"dav"}]
     finally:
         world.stop.set()
         await task
@@ -334,3 +339,16 @@ def test_calendars_auth_failure_exits_3_with_the_next_command(
 
 def test_calendars_unknown_account(tmp_path: Path, accounts: Accounts, config_file: Path) -> None:
     assert run(config_file, tmp_path / "s", "calendars", "nope")[0] == EXIT_CONFIG
+
+
+def test_calendars_while_another_calsync_holds_the_lock(
+    tmp_path: Path, accounts: Accounts, config_file: Path
+) -> None:
+    from calsync.cli import EXIT_RUNNING
+    from calsync.lock import RunLock
+
+    state = tmp_path / "s"
+    state.mkdir()
+    with RunLock(state / "run.lock"):
+        code, text = run(config_file, state, "calendars", "me")
+    assert code == EXIT_RUNNING and "try again once it has finished" in text and "trigger" not in text
