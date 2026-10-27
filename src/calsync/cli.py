@@ -14,8 +14,11 @@ from typing import TYPE_CHECKING, TextIO
 from calsync import __version__
 
 if TYPE_CHECKING:  # type-only: importing these at runtime would load httpx/icalendar
+    import httpx
+
     from calsync.config import Config
     from calsync.engine import CycleResult, RuleResult
+    from calsync.store import Store
     from calsync.views import ChangesView, RunsView, StateReader, StatusView, UpcomingView
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_AUTH, EXIT_RUNNING = 0, 1, 2, 3, 4
@@ -560,9 +563,17 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
     if unknown:
         out.write(f"unknown rule(s): {', '.join(unknown)}\n")
         return EXIT_CONFIG
+    chosen = [r for r in config.rules if not args.rules or r.name in args.rules]
+    for r in chosen:
+        if r.paused:  # not run, and fine for the exit code
+            out.write(f"rule {r.name}: paused\n")
+    active = [r.name for r in chosen if not r.paused]
+    if chosen and not active:  # every chosen rule is paused: nothing to run
+        return EXIT_OK
     db_path, lock_path = state_paths(_state_dir(args))
+    removed: list[str] = []
     with RunLock(lock_path):
-        adapters = await build_adapters(config, accounts_in_use(config, args.rules))
+        adapters = await build_adapters(config, accounts_in_use(config, active))
         try:
             store = Store(db_path)
             try:
@@ -571,16 +582,34 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
                     store,
                     config,
                     adapters,
-                    args.rules or None,
+                    active,
                     dry_run=args.dry_run,
                     allow_deletes=args.allow_deletes,
                 )
+                if not args.dry_run:
+                    removed = _remove_retired(args, config, result, store)
             finally:
                 store.close()
         finally:
             await adapters.aclose()
     _print_cycle(result, out, verbose=args.dry_run)
+    for summary in removed:
+        out.write(summary + "\n")
     return exit_code_for_results(result.rules.values())
+
+
+def _remove_retired(
+    args: argparse.Namespace, config: "Config", result: "CycleResult", store: "Store"
+) -> list[str]:
+    """Remove the retiring rules whose copies are all gone, as the daemon would (this process
+    holds the lock); the summaries of the removals that succeeded."""
+    from calsync.cycle import remove_retired, retired
+    from calsync.ops import OpContext
+
+    ctx = OpContext(
+        config_path=_config_path(args), state_dir=_state_dir(args), store=store, source="daemon", clock=_now
+    )
+    return [done.summary for name in retired(config, result, store) if (done := remove_retired(ctx, name))]
 
 
 def _configure_daemon_logging() -> None:
@@ -668,6 +697,10 @@ async def _trigger(args: argparse.Namespace, out: TextIO) -> int:
         out.write("ok: cycle requested\n")
         return EXIT_OK
     if response.status_code == 409:
+        error = _error_body(response)
+        if error.get("kind") == "paused":
+            out.write(f"{error.get('message') or 'the rule is paused'}\n")
+            return EXIT_FAILED
         out.write("the daemon runs with --no-sync\n")
         return EXIT_FAILED
     if response.status_code == 404:
@@ -675,6 +708,16 @@ async def _trigger(args: argparse.Namespace, out: TextIO) -> int:
         return EXIT_CONFIG
     out.write(f"error: the daemon answered HTTP {response.status_code}\n")
     return EXIT_FAILED
+
+
+def _error_body(response: "httpx.Response") -> dict[str, object]:
+    """The API's ``{"error": {...}}`` object; empty when the body is anything else."""
+    try:
+        body = response.json()
+    except ValueError:
+        return {}
+    error = body.get("error") if isinstance(body, dict) else None
+    return error if isinstance(error, dict) else {}
 
 
 WEB_OFF = 'the web UI is off ([web] listen = "off"); set [web] listen to HOST:PORT to use it\n'

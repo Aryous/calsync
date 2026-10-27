@@ -518,3 +518,22 @@ def test_losing_the_daemon_mid_op_is_a_clear_error(
     assert code == EXIT_FAILED
     assert json.loads(out) == {"error": {"kind": "daemon_lost", "message": LOST}}
     assert files.config.read_text() == TEXT  # not run here as well
+
+
+class PausedDaemon(FakeOpsDaemon):
+    def request_cycle(self, rule: str | None = None) -> bool:
+        from calsync.errors import RulePaused
+
+        if rule == "family":
+            raise RulePaused("family")
+        return True
+
+
+@pytest.mark.anyio
+async def test_trigger_for_a_paused_rule_says_so_and_exits_1(files: Files) -> None:
+    files.state.mkdir()
+    async with _serve(files.state, PausedDaemon(ANSWER)):
+        one = await anyio.to_thread.run_sync(lambda: files.cli("trigger", "--rule", "family"))
+        every = await anyio.to_thread.run_sync(lambda: files.cli("trigger"))
+    assert one == (EXIT_FAILED, 'rule "family" is paused\n')
+    assert every == (EXIT_OK, "ok: cycle requested\n")

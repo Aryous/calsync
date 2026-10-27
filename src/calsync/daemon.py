@@ -20,8 +20,21 @@ a failing server never cancels a cycle in progress. Once every service has ended
 finished), ``run`` raises the first failure.
 
 Operations (``calsync.ops``) posted to the socket run inside the daemon, under ``_cycle_lock``:
-never during a cycle, and the store keeps one writer. In this version a config the daemon
-writes takes effect when it restarts.
+never during a cycle, and the store keeps one writer.
+
+Hot reload: the daemon remembers the config file it runs (its ``Snapshot``). Between cycles it
+checks the file every ``WATCH_INTERVAL`` seconds (a ``stat`` first; the bytes are read only when
+size or mtime changed) and once more right before each cycle. An edit made outside calsync is
+validated: an invalid file keeps the running config (logged once per text, counts only); a
+valid one is applied and recorded as a ``config_change`` with source ``external``. A config an
+operation writes is applied when the operation returns and is never seen as external. Applying
+swaps the rules, rebuilds or closes only the accounts whose definition changed, and hands the
+running engine the new config (``Engine.replace_config``), all under ``_cycle_lock``. A changed
+``[web]`` address needs a restart (logged); ``allowed_hosts`` take effect at once.
+
+Paused rules never run (``request_cycle`` refuses them with ``RulePaused``). A retiring rule
+(``retire = true``) deletes its copies (the delete guard applies); after a cycle in which it
+ended ``ok`` with no copy left, the daemon removes it from the config (``source="daemon"``).
 
 Without sync (``--no-sync``) the daemon takes no lock, reads no credential, opens no store and
 runs no cycle: it only serves the API. It cannot run beside another daemon in the same state
@@ -43,9 +56,10 @@ from typing import Any, Protocol
 
 from calsync import api, debug, ops, wiring
 from calsync.config import Config
-from calsync.configfile import Snapshot
-from calsync.cycle import counts_line, run_cycle
+from calsync.configfile import Snapshot, read_snapshot, validate_text
+from calsync.cycle import counts_line, remove_retired, retired, run_cycle
 from calsync.engine import CycleResult, Engine, RuleResult
+from calsync.errors import CalsyncError, ConfigError, RulePaused
 from calsync.http import RequestLog
 from calsync.lock import RunLock
 from calsync.store import Store
@@ -56,6 +70,9 @@ log = logging.getLogger(__name__)
 # Minutes a rule is skipped after 1, 2, 3, 4 and 5 or more failures in a row.
 BACKOFF = (1, 2, 4, 8, 15)
 BACKOFF_CAP = timedelta(minutes=15)
+# Seconds between two checks of the config file while the daemon waits for the next cycle.
+WATCH_INTERVAL = 2.0
+EXTERNAL_SUMMARY = "edited outside calsync"
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -123,8 +140,13 @@ class Daemon:
         config_path: Path | None = None,
     ) -> None:
         self._config = config
-        self._config_path = config_path  # the file operations edit; None: no operations
-        self._written: Snapshot | None = None  # the config last written by an operation
+        self._config_path = config_path  # the file operations edit and the daemon watches; None: neither
+        # The file the running config came from, read when sync starts; what the watcher
+        # compares with. ``_stat``: its (size, mtime_ns) when last checked (None: missing).
+        self._snapshot: Snapshot | None = None
+        self._stat: tuple[int, int] | None = None
+        self._rejected: str | None = None  # fingerprint of an invalid edit, logged once
+        self._written: Snapshot | None = None  # written by an operation, applied when it returns
         self._state_dir = state_dir
         self._db_path, self._lock_path = wiring.state_paths(state_dir)
         self._sync = sync
@@ -222,9 +244,12 @@ class Daemon:
         rule. The backoff does not apply to a requested rule.
 
         True if accepted; False without sync (nothing runs cycles); ``ValueError`` for a rule
-        that is not configured."""
+        that is not configured, ``RulePaused`` (a ``ValueError``) for a paused one. Every rule
+        means every rule that is not paused."""
         if rule is not None and rule not in self._rules:
             raise ValueError(f"unknown rule {rule!r}")
+        if rule is not None and rule in self._paused():
+            raise RulePaused(rule)
         if not self._sync:
             return False
         if rule is None:
@@ -247,22 +272,54 @@ class Daemon:
         if self._config_path is None:
             raise ops.OpsUnavailable("The daemon was started without a config file path.")
         async with self._cycle_lock:
-            store = self._store
-            if store is None:  # stopped while waiting
+            if self._store is None:  # stopped while waiting
                 raise ops.OpsUnavailable("The daemon is stopping.")
-            ctx = ops.OpContext(
-                config_path=self._config_path,
-                state_dir=self._state_dir,
-                store=store,
-                source=source,
-                clock=self._clock,
-                on_config_written=self._config_written,
-            )
-            return ops.run_op(ctx, name, args, dry_run)
+            # An edit made by hand just before is applied and recorded first, as its own change
+            # (the operation would otherwise fold it into its own row).
+            await self._check_config()
+            return await self._op(name, args, dry_run, source)
+
+    async def _op(self, name: str, args: dict[str, Any], dry_run: bool, source: ops.Source) -> ops.OpResult:
+        """Run one operation and apply the config it wrote. The caller holds ``_cycle_lock``."""
+        try:
+            return ops.run_op(self._context(source), name, args, dry_run)
+        finally:
+            await self._apply_written()
+
+    def _context(self, source: ops.Source) -> ops.OpContext:
+        assert self._store is not None and self._config_path is not None
+        return ops.OpContext(
+            config_path=self._config_path,
+            state_dir=self._state_dir,
+            store=self._store,
+            source=source,
+            clock=self._clock,
+            on_config_written=self._config_written,
+        )
 
     def _config_written(self, snapshot: Snapshot) -> None:
+        """``on_config_written``: the file now holds ``snapshot``. Remembered at once, so the
+        watcher never takes the daemon's own write for an external edit; applied (async) when
+        the operation returns."""
+        self._snapshot, self._rejected = snapshot, None
         self._written = snapshot
-        log.info("config changed; applied at restart")
+
+    async def _apply_written(self) -> None:
+        snapshot, self._written = self._written, None
+        if snapshot is None:
+            return
+        try:
+            config = validate_text(snapshot.text, snapshot.path.parent)  # write_config validated it
+        except ConfigError as exc:  # cannot happen short of a bug; keep running what runs
+            log.error("the written config could not be applied (%d problems)", len(exc.problems))
+            return
+        await self._apply(config)
+        log.info("config changed; applied")
+
+    @property
+    def config(self) -> Config:
+        """The config the daemon runs now."""
+        return self._config
 
     def snapshot(self) -> DaemonInfo:
         return DaemonInfo(
@@ -299,7 +356,20 @@ class Daemon:
                 await self._build(sorted(wiring.accounts_in_use(self._config)))
                 self._store = store
                 self._engine = wiring.build_engine(self._config, self._adapters, store, clock=self._clock)
+                self._remember_file()
             yield sock, tcp
+
+    def _remember_file(self) -> None:
+        """The watcher's starting point: the file as it is now holds the running config (it
+        was loaded from it a moment ago)."""
+        if self._config_path is None:
+            return
+        try:
+            self._stat = _stat(self._config_path)
+            self._snapshot = read_snapshot(self._config_path)
+        except (OSError, ConfigError) as exc:  # no baseline: the first readable edit applies
+            log.warning("the config file could not be read (%s)", type(exc).__name__)
+            self._stat, self._snapshot = None, None
 
     async def _release(self) -> None:
         self._engine = self._store = None
@@ -323,6 +393,14 @@ class Daemon:
             if old is not None:
                 await self._close(name, old)
 
+    async def _drop(self, name: str) -> None:
+        """Close one account's adapters (no rule uses it any more)."""
+        old = self._parts.pop(name, None)
+        for table in (self._adapters.sources, self._adapters.targets, self._adapters.errors):
+            table.pop(name, None)
+        if old is not None:
+            await self._close(name, old)
+
     async def _close_adapters(self) -> None:
         parts, self._parts = self._parts, {}
         for name, part in parts.items():
@@ -340,6 +418,8 @@ class Daemon:
         due = True  # the first cycle starts at once
         deadline = self._clock()
         while not stop.is_set():
+            async with self._cycle_lock:  # right before each cycle, so it runs the file as it is
+                await self._check_config()
             rules, every = self._select(due)
             if rules:
                 await self._cycle(rules)
@@ -369,20 +449,153 @@ class Daemon:
 
     async def _wait(self, delay: float, stop: asyncio.Event) -> bool:
         """Wait ``delay`` seconds, or less if a cycle is requested or ``stop`` is set; True if
-        the time ran out."""
-        timer = asyncio.ensure_future(self._sleep(delay))
+        the time ran out. While a config file is watched, the wait is cut into polls of
+        ``WATCH_INTERVAL`` seconds, each followed by a check of the file."""
         woken = asyncio.ensure_future(self._wake.wait())
         stopped = asyncio.ensure_future(stop.wait())
+        remaining = delay
         try:
-            done, _ = await asyncio.wait({timer, woken, stopped}, return_when=asyncio.FIRST_COMPLETED)
+            while True:
+                step = min(remaining, WATCH_INTERVAL) if self._watching() else remaining
+                timer = asyncio.ensure_future(self._sleep(step))
+                try:
+                    done, _ = await asyncio.wait({timer, woken, stopped}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    timer.cancel()
+                    await asyncio.gather(timer, return_exceptions=True)
+                if timer not in done:
+                    return False
+                timer.result()  # a failing sleep fails the daemon
+                remaining -= step
+                if remaining <= 1e-9:
+                    return True
+                if stop.is_set() or self._wake.is_set():
+                    return False
+                async with self._cycle_lock:  # an operation may be running
+                    await self._check_config()
         finally:
-            for task in (timer, woken, stopped):
+            for task in (woken, stopped):
                 task.cancel()
-            await asyncio.gather(timer, woken, stopped, return_exceptions=True)
-        if timer in done:
-            timer.result()  # a failing sleep fails the daemon
-            return True
-        return False
+            await asyncio.gather(woken, stopped, return_exceptions=True)
+
+    def _watching(self) -> bool:
+        return self._config_path is not None and self._store is not None
+
+    # ----- hot reload ---------------------------------------------------------
+    async def _check_config(self) -> None:
+        """Apply an edit made to the config file outside calsync. The caller holds
+        ``_cycle_lock``. Cheap when nothing changed: one ``stat``."""
+        path = self._config_path
+        if path is None or self._store is None:
+            return
+        stat: tuple[int, int] | None
+        try:
+            stat = _stat(path)
+        except FileNotFoundError:
+            stat = None
+        except OSError as exc:  # no permission, …: logged once until it can be checked again
+            if self._stat != _UNCHECKABLE:
+                log.warning("the config file could not be checked (%s)", type(exc).__name__)
+            self._stat = _UNCHECKABLE
+            return
+        if stat == self._stat:
+            return
+        self._stat = stat
+        if stat is None:
+            self._reload_failed("", ["the config file is missing"])
+            return
+        try:
+            snapshot = read_snapshot(path)
+        except ConfigError as exc:  # not UTF-8
+            self._reload_failed(f"unreadable:{stat}", exc.problems)
+            return
+        except OSError as exc:
+            log.warning("the config file could not be read (%s)", type(exc).__name__)
+            self._stat = None  # try again at the next poll
+            return
+        if not snapshot.text.strip():
+            # Valid TOML for "no accounts, no rules", but far more likely an editor caught
+            # between truncating and writing: never drop every rule because of it.
+            self._reload_failed(snapshot.fingerprint, ["the config file is empty"])
+            return
+        previous = self._snapshot
+        if previous is not None and snapshot.fingerprint == previous.fingerprint:
+            self._rejected = None  # touched, or edited back to what runs
+            return
+        if snapshot.fingerprint == self._rejected:
+            return
+        try:
+            config = validate_text(snapshot.text, path.parent)
+        except ConfigError as exc:
+            self._reload_failed(snapshot.fingerprint, exc.problems)
+            return
+        await self._apply(config)
+        self._snapshot, self._rejected = snapshot, None
+        log.info("config reloaded (%s)", EXTERNAL_SUMMARY)
+        try:
+            self._store.record_config_change(
+                at=self._clock(),
+                source="external",
+                summary=EXTERNAL_SUMMARY,
+                before=previous.text if previous is not None else None,
+                after_fingerprint=snapshot.fingerprint,
+            )
+        except Exception as exc:  # applied all the same
+            log.warning("config history not recorded (%s)", type(exc).__name__)
+
+    def _reload_failed(self, fingerprint: str, problems: list[str]) -> None:
+        if fingerprint == self._rejected:
+            return
+        self._rejected = fingerprint
+        self._on_reload_failed(problems)
+
+    def _on_reload_failed(self, problems: list[str]) -> None:
+        """An edit made outside calsync is invalid; the running config stays. The count only:
+        a problem can quote a value (a push URL with a device key in it). The ``reload_failed``
+        alert hooks in here."""
+        log.warning("config reload failed (%d problems)", len(problems))
+
+    async def _apply(self, config: Config) -> None:
+        """Run ``config`` from now on. The caller holds ``_cycle_lock`` (never during a cycle)."""
+        old, self._config = self._config, config  # first: ``_build`` reads it
+        self._rules = [r.name for r in config.rules]
+        before, after = wiring.accounts_in_use(old), wiring.accounts_in_use(config)
+        secret_changed = old.google_client_secret_file != config.google_client_secret_file
+        rebuild = sorted(
+            name
+            for name in after
+            if name not in before
+            or old.accounts.get(name) != config.accounts.get(name)
+            or (secret_changed and config.accounts[name].provider == "google")
+        )
+        for name in sorted(before - after):
+            await self._drop(name)
+        for name in rebuild:
+            try:
+                await self._build([name])
+            except Exception as exc:  # its rules fail on their own (run_cycle); the rest applies
+                log.warning("setting up account %s failed (%s)", name, type(exc).__name__)
+                debug.details(log, f"setting up account {name} failed", exc)
+                self._adapters.errors[name] = CalsyncError(
+                    f"account {name} could not be set up ({type(exc).__name__})"
+                )
+        if self._engine is not None:
+            self._engine.replace_config(config)
+        names = set(self._rules)
+        self._pending &= names
+        self._reauth &= names
+        for name in [n for n in self._failures if n not in names]:
+            del self._failures[name]
+        # The listener is bound at start; the address is config, not a URL of anyone's data.
+        if (wanted := _web_address(config)) != _web_address(old):
+            if wanted is None:
+                log.info("restart the daemon to turn the web UI off")
+            else:
+                host = f"[{wanted[0]}]" if ":" in wanted[0] else wanted[0]
+                log.info("restart the daemon to listen on %s:%d", host, wanted[1])
+
+    def _paused(self) -> set[str]:
+        return {r.name for r in self._config.rules if r.paused}
 
     def _select(self, due: bool) -> tuple[list[str], bool]:
         """This cycle's rules, in config order: the requested ones and, when the wait ran out,
@@ -394,7 +607,12 @@ class Daemon:
         self._pending.clear()
         self._wake.clear()
         now = self._clock()
-        rules = [r for r in self._rules if r in requested or (due and not self._backed_off(r, now))]
+        paused = self._paused()  # never run, not even when requested
+        rules = [
+            r
+            for r in self._rules
+            if r not in paused and (r in requested or (due and not self._backed_off(r, now)))
+        ]
         return rules, every
 
     def _backed_off(self, rule: str, now: datetime) -> bool:
@@ -434,6 +652,28 @@ class Daemon:
             debug.details(log, "sync cycle failed", exc)
             return
         self._record(result)
+        await self._remove_retired(result)
+
+    async def _remove_retired(self, result: CycleResult) -> None:
+        """Remove the retiring rules this cycle finished (still under ``_cycle_lock``). A failed
+        removal is logged and tried again after the next cycle."""
+        if self._config_path is None or self._store is None:
+            return
+        done = retired(self._config, result, self._store)
+        if not done:
+            return
+        await self._check_config()  # a hand edit since the cycle started is recorded first
+        for name in done:
+            rule = next((r for r in self._config.rules if r.name == name), None)
+            if rule is None or not rule.retire:  # the hand edit removed or kept it
+                continue
+            try:
+                if remove_retired(self._context("daemon"), name) is not None:
+                    log.info(
+                        "rule %s retired: its copies are deleted and it is removed from the config", name
+                    )
+            finally:
+                await self._apply_written()
 
     def _record(self, result: CycleResult) -> None:
         now = self._clock()
@@ -451,3 +691,17 @@ class Daemon:
             parts.append(counts_line(name, r) + (f" error_kind={r.error_kind}" if r.error_kind else ""))
         parts.append(f"requests={result.requests}")
         log.info("%s", "; ".join(parts))
+
+
+_UNCHECKABLE = (-1, -1)
+
+
+def _web_address(config: Config) -> tuple[str, int] | None:
+    """Where ``[web]`` asks the web UI to listen; None: off."""
+    return (config.web.host, config.web.port) if config.web.enabled else None
+
+
+def _stat(path: Path) -> tuple[int, int]:
+    """The cheap change check: (size, mtime_ns) of the file (through a symlink)."""
+    st = path.stat()
+    return (st.st_size, st.st_mtime_ns)

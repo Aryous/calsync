@@ -195,3 +195,64 @@ def test_unreadable_secret_fails_only_its_rules(
     assert runs["good"].status == "ok" and runs["bad"].status == "failed"
     assert runs["bad"].error is not None and "credential file not found" in runs["bad"].error
     assert runs["bad"].error_kind == "auth" and runs["good"].error_kind is None
+
+
+def paused(text: str) -> str:
+    return text.replace("\nsource =", "\npaused = true\nsource =", 1)
+
+
+def test_run_skips_a_paused_rule(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, radicale_url: str, dav_user: str
+) -> None:
+    from calsync.views import StateReader
+
+    patch_google(monkeypatch, {"me": seeded().transport})
+    argv = write_config(
+        tmp_path,
+        google_account("me"),
+        dav_account("dav", radicale_url, dav_user, password(tmp_path / "pw")),
+        paused(rule("family", "me", "dav")),
+        rule("other", "me", "dav", calendar="Other"),
+    )
+    code, text = run([*argv, "run"])
+    assert code == EXIT_OK
+    assert text.startswith("rule family: paused\n") and "rule=other status=ok created=3" in text
+    assert "rule=family" not in text
+    assert run([*argv, "run", "--rule", "family"]) == (EXIT_OK, "rule family: paused\n")
+    with StateReader(tmp_path / "state" / "state.db") as reader:
+        assert [r.rule for r in reader.runs()] == ["other"]  # no run rows while paused
+
+
+def test_run_removes_a_rule_that_retired(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, radicale_url: str, dav_user: str
+) -> None:
+    from calsync.views import StateReader
+
+    patch_google(monkeypatch, {"me": seeded(2).transport})
+    family = rule("family", "me", "dav")
+    parts = [
+        google_account("me"),
+        dav_account("dav", radicale_url, dav_user, password(tmp_path / "pw")),
+        family,
+        rule("other", "me", "dav", calendar="Other"),
+    ]
+    argv = write_config(tmp_path, *parts)
+    assert run([*argv, "run"])[0] == EXIT_OK
+    config = tmp_path / "config.toml"
+    config.write_text(
+        config.read_text().replace(family, family.replace("\nsource", "\nretire = true\nsource"))
+    )
+    code, text = run([*argv, "run", "--dry-run"])
+    assert code == EXIT_OK and "rule=family status=ok created=0 updated=0 deleted=0" in text
+    assert 'name = "family"' in config.read_text()  # a dry run removes nothing
+    code, text = run([*argv, "run"])
+    assert code == EXIT_OK
+    assert "rule=family status=ok created=0 updated=0 deleted=2 failed=0\n" in text
+    assert 'rule "family" removed after its copies were deleted\n' in text
+    assert 'name = "family"' not in config.read_text() and 'name = "other"' in config.read_text()
+    with StateReader(tmp_path / "state" / "state.db") as reader:
+        [change] = reader.config_changes()
+    assert (change.source, change.summary) == (
+        "daemon",
+        'rule "family" removed after its copies were deleted',
+    )

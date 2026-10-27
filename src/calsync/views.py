@@ -33,9 +33,12 @@ from calsync.model import (
 from calsync.naming import object_id, rule_tag
 from calsync.store import SCHEMA_VERSION
 
-Health = Literal["ok", "failing", "blocked", "auth", "never_run"]
+# A rule's health: ``paused`` (the rule is paused) and ``retiring`` (``retire = true``: its
+# copies are being deleted) come from the config and win over the run-based ones.
+Health = Literal["ok", "failing", "blocked", "auth", "never_run", "paused", "retiring"]
 Delivery = Literal["delivered", "pending", "unknown"]
-# Worst first: the summary health is the first of these any rule has.
+# Worst first: the summary health is the first of these any rule has (paused and retiring
+# count as ok).
 _HEALTH_ORDER: tuple[Health, ...] = ("auth", "blocked", "failing", "never_run", "ok")
 NO_STATE_MESSAGE = "no state yet: run `calsync run` or start the daemon"
 
@@ -682,7 +685,15 @@ def _worst(present: set[Health]) -> Health:
     for health in _HEALTH_ORDER:
         if health in present:
             return health
-    return "ok"
+    return "ok"  # also: only paused or retiring rules
+
+
+def _rule_health(rule: Rule, last: RunView | None) -> Health:
+    if rule.paused:
+        return "paused"
+    if rule.retire:
+        return "retiring"
+    return _health(last)
 
 
 def _is_ok(status: str, failed: int) -> bool:
@@ -704,8 +715,13 @@ BLOCKED_ADVICE = "To allow them, stop the daemon, run the command, then start th
 
 
 def _attention(reader: StateReader, status: RuleStatus) -> Attention | None:
+    """What needs a person for one rule. A paused rule needs nothing; a retiring one keeps the
+    attention its runs call for (a retirement over the delete guard waits for a decision)."""
     rule = status.rule
-    if status.health == "auth":
+    if rule.paused:
+        return None
+    health = _health(status.last_run) if rule.retire else status.health
+    if health == "auth":
         error = ((status.last_run and status.last_run.error) or "").lower()
         account = rule.source.account if "google" in error or "oauth" in error else rule.target.account
         return Attention(
@@ -715,7 +731,7 @@ def _attention(reader: StateReader, status: RuleStatus) -> Attention | None:
             f"The {account} account needs to be connected again.",
             f"calsync auth {account}",
         )
-    if status.health == "blocked":
+    if health == "blocked":
         n = reader.blocked_count(rule.name)
         waiting = f"{n} deletions are" if n else "deletions are"
         # While the daemon runs it holds the lock, so the command can only run with it stopped
@@ -727,7 +743,7 @@ def _attention(reader: StateReader, status: RuleStatus) -> Attention | None:
             f"Sync paused: {waiting} waiting for your confirmation. {BLOCKED_ADVICE}",
             f"calsync run --rule {rule.name} --allow-deletes",
         )
-    if status.health == "failing":
+    if health == "failing":
         k = status.consecutive_failures
         return Attention("failing", rule.name, None, f"Sync has failed {k} times in a row.", None)
     return None
@@ -750,7 +766,7 @@ def build_status(config: Config, reader: StateReader, now: datetime) -> StatusVi
                 source_name=entry.get("summary_override") or entry.get("summary") or rule.source.calendar,
                 target_name=reader.target_calendar_name(rule.target.account, rule.target.calendar)
                 or rule.target.calendar,
-                health=_health(last),
+                health=_rule_health(rule, last),
                 last_run=last,
                 last_ok_at=last_ok.finished_at if last_ok else None,
                 consecutive_failures=_consecutive_failures(reader, rule.name),

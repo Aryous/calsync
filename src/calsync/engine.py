@@ -154,6 +154,11 @@ class _Blocked:
     read: bool = False  # the lookup succeeded: the same set need not be read again
 
 
+def _selection(rule: Rule) -> tuple[str, str, str, str]:
+    """What a rule's per-rule memories depend on: its source and target calendars."""
+    return (rule.source.account, rule.source.calendar, rule.target.account, rule.target.calendar)
+
+
 def _rule_names(rules: Iterable[Rule]) -> str:
     """Rule names for a log line. A calendar ref is never logged: it may be a Google calendar ID
     (an address) or a CalDAV URL."""
@@ -191,6 +196,27 @@ class Engine:
         # reading every planned delete each time would cost a multiget per cycle.
         self._last_protected: dict[str, frozenset[str]] = {}
         self._last_blocked: dict[str, _Blocked] = {}
+
+    def replace_config(self, config: Config) -> None:
+        """Run ``config`` from the next cycle on (the daemon's hot reload; never during a cycle).
+
+        Mirrors, calendar metadata, resolved ids, target calendars and caches are kept: they
+        belong to calendars, not rules. The per-rule memories (the last recorded blocked and
+        protected sets, the degraded warnings) are dropped for a rule that is gone or whose
+        source or target calendar changed, so its sets are recorded afresh; every other rule
+        keeps them, so a blocked rule is not read and recorded again because of an unrelated
+        edit."""
+        new = {r.name: r for r in config.rules}
+        stale = {
+            r.name
+            for r in self._config.rules
+            if (now := new.get(r.name)) is None or _selection(now) != _selection(r)
+        }
+        for name in stale:
+            self._last_blocked.pop(name, None)
+            self._last_protected.pop(name, None)
+        self._warned_degraded = {key for key in self._warned_degraded if key[0] not in stale}
+        self._config = config
 
     # ----- phase 1: ingest ---------------------------------------------
     async def _ingest(self, account: str, rules: list[Rule]) -> dict[str, Exception]:
@@ -370,7 +396,8 @@ class Engine:
             if rule.window is None
             else Window.around(self._clock(), rule.window.past, rule.window.future)
         )
-        desired, unparsed = self._desired(rule)
+        # A retiring rule syncs to nothing: every copy is a delete (the guard still applies).
+        desired, unparsed = ({}, frozenset[str]()) if rule.retire else self._desired(rule)
         incomplete = {oid for oid, want in desired.items() if not want.series.complete}
         result.degraded = len(unparsed) + len(incomplete)
         # Unparsed and degraded series keep an existing copy untouched (no update, no
@@ -726,14 +753,16 @@ class Engine:
     ) -> CycleResult:
         started = self._clock()
         mark = self._log.mark() if self._log else 0
-        selected = [r for r in self._config.rules if rules is None or r.name in rules]
+        # A paused rule never runs (and records no run); a retiring one needs no source.
+        selected = [r for r in self._config.rules if (rules is None or r.name in rules) and not r.paused]
         results = {r.name: RuleResult(r.name) for r in selected}
         for target in self._targets.values():
             target.reset()
 
         by_source: dict[str, list[Rule]] = defaultdict(list)
         for rule in selected:
-            by_source[rule.source.account].append(rule)
+            if not rule.retire:
+                by_source[rule.source.account].append(rule)
         outcomes = await asyncio.gather(
             *(self._ingest(a, rs) for a, rs in by_source.items()), return_exceptions=True
         )

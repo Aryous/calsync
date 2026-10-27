@@ -38,7 +38,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from calsync import __version__, debug, ops, views
 from calsync.config import Config
 from calsync.configfile import ConfigConflict
-from calsync.errors import ConfigError, ListenError
+from calsync.errors import ConfigError, ListenError, RulePaused
 from calsync.lock import DaemonServing
 from calsync.wiring import state_paths
 
@@ -247,6 +247,8 @@ class _Endpoints:
             raise ApiError(409, "read_only", "No daemon runs sync cycles here.")
         try:
             accepted = self._daemon.request_cycle(rule)
+        except RulePaused as exc:
+            raise ApiError(409, "paused", str(exc)) from None
         except ValueError:
             raise ApiError(404, "unknown_rule", f"Unknown rule {rule!r}.") from None
         if not accepted:

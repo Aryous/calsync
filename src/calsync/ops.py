@@ -370,6 +370,13 @@ def _rule_remove(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResul
 
     def edit(doc: tomlkit.TOMLDocument) -> _Edit:
         calendar = _target_calendar(doc, name)
+        if ctx.source == "daemon":
+            # The engine finished a retirement (``retire = true``, no copies left): only then
+            # does calsync remove a rule by itself. A hand edit that stopped it wins.
+            if configfile.rule_table(doc, name).get("retire") is not True:
+                raise ConfigError([f'rule "{name}" no longer retires'])
+            configfile.remove_rule(doc, name)
+            return _Edit(f'rule "{name}" removed after its copies were deleted')
         if delete_copies:
             # The engine deletes the copies (the guard applies), then removes the rule.
             configfile.set_rule_key(doc, name, "retire", True)

@@ -773,3 +773,41 @@ def test_v5_accessors_on_a_database_without_tables(tmp_path: Path) -> None:
         assert r.copy_summary("tag", "o1") is None
         assert r.delivered_at("family", "o1") is None
         assert r.series_count("me", GCAL) == 0
+
+
+# ----- paused and retiring rules ------------------------------------------------------------
+
+
+def _flagged(tmp_path: Path, runs: list[RunRecord], **flags: bool) -> dict[str, Any]:
+    with Store(tmp_path / "state.db") as store:
+        for run in runs:
+            store.record_runs([run])
+    with reader(tmp_path) as r:
+        return build_status(config_for([rule(**flags)]), r, NOW).to_json()
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [[], [_run("ok")], [_run("failed", error="boom", kind="other")], [_run("blocked", kind="guard")]],
+)
+def test_a_paused_rule_is_paused_whatever_its_runs_say(tmp_path: Path, runs: list[RunRecord]) -> None:
+    view = _flagged(tmp_path, runs, paused=True)
+    assert view["rules"][0]["health"] == "paused"
+    assert view["attention"] == [] and view["summary"]["health"] == "ok"
+
+
+def test_a_retiring_rule_is_retiring_and_counts_as_ok(tmp_path: Path) -> None:
+    view = _flagged(tmp_path, [_run("failed", error="boom", kind="other")], retire=True)
+    assert view["rules"][0]["health"] == "retiring" and view["summary"]["health"] == "ok"
+    assert [a["kind"] for a in view["attention"]] == ["failing"]  # a failure still needs a look
+
+
+def test_a_blocked_retiring_rule_keeps_the_blocked_attention(tmp_path: Path) -> None:
+    view = _flagged(tmp_path, [_run("blocked", error="would delete 4 of 4", kind="guard")], retire=True)
+    assert view["rules"][0]["health"] == "retiring"
+    assert [(a["kind"], a["rule"]) for a in view["attention"]] == [("blocked", "family")]
+
+
+def test_a_paused_rule_is_checked_before_retiring(tmp_path: Path) -> None:
+    view = _flagged(tmp_path, [], paused=True, retire=True)
+    assert view["rules"][0]["health"] == "paused" and view["attention"] == []

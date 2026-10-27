@@ -49,3 +49,11 @@ class ForbiddenError(CalsyncError):
     """The server understood the credentials but refused the request (HTTP 403 that is
     neither throttling nor an expired sync token): a permission or data problem, so
     re-entering credentials would not help."""
+
+
+class RulePaused(ValueError):
+    """A cycle was requested for a paused rule (the API answers 409 ``paused``)."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f'rule "{name}" is paused')
+        self.rule = name

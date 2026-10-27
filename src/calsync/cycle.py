@@ -1,12 +1,19 @@
 """One sync cycle as `calsync run` and the daemon run it: the engine's cycle plus the rules
-whose account could not be set up, recorded as failed runs so the history stays complete."""
+whose account could not be set up, recorded as failed runs so the history stays complete.
+Paused rules are skipped; a retiring rule whose copies are all gone is removed afterwards
+(``retired`` / ``remove_retired``)."""
 
+import logging
 from collections.abc import Sequence
 
+from calsync import debug, ops
 from calsync.config import Config
 from calsync.engine import CycleResult, Engine, RuleResult
+from calsync.naming import rule_tag
 from calsync.store import RunRecord, Store
 from calsync.wiring import Adapters
+
+log = logging.getLogger(__name__)
 
 
 async def run_cycle(
@@ -24,10 +31,11 @@ async def run_cycle(
     A rule whose source or target account has a setup error (``adapters.errors``) fails on its
     own without reaching the engine; the other rules run normally.
     """
-    selected = [r for r in config.rules if rules is None or r.name in rules]
+    selected = [r for r in config.rules if (rules is None or r.name in rules) and not r.paused]
     skipped: dict[str, RuleResult] = {}
     for rule in selected:
-        broken = [a for a in (rule.source.account, rule.target.account) if a in adapters.errors]
+        sides = (rule.target.account,) if rule.retire else (rule.source.account, rule.target.account)
+        broken = [a for a in sides if a in adapters.errors]
         if broken:
             skipped[rule.name] = RuleResult(rule.name)
             skipped[rule.name].fail(adapters.errors[broken[0]])
@@ -70,3 +78,29 @@ def counts_line(name: str, result: RuleResult) -> str:
         if value := getattr(result, label):
             line += f" {label}={value}"
     return line
+
+
+def retired(config: Config, result: CycleResult, store: Store) -> list[str]:
+    """The retiring rules of ``config`` that ``result`` finished: the rule ended ``ok`` and the
+    store records no copy of it in its target calendar."""
+    by_name = {r.name: r for r in config.rules}
+    return [
+        name
+        for name, r in result.rules.items()
+        if (rule := by_name.get(name)) is not None
+        and rule.retire
+        and r.status == "ok"
+        and store.copies(rule_tag(name), rule.target.account, rule.target.calendar) == 0
+    ]
+
+
+def remove_retired(ctx: ops.OpContext, name: str) -> ops.OpResult | None:
+    """Remove a rule that retired (``rule.remove`` with ``ctx.source == "daemon"``). A failure
+    (a conflict with a hand edit, an unreadable file) is logged by type; the next cycle that
+    finds the rule retired tries again. None on failure."""
+    try:
+        return ops.run_op(ctx, "rule.remove", {"name": name}, False)
+    except Exception as exc:  # never the text: a config problem can quote a value
+        log.warning("rule %s retired, but removing it from the config failed (%s)", name, type(exc).__name__)
+        debug.details(log, f"rule {name}: removing it from the config failed", exc)
+        return None

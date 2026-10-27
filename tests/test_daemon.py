@@ -856,7 +856,8 @@ async def test_an_op_over_the_socket_waits_for_the_running_cycle(
     assert (result.changed, result.summary) == (True, 'rule "family" paused')
     assert "# synced to the family calendar" in config_path.read_text()
     assert "paused = true" in config_path.read_text()
-    assert "config changed; applied at restart" in caplog.messages
+    assert "config changed; applied" in caplog.messages
+    assert [r.name for r in daemon.config.rules if r.paused] == ["family"]  # applied at once
     world.stop.set()
     await asyncio.wait_for(task, 5)
     with StateReader(short_dir / "state.db") as reader:

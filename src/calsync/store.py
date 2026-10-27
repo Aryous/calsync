@@ -457,6 +457,17 @@ class Store:
         return row[0] if row else None
 
     # ----- config history ------------------------------------------------
+    def copies(self, tag: str, account: str, ref: str) -> int:
+        """The copies of rule ``tag`` recorded in the target calendar ``ref`` of ``account``
+        (copies left in a calendar the rule no longer targets are not counted)."""
+        row = self._db.execute(
+            "SELECT COUNT(*) FROM target_object o JOIN target_calendar c "
+            "ON o.account = c.account AND o.calendar_href = c.href "
+            "WHERE c.account = ? AND c.ref = ? AND o.rule_tag = ?",
+            (account, ref, tag),
+        ).fetchone()
+        return int(row[0])
+
     def record_config_change(
         self,
         *,

@@ -407,3 +407,13 @@ async def test_an_unexpected_view_error_is_a_plain_500_without_its_text(
     for text in (caplog.text, response.text):
         assert "和朋友吃午饭" not in text and "example.invalid" not in text
     assert "RuntimeError" in caplog.text and "Traceback" not in caplog.text
+
+
+async def test_trigger_for_a_paused_rule_is_409_paused(tmp_path: Path) -> None:
+    from calsync.errors import RulePaused
+
+    daemon = FakeDaemon(RulePaused("family"))
+    async with client(tmp_path, daemon) as c:
+        response = await c.post("/api/trigger", json={"rule": "family"})
+    assert response.status_code == 409
+    assert response.json() == {"error": {"kind": "paused", "message": 'rule "family" is paused'}}
