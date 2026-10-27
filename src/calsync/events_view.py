@@ -19,7 +19,7 @@ from typing import Any, Literal
 
 from calsync.config import Config, Rule
 from calsync.model import Alarm, Instance, Series, When, expand, expand_instances, series_span
-from calsync.views import RuleReading, RunView, StateReader, _is_ok, _iso, source_series
+from calsync.views import RuleReading, RunView, StateReader, _iso, is_ok, source_series
 
 # Most days one events query may span (the GUI's widest view is a month, plus its edges).
 MAX_EVENT_DAYS = 62
@@ -154,7 +154,7 @@ class _RuleCopies:
         last = self.last
         if last is not None and last.status == "blocked":
             return "blocked", shaped, oid
-        if last is not None and not _is_ok(last.status, last.failed):
+        if last is not None and not is_ok(last.status, last.failed):
             return "failing", shaped, oid
         return "pending", shaped, oid
 

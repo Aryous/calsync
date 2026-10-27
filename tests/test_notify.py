@@ -84,7 +84,8 @@ class Cycles:
     """A state database; ``run`` records one cycle's runs, then evaluates its alerts."""
 
     def __init__(self, root: Path, config: Config | None = None) -> None:
-        self.store = Store(root / "state.db")
+        self.store_path = root / "state.db"
+        self.store = Store(self.store_path)
         self.config = config or notified()
         self.now = NOW
 
@@ -136,10 +137,10 @@ def test_an_auth_failure_alerts_once_per_account_until_it_recovers(cycles: Cycle
     assert alert.level == "timeSensitive"
     assert cycles.run(auth) == []  # still open: not again
     assert cycles.run(auth, result("work", "failed", kind="auth", account="me")) == []  # same account
-    assert cycles.store.open_alerts() == {"auth:me"}
+    assert set(cycles.store.open_alerts()) == {"auth:me"}
     [back] = cycles.run(result())
     assert (back.event, back.account, back.title) == ("recovered", "me", "「me」恢复正常")
-    assert cycles.store.open_alerts() == set()
+    assert cycles.store.open_alerts() == {}
     assert cycles.run(result()) == []  # recovered once
     assert kinds(cycles.run(auth)) == [("auth", "family", "me")]  # a new problem alerts again
 
@@ -156,12 +157,68 @@ def test_a_blocked_set_alerts_once_per_fingerprint(cycles: Cycles) -> None:
     shown = "、".join(TITLES[:5])
     assert alert.body == f"「family」要删除 23 个日程，可能是误删，已暂停这条线路。例如：{shown}…"
     assert cycles.run(result(status="blocked", fingerprint="fp-a")) == []
-    [again] = cycles.run(result(status="blocked", fingerprint="fp-b"))  # another set: a new alert
-    assert again.event == "blocked"
-    assert cycles.store.open_alerts() == {"blocked:family:fp-b"}  # the old set is superseded
+    # Another set a minute later replaces the open one, without a push (damped).
+    assert cycles.run(result(status="blocked", fingerprint="fp-b")) == []
+    assert set(cycles.store.open_alerts()) == {"blocked:family:fp-b"}  # the old set is superseded
     [back] = cycles.run(result())
     assert (back.event, back.rule, back.title) == ("recovered", "family", "「family」恢复正常")
-    assert cycles.store.open_alerts() == set()
+    assert cycles.store.open_alerts() == {}
+
+
+def test_a_growing_blocked_set_pushes_once_per_half_hour(cycles: Cycles) -> None:
+    """A set that grows by one each minute: one push, then the next only 30 minutes later."""
+    counts = [
+        len(cycles.run(result(status="blocked", fingerprint=f"fp-{i}", deletes=40 + i))) for i in range(31)
+    ]
+    assert counts == [1] + [0] * 29 + [1]  # the push at minute 0 is carried until minute 30
+    assert set(cycles.store.open_alerts()) == {"blocked:family:fp-30"}
+    [back] = cycles.run(result())
+    assert back.event == "recovered"  # a carried key recovers as any other
+    assert cycles.store.open_alerts() == {}
+
+
+def test_a_blocked_set_that_doubles_pushes_at_once(cycles: Cycles) -> None:
+    assert len(cycles.run(result(status="blocked", fingerprint="a", deletes=10))) == 1
+    assert cycles.run(result(status="blocked", fingerprint="b", deletes=19)) == []
+    [doubled] = cycles.run(result(status="blocked", fingerprint="c", deletes=20))  # twice the push's 10
+    assert "要删除 20 个日程" in doubled.body
+    assert cycles.run(result(status="blocked", fingerprint="d", deletes=39)) == []  # vs. 20 now
+    assert len(cycles.run(result(status="blocked", fingerprint="e", deletes=40))) == 1
+
+
+def test_a_new_set_after_the_damping_pushes_again(cycles: Cycles) -> None:
+    assert len(cycles.run(result(status="blocked", fingerprint="a", deletes=12))) == 1
+    cycles.now += notify.DAMPING - timedelta(minutes=2)
+    assert cycles.run(result(status="blocked", fingerprint="b", deletes=13)) == []  # 29 minutes on
+    cycles.now += timedelta(minutes=1)
+    assert len(cycles.run(result(status="blocked", fingerprint="c", deletes=13))) == 1  # 30 minutes on
+
+
+def test_an_approval_is_the_blocks_only_push(cycles: Cycles) -> None:
+    assert len(cycles.run(result(status="blocked"))) == 1
+    notify.approving(cycles.store, "family")  # as approve does, with the lock
+    assert cycles.store.open_alerts() == {}
+    assert cycles.run(result()) == []  # the approval cycle: no recovered (approved was the push)
+
+
+def test_an_approval_cycle_still_recovers_a_failing_rule(cycles: Cycles) -> None:
+    for _ in range(3):
+        cycles.run(result(status="failed"))
+    assert len(cycles.run(result(status="blocked"))) == 1
+    assert set(cycles.store.open_alerts()) == {"failing:family", "blocked:family:fp-a"}
+    notify.approving(cycles.store, "family")
+    assert kinds(cycles.run(result())) == [("recovered", "family", None)]
+
+
+def test_an_approval_cycle_that_fails_and_blocks_again_pushes_again(cycles: Cycles) -> None:
+    assert len(cycles.run(result(status="blocked", fingerprint="fp-a"))) == 1
+    notify.approving(cycles.store, "family")
+    assert cycles.run(result(status="failed")) == []  # the approval cycle failed (one plain failure)
+    [again] = cycles.run(result(status="blocked", fingerprint="fp-a"))  # the same set: not silent
+    assert again.event == "blocked"
+    notify.approving(cycles.store, "family")
+    assert kinds(cycles.run(result(status="failed", kind="auth", account="me"))) == [("auth", "family", "me")]
+    assert kinds(cycles.run(result(status="blocked", fingerprint="fp-a"))) == [("blocked", "family", None)]
 
 
 def test_a_blocked_body_without_titles_and_with_few(cycles: Cycles) -> None:
@@ -194,7 +251,67 @@ def test_a_partial_run_with_failed_items_counts_as_a_failure(cycles: Cycles) -> 
 def test_blocked_and_auth_cycles_never_raise_failing(cycles: Cycles) -> None:
     for _ in range(5):
         cycles.run(result(status="blocked"), result("work", "failed", kind="auth", account="me"))
-    assert cycles.store.open_alerts() == {"blocked:family:fp-a", "auth:me"}
+    assert set(cycles.store.open_alerts()) == {"blocked:family:fp-a", "auth:me"}
+
+
+def test_failing_counts_plain_failures_only(cycles: Cycles) -> None:
+    for _ in range(60):  # an hour of auth failures: one auth push
+        cycles.run(result(status="failed", kind="auth", account="me"))
+    # The account works again for "work"; "family" then fails once, transiently: 1, not 61.
+    alerts = cycles.run(result(status="failed"), result("work"))
+    assert kinds(alerts) == [("recovered", None, "me")]
+    assert cycles.run(result(status="failed")) == []
+    [alert] = cycles.run(result(status="failed"))  # three plain failures: one push
+    assert (alert.event, alert.title) == ("failing", "「family」连续 3 次同步失败")
+    assert cycles.run(result(status="failed")) == []
+
+
+def test_failing_waits_while_the_rule_is_blocked_or_its_account_is_out(cycles: Cycles) -> None:
+    cycles.run(result(status="blocked"))
+    for _ in range(4):
+        assert cycles.run(result(status="failed")) == []  # on hold: the blocked push stands
+    cycles.run(result("work", "failed", kind="auth", account="me"))  # opens auth:me
+    for _ in range(4):
+        assert cycles.run(result("work", "failed")) == []  # its account needs reconnecting
+
+
+def test_status_still_counts_every_run_that_is_not_ok(cycles: Cycles) -> None:
+    from calsync.views import consecutive_failures
+
+    cycles.run(result(status="blocked"))
+    cycles.run(result(status="failed", kind="auth", account="me"))
+    cycles.run(result(status="failed"))
+    assert consecutive_failures(cycles.store, "family") == 3
+
+
+def test_keys_of_rules_and_accounts_no_longer_configured_close_silently(tmp_path: Path) -> None:
+    from calsync.store import OpenAlert
+
+    c = Cycles(tmp_path)
+    try:
+        old = {
+            "failing:gone": OpenAlert(NOW),
+            "blocked:gone:fp": OpenAlert(NOW),
+            "auth:broken": OpenAlert(NOW),
+        }
+        c.store.update_alerts(opened={**old, "auth:me": OpenAlert(NOW), "failing:work": OpenAlert(NOW)})
+        assert c.run(result(status="failed")) == []
+        assert set(c.store.open_alerts()) == {"auth:me", "failing:work"}
+    finally:
+        c.store.close()
+
+
+def test_closed_alerts_are_pruned_after_30_days(cycles: Cycles) -> None:
+    import sqlite3
+
+    from calsync.store import OpenAlert
+
+    old, recent = NOW - timedelta(days=31), NOW - timedelta(days=29)
+    cycles.store.update_alerts(opened={"failing:x": OpenAlert(old), "failing:y": OpenAlert(recent)})
+    cycles.store.update_alerts(closed=["failing:x", "failing:y"])
+    cycles.run(result())
+    with sqlite3.connect(cycles.store_path) as db:
+        assert [r[0] for r in db.execute("SELECT key FROM alert")] == ["failing:y"]
 
 
 def test_two_rules_that_recover_together_each_say_so_once(cycles: Cycles) -> None:
@@ -234,17 +351,23 @@ def test_every_approval_notifies(cycles: Cycles) -> None:
     assert first.body == "已放行 23 个删除（来自 命令行）"
     assert second.body == "已放行 23 个删除（来自 界面）"
     assert (first.event, first.rule) == ("approved", "family")
-    assert cycles.store.open_alerts() == set()  # nothing to deduplicate
+    assert cycles.store.open_alerts() == {}  # nothing to deduplicate
 
 
-def test_a_reload_failure_alerts_once_per_text(cycles: Cycles) -> None:
-    [alert] = notify.reload_failed(cycles.store, "f1", 2, cycles.config, NOW)
+def test_a_reload_failure_alerts_once_and_is_damped(cycles: Cycles) -> None:
+    def failed(fingerprint: str, at: timedelta) -> list[notify.Alert]:
+        return notify.reload_failed(cycles.store, fingerprint, 2, cycles.config, NOW + at)
+
+    [alert] = failed("f1", timedelta())
     assert (alert.event, alert.title) == ("reload_failed", "配置文件有 2 处错误，仍按原配置运行")
-    assert notify.reload_failed(cycles.store, "f1", 2, cycles.config, NOW) == []
-    assert len(notify.reload_failed(cycles.store, "f2", 1, cycles.config, NOW)) == 1
+    assert failed("f1", timedelta(minutes=1)) == []
+    assert failed("f2", timedelta(minutes=5)) == []  # another text replaces it within 30 minutes
+    assert set(cycles.store.open_alerts()) == {"reload"}  # one key
+    assert failed("f2", timedelta(minutes=40)) == []  # the same text: reported (as carried)
+    assert len(failed("f3", timedelta(minutes=30))) == 1  # 30 minutes after the push
     notify.reload_ok(cycles.store, NOW)
-    assert cycles.store.open_alerts() == set()
-    assert len(notify.reload_failed(cycles.store, "f1", 2, cycles.config, NOW)) == 1
+    assert cycles.store.open_alerts() == {}  # closed, without a push
+    assert len(failed("f1", timedelta(minutes=31))) == 1
 
 
 # ----- texts and links --------------------------------------------------------------------------
@@ -591,16 +714,15 @@ async def test_the_daemon_notifies_approvals_and_reload_failures(
     await eventually(lambda: len(pushes.bodies()) == 1)
     assert pushes.bodies()[0]["title"] == "calsync 拦下了一批删除"
     assert (await d.approve(rule="family", wait=True)).data["status"] == "approved"
-    await eventually(lambda: len(pushes.bodies()) == 3)
-    approved, recovered = pushes.bodies()[1:]
-    assert approved["body"] == "已放行 12 个删除（来自 命令行）"
-    assert recovered["title"] == "「family」恢复正常"
+    await eventually(lambda: len(pushes.bodies()) == 2)
+    assert pushes.bodies()[1]["body"] == "已放行 12 个删除（来自 命令行）"
     d.path.write_text(text + "\n[[rules]]\nname = 5\n")  # an invalid edit
     d.daemon.request_cycle()  # the check before the cycle sees it
-    await eventually(lambda: len(pushes.bodies()) == 4)
-    assert pushes.bodies()[3]["title"].startswith("配置文件有 ")
+    await eventually(lambda: len(pushes.bodies()) == 3)
+    # One push per act: the approval cycle that went well sent no "recovered" after "approved".
+    assert pushes.bodies()[2]["title"].startswith("配置文件有 ")
     await d.cycle("work")
-    assert len(pushes.bodies()) == 4  # the same text is not reported twice
+    assert len(pushes.bodies()) == 3  # the same text is not reported twice
     await d.stop()
 
 
@@ -641,13 +763,48 @@ def test_calsync_run_trigger_and_approve_send_in_process(
     assert pushes.requests == []  # a dry run records nothing and alerts nothing
     assert here.files.cli("run")[0] == EXIT_FAILED  # blocked
     assert here.titles() == ["calsync 拦下了一批删除"]
-    assert "例如：Event " in pushes.bodies()[0]["body"] or SECRET_TITLE in pushes.bodies()[0]["body"]
+    assert SECRET_TITLE in pushes.bodies()[0]["body"]  # "secret" sorts first by object id: shown
     assert len(pushes.bodies("hooks.example.com")) == 1
     assert here.files.cli("trigger", "--wait")[0] == EXIT_FAILED  # still blocked: nothing new
     assert len(here.titles()) == 1
     code, out = here.files.cli("approve", "family", "--yes")
     assert code == EXIT_OK, out
-    assert here.titles()[1:] == ["calsync 放行了删除", "「family」恢复正常"]
+    assert here.titles()[1:] == ["calsync 放行了删除"]  # one push per act: no "recovered" after it
+    assert_private(caplog)
+
+
+def test_an_approval_whose_cycle_fails_leaves_a_new_block_audible(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch, pushes: Pushes
+) -> None:
+    from tests.test_approve import seed
+
+    here = Here(short_dir, monkeypatch, pushes)
+    ids = seed(here.world.fake)
+    assert here.files.cli("run")[0] == EXIT_OK
+    for event_id in ids:
+        here.world.fake.cancel_event(GCAL, event_id)
+    assert here.files.cli("run")[0] == EXIT_FAILED  # blocked
+    here.world.deny.add("me")  # the approval cycle fails
+    code, out = here.files.cli("approve", "family", "--yes")
+    assert code != EXIT_OK, out
+    assert here.titles()[1:] == ["calsync 放行了删除", "「me」需要重新连接"]
+    assert here.files.cli("run")[0] == EXIT_FAILED  # the same set blocks again: pushed again
+    assert here.titles()[3:] == ["calsync 拦下了一批删除", "「me」恢复正常"]
+
+
+def test_a_push_that_raises_never_fails_a_command(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch, pushes: Pushes, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def broken(self: notify.Notifier, alerts: Any) -> None:
+        raise RuntimeError("boom " + SECRET_TITLE)
+
+    caplog.set_level(logging.DEBUG, logger="calsync")
+    monkeypatch.setattr(notify.Notifier, "send", broken)
+    here = Here(short_dir, monkeypatch, pushes)
+    here.world.deny.add("me")  # the first build only
+    assert here.files.cli("run")[0] == 3  # "auth" raised; the auth exit code, as without alerts
+    assert here.files.cli("trigger", "--rule", "family")[0] == EXIT_OK  # "recovered" raised
+    assert caplog.messages.count("notification failed (RuntimeError)") == 2
     assert_private(caplog)
 
 
@@ -676,6 +833,21 @@ async def test_notify_test_through_the_daemon(tmp_path: Path, monkeypatch: pytes
     assert result.summary == "test push: bark failed (PushRefused), webhook ok"
     world.stop.set()
     await asyncio.wait_for(task, 5)
+
+
+async def test_a_daemon_without_sync_sends_a_test_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from calsync.daemon import Daemon
+
+    pushes = Pushes()
+    monkeypatch.setattr(notify, "TRANSPORT", pushes.transport())
+    viewer = Daemon(configfile.validate_text(TEXT + BOTH, tmp_path), tmp_path, sync=False)
+    result = await asyncio.wait_for(viewer.run_op("notify.test", {}, False, source="ui"), 5)
+    assert result.data == {"channels": {"bark": "ok", "webhook": "ok"}}
+    assert len(pushes.requests) == 2
+    with pytest.raises(ConfigError, match="no dry run"):
+        await viewer.run_op("notify.test", {}, True, source="ui")
 
 
 def test_trigger_in_process_sends(short_dir: Path, monkeypatch: pytest.MonkeyPatch, pushes: Pushes) -> None:

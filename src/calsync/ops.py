@@ -86,7 +86,7 @@ class DaemonHooks(Protocol):
 
 
 class OpsUnavailable(CalsyncError):
-    """This daemon runs no operations (``--no-sync``: no lock, no store)."""
+    """This daemon runs no operations (``--no-sync``: no lock, no store), ``notify.test`` aside."""
 
 
 class DaemonStopping(OpsUnavailable):
@@ -710,6 +710,7 @@ def _approve(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
     log.info("rule %s: %d deletes approved (%s)", name, blocked.count, ctx.source)
     from calsync import notify
 
+    notify.approving(ctx.store, name)  # the approval is this block's push: its key closes now
     approval = notify.approved(name, blocked.count, ctx.source, config, ctx.clock())
     result, removed = asyncio.run(_cycle_here(ctx, config, [name], {name: fingerprint}, alerts=[approval]))
     outcome = _outcome(op, name, fingerprint, blocked.count, result)
@@ -829,8 +830,20 @@ async def _cycle_here(
     removed = [
         done.summary for n in retired(config, result, ctx.store) if (done := remove_retired(removal, n))
     ]
-    await notify.Notifier(config.notify).send([*alerts, *raised])
+    await send_contained(config, [*alerts, *raised])
     return result, removed
+
+
+async def send_contained(config: Config, alerts: Sequence["Alert"]) -> None:
+    """Send ``alerts`` before returning; nothing a push does fails the command that sends it
+    (a failure is logged by type)."""
+    from calsync import notify
+
+    try:
+        await notify.Notifier(config.notify).send(alerts)
+    except Exception as exc:
+        log.warning("notification failed (%s)", type(exc).__name__)
+        debug.details(log, "notification failed", exc)
 
 
 # ----- a cycle now ---------------------------------------------------------------------------
@@ -958,13 +971,19 @@ async def _notify_test(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> O
     """One test push to every configured channel. ``data``: ``{"channels": {"bark": …,
     "webhook": …}}``, each ``ok``, ``failed (<Type>)`` or ``not configured``. It changes
     nothing; each push waits at most ``notify.SEND_TIMEOUT`` seconds."""
+    if dry_run:
+        raise ConfigError([NOTIFY_TEST_NO_DRY_RUN])
+    return await notify_test(_config_now(ctx), args, dry_run)
+
+
+async def notify_test(config: Config, args: dict[str, Any], dry_run: bool) -> OpResult:
+    """``notify.test`` with ``config``: all it needs (a daemon without sync runs it too)."""
     from calsync import notify
 
     op = "notify.test"
     if dry_run:
         raise ConfigError([NOTIFY_TEST_NO_DRY_RUN])
     _Args(op, args, set())
-    config = _config_now(ctx)
     report = await notify.Notifier(config.notify).test(config.notify.language)
     summary = "test push: " + ", ".join(f"{channel} {outcome}" for channel, outcome in report.items())
     return OpResult(op, False, summary, data={"channels": report})

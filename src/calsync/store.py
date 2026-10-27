@@ -166,6 +166,28 @@ class AccountCalendar:
     fetched_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class OpenAlert:
+    """An open ``alert`` key: when its push went out (None: unknown) and its detail."""
+
+    sent_at: datetime | None
+    detail: Mapping[str, Any] | None = None
+
+
+def _open_alert(state: str, sent: str | None) -> OpenAlert:
+    detail: Any = None
+    if state.startswith("open "):
+        try:
+            detail = json.loads(state[len("open ") :])
+        except ValueError:
+            detail = None
+    try:
+        sent_at = datetime.fromisoformat(sent) if sent else None
+    except ValueError:
+        sent_at = None
+    return OpenAlert(sent_at, detail if isinstance(detail, dict) else None)
+
+
 def _utc(t: datetime) -> str:
     """Times in the history tables are stored in UTC so they compare (and prune) as text."""
     return t.astimezone(UTC).isoformat()
@@ -469,26 +491,55 @@ class Store:
         ).fetchone()
         return row[0] if row else None
 
-    def statuses(self, rule: str) -> Iterator[tuple[str, int]]:
-        """The rule's run (status, failed) pairs, newest first (as ``StateReader.statuses``)."""
-        rows = self._db.execute("SELECT status, failed FROM run WHERE rule = ? ORDER BY id DESC", (rule,))
-        return ((r[0], r[1]) for r in rows.fetchall())
+    def statuses(self, rule: str) -> Iterator[tuple[str, int, str | None]]:
+        """The rule's runs as (status, failed, error_kind), newest first (as
+        ``StateReader.statuses``)."""
+        rows = self._db.execute(
+            "SELECT status, failed, error_kind FROM run WHERE rule = ? ORDER BY id DESC", (rule,)
+        )
+        return ((r[0], r[1], r[2]) for r in rows.fetchall())
 
     # ----- alerts -------------------------------------------------------
-    def open_alerts(self) -> set[str]:
-        """The keys of the alerts sent and not yet closed (``notify``)."""
-        return {r[0] for r in self._db.execute("SELECT key FROM alert WHERE state = 'open'")}
+    # ``alert.state`` is ``closed``, ``open``, or ``open <JSON>``: an open key with its detail
+    # (the count a ``blocked`` push named, the config text a ``reload`` push was for), which
+    # ``notify`` reads to damp a replacement key. Kept in ``state`` so the schema stays as is.
 
-    def update_alerts(self, *, opened: Iterable[str] = (), closed: Iterable[str] = (), at: datetime) -> None:
-        """Open ``opened`` (sent at ``at``) and close ``closed``, in one transaction."""
+    def open_alerts(self) -> dict[str, OpenAlert]:
+        """The alerts sent and not yet closed, by key (``notify``)."""
+        rows = self._db.execute(
+            "SELECT key, state, last_sent_at FROM alert WHERE state = 'open' OR state LIKE 'open %'"
+        )
+        return {key: _open_alert(state, sent) for key, state, sent in rows.fetchall()}
+
+    def update_alerts(
+        self,
+        *,
+        opened: Mapping[str, OpenAlert] | None = None,
+        closed: Iterable[str] = (),
+        prune_before: datetime | None = None,
+    ) -> None:
+        """Open (or replace) ``opened``, close ``closed`` and, with ``prune_before``, delete the
+        closed rows last sent before it (or never), in one transaction."""
+        rows = [
+            (
+                key,
+                "open " + json.dumps(alert.detail, sort_keys=True) if alert.detail else "open",
+                _utc(alert.sent_at) if alert.sent_at is not None else None,
+            )
+            for key, alert in (opened or {}).items()
+        ]
         with self._tx():
             self._db.executemany(
-                "INSERT OR REPLACE INTO alert (key, state, last_sent_at) VALUES (?, 'open', ?)",
-                [(key, _utc(at)) for key in opened],
+                "INSERT OR REPLACE INTO alert (key, state, last_sent_at) VALUES (?, ?, ?)", rows
             )
             self._db.executemany(
                 "UPDATE alert SET state = 'closed' WHERE key = ?", [(key,) for key in closed]
             )
+            if prune_before is not None:
+                self._db.execute(
+                    "DELETE FROM alert WHERE state = 'closed' AND (last_sent_at IS NULL OR last_sent_at < ?)",
+                    (_utc(prune_before),),
+                )
 
     # ----- config history ------------------------------------------------
     def copies(self, tag: str, account: str, ref: str) -> int:

@@ -62,8 +62,9 @@ Everything that waits on the network under ``_cycle_lock`` outside a cycle is bo
 sync.
 
 Without sync (``--no-sync``) the daemon takes no lock, reads no credential, opens no store and
-runs no cycle: it only serves the API. It cannot run beside another daemon in the same state
-directory (that one's socket is live: exit 4), only beside ``calsync run``; to show a running
+runs no cycle: it only serves the API (and sends ``notify.test``, which needs only the
+config). It cannot run beside another daemon in the same state directory (that one's socket
+is live: exit 4), only beside ``calsync run``; to show a running
 daemon's data, point it at a copy of the state directory.
 """
 
@@ -331,6 +332,8 @@ class Daemon:
         The operation runs on the event loop's thread: the store's sqlite connection belongs to
         it, and an operation is one small file write and one row; the lock keeps cycles out."""
         if self._store is None:
+            if name == "notify.test":  # needs only the config: a viewer daemon can test its pushes
+                return await ops.notify_test(self._config, args, dry_run)
             does = "runs no sync cycles" if name == "trigger" else "changes no configuration"
             raise ops.OpsUnavailable(f"The daemon runs with --no-sync: it {does}.")
         if self._config_path is None:
@@ -426,6 +429,8 @@ class Daemon:
             raise ops.DaemonStopping()
         self.request_cycle(rule)
         self._approvals[rule] = fingerprint
+        if self._store is not None:  # the approval is this block's push: its key closes now
+            notify.approving(self._store, rule)
         self._on_approved(rule, count, origin)
         return self._wait_for_cycle({rule}) if wait else None
 

@@ -1,23 +1,32 @@
-"""Notifications (v3 §11, v2 §4.6): quiet while all is well, a push when something needs a person.
+"""Notifications (v3 §11, v2 §4.6): quiet while all is well, one push per problem.
 
 Alerts:
 
 - ``auth`` (per account): an account's credential stopped working;
 - ``blocked`` (per rule and blocked set): the mass-delete guard held deletes back (the count and
-  up to ``EXAMPLES`` titles);
-- ``failing`` (per rule): the rule failed ``failure_threshold`` cycles in a row (blocked and auth
-  failures have their own alerts and are not counted as this one);
+  up to ``EXAMPLES`` titles). A set that replaces the rule's open one (it grew, or changed) is
+  pushed only ``DAMPING`` after the last push, unless it is at least twice the count that push
+  named;
+- ``failing`` (per rule): the rule's plain failures (failed, or partial with failed items) since
+  its last ``ok`` run reached ``failure_threshold``. Blocked and auth runs are not counted, and
+  nothing is raised while the rule's ``blocked`` key or the ``auth`` key of one of its accounts
+  is open: that push already asks for a person;
 - ``recovered``: the first ``ok`` run of a rule after an open ``failing`` / ``blocked`` alert of
   that rule (one push for the rule), or of an ``auth`` alert of one of its accounts (one push
   for the account);
-- ``reload_failed`` (per config text): an edit made by hand is invalid (the count of problems,
-  never their text);
-- ``approved``: blocked deletes were approved (rule, count, origin). Never deduplicated.
+- ``reload_failed``: an edit made by hand is invalid (the count of problems, never their text);
+  another invalid text while it is open is damped as a blocked set is;
+- ``approved``: blocked deletes were approved (rule, count, origin). Never deduplicated; the
+  approval closes the rule's ``blocked`` key, so a successful approval cycle sends no
+  ``recovered`` for it (one push per act) and a set that blocks again is pushed again.
 
 Deduplication lives in the state DB's ``alert`` table (written only by the run-lock holder): an
-open key (``auth:<account>``, ``blocked:<rule>:<fingerprint>``, ``failing:<rule>``,
-``reload:<fingerprint>``) is not sent again; ``recovered`` (or a valid config) closes it. A key
-is opened before its push is sent, so a push that fails is not retried.
+open key (``auth:<account>``, ``blocked:<rule>:<fingerprint>``, ``failing:<rule>``, ``reload``)
+is not sent again; ``recovered`` (or a valid config, or an approval) closes it, and so does a
+config without its rule (or without a rule that uses its account), silently. ``calsync auth``
+takes no lock, so it closes nothing: the ``auth`` key closes (with ``recovered``) at the first
+``ok`` run of a rule that uses the account. A key is opened before its push is sent, so a push
+that fails is not retried. Closed rows are pruned after ``ALERT_RETENTION``.
 
 Delivery: a JSON POST to ``bark_url`` and/or ``webhook_url``, each bounded by ``SEND_TIMEOUT``.
 A failure is logged as ``notification failed (<channel>, <ExceptionType>)``: never the URL (a
@@ -38,7 +47,7 @@ import asyncio
 import logging
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -47,8 +56,8 @@ import httpx
 from calsync import debug
 from calsync.config import Config, NotifyConfig, Rule
 from calsync.http import RequestLog, make_client
-from calsync.store import Store
-from calsync.views import _consecutive_failures, _is_ok  # pyright: ignore[reportPrivateUsage]
+from calsync.store import OpenAlert, Store
+from calsync.views import consecutive_failures, flat, is_ok
 
 if TYPE_CHECKING:
     from calsync.engine import RuleResult
@@ -59,6 +68,12 @@ SEND_TIMEOUT = 5.0  # seconds, per push (read when used: tests shorten it)
 SHUTDOWN_GRACE = 5.0  # seconds a stopping daemon waits for pushes still in flight
 EXAMPLES = 5  # titles in a ``blocked`` push
 GROUP = "calsync"
+# A key that replaces an open one of its kind (a rule's blocked set, an invalid config text) is
+# pushed no sooner than this after the last push; a blocked set at least twice the size of the
+# one last pushed is pushed at once.
+DAMPING = timedelta(minutes=30)
+ALERT_RETENTION = timedelta(days=30)  # closed ``alert`` rows older than this are pruned
+RELOAD = "reload"  # the ``reload_failed`` key
 URGENT = "timeSensitive"  # Bark's level for alerts that need a person soon
 # The user-facing texts. ``{s}`` is the English plural ending, ignored in Chinese.
 TEXTS: dict[str, dict[str, str]] = {
@@ -149,8 +164,9 @@ def evaluate(
     results: Mapping[str, "RuleResult"], *, store: Store, config: Config, now: datetime
 ) -> list[Alert]:
     """The alerts a recorded cycle raises (its runs are in ``store`` already), with the
-    ``alert`` table updated: keys opened for what is sent, closed for what recovered. Called by
-    the lock holder only. A failure is logged by type and raises nothing (no alert then)."""
+    ``alert`` table updated: keys opened for what is sent (or carried, when damped), closed for
+    what recovered or is no longer configured, and closed rows pruned. Called by the lock
+    holder only. A failure is logged by type and raises nothing (no alert then)."""
     try:
         return _evaluate(results, store, config, now)
     except Exception as exc:
@@ -168,14 +184,43 @@ def _accounts(rule: Rule | None) -> list[str]:
 def _auth_account(r: "RuleResult", rule: Rule | None) -> str | None:
     """The account an auth failure names; a failure inside the rule (no adapter named) is the
     target's, the side a rule writes to."""
-    if r.error_kind != "auth" or _is_ok(r.status, r.failed):
+    if r.error_kind != "auth" or is_ok(r.status, r.failed):
         return None
     return r.error_account or (rule.target.account if rule is not None else None)
 
 
+def _key_rule(key: str) -> str | None:
+    """The rule a ``failing`` or ``blocked`` key belongs to (a fingerprint has no colon)."""
+    if key.startswith("failing:"):
+        return key[len("failing:") :]
+    if key.startswith("blocked:"):
+        return key[len("blocked:") :].rsplit(":", 1)[0]
+    return None
+
+
 def _rule_keys(name: str, keys: Iterable[str]) -> set[str]:
-    """The open keys of rule ``name`` (a fingerprint never contains a colon)."""
-    return {k for k in keys if k == f"failing:{name}" or k.rsplit(":", 1)[0] == f"blocked:{name}"}
+    """The keys of rule ``name``."""
+    return {k for k in keys if _key_rule(k) == name}
+
+
+def _blocked_keys(name: str, keys: Iterable[str]) -> set[str]:
+    return {k for k in _rule_keys(name, keys) if k.startswith("blocked:")}
+
+
+def _damped(previous: OpenAlert | None, now: datetime) -> bool:
+    """Whether a key that replaces the open ``previous`` is pushed no sooner than
+    ``DAMPING`` after ``previous``'s push."""
+    return previous is not None and previous.sent_at is not None and now - previous.sent_at < DAMPING
+
+
+def _plain_failure(status: str, failed: int, error_kind: str | None) -> bool:
+    """A run that ``failing`` counts: failed, or partial with failed items; never blocked (the
+    guard) nor an auth failure (``auth``)."""
+    return not is_ok(status, failed) and status != "blocked" and error_kind != "auth"
+
+
+def _planned(r: "RuleResult") -> int:
+    return len(r.plan.delete) if r.plan is not None else len(r.blocked_titles)
 
 
 def _evaluate(
@@ -184,24 +229,32 @@ def _evaluate(
     text = _Texts(config)
     was_open = store.open_alerts()  # one snapshot: the outcome never depends on the rules' order
     by_name = {r.name: r for r in config.rules}
-    opened: list[str] = []
-    closed: set[str] = set()
+    in_use = {a for r in config.rules for a in _accounts(r)}
+    opened: dict[str, OpenAlert] = {}
     alerts: list[Alert] = []
+    # The keys of a rule (an account) no longer configured close, without a push.
+    closed: set[str] = {
+        k
+        for k in was_open
+        if ((owner := _key_rule(k)) is not None and owner not in by_name)
+        or (k.startswith("auth:") and k[len("auth:") :] not in in_use)
+    }
     # An account that failed this cycle has not recovered, whatever another rule says.
     failing_auth = {
         a for name, r in results.items() if (a := _auth_account(r, by_name.get(name))) is not None
     }
 
-    def raise_(key: str, alert: Alert) -> None:
+    def raise_(key: str, alert: Alert, detail: Mapping[str, Any] | None = None) -> None:
         if key in was_open or key in opened:
             return
-        opened.append(key)
+        opened[key] = OpenAlert(now, detail)
         alerts.append(alert)
 
+    plain: list[str] = []
     for name, r in results.items():
         rule = by_name.get(name)
-        if _is_ok(r.status, r.failed):
-            mine = _rule_keys(name, was_open)
+        if is_ok(r.status, r.failed):
+            mine = _rule_keys(name, was_open) - closed
             if mine:
                 alerts.append(_recovered(text, config, now, rule=name))
             for account in _accounts(rule):
@@ -214,8 +267,22 @@ def _evaluate(
             if r.blocked_fingerprint is None:
                 continue
             key = f"blocked:{name}:{r.blocked_fingerprint}"
-            closed |= {k for k in _rule_keys(name, was_open) if k.startswith("blocked:") and k != key}
-            raise_(key, _blocked(text, config, now, r))
+            older = _blocked_keys(name, was_open) - {key}
+            closed |= older
+            if key in was_open:
+                continue
+            count = _planned(r)
+            last = max(
+                (was_open[k] for k in older if was_open[k].sent_at is not None),
+                key=lambda a: a.sent_at or now,
+                default=None,
+            )
+            pushed = last.detail.get("count") if last is not None and last.detail else None
+            if _damped(last, now) and not (isinstance(pushed, int) and count >= 2 * pushed):
+                assert last is not None
+                opened[key] = last  # the push it stands for: its time and the count it named
+            else:
+                raise_(key, _blocked(text, config, now, r), {"count": count})
         elif r.error_kind == "auth":
             account = _auth_account(r, rule)
             if account is None:
@@ -232,19 +299,27 @@ def _evaluate(
             )
             raise_(f"auth:{account}", alert)
         else:
-            failures = _consecutive_failures(store, name)
-            if failures >= config.notify.failure_threshold:
-                alert = Alert(
-                    "failing",
-                    text("failing.title", failures, rule=name),
-                    text("failing.body"),
-                    rule=name,
-                    url=link(config, "rule", name),
-                    at=now,
-                )
-                raise_(f"failing:{name}", alert)
-    if opened or closed:
-        store.update_alerts(opened=opened, closed=closed - set(opened), at=now)
+            plain.append(name)
+    # ``failing`` last, against what is open after this cycle: a rule on hold (blocked) or with
+    # an account to reconnect already has the push that needs a person.
+    still_open = (set(was_open) | set(opened)) - closed
+    for name in plain:
+        if _blocked_keys(name, still_open) or any(
+            f"auth:{a}" in still_open or a in failing_auth for a in _accounts(by_name.get(name))
+        ):
+            continue
+        failures = consecutive_failures(store, name, _plain_failure)
+        if failures >= config.notify.failure_threshold:
+            alert = Alert(
+                "failing",
+                text("failing.title", failures, rule=name),
+                text("failing.body"),
+                rule=name,
+                url=link(config, "rule", name),
+                at=now,
+            )
+            raise_(f"failing:{name}", alert)
+    store.update_alerts(opened=opened, closed=closed - set(opened), prune_before=now - ALERT_RETENTION)
     return alerts
 
 
@@ -264,13 +339,9 @@ def _recovered(
     )
 
 
-def _flat(title: str) -> str:
-    return " ".join(title.split())
-
-
 def _blocked(text: _Texts, config: Config, now: datetime, r: "RuleResult") -> Alert:
-    count = len(r.plan.delete) if r.plan is not None else len(r.blocked_titles)
-    shown = [t for t in (_flat(t) for t in r.blocked_titles) if t][:EXAMPLES]
+    count = _planned(r)
+    shown = [t for t in (flat(t) for t in r.blocked_titles) if t][:EXAMPLES]
     body = text("blocked.body", count, rule=r.rule)
     if shown:
         more = "…" if count > len(shown) else ""
@@ -300,16 +371,34 @@ def approved(rule: str, count: int, origin: str, config: Config, now: datetime) 
     )
 
 
+def approving(store: Store, rule: str) -> None:
+    """An approval of ``rule``'s blocked set was taken (its ``approved`` push is the one for
+    this act): the rule's ``blocked`` keys close, without a push. A successful approval cycle
+    then sends no ``recovered`` for the block, and a set that blocks again is pushed again.
+    Called by the lock holder; contained like ``evaluate``."""
+    try:
+        keys = _blocked_keys(rule, store.open_alerts())
+        if keys:
+            store.update_alerts(closed=keys)
+    except Exception as exc:
+        log.warning("alerts not updated (%s)", type(exc).__name__)
+        debug.details(log, "alerts not updated", exc)
+
+
 def reload_failed(
     store: Store, fingerprint: str, problems: int, config: Config, now: datetime
 ) -> list[Alert]:
-    """``reload_failed`` for the config text ``fingerprint`` (once per text, until a config
-    applies). Contained like ``evaluate``."""
+    """``reload_failed`` for the config text ``fingerprint``: one ``reload`` key, until a config
+    applies. Another invalid text while it is open replaces it, pushed only ``DAMPING`` after
+    the last push. Contained like ``evaluate``."""
     try:
-        key = f"reload:{fingerprint}"
-        if key in store.open_alerts():
+        last = store.open_alerts().get(RELOAD)
+        if last is not None and last.detail and last.detail.get("fingerprint") == fingerprint:
+            return []  # this text was reported
+        if last is not None and _damped(last, now):
+            store.update_alerts(opened={RELOAD: OpenAlert(last.sent_at, {"fingerprint": fingerprint})})
             return []
-        store.update_alerts(opened=[key], at=now)
+        store.update_alerts(opened={RELOAD: OpenAlert(now, {"fingerprint": fingerprint})})
     except Exception as exc:
         log.warning("alerts not evaluated (%s)", type(exc).__name__)
         debug.details(log, "alerts not evaluated", exc)
@@ -319,12 +408,12 @@ def reload_failed(
 
 
 def reload_ok(store: Store, now: datetime) -> None:
-    """A config applied (or the file is back to what runs): the ``reload_failed`` keys close,
-    without a push."""
+    """A config applied (or the file is back to what runs): the ``reload`` key closes, without
+    a push."""
     try:
-        keys = [k for k in store.open_alerts() if k.startswith("reload:")]
+        keys = [k for k in store.open_alerts() if k == RELOAD or k.startswith(f"{RELOAD}:")]
         if keys:
-            store.update_alerts(closed=keys, at=now)
+            store.update_alerts(closed=keys)
     except Exception as exc:
         log.warning("alerts not updated (%s)", type(exc).__name__)
         debug.details(log, "alerts not updated", exc)

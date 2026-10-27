@@ -529,7 +529,7 @@ def _confirm_blocked(
     set that is no longer recorded (the operation's own answers)."""
     from calsync import ops
     from calsync.errors import ConfigError
-    from calsync.views import StateReader, StateUnavailable, build_blocked
+    from calsync.views import StateReader, StateUnavailable, build_blocked, flat
     from calsync.wiring import state_paths
 
     config = _load(args)
@@ -549,7 +549,7 @@ def _confirm_blocked(
     noun = "copy" if blocked.count == 1 else "copies"
     out.write(f"rule {blocked.rule}: {blocked.count} {noun} would be deleted:\n")
     for item in blocked.items[:PROMPT_TITLES]:
-        out.write(f"  - {_flat(item.title) if item.title else '(untitled)'}\n")
+        out.write(f"  - {flat(item.title) if item.title else '(untitled)'}\n")
     if blocked.count > PROMPT_TITLES:
         out.write(f"  … and {blocked.count - PROMPT_TITLES} more (calsync blocked --rule {blocked.rule})\n")
     out.write(f"Type the rule name ({blocked.rule}) to approve: ")
@@ -779,13 +779,9 @@ async def _auth(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
     return EXIT_OK
 
 
-def _flat(text: str) -> str:
-    """One line of user text: newlines and other whitespace runs become single spaces."""
-    return " ".join(text.split())
-
-
 def _print_cycle(result: "CycleResult", out: TextIO, verbose: bool) -> None:
     from calsync.cycle import counts_line
+    from calsync.views import flat
 
     for name, r in result.rules.items():
         line = counts_line(name, r)
@@ -793,20 +789,20 @@ def _print_cycle(result: "CycleResult", out: TextIO, verbose: bool) -> None:
             line += f" error={r.error!r}"
         out.write(line + "\n")
         if r.setup_detail:  # what to fix in the account's setup (a local path or mode)
-            out.write(f"  {_flat(r.setup_detail)}\n")
+            out.write(f"  {flat(r.setup_detail)}\n")
         # Titles are listed in plan.delete order only when every one was read.
         titled = r.status == "blocked" and r.blocked_titles_complete
         if r.status == "blocked":
             for title in r.blocked_titles:
-                out.write(f"  - {_flat(title)}\n")
+                out.write(f"  - {flat(title)}\n")
             if not r.blocked_titles_complete:
                 out.write("  (titles incomplete)\n")
             out.write("  re-run with --allow-deletes if this is intended\n")
         if verbose and r.plan is not None:
             for want in r.plan.create:
-                out.write(f"  + {_flat(want.series.title)} @ {want.series.start.value.isoformat()}\n")
+                out.write(f"  + {flat(want.series.title)} @ {want.series.start.value.isoformat()}\n")
             for want, _ in r.plan.update:
-                out.write(f"  ~ {_flat(want.series.title)} @ {want.series.start.value.isoformat()}\n")
+                out.write(f"  ~ {flat(want.series.title)} @ {want.series.start.value.isoformat()}\n")
             if not (titled and len(r.blocked_titles) == len(r.plan.delete)):
                 for have in r.plan.delete:  # no title known: the href is all we have
                     out.write(f"  - {have.href}\n")
@@ -817,6 +813,7 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
     from calsync import notify
     from calsync.cycle import run_cycle
     from calsync.lock import RunLock
+    from calsync.ops import send_contained
     from calsync.store import Store
     from calsync.wiring import accounts_in_use, build_adapters, build_engine, state_paths
 
@@ -860,7 +857,7 @@ async def _run(args: argparse.Namespace, out: TextIO) -> int:
     for summary in removed:
         out.write(summary + "\n")
     out.flush()  # the result first: a slow channel delays only the exit
-    await notify.Notifier(config.notify).send(alerts)  # each push bounded; a failure only logged
+    await send_contained(config, alerts)  # each push bounded; a failure only logged
     return exit_code_for_results(result.rules.values())
 
 
@@ -1175,8 +1172,10 @@ def _span_text(start: "When", end: "When") -> str:
 
 
 def _print_event(view: "EventDetail", out: TextIO) -> None:
+    from calsync.views import flat
+
     event = view.event
-    out.write(f"{_flat(event.instance.title)}\n")
+    out.write(f"{flat(event.instance.title)}\n")
     out.write(f"  when: {_span_text(event.instance.start, event.instance.end)}\n")
     out.write(f"  source: {event.source['account']} / {event.source['calendar_name']}\n")
     for d in event.deliveries:
@@ -1188,7 +1187,7 @@ def _print_event(view: "EventDetail", out: TextIO) -> None:
 
 def _print_view(view: View, out: TextIO) -> None:
     from calsync.events_view import EventDetail, EventsView
-    from calsync.views import BlockedView, ChangesView, RunsView, StatusView, UpcomingView
+    from calsync.views import BlockedView, ChangesView, RunsView, StatusView, UpcomingView, flat
 
     if isinstance(view, StatusView):
         for status in view.rules:
@@ -1208,7 +1207,7 @@ def _print_view(view: View, out: TextIO) -> None:
             when = "all day" if start.all_day else start.utc().astimezone().strftime("%H:%M")
             alarms = ",".join(str(m) for m in event.alarms_minutes_before) or "none"
             out.write(
-                f"{when}  {_flat(event.instance.title)}  [{event.target_calendar}]  alarms={alarms}  "
+                f"{when}  {flat(event.instance.title)}  [{event.target_calendar}]  alarms={alarms}  "
                 f"{event.delivery}\n"
             )
     elif isinstance(view, RunsView):
@@ -1236,7 +1235,7 @@ def _print_view(view: View, out: TextIO) -> None:
                 f"fingerprint={fingerprint}\n"
             )
             for item in blocked.items:
-                out.write(f"  - {_flat(item.title) if item.title else '(untitled)'}\n")
+                out.write(f"  - {flat(item.title) if item.title else '(untitled)'}\n")
             out.write(f"  approve with: calsync approve {blocked.rule}\n")
     elif isinstance(view, EventsView):
         if not view.events:
@@ -1244,7 +1243,7 @@ def _print_view(view: View, out: TextIO) -> None:
         for event in view.events:
             deliveries = ", ".join(f"{d.target['calendar_name']}: {d.state}" for d in event.deliveries)
             out.write(
-                f"{_span_text(event.instance.start, event.instance.end)}  {_flat(event.instance.title)}  "
+                f"{_span_text(event.instance.start, event.instance.end)}  {flat(event.instance.title)}  "
                 f"[{event.source['calendar_name']} → {deliveries}]\n"
             )
         if view.events:
@@ -1260,7 +1259,7 @@ def _print_view(view: View, out: TextIO) -> None:
         _print_event(view, out)
     elif isinstance(view, ChangesView):
         for change in view.changes:
-            title = _flat(change.title) if change.title else "(untitled)"
+            title = flat(change.title) if change.title else "(untitled)"
             out.write(
                 f"{change.at.isoformat()} rule={change.rule} {change.action} {title} object={change.object_id}\n"
             )

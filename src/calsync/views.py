@@ -12,7 +12,7 @@ import json
 import re
 import sqlite3
 import tomllib
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -278,14 +278,16 @@ class StateReader:
         rows = self._run_rows("WHERE rule = ? AND status = 'ok'", (rule,), 1)
         return rows[0] if rows else None
 
-    def statuses(self, rule: str) -> Iterator[tuple[str, int]]:
-        """The rule's run (status, failed) pairs, newest first."""
-        if not {"rule", "status", "failed", "id"} <= self.columns("run"):
+    def statuses(self, rule: str) -> Iterator[tuple[str, int, str | None]]:
+        """The rule's runs as (status, failed, error_kind), newest first."""
+        columns = self.columns("run")
+        if not {"rule", "status", "failed", "id"} <= columns:
             return iter(())
+        kind = "error_kind" if "error_kind" in columns else "NULL"
         return (
-            (r[0], r[1])
+            (r[0], r[1], r[2])
             for r in self._db.execute(
-                "SELECT status, failed FROM run WHERE rule = ? ORDER BY id DESC", (rule,)
+                f"SELECT status, failed, {kind} FROM run WHERE rule = ? ORDER BY id DESC", (rule,)
             )
         )
 
@@ -934,7 +936,7 @@ class StatusView:
 def _health(run: RunView | None) -> Health:
     if run is None:
         return "never_run"
-    if _is_ok(run.status, run.failed):
+    if is_ok(run.status, run.failed):
         return "ok"
     if run.error_kind == "auth" or (run.error_kind is None and (run.error or "").startswith("AuthError")):
         return "auth"
@@ -958,25 +960,40 @@ def _rule_health(rule: Rule, last: RunView | None) -> Health:
     return _health(last)
 
 
-def _is_ok(status: str, failed: int) -> bool:
+def is_ok(status: str, failed: int) -> bool:
     """A run whose health is ``ok``: ok, or partial without failed items."""
     return status == "ok" or (status == "partial" and failed == 0)
 
 
 class RunStatuses(Protocol):
-    """What ``_consecutive_failures`` reads: a ``StateReader``, or the writer's ``Store``."""
+    """What ``consecutive_failures`` reads: a ``StateReader``, or the writer's ``Store``."""
 
-    def statuses(self, rule: str) -> Iterator[tuple[str, int]]: ...
+    def statuses(self, rule: str) -> Iterator[tuple[str, int, str | None]]: ...
 
 
-def _consecutive_failures(reader: RunStatuses, rule: str) -> int:
-    """The newest runs in a row whose health is not ``ok``."""
+def _any_failure(status: str, failed: int, error_kind: str | None) -> bool:
+    return True
+
+
+def consecutive_failures(
+    reader: RunStatuses,
+    rule: str,
+    counts: Callable[[str, int, str | None], bool] = _any_failure,
+) -> int:
+    """The newest runs since the last ``ok`` one whose (status, failed, error_kind) ``counts``
+    (by default every one: the runs in a row whose health is not ``ok``)."""
     count = 0
-    for status, failed in reader.statuses(rule):
-        if _is_ok(status, failed):
+    for status, failed, error_kind in reader.statuses(rule):
+        if is_ok(status, failed):
             break
-        count += 1
+        if counts(status, failed, error_kind):
+            count += 1
     return count
+
+
+def flat(text: str) -> str:
+    """One line of user text: newlines and other whitespace runs become single spaces."""
+    return " ".join(text.split())
 
 
 def blocked_message(rule: str, count: int) -> str:
@@ -1033,7 +1050,7 @@ def _account_auth(account: str, rules: Sequence[Rule], last: Mapping[str, RunVie
     runs = [last[r.name] for r in using]
     if any(run is not None and run.error_kind == "auth" and run.error_account == account for run in runs):
         return "failed"
-    if using and all(run is not None and _is_ok(run.status, run.failed) for run in runs):
+    if using and all(run is not None and is_ok(run.status, run.failed) for run in runs):
         return "ok"
     return "unknown"
 
@@ -1095,7 +1112,7 @@ def build_status(config: Config, reader: StateReader, now: datetime) -> StatusVi
                 health=_rule_health(rule, last),
                 last_run=last,
                 last_ok_at=last_ok.finished_at if last_ok else None,
-                consecutive_failures=_consecutive_failures(reader, rule.name),
+                consecutive_failures=consecutive_failures(reader, rule.name),
                 copies=reader.copies(rule_tag(rule.name)),
             )
         )
@@ -1178,7 +1195,7 @@ def _blocked_rule(rule: Rule, reader: StateReader) -> BlockedRule | None:
         return None
     first = runs[0]
     for run in runs:  # newest first: back to the last ok run (a failure does not end a block)
-        if _is_ok(run.status, run.failed):
+        if is_ok(run.status, run.failed):
             break
         if run.status == "blocked":
             first = run
