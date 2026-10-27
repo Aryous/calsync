@@ -12,6 +12,7 @@ dependencies = [
     "anyio>=4.6",
     "starlette>=1.10,<2",
     "uvicorn>=0.54,<1",
+    "tomlkit>=0.13",
 ]
 
 [project.scripts]
