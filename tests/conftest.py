@@ -1,3 +1,4 @@
+import os
 import shutil
 import socket
 import subprocess
@@ -5,7 +6,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import httpx
@@ -22,6 +23,26 @@ def _no_calsync_debug(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: igno
     """The type-only log assertions hold whatever the developer's shell sets; a test that
     wants ``CALSYNC_DEBUG`` sets it itself."""
     monkeypatch.delenv("CALSYNC_DEBUG", raising=False)
+
+
+@pytest.fixture
+def local_zone() -> Iterator[Callable[[str], None]]:
+    """``local_zone("Asia/Shanghai")`` makes that the process's local zone (``TZ`` plus
+    ``time.tzset``) for the rest of the test; the previous zone comes back afterwards."""
+    saved = os.environ.get("TZ")
+
+    def set_zone(name: str) -> None:
+        os.environ["TZ"] = name
+        time.tzset()
+
+    try:
+        yield set_zone
+    finally:
+        if saved is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = saved
+        time.tzset()
 
 
 @pytest.fixture

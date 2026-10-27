@@ -183,9 +183,9 @@ async def test_the_view_shape(tmp_path: Path) -> None:
     await synced(tmp_path)
     with StateReader(tmp_path / "state.db") as reader:
         body = build_events(two_rules(), reader, FROM, TO, now=NOW).to_json()
-    assert list(body) == ["from", "to", "schema", "events"]
+    assert list(body) == ["from", "to", "schema", "truncated", "events"]
     assert body["from"] == FROM.isoformat() and body["to"] == TO.isoformat()
-    assert body["schema"]["current"] is True
+    assert body["schema"]["current"] is True and body["truncated"] is False
 
 
 async def test_rule_and_target_filters_restrict_the_deliveries(tmp_path: Path) -> None:
@@ -435,3 +435,126 @@ async def test_a_62_day_range_over_300_series_is_fast(tmp_path: Path) -> None:
     elapsed = time.monotonic() - started
     assert len(found) > 6000
     assert elapsed < 2.0, elapsed
+
+
+# ----- fix round 1 ------------------------------------------------------------------------------------
+
+
+def _all_day_event(eid: str, title: str, first: str, end: str) -> dict[str, Any]:
+    return {
+        "id": eid,
+        "status": "confirmed",
+        "summary": title,
+        "start": {"date": first},
+        "end": {"date": end},
+    }
+
+
+@pytest.mark.parametrize("offset", ["+08:00", "-05:00"])
+async def test_a_local_day_view_shows_that_days_all_day_events(tmp_path: Path, offset: str) -> None:
+    fake = FakeGoogle()
+    fake.add_calendar(GCAL, "Family")
+    for eid, first, end in [
+        ("before", "2026-10-27", "2026-10-28"),
+        ("on", "2026-10-28", "2026-10-29"),
+        ("after", "2026-10-29", "2026-10-30"),
+        ("trip", "2026-10-26", "2026-10-31"),  # five days over the 28th
+    ]:
+        fake.put_event(GCAL, _all_day_event(eid, eid.capitalize(), first, end))
+    config = config_for([rule("family")])
+    h = build_fake(tmp_path, fake, config)
+    await h.engine.cycle()
+    start = datetime.fromisoformat(f"2026-10-28T00:00:00{offset}")
+    found = events(tmp_path, config, start=start, end=start + timedelta(days=1))
+    assert sorted(e["title"] for e in found) == ["On", "Trip"]
+    for event in found:  # the ids still name the occurrence
+        assert detail(tmp_path, config, event["id"])["start"] == event["start"]
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        datetime(2040, 1, 1, tzinfo=UTC),  # beyond ten years from now
+        datetime(2010, 1, 1, tzinfo=UTC),  # ten years before
+        datetime(9999, 12, 30, tzinfo=UTC),  # the default week after it would overflow
+        datetime(1, 1, 1, tzinfo=UTC),
+    ],
+)
+def test_the_range_must_lie_within_ten_years_of_now(start: datetime) -> None:
+    from calsync.events_view import event_range
+
+    with pytest.raises(ValueError, match="within 10 years"):
+        event_range(start, None, NOW)
+
+
+def test_the_range_end_must_lie_within_ten_years_of_now() -> None:
+    from calsync.events_view import event_range
+
+    start = NOW + timedelta(days=3650)
+    assert event_range(start, start + timedelta(days=1), NOW)[0] == start  # still inside
+    with pytest.raises(ValueError, match="within 10 years"):
+        event_range(start, start + timedelta(days=10), NOW)
+
+
+@pytest.mark.parametrize(
+    "instance",
+    [
+        "9000-01-01T19:00:00+08:00",  # a far instance: refused before expanding to it
+        "9999-12-31",  # the day after it is not representable
+        "9999-12-31T23:59:59+00:00",
+        "0001-01-01T00:00:00+08:00",
+        "2040-01-03T19:00:00+08:00",
+    ],
+)
+async def test_ids_naming_far_instances_are_not_found(tmp_path: Path, instance: str) -> None:
+    fake = seeded()
+    fake.put_event(
+        GCAL,
+        google_event(
+            "daily",
+            "Daily",
+            f"2026-10-20T19:00:00{TZ}",
+            f"2026-10-20T20:00:00{TZ}",
+            recurrence=["RRULE:FREQ=DAILY"],
+        ),
+    )
+    h = build_fake(tmp_path, fake, two_rules())
+    await h.engine.cycle()
+    started = time.monotonic()
+    with pytest.raises(NotFound):
+        detail(tmp_path, two_rules(), event_id("me", GCAL, "daily", instance))
+    assert time.monotonic() - started < 0.5
+
+
+async def test_a_series_cut_at_the_expansion_limit_marks_the_view_truncated(tmp_path: Path) -> None:
+    import io
+
+    from calsync.cli import _print_view  # pyright: ignore[reportPrivateUsage]
+
+    fake = seeded()
+    fake.put_event(
+        GCAL,
+        google_event(
+            "hourly",
+            "Hourly",
+            f"2026-10-20T00:00:00{TZ}",
+            f"2026-10-20T00:10:00{TZ}",
+            recurrence=["RRULE:FREQ=HOURLY"],
+        ),
+    )
+    config = config_for([rule("family")])
+    h = build_fake(tmp_path, fake, config)
+    await h.engine.cycle()
+    start = datetime(2026, 10, 24, tzinfo=UTC)
+    with StateReader(tmp_path / "state.db") as reader:
+        cut = build_events(config, reader, start, start + timedelta(days=62), now=NOW)
+        whole = build_events(config, reader, start, start + timedelta(days=7), now=NOW)
+    body = cut.to_json()
+    assert body["truncated"] is True
+    assert sum(e["title"] == "Hourly" for e in body["events"]) == 1000
+    assert whole.to_json()["truncated"] is False
+    out = io.StringIO()
+    _print_view(cut, out)
+    assert out.getvalue().splitlines()[-1] == (
+        "note: a recurring event has more instances than shown (at most 1000 per event); narrow the range"
+    )

@@ -214,14 +214,14 @@ def test_config_get_masks_urls_and_identities(files: Files) -> None:
     assert body["notify"]["public_url"] == "https://calsync.example.com"
     family = body["accounts"]["family-icloud"]
     assert family == {
+        "name": "family-icloud",
         "provider": "caldav",
         "host": "iCloud",
-        "server_url": "icloud",
-        "username": "(hidden)",
-        "credential": {"backend": "env", "ref": "(hidden)"},
-        "max_concurrency": 2,
+        "credential_configured": True,
     }
+    assert body["google"] == {"client_secret_file": {"configured": True}}
     assert "DEVICEKEY" not in out and "family@example.com" not in out and "FAMILY_PW" not in out
+    assert str(files.config.parent) not in out and "google-client.json" not in out and "username" not in out
     assert body["rules"][0] == {
         "name": "family",
         "source": {"account": "me-google", "calendar": "Family"},
@@ -240,6 +240,7 @@ def test_config_get_masks_urls_and_identities(files: Files) -> None:
     assert revealed["notify"]["bark_url"] == "https://bark.example.com/DEVICEKEY"
     assert revealed["accounts"]["family-icloud"]["username"] == "family@example.com"
     assert revealed["accounts"]["family-icloud"]["credential"]["ref"] == "FAMILY_PW"
+    assert revealed["google"]["client_secret_file"].endswith(".json")  # the full path
 
 
 def test_config_get_without_a_config(short_dir: Path) -> None:

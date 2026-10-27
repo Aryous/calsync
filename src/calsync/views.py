@@ -512,32 +512,39 @@ def _scheme_host(url: str) -> str:
 
 
 def config_json(config: Config, *, reveal: bool = False) -> dict[str, Any]:
-    """The parsed config as JSON (``calsync config get``). Unless ``reveal``: push, webhook and
-    public URLs are cut to scheme and host, a CalDAV URL too, and each account's username (an
-    Apple ID) and credential ref read ``"(hidden)"``."""
+    """The parsed config as JSON (``calsync config get``, ``GET /api/config``). Unless
+    ``reveal``: push, webhook and public URLs are cut to scheme and host; each account shows
+    only its ``name``, ``provider``, ``host`` and whether a credential is configured (never the
+    username, an Apple ID, the credential ref or the server URL); the Google client secret file
+    shows only whether one is configured (its path names the home directory)."""
     from calsync.durations import format_duration
 
     def url(value: str | None) -> str | None:
         return value if reveal or value is None or value == "icloud" else _scheme_host(value)
 
-    def hidden(value: str | None) -> str | None:
-        return value if reveal or value is None else HIDDEN
-
     def alarms(rule: Rule) -> str | list[str]:
         policy = rule.alarms
         return policy if isinstance(policy, str) else [format_duration(o) for o in policy]
 
-    accounts = {
+    accounts: dict[str, dict[str, Any]] = {
         a.name: {
             "provider": a.provider,
             "host": host_for(a.provider, a.server_url),
-            "server_url": url(a.server_url),
-            "username": hidden(a.username),
-            "credential": {"backend": a.credential.backend, "ref": hidden(a.credential.ref)},
+            "server_url": a.server_url,
+            "username": a.username,
+            "credential": {"backend": a.credential.backend, "ref": a.credential.ref},
             "max_concurrency": a.max_concurrency,
+        }
+        if reveal
+        else {
+            "name": a.name,
+            "provider": a.provider,
+            "host": host_for(a.provider, a.server_url),
+            "credential_configured": bool(a.credential.ref),
         }
         for a in config.accounts.values()
     }
+    secret_file = config.google_client_secret_file
     rules = [
         {
             "name": r.name,
@@ -567,9 +574,9 @@ def config_json(config: Config, *, reveal: bool = False) -> dict[str, Any]:
     return {
         "revealed": reveal,
         "google": {
-            "client_secret_file": None
-            if config.google_client_secret_file is None
-            else str(config.google_client_secret_file)
+            "client_secret_file": (None if secret_file is None else str(secret_file))
+            if reveal
+            else {"configured": secret_file is not None}
         },
         "accounts": accounts,
         "rules": rules,
@@ -926,7 +933,8 @@ def _account_view(
 
 
 def _midnight(now: datetime) -> datetime:
-    """The start of ``now``'s day, in ``now``'s own zone."""
+    """The start of ``now``'s day, in ``now``'s own zone (pass ``now.astimezone()`` for the
+    local day)."""
     return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
@@ -972,7 +980,7 @@ def build_status(config: Config, reader: StateReader, now: datetime) -> StatusVi
         accounts=tuple(_account_view(a, config, reader, lasts, cids) for a in config.accounts.values()),
         rules=tuple(rules),
         attention=attention,
-        delivered_today=reader.deliveries_since(_midnight(now)),
+        delivered_today=reader.deliveries_since(_midnight(now.astimezone())),  # this machine's day
     )
 
 
@@ -1180,7 +1188,8 @@ def _rule_events(
             delivery = "delivered" if reading.delivered(reading.object_id(item), shaped) else "pending"
         events.extend(
             UpcomingEvent(rule.name, inst, reading.target_name, delivery)
-            for inst in expand_instances(shaped, now, end)
+            # In local time: an all-day event counts on this machine's days (instants are the same).
+            for inst in expand_instances(shaped, now.astimezone(), end.astimezone())
         )
     return events
 

@@ -7,7 +7,7 @@ import getpass
 import json
 import sys
 from collections.abc import Callable, Iterable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TextIO
 
@@ -237,11 +237,12 @@ def _instant(text: str) -> datetime:
     """An ISO 8601 time; one without an offset is local time."""
     try:
         value = datetime.fromisoformat(text)
-    except ValueError:
+        # A local time near the ends of the calendar may have no instant (ValueError, OverflowError).
+        return value if value.tzinfo is not None else value.astimezone()
+    except (ValueError, OverflowError):
         raise argparse.ArgumentTypeError(
             f"expected an ISO 8601 time such as 2026-10-24T08:00, got {text!r}"
         ) from None
-    return value if value.tzinfo is not None else value.astimezone()
 
 
 def _config_path(args: argparse.Namespace) -> Path:
@@ -995,10 +996,18 @@ def _show(
 
 
 def _span_text(start: "When", end: "When") -> str:
-    """``2026-10-24 18:00–18:15`` in local time; ``2026-11-05 all day``."""
+    """``2026-10-24 18:00–18:15`` in local time, ``2026-10-28 22:00 – 2026-10-29 01:00`` over
+    midnight; ``2026-11-05 all day``, ``2026-11-05 – 2026-11-07 all day`` (the last day shown,
+    not the exclusive end)."""
     if start.all_day:
-        return f"{start.value.isoformat()} all day"
+        first = start.value
+        last = end.value - timedelta(days=1) if isinstance(end.value, date) and end.all_day else first
+        if last > first:
+            return f"{first.isoformat()} – {last.isoformat()} all day"
+        return f"{first.isoformat()} all day"
     lo, hi = start.utc().astimezone(), end.utc().astimezone()
+    if hi.date() != lo.date():
+        return f"{lo.strftime('%Y-%m-%d %H:%M')} – {hi.strftime('%Y-%m-%d %H:%M')}"
     return f"{lo.strftime('%Y-%m-%d %H:%M')}–{hi.strftime('%H:%M')}"
 
 
@@ -1075,6 +1084,15 @@ def _print_view(view: View, out: TextIO) -> None:
                 f"{_span_text(event.instance.start, event.instance.end)}  {_flat(event.instance.title)}  "
                 f"[{event.source['calendar_name']} → {deliveries}]\n"
             )
+        if view.events:
+            out.write("(use --json for event ids)\n")
+        if view.truncated:
+            from calsync.model import EXPANSION_LIMIT
+
+            out.write(
+                f"note: a recurring event has more instances than shown (at most {EXPANSION_LIMIT} "
+                "per event); narrow the range\n"
+            )
     elif isinstance(view, EventDetail):
         _print_event(view, out)
     elif isinstance(view, ChangesView):
@@ -1118,7 +1136,7 @@ def cmd_events(args: argparse.Namespace, out: TextIO) -> int:
     try:
         start, end = event_range(args.start, args.end, now)
         target = parse_target(args.target) if args.target is not None else None
-    except ValueError as exc:
+    except (ValueError, OverflowError) as exc:
         return _refuse(args, out, "bad_request", str(exc), EXIT_CONFIG)
     config = _load(args)
     if args.rule is not None and args.rule not in {r.name for r in config.rules}:
@@ -1146,10 +1164,15 @@ def cmd_event(args: argparse.Namespace, out: TextIO) -> int:
 def cmd_upcoming(args: argparse.Namespace, out: TextIO) -> int:
     from calsync.views import build_upcoming
 
+    now = _now()
+    try:
+        _ = now + timedelta(hours=args.hours)  # only whether it is representable
+    except OverflowError:
+        return _refuse(args, out, "bad_request", "hours: too far ahead", EXIT_CONFIG)
     return _show(
         args,
         out,
-        lambda config, reader: build_upcoming(config, reader, _now(), hours=args.hours, rule=args.rule),
+        lambda config, reader: build_upcoming(config, reader, now, hours=args.hours, rule=args.rule),
     )
 
 

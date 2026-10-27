@@ -25,6 +25,8 @@ RENDER_VERSION = 2
 MAX_TIME = datetime(9999, 12, 31, tzinfo=UTC)
 # Beyond this many occurrences the series is treated as unbounded (safe direction: never mistaken for finished).
 SPAN_EXPANSION_LIMIT = 10_000
+# Most candidate instances one read-only expansion (``expand``) considers from its range on.
+EXPANSION_LIMIT = 1000
 
 AlarmPolicy = Literal["copy", "strip"] | tuple[timedelta, ...]
 AttendeeMode = Literal["none", "notes"]
@@ -447,19 +449,41 @@ def _overlaps(start: When, end: When, lo: datetime, hi: datetime) -> bool:
     return s < hi and (e > lo or (s == e and s >= lo))
 
 
-def expand_instances(series: Series, start: datetime, end: datetime, *, limit: int = 1000) -> list[Instance]:
+def _day_range(start: datetime, end: datetime) -> tuple[datetime, datetime]:
+    """``[start, end)`` as the days it touches, each taken in its own zone, anchored at 00:00
+    UTC as ``When.utc()`` anchors a date: a day view of 28 October at +08:00 holds the all-day
+    events of the 28th, not of the 27th (which 16:00Z on the 27th would)."""
+    lo = datetime(start.year, start.month, start.day, tzinfo=UTC)
+    hi = datetime(end.year, end.month, end.day, tzinfo=UTC)
+    if end != end.replace(hour=0, minute=0, second=0, microsecond=0):
+        with suppress(OverflowError):  # the last representable day: as far as it goes
+            hi += timedelta(days=1)  # a day only partly in range is in it
+    return lo, hi
+
+
+@dataclass(frozen=True, slots=True)
+class Expansion:
+    instances: list[Instance]
+    truncated: bool  # the limit cut the expansion short inside the range
+
+
+def expand(series: Series, start: datetime, end: datetime, *, limit: int = EXPANSION_LIMIT) -> Expansion:
     """The instances of ``series`` that intersect ``[start, end)``, sorted by start.
 
-    Wall-clock times stay fixed across DST (the expansion runs in the series' zone). EXDATEs and
-    the original starts of overrides are removed; overrides appear with their own fields. At most
-    ``limit`` candidates are considered from the window on. Never raises on a bad recurrence: the
-    master occurrence alone is returned (if it is in range).
+    Wall-clock times stay fixed across DST (the expansion runs in the series' zone). An all-day
+    series is matched by day: against the days ``[start, end)`` touches in its own zone (see
+    ``_day_range``). EXDATEs and the original starts of overrides are removed; overrides appear
+    with their own fields. At most ``limit`` candidates are considered from the window on
+    (``truncated`` when that cut the range short). Never raises on a bad recurrence: the master
+    occurrence alone is returned (if it is in range).
     """
+    if series.start.all_day:
+        start, end = _day_range(start, end)
     recurring = bool(series.recurrence)
     master = Instance(series.start, series.end, series.title, series.location, series.alarms, recurring)
     only_master = [master] if _overlaps(series.start, series.end, start, end) else []
     if not recurring:
-        return only_master
+        return Expansion(only_master, False)
     all_day = series.start.all_day
     zone = None if all_day else _zone(series.start.tzid)
     duration = series.end.utc() - series.start.utc()
@@ -471,13 +495,17 @@ def expand_instances(series: Series, start: datetime, end: datetime, *, limit: i
 
     removed = {key(w) for w in series.exdates} | {key(o.original_start) for o in series.overrides}
     found: list[Instance] = []
+    truncated = False
     try:
         rset = _occurrence_set(series, zone)
         lo, hi = start - duration, end
         if zone is None:  # naive midnights; dates are anchored at 00:00 UTC, as in When.utc()
             lo, hi = lo.astimezone(UTC).replace(tzinfo=None), hi.astimezone(UTC).replace(tzinfo=None)
         for count, dt in enumerate(rset.xafter(lo, inc=True)):
-            if dt >= hi or count >= limit:
+            if dt >= hi:
+                break
+            if count >= limit:
+                truncated = True
                 break
             if zone is None:
                 inst_start, inst_end = When(dt.date()), When(dt.date() + duration)
@@ -488,10 +516,17 @@ def expand_instances(series: Series, start: datetime, end: datetime, *, limit: i
                 continue
             found.append(Instance(inst_start, inst_end, series.title, series.location, series.alarms, True))
     except Exception:  # a bad RRULE/RDATE (dateutil and icalendar raise many types): the master only
-        return only_master
+        return Expansion(only_master, False)
     found.extend(
         Instance(o.start, o.end, o.title, o.location, o.alarms, True)
         for o in series.overrides
         if _overlaps(o.start, o.end, start, end)
     )
-    return sorted(found, key=lambda i: _when_order(i.start))
+    return Expansion(sorted(found, key=lambda i: _when_order(i.start)), truncated)
+
+
+def expand_instances(
+    series: Series, start: datetime, end: datetime, *, limit: int = EXPANSION_LIMIT
+) -> list[Instance]:
+    """``expand(...).instances``."""
+    return expand(series, start, end, limit=limit).instances

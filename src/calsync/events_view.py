@@ -18,11 +18,15 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
 from calsync.config import Config, Rule
-from calsync.model import Alarm, Instance, Series, When, expand_instances, series_span
+from calsync.model import Alarm, Instance, Series, When, expand, expand_instances, series_span
 from calsync.views import RuleReading, RunView, StateReader, _is_ok, _iso, source_series
 
 # Most days one events query may span (the GUI's widest view is a month, plus its edges).
 MAX_EVENT_DAYS = 62
+# How far from now a query (and an event id's instance) may lie: expanding a recurring series
+# costs its instances from its start up to the range, whatever the range's width.
+HORIZON_YEARS = 10
+HORIZON = timedelta(days=round(365.25 * HORIZON_YEARS))
 
 # Worst first: the first that applies is the state. ``unknown``: the state comes from another
 # calsync version (its hashes are not comparable); ``delivered``: the copy's recorded hash is the
@@ -37,14 +41,26 @@ class NotFound(Exception):
     """No such event: a malformed id, or one that names no current occurrence."""
 
 
+def _in_horizon(moment: datetime, now: datetime) -> bool:
+    return abs(moment - now) <= HORIZON  # a difference of two datetimes never overflows
+
+
 def event_range(start: datetime | None, end: datetime | None, now: datetime) -> tuple[datetime, datetime]:
     """The range an events query covers: from ``start`` (default: today's local midnight) to
     ``end`` (exclusive; default: a week later). ``ValueError`` (its text for the person) for a
-    range that ends before it starts or spans more than ``MAX_EVENT_DAYS`` days."""
+    range that ends before it starts, spans more than ``MAX_EVENT_DAYS`` days, or does not lie
+    within ``HORIZON_YEARS`` of ``now``."""
     if start is None:
         start = now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    if not _in_horizon(start, now):  # before the default end: that could overflow
+        raise ValueError(f"from: must be within {HORIZON_YEARS} years of today")
     if end is None:
-        end = start + timedelta(days=7)
+        try:
+            end = start + timedelta(days=7)
+        except OverflowError:
+            raise ValueError("from: too far from today") from None
+    if not _in_horizon(end, now):
+        raise ValueError(f"to: must be within {HORIZON_YEARS} years of today")
     if end < start:
         raise ValueError("to: must not be before from")
     # An hour more: local midnights 62 days apart across a DST change differ by that much.
@@ -208,12 +224,16 @@ class EventsView:
     schema_version: int | None
     schema_current: bool
     events: tuple[Event, ...]
+    # Some recurring series has more instances in the range than one expansion considers
+    # (``model.expand``'s limit): the later ones are missing.
+    truncated: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
             "from": self.start.isoformat(),
             "to": self.end.isoformat(),
             "schema": {"version": self.schema_version, "current": self.schema_current},
+            "truncated": self.truncated,
             "events": [e.to_json() for e in self.events],
         }
 
@@ -314,11 +334,14 @@ def build_events(
     location. Each series is expanded once, whatever the number of rules."""
     needle = query.casefold() if query else None
     events: list[Event] = []
+    truncated = False
     for cal in _calendars(config, reader, now, rule=rule, target=target):
         source = _source_json(config, cal)
         targets = [_target_json(c) for c in cal.rules]
         for item in source_series(reader, cal.account, cal.cid, cal.entry):
-            instances = expand_instances(item, start, end)
+            expansion = expand(item, start, end)
+            truncated = truncated or expansion.truncated
+            instances = expansion.instances
             if needle is not None:
                 instances = [i for i in instances if _matches(i, needle)]
             if not instances:
@@ -345,28 +368,35 @@ def build_events(
         schema_version=reader.schema_version(),
         schema_current=reader.schema_current(),
         events=tuple(events),
+        truncated=truncated,
     )
 
 
 # ----- one event ----------------------------------------------------------------------------------
 
 
-def _parse_start(text: str) -> tuple[datetime, datetime]:
-    """A small range that holds only instances starting at ``text`` (an instance's ``start``)."""
+def _parse_start(text: str, now: datetime) -> tuple[datetime, datetime]:
+    """A small range that holds only instances starting at ``text`` (an instance's ``start``).
+    ``NotFound`` for a start that is no time, or lies beyond the query horizon (no events
+    query lists it, and expanding a series up to it could take long)."""
     try:
-        if "T" not in text:
+        if "T" in text:
+            lo = datetime.fromisoformat(text)
+            if lo.tzinfo is None:
+                raise NotFound(text)
+            span = timedelta(seconds=1)
+        else:
             day = date.fromisoformat(text)
             lo = datetime(day.year, day.month, day.day, tzinfo=UTC)  # as ``When.utc`` anchors a date
-            return lo, lo + timedelta(days=1)
-        moment = datetime.fromisoformat(text)
-    except ValueError:
+            span = timedelta(days=1)
+        if not _in_horizon(lo, now):
+            raise NotFound(text)
+        return lo, lo + span
+    except (ValueError, OverflowError):
         raise NotFound(text) from None
-    if moment.tzinfo is None:
-        raise NotFound(text)
-    return moment, moment + timedelta(seconds=1)
 
 
-def _occurrence(item: Series, rest: str) -> Instance | None:
+def _occurrence(item: Series, rest: str, now: datetime) -> Instance | None:
     """The occurrence of ``item`` that the id's tail (``rest``: after the calendar) names."""
     if rest == item.source_id:
         if item.recurrence:
@@ -376,7 +406,7 @@ def _occurrence(item: Series, rest: str) -> Instance | None:
     if not rest.startswith(prefix) or not item.recurrence:
         return None
     text = rest[len(prefix) :]
-    lo, hi = _parse_start(text)
+    lo, hi = _parse_start(text, now)
     return next((i for i in expand_instances(item, lo, hi) if _when(i.start) == text), None)
 
 
@@ -393,7 +423,7 @@ def build_event(config: Config, reader: StateReader, eid: str, now: datetime) ->
             continue
         rest = key[len(prefix) :]
         for item in source_series(reader, cal.account, cal.cid, cal.entry):
-            inst = _occurrence(item, rest)
+            inst = _occurrence(item, rest, now)
             if inst is None:
                 continue
             span = _span(cal, item)

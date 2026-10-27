@@ -133,9 +133,10 @@ def _instant(request: Request, name: str) -> datetime | None:
         return None
     try:
         value = datetime.fromisoformat(text)
-    except ValueError:
+        # A local time near the ends of the calendar may have no instant (ValueError, OverflowError).
+        return value if value.tzinfo is not None else value.astimezone()
+    except (ValueError, OverflowError):
         raise ApiError(400, "bad_request", f"{name}: expected an ISO 8601 time, got {text!r}") from None
-    return value if value.tzinfo is not None else value.astimezone()
 
 
 async def _trigger_rule(request: Request) -> str | None:
@@ -261,7 +262,7 @@ class _Endpoints:
         now = self._clock()
         try:
             start, end = events_view.event_range(_instant(request, "from"), _instant(request, "to"), now)
-        except ValueError as exc:
+        except (ValueError, OverflowError) as exc:
             raise ApiError(400, "bad_request", str(exc)) from None
         rule = self._rule(request)
         target: tuple[str, str] | None = None

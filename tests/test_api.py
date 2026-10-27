@@ -445,7 +445,7 @@ async def test_events(state: Path) -> None:
         by_target = (await c.get("/api/events", params={**DAY, "target": "dav:Family"})).json()
     assert response.status_code == 200
     body = response.json()
-    assert list(body) == ["from", "to", "schema", "events"]
+    assert list(body) == ["from", "to", "schema", "truncated", "events"]
     assert [(e["title"], e["start"]) for e in body["events"]] == [
         ("Standup", "2026-10-24T18:00:00+08:00"),
         ("Lunch", "2026-10-25T12:00:00+08:00"),
@@ -479,6 +479,11 @@ async def test_events_accept_dates(state: Path) -> None:
         {"from": "soon"},
         {"to": "later"},
         {**DAY, "target": "no-colon"},
+        {"from": "2040-01-01"},  # beyond ten years from now
+        {"from": "9999-12-30"},  # its default end would overflow
+        {"from": "9999-12-31T23:00"},  # local time: not representable as an instant
+        {"from": "0001-01-01T00:00"},
+        {"from": "2026-10-24T00:00+00:00", "to": "9999-12-31T23:59+00:00"},
     ],
 )
 async def test_bad_event_ranges_are_400(state: Path, params: dict[str, str]) -> None:
@@ -536,10 +541,38 @@ async def test_config_is_masked(tmp_path: Path) -> None:
     body = response.json()
     assert body == views.config_json(config()) and body["revealed"] is False
     assert revealing.json() == body  # --reveal exists only on the CLI
-    dav = body["accounts"]["dav"]
-    assert dav["username"] == "(hidden)" and dav["credential"]["ref"] == "(hidden)"
-    assert dav["server_url"] == "http://unused" and dav["host"] == "unused"
-    assert '"u"' not in response.text and "UNUSED" not in response.text
+    assert body["accounts"] == {
+        "me": {"name": "me", "provider": "google", "host": "Google Calendar", "credential_configured": True},
+        "dav": {"name": "dav", "provider": "caldav", "host": "unused", "credential_configured": True},
+    }
+    assert body["google"] == {"client_secret_file": {"configured": True}}
+    text = response.text
+    assert str(Path.home()) not in text and "unused.json" not in text  # the client secret path
+    assert '"u"' not in text and "username" not in text  # the CalDAV login (an Apple ID)
+    assert "UNUSED" not in text and '"ref"' not in text  # the credential ref
+    assert "http://unused" not in text  # the server URL
+
+
+async def test_config_cuts_push_urls_to_scheme_and_host(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from calsync.config import NotifyConfig
+
+    pushing = replace(
+        config(),
+        notify=NotifyConfig(
+            bark_url="https://bark.example.com/DEVICEKEY", webhook_url="https://hooks.example.com/h/T0KEN"
+        ),
+    )
+    app = api.create_app(config_provider=lambda: pushing, state_dir=tmp_path, daemon=None, clock=lambda: NOW)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://calsync") as c:
+        response = await c.get("/api/config")
+    notify = response.json()["notify"]
+    assert (notify["bark_url"], notify["webhook_url"]) == (
+        "https://bark.example.com",
+        "https://hooks.example.com",
+    )
+    assert "DEVICEKEY" not in response.text and "T0KEN" not in response.text
 
 
 async def test_config_history(state: Path) -> None:

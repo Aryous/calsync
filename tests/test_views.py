@@ -2,7 +2,7 @@
 
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -981,18 +981,19 @@ def test_account_auth_without_runs_or_rules_is_unknown(tmp_path: Path) -> None:
     assert [a["auth"] for a in view["accounts"]] == ["unknown", "unknown"]
 
 
-def test_delivered_today_counts_writes_since_midnight_in_nows_zone(tmp_path: Path) -> None:
-    from zoneinfo import ZoneInfo
-
-    zone = ZoneInfo("Asia/Shanghai")
-    now = NOW.astimezone(zone)  # 16:00 on 2026-10-24 there
-    midnight = datetime(2026, 10, 24, tzinfo=zone)
+def test_delivered_today_counts_writes_since_local_midnight(
+    tmp_path: Path, local_zone: Callable[[str], None]
+) -> None:
+    # 20:00Z on the 24th is 04:00 on the 25th in Shanghai: "today" there began at 16:00Z.
+    local_zone("Asia/Shanghai")
+    now = datetime(2026, 10, 24, 20, 0, tzinfo=UTC)
+    midnight = datetime(2026, 10, 24, 16, 0, tzinfo=UTC)
 
     def change(action: str, at: datetime) -> ChangeRecord:
         return ChangeRecord("family", "o1", action, at, "Lunch")
 
     changes = [
-        change("created", midnight - timedelta(microseconds=1)),  # yesterday there
+        change("created", midnight - timedelta(minutes=1)),  # yesterday there (but today in UTC)
         change("created", midnight),
         change("updated", midnight + timedelta(hours=1, microseconds=5)),
         change("reverted", now),
@@ -1002,9 +1003,39 @@ def test_delivered_today_counts_writes_since_midnight_in_nows_zone(tmp_path: Pat
     with Store(tmp_path / "state.db") as store:
         store.record_runs([_run("ok")], changes)
     with reader(tmp_path) as r:
-        assert build_status(family(), r, now).to_json()["summary"]["delivered_today"] == 3
-        utc = build_status(family(), r, NOW).to_json()["summary"]["delivered_today"]
-    assert utc == 1  # midnight UTC is 08:00 in Shanghai: only the last write is after it
+        view = build_status(family(), r, now).to_json()
+        assert view["summary"]["delivered_today"] == 3
+        assert view["generated_at"] == now.isoformat()  # still the instant as given
+        local_zone("UTC")
+        assert build_status(family(), r, now).to_json()["summary"]["delivered_today"] == 4
+
+
+@pytest.mark.anyio
+async def test_upcoming_all_day_events_fall_on_local_days(
+    tmp_path: Path, local_zone: Callable[[str], None]
+) -> None:
+    local_zone("Asia/Shanghai")
+    fake = FakeGoogle()
+    fake.add_calendar(GCAL, "Family")
+    for eid, first, end in [("yesterday", "2026-10-24", "2026-10-25"), ("today", "2026-10-25", "2026-10-26")]:
+        fake.put_event(
+            GCAL,
+            {
+                "id": eid,
+                "status": "confirmed",
+                "summary": eid,
+                "start": {"date": first},
+                "end": {"date": end},
+            },
+        )
+    config = family()
+    h = build_fake(tmp_path, fake, config)
+    await h.engine.cycle()
+    now = datetime(2026, 10, 24, 23, 0, tzinfo=UTC)  # 07:00 on the 25th in Shanghai
+    with reader(tmp_path) as r:
+        view = build_upcoming(config, r, now, hours=12).to_json()
+    assert [e["title"] for e in view["events"]] == ["today"]
+    assert view["from"] == now.isoformat()  # the JSON keeps the instant as given
 
 
 def test_changes_carry_their_detail(tmp_path: Path) -> None:

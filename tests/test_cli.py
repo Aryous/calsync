@@ -1340,6 +1340,7 @@ def test_events_text(synced: list[str]) -> None:
         line("2026-10-24T18:00:00+08:00", "2026-10-24T18:15:00+08:00", "Standup"),
         line("2026-10-25T12:00:00+08:00", "2026-10-25T13:00:00+08:00", "Lunch break"),
         line("2026-10-25T18:00:00+08:00", "2026-10-25T18:15:00+08:00", "Standup"),
+        "(use --json for event ids)",
     ]
 
 
@@ -1347,7 +1348,10 @@ def test_events_text_all_day_and_empty(synced: list[str]) -> None:
     code, text = run(
         [*synced, "events", "--from", "2026-11-05T00:00+00:00", "--to", "2026-11-06T00:00+00:00"]
     )
-    assert (code, text) == (EXIT_OK, "2026-11-05 all day  Holiday  [Family → Family: delivered]\n")
+    assert (code, text) == (
+        EXIT_OK,
+        "2026-11-05 all day  Holiday  [Family → Family: delivered]\n(use --json for event ids)\n",
+    )
     code, text = run([*synced, "events", "--from", "2030-01-01", "--to", "2030-01-02"])
     assert (code, text) == (EXIT_OK, "no events\n")
 
@@ -1358,7 +1362,7 @@ def test_events_json_and_filters(synced: list[str]) -> None:
     code, text = run([*synced, "events", *RANGE, "--json"])
     assert code == EXIT_OK
     body = json.loads(text)
-    assert list(body) == ["from", "to", "schema", "events"]
+    assert list(body) == ["from", "to", "schema", "truncated", "events"]
     assert [e["title"] for e in body["events"]] == ["Standup", "Lunch\nbreak", "Standup"]
     code, text = run([*synced, "events", *RANGE, "--json", "--query", "LUNCH", "--rule", "family"])
     assert [e["title"] for e in json.loads(text)["events"]] == ["Lunch\nbreak"]
@@ -1388,6 +1392,9 @@ def test_events_defaults_to_a_week_from_today(synced: list[str]) -> None:
         (["--rule", "nope"], "unknown rule(s): nope"),
         (["--target", "dav:Nowhere"], "no rule syncs into dav:Nowhere"),
         (["--target", "nocolon"], "target: expected ACCOUNT:CALENDAR, got 'nocolon'"),
+        (["--from", "2040-01-01"], "from: must be within 10 years of today"),
+        (["--from", "9999-12-30"], "from: must be within 10 years of today"),
+        (["--from", "2026-10-24", "--to", "9999-12-31T23:59+00:00"], "to: must be within 10 years of today"),
     ],
 )
 def test_events_refuses_bad_arguments(synced: list[str], argv: list[str], message: str) -> None:
@@ -1396,6 +1403,36 @@ def test_events_refuses_bad_arguments(synced: list[str], argv: list[str], messag
     assert run([*synced, "events", *argv]) == (EXIT_CONFIG, message + "\n")
     code, text = run([*synced, "events", *argv, "--json"])
     assert code == EXIT_CONFIG and json.loads(text)["error"]["message"] == message
+
+
+def test_events_refuses_an_unrepresentable_local_time(
+    synced: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as info:  # argparse: a usage error, exit 2 (not a traceback)
+        run([*synced, "events", "--from", "9999-12-31T23:00"])
+    assert info.value.code == EXIT_CONFIG and "expected an ISO 8601 time" in capsys.readouterr().err
+
+
+def test_upcoming_refuses_hours_beyond_the_calendar(synced: list[str]) -> None:
+    assert run([*synced, "upcoming", "--hours", "999999999999"]) == (EXIT_CONFIG, "hours: too far ahead\n")
+
+
+def test_span_text_shows_the_end_date_of_a_multi_day_event(local_zone: Any) -> None:
+    from datetime import date, datetime, timedelta, timezone
+
+    from calsync.cli import _span_text  # pyright: ignore[reportPrivateUsage]
+    from calsync.model import When
+
+    local_zone("Asia/Shanghai")
+    plus8 = timezone(timedelta(hours=8))
+
+    def at(d: int, h: int) -> When:
+        return When(datetime(2026, 10, d, h, tzinfo=plus8), "Asia/Shanghai")
+
+    assert _span_text(at(28, 18), at(28, 19)) == "2026-10-28 18:00–19:00"
+    assert _span_text(at(28, 22), at(29, 1)) == "2026-10-28 22:00 – 2026-10-29 01:00"
+    assert _span_text(When(date(2026, 11, 5)), When(date(2026, 11, 6))) == "2026-11-05 all day"
+    assert _span_text(When(date(2026, 11, 5)), When(date(2026, 11, 8))) == "2026-11-05 – 2026-11-07 all day"
 
 
 def test_event_show(synced: list[str]) -> None:
