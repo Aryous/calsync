@@ -90,7 +90,6 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 svg.svc { width: 22px; height: 22px; flex: none; }
 svg.svc.xs { width: 15px; height: 15px; }
 .cm { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; vertical-align: -3px; }
-.cm small { color: var(--ink-3); font-size: inherit; }
 
 /* ----- page column ------------------------------------------------------------------------ */
 .wrap {
@@ -104,7 +103,8 @@ svg.svc.xs { width: 15px; height: 15px; }
 }
 
 /* ----- header ----------------------------------------------------------------------------- */
-.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; height: 68px; padding-top: env(safe-area-inset-top); }
+/* The bar is 68 px below the safe area (border-box: the inset is added, not taken from it). */
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px; height: calc(68px + env(safe-area-inset-top)); padding-top: env(safe-area-inset-top); }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 16px; letter-spacing: -.01em; text-decoration: none; }
 .brand svg { width: 24px; height: 24px; flex: none; }
 .mark-tile { fill: var(--hub); }
@@ -154,6 +154,7 @@ svg.svc.xs { width: 15px; height: 15px; }
 .result h1 { font-size: 22px; line-height: 1.3; font-weight: 600; letter-spacing: -.02em; }
 .result p { margin-top: 6px; color: var(--ink-3); font-size: 13.5px; }
 .result p.bad { color: var(--bad); }
+.result .note:empty { margin: 0; }
 
 /* ----- lower: tabs ------------------------------------------------------------------------ */
 .lower { margin-top: 48px; padding-bottom: 72px; }
@@ -201,7 +202,7 @@ svg.svc.xs { width: 15px; height: 15px; }
 /* ----- phone ------------------------------------------------------------------------------ */
 @media (max-width: 760px), (hover: none) and (pointer: coarse) and (max-width: 1024px) {
   :root { --hourH: 44px; --gutter: 16px; }
-  .top { height: 60px; }
+  .top { height: calc(60px + env(safe-area-inset-top)); }
   .top .btn .lbl { display: none; }
   .top .btn { width: 44px; height: 44px; padding: 0; }
   .canvas { grid-template-columns: minmax(0,1fr) 64px minmax(0,1fr); column-gap: 22px; padding: 22px 0 34px; min-height: 0; }

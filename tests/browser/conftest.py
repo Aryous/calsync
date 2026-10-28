@@ -101,17 +101,25 @@ def watch_of(page: Page) -> Watch:
 
 
 @pytest.fixture(scope="session")
-def live(tmp_path_factory: pytest.TempPathFactory) -> Iterator[LiveDaemon]:
-    """The session's daemon. It starts outside the per-test seal (a session fixture cannot use
-    it): ``seal_session`` gives it the same environment, and nothing it runs leaves the process
-    or loopback."""
-    with seal_session(tmp_path_factory.mktemp("browser-session")), live_daemon() as daemon:
+def session_seal(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """The environment every live daemon here runs in, for the whole session: the environment
+    part of the per-test seal (which a session fixture cannot use) and ``TZ=Asia/Shanghai``. The
+    per-test network guard still applies during each test; nothing a daemon runs leaves the
+    process or loopback."""
+    with seal_session(tmp_path_factory.mktemp("browser-session")):
+        yield
+
+
+@pytest.fixture(scope="session")
+def live(session_seal: None) -> Iterator[LiveDaemon]:
+    """The session's daemon: keep it as seeded (see ``fresh_live``)."""
+    with live_daemon() as daemon:
         yield daemon
 
 
 @pytest.fixture
-def fresh_live() -> Iterator[LiveDaemon]:
-    """A daemon of this test's own (the per-test seal is in place)."""
+def fresh_live(session_seal: None) -> Iterator[LiveDaemon]:
+    """A daemon of this test's own, for tests that run cycles or change the config."""
     with live_daemon() as daemon:
         yield daemon
 

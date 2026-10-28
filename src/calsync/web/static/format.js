@@ -5,7 +5,6 @@
 import { t, getLang } from "/static/i18n.js";
 
 const pad = (n) => String(n).padStart(2, "0");
-const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 export function toDate(value) {
   if (value == null) return null;
@@ -25,16 +24,9 @@ export function ymd(value) {
   return d ? `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` : "";
 }
 
+/** The weekday's short name; each key is a literal for the key test. */
 function weekday(d) {
-  switch (WEEKDAYS[d.getDay()]) {
-    case "Sun": return t("Sun");
-    case "Mon": return t("Mon");
-    case "Tue": return t("Tue");
-    case "Wed": return t("Wed");
-    case "Thu": return t("Thu");
-    case "Fri": return t("Fri");
-    default: return t("Sat");
-  }
+  return [t("Sun"), t("Mon"), t("Tue"), t("Wed"), t("Thu"), t("Fri"), t("Sat")][d.getDay()];
 }
 
 /** "10月26日 周一" / "Mon 26 Oct", local. */

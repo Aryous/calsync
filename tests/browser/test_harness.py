@@ -32,3 +32,15 @@ def test_a_page_pairs_through_the_key_link(paired_page: Page, live: LiveDaemon) 
     assert paired_page.url == f"{live.url}/"
     cookies = paired_page.context.cookies()
     assert any(c.get("name") == "calsync_session" for c in cookies)
+
+
+def test_a_fresh_daemon_runs_in_shanghai_without_a_page(fresh_live: LiveDaemon) -> None:
+    """``fresh_live`` brings the session's environment itself (local zone included): local days
+    are Asia/Shanghai's whether or not a test opens a page."""
+    import os
+    import time
+
+    assert os.environ["TZ"] == "Asia/Shanghai" and time.strftime("%z") == "+0800"
+    events = fresh_live.get("/api/events", **{"from": "2026-10-29", "to": "2026-10-30"})["events"]
+    fees = next(e for e in events if e["title"] == "交物业费")
+    assert fees["all_day"] is True and fees["start"].startswith("2026-10-29")

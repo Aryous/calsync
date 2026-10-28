@@ -62,36 +62,61 @@ export function opensInspector(route) {
   return route.name !== "root" && route.name !== "activity";
 }
 
+// Closing an inspector returns to the map entry it was opened from, so the browser's Back never
+// reopens an inspector that was closed: each history entry records (in history.state) how many
+// inspector entries lead to it since the map (``depth``) and whether a map entry precedes them
+// (``mapBehind``). Closing goes back ``depth`` entries; an inspector loaded directly from a link
+// (no map entry behind it) goes back to the first inspector entry and turns it into the map.
+const MAP_ENTRY = { depth: 0, mapBehind: false };
+
+function entryOf(next, previous) {
+  if (!opensInspector(next)) return MAP_ENTRY;
+  if (previous === null) return { depth: 1, mapBehind: false }; // loaded with this hash
+  if (previous.depth === 0) return { depth: 1, mapBehind: true };
+  return { depth: previous.depth + 1, mapBehind: previous.mapBehind };
+}
+
+function remember(entry, url) {
+  const state = window.history.state && typeof window.history.state === "object" ? window.history.state : {};
+  window.history.replaceState({ ...state, calsync: entry }, "", url);
+}
+
 function useRoute() {
   const [route, setRoute] = useState(() => parseRoute(window.location.hash) || ROOT);
-  // True when the current inspector was opened from the map in this page: closing it goes back,
-  // so the browser's history stays the person's own (open, close, back reopens nothing).
-  const fromMap = useRef(false);
+  const entry = useRef(null); // the current history entry's {depth, mapBehind}
+  const toMap = useRef(false); // closing: the next entry we arrive at becomes the map
 
   useEffect(() => {
-    const onHash = (e) => {
+    const onHash = () => {
       const next = parseRoute(window.location.hash);
-      if (next === null) {
-        window.history.replaceState(null, "", "#/");
+      if (next === null || toMap.current) {
+        toMap.current = false;
+        remember(MAP_ENTRY, "#/");
+        entry.current = MAP_ENTRY;
         setRoute(ROOT);
         return;
       }
-      const before = e && e.oldURL ? parseRoute(new URL(e.oldURL).hash) : null;
-      fromMap.current = opensInspector(next) && before !== null && !opensInspector(before);
+      const stored = window.history.state && window.history.state.calsync;
+      entry.current = stored || entryOf(next, entry.current);
+      if (!stored) remember(entry.current);
       setRoute((current) => (current.key === next.key ? current : next));
     };
     window.addEventListener("hashchange", onHash);
     // Effects run after the first paint: the hash may have changed since the first render.
-    onHash(null);
+    onHash();
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
   const closeInspector = useCallback(() => {
-    if (fromMap.current) {
-      fromMap.current = false;
-      window.history.back();
+    const here = entry.current || MAP_ENTRY;
+    if (here.mapBehind && here.depth > 0) {
+      window.history.go(-here.depth);
+    } else if (here.depth > 1) {
+      toMap.current = true;
+      window.history.go(-(here.depth - 1));
     } else {
-      window.history.replaceState(null, "", "#/");
+      remember(MAP_ENTRY, "#/");
+      entry.current = MAP_ENTRY;
       setRoute(ROOT);
     }
   }, []);
@@ -139,7 +164,7 @@ function SyncButton({ onResult }) {
   const label = pending ? t("Syncing…") : t("Sync now");
 
   const run = async () => {
-    if (busy) return;
+    if (pending) return; // one cycle at a time: ours, or one the daemon is running
     setBusy(true);
     onResult(null);
     try {
@@ -153,7 +178,7 @@ function SyncButton({ onResult }) {
   };
 
   return html`<button class=${pending ? "btn busy" : "btn"} type="button" aria-label=${label}
-      aria-busy=${pending ? "true" : "false"} disabled=${busy} onClick=${run}>
+      aria-busy=${pending ? "true" : "false"} disabled=${pending} onClick=${run}>
     <${Icon} name="sync"/><span class="lbl">${label}</span>
   </button>`;
 }
@@ -221,38 +246,47 @@ function Result({ note }) {
     title = headline(status);
     line = detailLine(status);
   } else if (error) {
-    const shown = errorNote(error);
-    line = shown.text;
+    line = errorNote(error).text;
     bad = true;
   }
-  if (note) {
-    line = note.text;
-    bad = Boolean(note.bad);
-  }
-  return html`<section class="result" aria-live="polite">
+  // Only the result of 立即同步 is announced (role=status); the ticking "N 分钟前" line is not.
+  return html`<section class="result">
     <h1>${title}</h1>
-    ${line ? html`<p class=${bad ? "bad" : ""} data-role="result-line">${line}</p>` : null}
+    ${line && !note ? html`<p class=${bad ? "bad" : ""}>${line}</p>` : null}
+    <p class=${note && note.bad ? "note bad" : "note"} role="status" aria-live="polite" data-role="result-note">${note ? note.text : ""}</p>
   </section>`;
 }
 
 // ----- lower: 日历 | 活动 --------------------------------------------------------------------
+
+const TABS = ["calendar", "activity"];
 
 function Lower({ route }) {
   const [tab, setTab] = useState(route.name === "activity" ? "activity" : "calendar");
   useEffect(() => {
     if (route.name === "activity") setTab("activity");
   }, [route.name]);
-  const tabs = [
-    ["calendar", t("Calendar")],
-    ["activity", t("Activity")],
-  ];
+  const label = (id) => (id === "calendar" ? t("Calendar") : t("Activity"));
+
+  // The ARIA tabs pattern: one tab stop; ←/→ (wrapping), Home and End move focus and select.
+  const onKeyDown = (e) => {
+    const i = TABS.indexOf(tab);
+    const moves = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: TABS.length - 1 };
+    if (!(e.key in moves)) return;
+    e.preventDefault();
+    const next = TABS[(moves[e.key] + TABS.length) % TABS.length];
+    setTab(next);
+    const button = document.getElementById(`tab-${next}`);
+    if (button) button.focus();
+  };
+
   return html`<section class="lower">
-    <div class="tabs" role="tablist">
-      ${tabs.map(([id, label]) => html`<button class="tab" type="button" role="tab" id=${`tab-${id}`}
+    <div class="tabs" role="tablist" onKeyDown=${onKeyDown}>
+      ${TABS.map((id) => html`<button class="tab" type="button" role="tab" id=${`tab-${id}`}
           aria-selected=${tab === id ? "true" : "false"} aria-controls=${`pane-${id}`}
-          tabindex=${tab === id ? "0" : "-1"} onClick=${() => setTab(id)}>${label}</button>`)}
+          tabindex=${tab === id ? "0" : "-1"} onClick=${() => setTab(id)}>${label(id)}</button>`)}
     </div>
-    ${tabs.map(([id]) => html`<div class="pane" role="tabpanel" id=${`pane-${id}`}
+    ${TABS.map((id) => html`<div class="pane" role="tabpanel" id=${`pane-${id}`} tabindex="0"
         aria-labelledby=${`tab-${id}`} hidden=${tab !== id}></div>`)}
   </section>`;
 }

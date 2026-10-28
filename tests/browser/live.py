@@ -218,6 +218,9 @@ class World:
 
     google: dict[str, FakeGoogle] = field(default_factory=dict)
     targets: dict[str, FakeTarget] = field(default_factory=dict)
+    # While set and not open, every Google request waits for it (``LiveDaemon.hold_cycles``): a
+    # cycle stays in progress, and the daemon's loop (its web UI too) keeps running meanwhile.
+    gate: asyncio.Event | None = None
 
     @classmethod
     def seeded(cls) -> World:
@@ -239,10 +242,18 @@ class World:
                 adapters.targets[name] = self.targets.setdefault(name, FakeTarget())
                 continue
             fake = self.google.setdefault(name, FakeGoogle())
-            client = make_client(adapters.log, transport=fake.transport())
+            client = make_client(adapters.log, transport=httpx.MockTransport(self._gated(fake)))
             adapters.clients.append(client)
             adapters.sources[name] = GoogleSource(client, StaticToken("t"), base_url=BASE_URL)
         return adapters
+
+    def _gated(self, fake: FakeGoogle) -> Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]:
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if self.gate is not None:
+                await self.gate.wait()
+            return fake.handler(request)
+
+        return handler
 
 
 @contextlib.contextmanager
@@ -339,7 +350,26 @@ class LiveDaemon:
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
 
+    def hold_cycles(self) -> None:
+        """From now on a cycle waits at its first Google request until ``release_cycles``."""
+
+        def close() -> None:
+            self.world.gate = asyncio.Event()
+
+        self.in_loop(close)
+
+    def release_cycles(self) -> None:
+        def open_gate() -> None:
+            if self.world.gate is not None:
+                self.world.gate.set()
+                self.world.gate = None
+
+        if self._loop is not None and not self._loop.is_closed():
+            self.in_loop(open_gate)
+
     def stop(self, timeout: float = 15) -> None:
+        with contextlib.suppress(RuntimeError, TimeoutError):  # a held cycle must not block the stop
+            self.release_cycles()
         if self._loop is not None and self._stop is not None and not self._loop.is_closed():
             with contextlib.suppress(RuntimeError):  # the loop closed meanwhile
                 self._loop.call_soon_threadsafe(self._stop.set)
@@ -382,11 +412,6 @@ class LiveDaemon:
     @property
     def pair_url(self) -> str:
         return f"{self.url}/?k={self.key}"
-
-    @property
-    def cookie(self) -> dict[str, str]:
-        """The session cookie a paired browser holds (for ``context.add_cookies``)."""
-        return {"name": auth.COOKIE, "value": auth.session_token(self.key), "url": self.url}
 
     def cycles(self) -> int:
         return self.daemon.snapshot().cycles
