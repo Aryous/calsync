@@ -41,7 +41,10 @@ BASE_URL = "https://www.googleapis.com/calendar/v3"
 EVENT_FIELDS = (
     "id,status,updated,summary,description,location,start,end,"
     "originalStartTime,recurringEventId,recurrence,reminders,transparency,"
-    "attendees(email,displayName,resource),hangoutLink,conferenceData(entryPoints(entryPointType,uri))"
+    "attendees(email,displayName,resource),hangoutLink,conferenceData(entryPoints(entryPointType,uri)),"
+    # For writes (phase C): who organises it (only the organiser may change it), when it was
+    # created (the oldest of duplicates), and an agent's key for the event.
+    "created,organizer(self),extendedProperties(private)"
 )
 # Identical for the initial full sync and every incremental call, as Google
 # requires. ``fields`` MUST keep nextSyncToken/nextPageToken or incremental
@@ -135,6 +138,16 @@ class GoogleSource:
         self._client = client
         self._token = token
         self._base = base_url.rstrip("/")
+
+    @property
+    def token(self) -> TokenProvider:
+        """The account's token provider (a writer for the same account shares it)."""
+        return self._token
+
+    @property
+    def scopes(self) -> frozenset[str] | None:
+        """The scopes Google reported at the last token refresh; None: not known (yet)."""
+        return getattr(self._token, "scopes", None)
 
     async def _get(self, path: str, params: Mapping[str, str], kind: str) -> dict[str, Any]:
         response = await self._send(path, params, kind)

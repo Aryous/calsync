@@ -623,7 +623,7 @@ def test_auth_google_browser_failure_keeps_existing_credential(
         f'[accounts.g]\nprovider = "google"\ncredential = {{ backend = "file", ref = "{secret}" }}\n'
     )
 
-    async def refused(config: object) -> str:
+    async def refused(config: object, **_: object) -> str:
         raise AuthError("Google sign-in was not completed: access_denied")
 
     monkeypatch.setattr(cli, "_google_browser_sign_in", refused)
@@ -1581,3 +1581,75 @@ def test_the_daemon_names_an_escaping_error_by_its_type_only(
 
     monkeypatch.setattr(cli, "_daemon", misconfigured)
     assert run(["daemon"]) == (2, "configuration error:\n  - web.listen: not this computer's address\n")
+
+
+def _google_auth_setup(tmp_path: Path) -> tuple[Path, Path]:
+    secret = tmp_path / "google-cred"
+    client = tmp_path / "client.json"
+    client.write_text('{"installed": {"client_id": "id", "client_secret": "sec"}}')
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(
+        f'[google]\nclient_secret_file = "{client}"\n'
+        f'[accounts.g]\nprovider = "google"\ncredential = {{ backend = "file", ref = "{secret}" }}\n'
+    )
+    return cfg, secret
+
+
+@pytest.mark.parametrize(
+    ("args", "scopes", "expected"),
+    [
+        (
+            ["--write"],
+            "calendar.readonly calendar.events",
+            "ok: credentials stored (read and write), 1 calendars visible",
+        ),
+        ([], "calendar.readonly", "ok: credentials stored (read only), 1 calendars visible"),
+        (["--write"], "calendar.readonly", "write access was not granted"),
+    ],
+)
+def test_auth_write_asks_for_write_access_and_says_what_was_granted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str], scopes: str, expected: str
+) -> None:
+    from calsync import cli, wiring
+    from calsync.sources.base import CalendarInfo
+
+    cfg, secret = _google_auth_setup(tmp_path)
+    asked: list[bool] = []
+    granted = frozenset(f"https://www.googleapis.com/auth/{s}" for s in scopes.split())
+
+    async def sign_in(config: object, *, write: bool = False) -> str:
+        asked.append(write)
+        return "rt"
+
+    class Source:
+        scopes = granted
+
+        async def list_calendars(self) -> list[CalendarInfo]:
+            return [CalendarInfo("c1", "Family", "owner")]
+
+    class Built:
+        def adapter(self, name: str) -> Source:
+            return Source()
+
+        async def aclose(self) -> None:
+            pass
+
+    async def built(config: object, name: str, secret_text: str) -> Built:
+        return Built()
+
+    monkeypatch.setattr(cli, "_google_browser_sign_in", sign_in)
+    monkeypatch.setattr(wiring, "adapters_with_secret", built)
+    code, text = run(["--config", str(cfg), "auth", "g", *args])
+    assert code == EXIT_OK and expected in text
+    assert asked == [bool(args)]
+    assert json.loads(secret.read_text()) == {"refresh_token": "rt"}  # the format is unchanged
+
+
+def test_auth_write_is_for_google_accounts_only(tmp_path: Path) -> None:
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(
+        '[accounts.d]\nprovider = "caldav"\nserver_url = "https://dav.example.com/"\nusername = "u"\n'
+        f'credential = {{ backend = "file", ref = "{tmp_path / "pw"}" }}\n'
+    )
+    code, text = run(["--config", str(cfg), "auth", "d", "--write"])
+    assert code == EXIT_CONFIG and "--write applies only to google accounts" in text

@@ -40,6 +40,17 @@ def test_authorization_url_requests_offline_readonly_access() -> None:
     }
 
 
+def test_authorization_url_asks_for_write_access_when_told() -> None:
+    from calsync.sources.google_oauth import WRITE_SCOPES
+
+    url = authorization_url("cid", "http://127.0.0.1:5000/", "chal", "st", scope=WRITE_SCOPES)
+    scope = parse_qs(urlsplit(url).query)["scope"][0]
+    assert scope.split() == [
+        "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/calendar.events",
+    ]
+
+
 async def _hit(url: str) -> httpx.Response:
     async with httpx.AsyncClient() as client:
         return await client.get(url)

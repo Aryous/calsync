@@ -138,6 +138,11 @@ def _parser() -> argparse.ArgumentParser:
     auth.add_argument(
         "--refresh-token-stdin", action="store_true", help="google: read an existing refresh token from stdin"
     )
+    auth.add_argument(
+        "--write",
+        action="store_true",
+        help="google: also ask for write access to events (calsync creates and changes originals)",
+    )
 
     notify_cmd = sub.add_parser("notify", help="push notifications (Bark, webhook)")
     notify_sub = notify_cmd.add_subparsers(dest="notify_command", required=True)
@@ -812,14 +817,14 @@ def cmd_calendars(args: argparse.Namespace, out: TextIO) -> int:
     return EXIT_OK
 
 
-async def _google_browser_sign_in(config: "Config") -> str:
+async def _google_browser_sign_in(config: "Config", *, write: bool = False) -> str:
     """Browser OAuth (loopback + PKCE); returns a refresh token. Progress goes to stderr."""
     import webbrowser
 
     from calsync.errors import ConfigError
     from calsync.http import RequestLog, make_client
     from calsync.sources.google_auth import load_client_secret
-    from calsync.sources.google_oauth import sign_in
+    from calsync.sources.google_oauth import SCOPE, WRITE_SCOPES, sign_in
 
     if config.google_client_secret_file is None:
         raise ConfigError(["google.client_secret_file: required for google accounts"])
@@ -831,6 +836,7 @@ async def _google_browser_sign_in(config: "Config") -> str:
             client_secret=client_secret,
             open_browser=webbrowser.open,
             out=sys.stderr,
+            scope=WRITE_SCOPES if write else SCOPE,
         )
 
 
@@ -853,12 +859,15 @@ async def _auth(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
         out.write(f"unknown account {args.account!r}\n")
         return EXIT_CONFIG
     google = account.provider == "google"
+    if args.write and not google:
+        out.write(f"--write applies only to google accounts; {args.account!r} is caldav\n")
+        return EXIT_CONFIG
     if args.refresh_token_stdin and not google:
         out.write(f"--refresh-token-stdin applies only to google accounts; {args.account!r} is caldav\n")
         return EXIT_CONFIG
     if google and not args.refresh_token_stdin:
         try:
-            raw = await _google_browser_sign_in(config)
+            raw = await _google_browser_sign_in(config, write=args.write)
         except CalsyncError as exc:
             out.write(f"sign-in failed, credentials not stored (existing ones unchanged): {exc}\n")
             return exit_code_for(exc)
@@ -872,14 +881,26 @@ async def _auth(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
     try:
         adapters = await adapters_with_secret(config, args.account, secret)
         try:
-            found = await adapters.adapter(args.account).list_calendars()
+            adapter = adapters.adapter(args.account)
+            found = await adapter.list_calendars()
+            scopes = getattr(adapter, "scopes", None)
         finally:
             await adapters.aclose()
     except CalsyncError as exc:
         out.write(f"verification failed, credentials not stored (existing ones unchanged): {exc}\n")
         return exit_code_for(exc)
     write_secret(account.credential, secret)
-    out.write(f"ok: credentials stored, {len(found)} calendars visible\n")
+    from calsync.sources.google_write import WRITE_SCOPE
+
+    access = ""
+    if google and scopes is not None:
+        access = " (read and write)" if WRITE_SCOPE in scopes else " (read only)"
+    out.write(f"ok: credentials stored{access}, {len(found)} calendars visible\n")
+    if google and args.write and scopes is not None and WRITE_SCOPE not in scopes:
+        out.write(
+            "write access was not granted: on Google's page, tick the box for changing events, "
+            f"then run `calsync auth {args.account} --write` again\n"
+        )
     return EXIT_OK
 
 

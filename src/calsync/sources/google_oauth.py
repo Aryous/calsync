@@ -23,6 +23,9 @@ from calsync.sources.google_auth import TOKEN_URL
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+# Read and write (``calsync auth --write``). Installed apps get no incremental authorization:
+# write access asks for both scopes again in one consent.
+WRITE_SCOPES = f"{SCOPE} https://www.googleapis.com/auth/calendar.events"
 SIGN_IN_TIMEOUT = 300.0
 
 _DONE_PAGE = (
@@ -48,14 +51,20 @@ def new_pkce() -> Pkce:
 
 
 def authorization_url(
-    client_id: str, redirect_uri: str, challenge: str, state: str, *, auth_url: str = AUTH_URL
+    client_id: str,
+    redirect_uri: str,
+    challenge: str,
+    state: str,
+    *,
+    auth_url: str = AUTH_URL,
+    scope: str = SCOPE,
 ) -> str:
     query = urlencode(
         {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
-            "scope": SCOPE,
+            "scope": scope,
             "access_type": "offline",  # we need a refresh token
             "prompt": "consent",  # always return a refresh token, even on re-auth
             "code_challenge": challenge,
@@ -178,12 +187,15 @@ async def sign_in(
     wait_seconds: float = SIGN_IN_TIMEOUT,
     auth_url: str = AUTH_URL,
     token_url: str = TOKEN_URL,
+    scope: str = SCOPE,
 ) -> str:
     """Run the browser flow and return a refresh token."""
     pkce = new_pkce()
     state = secrets.token_urlsafe(24)
     async with LoopbackReceiver() as receiver:
-        url = authorization_url(client_id, receiver.redirect_uri, pkce.challenge, state, auth_url=auth_url)
+        url = authorization_url(
+            client_id, receiver.redirect_uri, pkce.challenge, state, auth_url=auth_url, scope=scope
+        )
         out.write(f"Opening your browser to sign in to Google. If it does not open, visit:\n{url}\n")
         out.flush()
         open_browser(url)
