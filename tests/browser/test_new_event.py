@@ -19,7 +19,7 @@ def calendar(page: Page) -> Any:
 
 
 def created(daemon: LiveDaemon, cid: str, title: str) -> dict[str, Any]:
-    fake = daemon.world.google["personal"]
+    fake = daemon.world.google["main"]
     return next(e for e in daemon.in_loop(lambda: fake.events(cid)) if e.get("summary") == title)
 
 
@@ -31,7 +31,7 @@ def test_the_toolbar_creates_an_event(open_page: OpenPage, fresh_live: LiveDaemo
     form = page.locator("aside.insp")
     expect(form.locator("#insp-title")).to_have_text("新建日程")
     radios = form.locator('[data-role="calendars"] [role="radio"]')
-    expect(radios).to_have_count(3)  # 家庭日程, 孩子学校, 工作: synced and writable (not 中国节假日)
+    expect(radios).to_have_count(3)  # 生活, 课程, 工作: synced and writable (not 中国节假日)
     expect(radios.first).to_have_attribute("aria-checked", "true")
     expect(form.locator("#ev-date")).to_have_value("2026-10-26")
     expect(form.locator("#ev-start")).to_have_value("11:00")  # the next half hour after 10:42
@@ -62,11 +62,11 @@ def test_a_click_on_an_empty_hour_and_the_remembered_calendar(
     expect(page).to_have_url(re.compile(r"#/event-new\?start=2026-10-26T15%3A00$"))
     form = page.locator("aside.insp")
     expect(form.locator("#ev-start")).to_have_value("15:00")
-    form.locator('[data-role="calendars"]').get_by_role("radio", name=re.compile("孩子学校")).click()
-    form.locator("#ev-title").fill("接孩子")
+    form.locator('[data-role="calendars"]').get_by_role("radio", name=re.compile("课程")).click()
+    form.locator("#ev-title").fill("取快递")
     form.locator('[data-key="alarms"] .seg').get_by_role("button", name="不提醒").click()
     form.locator('[data-role="save"]').click()
-    expect(form.locator("#insp-title")).to_have_text("接孩子")
-    assert created(fresh_live, SCHOOL, "接孩子")["reminders"] == {"useDefault": False, "overrides": []}
+    expect(form.locator("#insp-title")).to_have_text("取快递")
+    assert created(fresh_live, SCHOOL, "取快递")["reminders"] == {"useDefault": False, "overrides": []}
     page.evaluate("location.hash = '#/event-new'")
-    expect(form.locator('[data-role="calendars"] [aria-checked="true"]')).to_contain_text("孩子学校")
+    expect(form.locator('[data-role="calendars"] [aria-checked="true"]')).to_contain_text("课程")

@@ -4,15 +4,15 @@
 the real scheduler, operations, local API and web UI (TCP on ``127.0.0.1:<free port>``), with
 fake accounts behind them:
 
-- two Google accounts (``personal``: 家庭日程, 孩子学校, 中国节假日 (no rule uses it); ``work``:
+- two Google accounts (``main``: 生活, 课程, 中国节假日 (no rule uses it); ``work``:
   工作), each a ``FakeGoogle`` reached through ``httpx.MockTransport``;
-- two iCloud accounts (``family-icloud``: 家庭; ``my-icloud``: 我的日历), each a ``FakeTarget``;
-- four rules, as in the concept: ``family-home`` 家庭日程 → 家庭, ``school-home`` 孩子学校 → 家庭,
-  ``family-mine`` 家庭日程 → 我的日历 (busy only), ``work-mine`` 工作 → 我的日历;
+- two iCloud accounts (``icloud-shared``: 共享日历; ``icloud-me``: 我的日历), each a ``FakeTarget``;
+- four rules, as in the concept: ``life-shared`` 生活 → 共享日历, ``course-shared`` 课程 → 共享日历,
+  ``life-me`` 生活 → 我的日历 (busy only), ``work-me`` 工作 → 我的日历;
 - events in the week of ``NOW`` (Monday 2026-10-26 10:42 in Asia/Shanghai): weekly series (one
   with a moved instance), all-day events, timed events with a location, and one change pending
-  delivery (``PENDING_TITLE``: delivered to 家庭 by ``family-home``, not yet to 我的日历 by
-  ``family-mine``).
+  delivery (``PENDING_TITLE``: delivered to 共享日历 by ``life-shared``, not yet to 我的日历 by
+  ``life-me``).
 
 Time: the daemon's clock is ``LiveClock``, pinned to ``NOW`` (``advance`` moves it). The schedule
 waits with the real ``asyncio.sleep``, but with a pinned clock and ``interval = "1h"`` no timed
@@ -80,7 +80,7 @@ client_secret_file = "unused.json"
 interval = "1h"
 jitter = 0.0
 
-[accounts.personal]
+[accounts.main]
 provider = "google"
 credential = { backend = "env", ref = "UNUSED" }
 
@@ -88,38 +88,38 @@ credential = { backend = "env", ref = "UNUSED" }
 provider = "google"
 credential = { backend = "env", ref = "UNUSED" }
 
-[accounts.family-icloud]
+[accounts.icloud-shared]
 provider = "caldav"
 server_url = "icloud"
-username = "family@example.com"
+username = "shared@example.com"
 credential = { backend = "env", ref = "UNUSED" }
 
-[accounts.my-icloud]
+[accounts.icloud-me]
 provider = "caldav"
 server_url = "icloud"
 username = "me@example.com"
 credential = { backend = "env", ref = "UNUSED" }
 
 [[rules]]
-name = "family-home"
-source = { account = "personal", calendar = "家庭日程" }
-target = { account = "family-icloud", calendar = "家庭" }
+name = "life-shared"
+source = { account = "main", calendar = "生活" }
+target = { account = "icloud-shared", calendar = "共享日历" }
 
 [[rules]]
-name = "school-home"
-source = { account = "personal", calendar = "孩子学校" }
-target = { account = "family-icloud", calendar = "家庭" }
+name = "course-shared"
+source = { account = "main", calendar = "课程" }
+target = { account = "icloud-shared", calendar = "共享日历" }
 
 [[rules]]
-name = "family-mine"
-source = { account = "personal", calendar = "家庭日程" }
-target = { account = "my-icloud", calendar = "我的日历" }
+name = "life-me"
+source = { account = "main", calendar = "生活" }
+target = { account = "icloud-me", calendar = "我的日历" }
 fields = { content = "busy" }
 
 [[rules]]
-name = "work-mine"
+name = "work-me"
 source = { account = "work", calendar = "工作" }
-target = { account = "my-icloud", calendar = "我的日历" }
+target = { account = "icloud-me", calendar = "我的日历" }
 """
 
 
@@ -142,9 +142,15 @@ def _all_day(eid: str, title: str, day: str, next_day: str) -> dict[str, Any]:
     }
 
 
+# The accounts' own calendars: Google names a primary calendar after the account's email.
+MAIN_EMAIL = "alex@example.com"
+WORK_EMAIL = "alex@work.example.com"
+
+
 def seed_personal(fake: FakeGoogle) -> None:
-    fake.add_calendar(FAMILY, "家庭日程")
-    fake.add_calendar(SCHOOL, "孩子学校")
+    fake.add_calendar(MAIN_EMAIL, MAIN_EMAIL, primary=True)
+    fake.add_calendar(FAMILY, "生活")
+    fake.add_calendar(SCHOOL, "课程")
     fake.add_calendar(HOLIDAYS, "中国节假日", access_role="reader")
     # 晨跑: Mondays, Wednesdays and Fridays since 5 October; this Wednesday's run is half an hour later.
     fake.put_event(
@@ -165,10 +171,12 @@ def seed_personal(fake: FakeGoogle) -> None:
             originalStartTime={"dateTime": _at("2026-10-28", "07:00"), "timeZone": ZONE},
         ),
     )
-    fake.put_event(FAMILY, _timed("call", "家庭视频通话", "2026-10-26", "19:30", "20:15"))
+    fake.put_event(FAMILY, _timed("call", "视频通话", "2026-10-26", "19:30", "20:15"))
     fake.put_event(FAMILY, _timed("dentist", "社区活动", "2026-10-27", "14:00", "15:00", location="社区中心"))
     fake.put_event(FAMILY, _all_day("fees", "交物业费", "2026-10-29", "2026-10-30"))
-    fake.put_event(FAMILY, _timed("dinner", "家庭聚餐", "2026-10-30", "19:00", "21:00", location="外婆家"))
+    fake.put_event(
+        FAMILY, _timed("dinner", "周五聚餐", "2026-10-30", "19:00", "21:00", location="老地方餐厅")
+    )
     fake.put_event(
         SCHOOL,
         _timed(
@@ -181,11 +189,12 @@ def seed_personal(fake: FakeGoogle) -> None:
             location="少年宫",
         ),
     )
-    fake.put_event(SCHOOL, _timed("meeting", "家长会", "2026-10-28", "17:00", "18:00"))
-    fake.put_event(SCHOOL, _all_day("outing", "秋游", "2026-10-31", "2026-11-01"))
+    fake.put_event(SCHOOL, _timed("meeting", "项目例会", "2026-10-28", "17:00", "18:00"))
+    fake.put_event(SCHOOL, _all_day("outing", "团建", "2026-10-31", "2026-11-01"))
 
 
 def seed_work(fake: FakeGoogle) -> None:
+    fake.add_calendar(WORK_EMAIL, WORK_EMAIL, primary=True)
     fake.add_calendar(WORK, "工作")
     fake.put_event(
         WORK,
@@ -205,10 +214,10 @@ CONFIG_WITHOUT_GOOGLE = """\
 interval = "1h"
 jitter = 0.0
 
-[accounts.family-icloud]
+[accounts.icloud-shared]
 provider = "caldav"
 server_url = "icloud"
-username = "family@example.com"
+username = "shared@example.com"
 credential = { backend = "env", ref = "UNUSED" }
 """
 
@@ -268,15 +277,13 @@ class World:
 
     @classmethod
     def seeded(cls) -> World:
-        personal, work = FakeGoogle(), FakeGoogle()
-        seed_personal(personal)
+        main, work = FakeGoogle(), FakeGoogle()
+        seed_personal(main)
         seed_work(work)
         home, mine = FakeTarget(), FakeTarget()
-        home.add_calendar("家庭")
+        home.add_calendar("共享日历")
         mine.add_calendar("我的日历")
-        return cls(
-            google={"personal": personal, "work": work}, targets={"family-icloud": home, "my-icloud": mine}
-        )
+        return cls(google={"main": main, "work": work}, targets={"icloud-shared": home, "icloud-me": mine})
 
     async def factory(self, config: Config, names: set[str], *, log: RequestLog | None = None) -> Adapters:
         adapters = Adapters(log or RequestLog())
@@ -459,10 +466,10 @@ class LiveDaemon:
             return False
 
     def _stage_pending(self) -> None:
-        """One change pending delivery: a new event in 家庭日程, delivered by ``family-home`` only,
-        so ``family-mine`` still owes it to 我的日历."""
-        self.in_loop(lambda: self.world.google["personal"].put_event(FAMILY, pending_event()))
-        result = self.op("trigger", {"rule": "family-home", "wait": True, "timeout": 30})
+        """One change pending delivery: a new event in 生活, delivered by ``life-shared`` only,
+        so ``life-me`` still owes it to 我的日历."""
+        self.in_loop(lambda: self.world.google["main"].put_event(FAMILY, pending_event()))
+        result = self.op("trigger", {"rule": "life-shared", "wait": True, "timeout": 30})
         assert result.data.get("ran") is True, result.to_json()
 
     # ----- staging what needs a person -------------------------------------------------
@@ -476,26 +483,26 @@ class LiveDaemon:
         result = self.op("rule.pause", {"name": rule})
         assert result.changed, result.to_json()
 
-    def stage_auth(self, account: str = "work", rule: str = "work-mine") -> None:
+    def stage_auth(self, account: str = "work", rule: str = "work-me") -> None:
         """``account``'s Google credential stops working (every request 401) and ``rule`` runs on
         it: the rule's health is ``auth``, an ``auth`` attention names the account."""
         self.in_loop(lambda: self.world.refused.add(account))
         self.trigger(rule)
 
     def stage_blocked(self) -> None:
-        """Every 孩子学校 event is cancelled in Google and ``school-home`` runs: deleting all three
+        """Every 课程 event is cancelled in Google and ``course-shared`` runs: deleting all three
         copies is over the delete guard (max_ratio 0.5), so the run is ``blocked``."""
 
         def cancel() -> None:
-            google = self.world.google["personal"]
+            google = self.world.google["main"]
             for event_id in ("piano", "meeting", "outing"):
                 google.cancel_event(SCHOOL, event_id)
 
         self.in_loop(cancel)
-        assert self.trigger("school-home")["rules"]["school-home"]["status"] == "blocked"
+        assert self.trigger("course-shared")["rules"]["course-shared"]["status"] == "blocked"
 
     def stage_failing(
-        self, rule: str = "family-mine", account: str = "my-icloud", calendar: str = "我的日历"
+        self, rule: str = "life-me", account: str = "icloud-me", calendar: str = "我的日历"
     ) -> None:
         """The target calendar fails once (a 503-like error) while ``rule`` runs: ``failing``."""
         from calsync.errors import TransientError

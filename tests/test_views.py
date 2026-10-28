@@ -155,6 +155,7 @@ async def test_status_after_a_cycle(tmp_path: Path) -> None:
             "name": "me",
             "provider": "google",
             "host": "Google Calendar",
+            "email": None,  # known once the calendar list is cached (its primary calendar)
             "auth": "ok",
             "calendars": [],
             "can_write": None,
@@ -163,6 +164,7 @@ async def test_status_after_a_cycle(tmp_path: Path) -> None:
             "name": "dav",
             "provider": "caldav",
             "host": "unused",
+            "email": "u",  # a CalDAV account's user name
             "auth": "ok",
             "calendars": [],
             "can_write": None,
@@ -967,11 +969,20 @@ async def test_status_accounts_carry_their_cached_calendars(tmp_path: Path) -> N
     view = await _cached_status(tmp_path, family())
     me, dav = view["accounts"]
     assert me["calendars"] == [
-        {"id": GCAL, "name": "Family", "role": "owner", "series": 3, "rules": ["family"], "synced": True},
+        {
+            "id": GCAL,
+            "name": "Family",
+            "role": "owner",
+            "primary": False,
+            "series": 3,
+            "rules": ["family"],
+            "synced": True,
+        },
         {
             "id": "other@group.calendar.google.com",
             "name": "Other",
             "role": "reader",
+            "primary": False,
             "series": 0,
             "rules": [],
             "synced": False,
@@ -984,6 +995,7 @@ async def test_status_accounts_carry_their_cached_calendars(tmp_path: Path) -> N
         "id": "/dav/x/",
         "name": "Spare",
         "role": None,
+        "primary": False,
         "series": None,
         "rules": [],
         "synced": False,
@@ -1218,3 +1230,21 @@ def test_mask_config_text_masks_what_config_json_masks() -> None:
     for secret in ("secret.json", "OLDPATH", "MULTILINE", "nas.lan:8766/x"):
         assert secret not in masked
     assert mask_config_text(masked) == masked  # stable
+
+
+@pytest.mark.anyio
+async def test_a_google_account_is_named_by_its_primary_calendar(tmp_path: Path) -> None:
+    from calsync.store import AccountCalendar
+
+    view = await _cached_status(tmp_path, family())
+    assert view["accounts"][0]["email"] is None
+    with Store(tmp_path / "state.db") as store:
+        store.save_account_calendars(
+            "me",
+            [AccountCalendar("me", "someone@example.com", "someone@example.com", "owner", NOW, True)],
+            NOW,
+        )
+    with reader(tmp_path) as r:
+        status = build_status(family(), r, NOW).to_json()
+    me = status["accounts"][0]
+    assert me["email"] == "someone@example.com" and me["calendars"][0]["primary"] is True

@@ -191,7 +191,6 @@ function Reconnect({ status, account, service }) {
       ? t("For safety, signing in to Google happens only on the computer calsync runs on. In a terminal there, run:")
       : t("For safety, the app-specific password is typed only on the computer calsync runs on. In a terminal there, run:")}</p>
     <${Command} command=${command}/>
-    <p class="hp after">${t("Once it is done this page updates by itself; no need to reload.")}</p>
   </div>`;
 }
 
@@ -502,15 +501,13 @@ export function ConnectForm({ route, onClose, onReplace, active = true }) {
   const terminalNote = terminalAdd ? html`<div class="note" data-role="terminal-add">
       <p>${t("The keychain already holds a credential for {name}. For safety, this account is added in a terminal:", { name: typed })}</p>
       <${Command} command=${terminalAdd}/>
-      <p class="hp after" role="status">${t("Once it is added, this page goes on by itself.")}</p>
     </div>` : null;
 
   let details;
   if (google) {
     if (!config) details = html`<p class="hp" aria-busy="true">${t("Reading the settings…")}</p>`;
     else if (configured) {
-      details = html`<p class="hp">${t("The Google app credentials are set up already. calsync signs in to this account with them.")}</p>
-        ${errorText}${terminalNote}
+      details = html`${errorText}${terminalNote}
         <div class="acts">${back}${addButton(Boolean(terminalAdd))}</div>`;
     } else {
       details = html`<div class="note">${t("calsync signs in with Google app credentials of your own: your events never pass through anybody else's server. This is needed once.")}</div>
@@ -528,7 +525,6 @@ export function ConnectForm({ route, onClose, onReplace, active = true }) {
     const icloud = server === "icloud";
     details = html`<${Seg} label=${t("Server")} value=${server} options=${[["icloud", "iCloud"], ["other", t("Another CalDAV server")]]}
         onPick=${(v) => { setServer(v); setError({ field: "", text: "" }); }}/>
-      <p class="hp after">${icloud ? t("calsync works out by itself whether it is the global or the China mainland iCloud.") : t("Any CalDAV server that speaks https.")}</p>
       ${icloud ? null : html`<label class="fl">${t("Server address")}
         <input class=${error.field === "url" ? "field w err" : "field w"} type="url" inputmode="url" autocomplete="url" spellcheck="false"
             placeholder=${`${SCHEME}caldav.example.com`} value=${url} aria-invalid=${error.field === "url" ? "true" : "false"}
@@ -538,7 +534,6 @@ export function ConnectForm({ route, onClose, onReplace, active = true }) {
             autocomplete="username" spellcheck="false" autocapitalize="off" data-autofocus=""
             placeholder=${icloud ? "name@example.com" : ""} value=${user} aria-invalid=${error.field === "user" ? "true" : "false"}
             onInput=${(e) => setUser(e.currentTarget.value)} onKeyDown=${enter(add)}/></label>
-      <p class="hp after">${t("It is not a secret: it is written to config.toml. The app-specific password comes next, in the terminal, never through the browser.")}</p>
       ${errorText}${terminalNote}
       <div class="acts">${back}${addButton(Boolean(terminalAdd))}</div>`;
   }
@@ -552,9 +547,8 @@ export function ConnectForm({ route, onClose, onReplace, active = true }) {
         <${Step} id="name" stage=${stage} title=${t("A name for the account")} summary=${typed}>
           <label class="fl">${t("Account name")}
             <input class=${nameError ? "field w err" : "field w"} type="text" spellcheck="false" autocapitalize="off" autocomplete="off"
-                value=${name || ""} aria-invalid=${nameError ? "true" : "false"} aria-describedby="name-hint"
+                value=${name || ""} aria-invalid=${nameError ? "true" : "false"}
                 onInput=${(e) => { setName(e.currentTarget.value); if (nameError) setNameError(""); }} onKeyDown=${enter(next)}/></label>
-          <p class="hp after" id="name-hint">${t("Only used inside calsync and in its terminal commands, e.g. grandma-icloud.")}</p>
           ${nameError ? html`<p class="errt" role="alert">${nameError}</p>` : null}
           <div class="acts"><button class="btn primary" type="button" onClick=${next}>${t("Next")}</button></div>
         <//>

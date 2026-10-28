@@ -244,8 +244,7 @@ function Alarms({ value, onChange }) {
       ? html`<div class="alarm-picks" role="group" aria-labelledby="alarm-lb" data-role="alarm-picks">
           ${presets.map((m) => html`<button type="button" class="pick" aria-pressed=${value.alarms.includes(m) ? "true" : "false"}
               onClick=${() => toggle(m)}>${alarmLabel(m)}</button>`)}
-        </div>
-        <p class="hp after">${t("Up to five reminders.")}</p>`
+        </div>`
       : null}
   </div>`;
 }
@@ -297,7 +296,6 @@ function Fields({ value, onChange, disabled, longBefore = false }) {
 function CalendarPicker({ calendars, value, onPick }) {
   const stop = value || (calendars[0] && `${calendars[0].account}:${calendars[0].id}`);
   return html`<div class="fs" data-key="calendar"><span class="lb" id="cal-lb">${t("Calendar")}</span>
-    <p class="hp">${t("The event goes into Google; its line brings it to iCloud.")}</p>
     <div role="radiogroup" aria-labelledby="cal-lb" data-role="calendars" onKeyDown=${onRadioKeys}>
       ${calendars.map((c) => {
         const key = `${c.account}:${c.id}`;
@@ -433,9 +431,7 @@ export function EditForm({ route, onClose, onReplace, active = true }) {
       ${note && note.reload ? html`<button class="btn" type="button" data-role="reload" onClick=${reread}>${t("Read it again")}</button>` : null}
     </div>
     <div class="ifoot">
-      <span class="fh"><${Icon} name="pen"/>${creating
-        ? (chosen ? t("Saved in Google “{calendar}”; the copy follows.", { calendar: chosen.name }) : "")
-        : t("Saved in Google; the copy in iCloud follows at once.")}</span>
+      <span></span>
       <button class=${busy ? "btn primary busy" : "btn primary"} type="button" data-role="save"
           aria-disabled=${blocked ? "true" : "false"} onClick=${save}>
         ${busy ? html`<${Icon} name="sync"/>${t("Saving…")}` : creating ? t("Create") : t("Save")}</button>

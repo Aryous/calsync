@@ -423,8 +423,8 @@ def test_v3_database_is_upgraded_in_place(tmp_path: Path) -> None:
             [ChangeRecord("a", "o1", "created", T1, "Lunch")],
         )
         assert store.last_title("a", "o1") == "Lunch"
-    assert store_mod.SCHEMA_VERSION == 6
-    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
+    assert store_mod.SCHEMA_VERSION == 7
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("7",)]
     run_columns = [r[1] for r in _rows(db, "PRAGMA table_info(run)")]
     assert run_columns[-5:] == ["reverted", "protected", "out_of_window", "error_kind", "error_account"]
     assert _rows(db, "SELECT rule, reverted, protected, out_of_window, error_kind FROM run ORDER BY id") == [
@@ -453,15 +453,15 @@ def test_upgrade_after_a_rollback_drops_the_stale_change_table(tmp_path: Path) -
     with Store(db) as store:
         assert [r.rule for r in store.latest_runs()] == ["a"]
         assert store.last_title("a", "o1") is None  # its run ids no longer exist: dropped
-    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("7",)]
     assert _count(db, "SELECT COUNT(*) FROM change") == 0
 
 
-@pytest.mark.parametrize("old", ["3", "4", "5"])
+@pytest.mark.parametrize("old", ["3", "4", "5", "6"])
 def test_upgraded_schema_equals_a_fresh_one(tmp_path: Path, old: str) -> None:
     """The upgrade steps and a fresh schema describe the same tables, columns and indexes.
     This is the drift guard: the fresh DDL and the steps are written separately."""
-    {"3": _v3_database, "4": _v4_database, "5": _v5_database}[old](tmp_path / "old.db")
+    {"3": _v3_database, "4": _v4_database, "5": _v5_database, "6": _v6_database}[old](tmp_path / "old.db")
     Store(tmp_path / "old.db").close()
     Store(tmp_path / "new.db").close()
 
@@ -502,7 +502,7 @@ def test_failed_upgrade_leaves_the_v3_database_as_it_was(
     assert _count(db, "SELECT COUNT(*) FROM run") == 1
 
 
-@pytest.mark.parametrize("version", ["2", "7"])
+@pytest.mark.parametrize("version", ["2", "8"])
 def test_version_without_an_upgrade_path_is_rebuilt(tmp_path: Path, version: str) -> None:
     """Older than the first step or newer than this code: dropped and rebuilt, as before."""
     db = tmp_path / "s.db"
@@ -510,7 +510,7 @@ def test_version_without_an_upgrade_path_is_rebuilt(tmp_path: Path, version: str
     with Store(db) as store:
         assert store.latest_runs() == []
         assert store.load_source("g") == ({}, {})
-    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("7",)]
     assert _count(db, "SELECT COUNT(*) FROM change") == 0
 
 
@@ -597,7 +597,7 @@ def test_v4_database_is_upgraded_in_place(tmp_path: Path) -> None:
         )
         assert store.last_title("a", "o1") == "Lunch"
         assert store.config_changes() == []
-    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("7",)]
     assert _rows(db, "SELECT summary FROM target_object") == [(None,)]
     assert _rows(db, "SELECT detail FROM change") == [(None,)]
     assert _rows(db, "SELECT error_account FROM run") == [(None,)]
@@ -622,7 +622,7 @@ def test_upgrade_after_a_rollback_drops_the_stale_v5_tables(tmp_path: Path) -> N
     with Store(db) as store:
         assert store.config_changes() == []
         assert [r.rule for r in store.latest_runs()] == ["a"]
-    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("7",)]
     assert "stale" not in [r[1] for r in _rows(db, "PRAGMA table_info(account_calendar)")]
     assert _count(db, "SELECT COUNT(*) FROM account_calendar") == 0
 
@@ -733,7 +733,7 @@ def test_v5_database_is_upgraded_in_place(tmp_path: Path) -> None:
         assert store.last_title("a", "o1") == "Lunch"
         assert [c.summary for c in store.config_changes()] == ["x"]
         assert store.writes() == [] and store.scopes("g") is None
-    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("7",)]
     assert _count(db, "SELECT COUNT(*) FROM run") == 1
 
 
@@ -784,3 +784,49 @@ def test_scopes_round_trip(tmp_path: Path) -> None:
         assert store.scopes("g") == frozenset({"a", "b"})
         store.save_scopes("g", frozenset({"a"}), T1)
         assert store.scopes("g") == frozenset({"a"})
+
+
+def _v6_database(path: Path) -> None:
+    """A version-6 database: the v5 one upgraded by the 5 -> 6 step alone."""
+    _v5_database(path)
+    with closing(sqlite3.connect(path)) as conn:
+        store_mod._upgrade_5(conn)  # pyright: ignore[reportPrivateUsage]
+        conn.execute("UPDATE meta SET value = '6' WHERE key = 'schema_version'")
+        conn.execute(
+            "INSERT INTO account_calendar (account, id, name, role, fetched_at) VALUES ('g', 'me@example.com', 'me@example.com', 'owner', ?)",
+            (T0.isoformat(),),
+        )
+        conn.commit()
+
+
+def test_v6_database_is_upgraded_in_place(tmp_path: Path) -> None:
+    from calsync.views import StateReader
+
+    db = tmp_path / "s.db"
+    _v6_database(db)
+    Store(db).close()
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("7",)]
+    assert _rows(db, "SELECT id, is_primary FROM account_calendar") == [("me@example.com", 0)]
+    with StateReader(db) as reader:
+        [cal] = reader.account_calendars("g")
+        assert cal.primary is False  # known at the next refresh
+
+
+def test_the_primary_flag_round_trips(tmp_path: Path) -> None:
+    from calsync.store import AccountCalendar
+    from calsync.views import StateReader
+
+    with Store(tmp_path / "s.db") as store:
+        store.save_account_calendars(
+            "g",
+            [
+                AccountCalendar("g", "me@example.com", "me@example.com", "owner", T0, True),
+                AccountCalendar("g", "c2", "Work", "owner", T0),
+            ],
+            T0,
+        )
+    with StateReader(tmp_path / "s.db") as reader:
+        assert [(c.id, c.primary) for c in reader.account_calendars("g")] == [
+            ("c2", False),
+            ("me@example.com", True),
+        ]

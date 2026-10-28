@@ -6,7 +6,7 @@
 
 import { html, useCallback, useEffect, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
 import { t, getLang } from "/static/i18n.js";
-import { clockTime, serviceName, serviceOf, serviceShort, when, ymd } from "/static/format.js";
+import { accountLabel, calendarTitle, clockTime, serviceName, serviceOf, serviceShort, when, ymd } from "/static/format.js";
 import { get, op, useStatus } from "/static/api.js";
 import { Command } from "/static/command.js";
 import { Icon, Service } from "/static/icons.js";
@@ -105,7 +105,7 @@ function Compare({ ev, delivery, status }) {
       })}</tbody>
     </table>
     ${busy ? html`<p class="hp after" data-role="busy-note">${t("In “{calendar}” this shows only as “busy”: that is the line's setting.", { calendar: delivery.target.calendar_name })}</p>` : null}
-    ${copy && differs.size ? html`<p class="hp after">${t("The copy catches up at the next sync.")}</p>` : null}`;
+`;
 }
 
 /** 删除: a confirmation (and, for a repeating event, which times) before anything is written. */
@@ -140,7 +140,7 @@ function DeleteConfirm({ ev, onCancel, onDone }) {
   };
   return html`<div class="del" data-role="delete" ref=${box} role="group" aria-labelledby="del-title">
     <h3 id="del-title">${t("Delete “{title}” in Google?", { title: ev.title || t("(no title)") })}</h3>
-    <p class="hp">${t("Its copies in iCloud are deleted at the same sync.")}</p>
+    <p class="hp">${t("Its copies are deleted at the same sync.")}</p>
     ${ev.recurring ? html`<${ScopeChoice} value=${scope} onPick=${setScope} verb="delete"/>` : null}
     ${human ? html`<div class="note warn"><p>${t("This needs you, in a terminal on the computer calsync runs on:")}</p><${Command} command=${human.command}/></div>` : null}
     <p class="inote bad" role="status" data-role="delete-outcome">${note || ""}</p>
@@ -200,7 +200,7 @@ export function EventForm({ route, onClose, active = true }) {
     <div class="ib">
       <div class="src-row" data-role="source">
         <span class="lb2">${t("Comes from")}</span><${Service} service=${srcService}/>
-        <span class="grow"><b>${ev.source.calendar_name}</b><small>${ev.source.account} · ${serviceName(srcService)}</small></span>
+        <span class="grow"><b>${calendarTitle(ev.source.account, ev.source.calendar_name)}</b><small>${accountLabel(ev.source.account)} · ${serviceName(srcService)}</small></span>
         ${ev.recurring ? html`<span class="tag">${t("Repeats")}</span>` : null}
       </div>
       <div class="fs" data-key="deliveries"><span class="lb">${t("Delivered to")}</span>
@@ -209,7 +209,7 @@ export function EventForm({ route, onClose, active = true }) {
               const [text, tone] = stateText(d, status);
               return html`<a class="row" href=${`#/rule/${encodeURIComponent(d.rule)}`} data-rule=${d.rule} data-state=${d.state}>
                 <${Service} service=${d.service}/>
-                <span class="grow">${d.target.calendar_name}<small>${d.target.account} · ${serviceName(d.service)}</small></span>
+                <span class="grow">${calendarTitle(d.target.account, d.target.calendar_name)}<small>${accountLabel(d.target.account)} · ${serviceName(d.service)}</small></span>
                 <span class=${`r ${tone}`}>${text}</span>
                 ${d.state === "blocked" ? html`<span class="vh">${t("Review")}</span>` : null}
               </a>`;

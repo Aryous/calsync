@@ -22,7 +22,7 @@ def event_of(daemon: LiveDaemon, title: str, day: str) -> dict[str, Any]:
 
 
 def google(daemon: LiveDaemon, event_id: str) -> dict[str, Any]:
-    return daemon.in_loop(lambda: daemon.world.google["personal"].event(FAMILY, event_id))
+    return daemon.in_loop(lambda: daemon.world.google["main"].event(FAMILY, event_id))
 
 
 def insp(page: Page) -> Locator:
@@ -77,7 +77,7 @@ def test_a_repeating_event_asks_which_times(open_page: OpenPage, fresh_live: Liv
     expect(save).to_have_attribute("aria-disabled", "false")
     save.click()
     expect(insp(page).locator("#insp-title")).to_have_text("晨跑（公园）")
-    fake = fresh_live.world.google["personal"]
+    fake = fresh_live.world.google["main"]
     events = fresh_live.in_loop(lambda: fake.events(FAMILY))
     assert [
         e["summary"]
@@ -90,58 +90,58 @@ def test_a_repeating_event_asks_which_times(open_page: OpenPage, fresh_live: Liv
 def test_a_change_made_elsewhere_meanwhile_is_not_overwritten(
     open_page: OpenPage, fresh_live: LiveDaemon
 ) -> None:
-    page, _ = open_detail(open_page, fresh_live, "家庭聚餐", "2026-10-30")
+    page, _ = open_detail(open_page, fresh_live, "周五聚餐", "2026-10-30")
     insp(page).locator('[data-role="edit-event"]').click()
     form = insp(page)
-    expect(form.locator("#ev-title")).to_have_value("家庭聚餐")
-    fake = fresh_live.world.google["personal"]
+    expect(form.locator("#ev-title")).to_have_value("周五聚餐")
+    fake = fresh_live.world.google["main"]
     fresh_live.in_loop(lambda: fake.touch(FAMILY, "dinner", location="奶奶家"))
     watch_of(page).allow(r"status of 409")
-    form.locator("#ev-title").fill("周五聚餐")
+    form.locator("#ev-title").fill("周五晚饭")
     form.locator('[data-role="save"]').click()
     expect(form.locator('[data-role="outcome"]')).to_contain_text("刚在 Google 里被改过")
-    assert google(fresh_live, "dinner")["summary"] == "家庭聚餐"
+    assert google(fresh_live, "dinner")["summary"] == "周五聚餐"
     form.locator('[data-role="reload"]').click()  # read the event again: the form starts over
     expect(form.locator("#ev-location")).to_have_value("奶奶家")
 
 
 def test_an_invitation_cannot_be_changed(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
-    fake = fresh_live.world.google["personal"]
+    fake = fresh_live.world.google["main"]
     invite = google_event(
         "invite", "同学聚会", "2026-10-29T18:00:00+08:00", "2026-10-29T20:00:00+08:00",
         tz="Asia/Shanghai", organizer={"email": "classmate@example.com"},
     )  # fmt: skip
     fresh_live.in_loop(lambda: fake.put_event(FAMILY, invite))
-    fresh_live.trigger("family-home")
+    fresh_live.trigger("life-shared")
     page, _ = open_detail(open_page, fresh_live, "同学聚会", "2026-10-29")
     expect(insp(page).locator('[data-role="locked"]')).to_have_text("这是别人邀请你的日程，只有组织者能改。")
     expect(insp(page).locator('[data-role="edit-event"]')).to_have_count(0)
 
 
 def test_deleting_an_event_and_its_copies(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
-    page, _ = open_detail(open_page, fresh_live, "家庭视频通话", "2026-10-26")
+    page, _ = open_detail(open_page, fresh_live, "视频通话", "2026-10-26")
     insp(page).locator('[data-role="delete-event"]').click()
     box = insp(page).locator('[data-role="delete"]')
-    expect(box.locator("h3")).to_have_text("在 Google 里删除「家庭视频通话」？")
+    expect(box.locator("h3")).to_have_text("在 Google 里删除「视频通话」？")
     box.locator('[data-role="confirm-delete"]').click()
     expect(insp(page)).not_to_have_class(re.compile(r"\bopen\b"))
     assert google(fresh_live, "call")["status"] == "cancelled"
     assert not [
         e
         for e in fresh_live.get("/api/events", **{"from": "2026-10-26", "to": "2026-10-27"})["events"]
-        if e["title"] == "家庭视频通话"
+        if e["title"] == "视频通话"
     ]
 
 
 def test_without_write_access_the_command_is_shown(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
-    fake = fresh_live.world.google["personal"]
+    fake = fresh_live.world.google["main"]
     fresh_live.in_loop(lambda: setattr(fake, "write_scope", False))
     page, _ = open_detail(open_page, fresh_live, "社区活动", "2026-10-27")
     insp(page).locator('[data-role="edit-event"]').click()
     form = insp(page)
     form.locator("#ev-title").fill("x")
     form.locator('[data-role="save"]').click()
-    expect(form.locator('[data-role="needs-human"] code')).to_have_text("calsync auth personal --write")
+    expect(form.locator('[data-role="needs-human"] code')).to_have_text("calsync auth main --write")
     assert google(fresh_live, "dentist")["summary"] == "社区活动"
 
 
@@ -159,12 +159,12 @@ def test_the_form_fits_the_phone(open_page: OpenPage, fresh_live: LiveDaemon) ->
 
 
 def test_a_long_timed_event_keeps_its_last_day(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
-    fake = fresh_live.world.google["personal"]
+    fake = fresh_live.world.google["main"]
     trip = google_event(
         "trip", "出差", "2026-10-28T10:00:00+08:00", "2026-10-30T12:00:00+08:00", tz="Asia/Shanghai"
     )
     fresh_live.in_loop(lambda: fake.put_event(FAMILY, trip))
-    fresh_live.trigger("family-home")
+    fresh_live.trigger("life-shared")
     page, _ = open_detail(open_page, fresh_live, "出差", "2026-10-28")
     insp(page).locator('[data-role="edit-event"]').click()
     form = insp(page)

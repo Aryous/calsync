@@ -45,8 +45,8 @@ Google Calendar ──► calsync (your machine) ──► iCloud / any CalDAV �
 
 Google calendars can only be shared with Google accounts and iCloud calendars
 only with Apple IDs, so a calendar you maintain in Google — for example
-through an AI assistant connected to Google Calendar — cannot simply appear on
-a family member's iPhone. ICS subscription links are read-only, refresh
+through an AI assistant connected to Google Calendar — cannot simply appear in
+an iCloud calendar (yours, or anyone's you write to). ICS subscription links are read-only, refresh
 slowly and drop alerts.
 
 calsync bridges the gap one way: keep writing in Google, and the events show
@@ -949,7 +949,7 @@ stale one.
 | an event changed on the iPhone snaps back (`reverted=1`) | expected: sync is one way, the Google version wins. Make the change in Google |
 | log says an object "was reverted 3 times within 6:00:00 … not reverting it until …; the source version will be written back then" | something on the target rewrites that event after every write (the loop breaker stepped in). calsync leaves it alone for 24 hours (changes made in Google still sync), then writes the Google version back once ("the hold on 1 copy(ies) ended"). If it keeps happening, look for another app or sync service editing that calendar |
 | log says "copy(ies) read back with no calsync marker" | information only: the target (e.g. iOS) dropped calsync's hidden `X-CALSYNC-HASH` from those copies (a copy that keeps an older marker is not reported). Edits are still judged by visible content and reverted as usual |
-| events arrive on a family member's iPhone but no alert fires | check, in order: notifications for the Calendar app are on (Settings → Notifications → Calendar); the calendar's own Event Alerts switch is on; the calendar is shared rather than in their account, in which case only their Default Alert Time applies (see Known limitations) |
+| events arrive in the target calendar on an iPhone but no alert fires | check, in order: notifications for the Calendar app are on (Settings → Notifications → Calendar); the calendar's own Event Alerts switch is on; the calendar is shared rather than in their account, in which case only their Default Alert Time applies (see Known limitations) |
 | no alert while the Calendar app is open | expected: iOS shows the alert inside the app instead of as a notification |
 | behind a proxy | set `HTTPS_PROXY`; calsync honours the standard proxy variables |
 | the log says only `sync cycle failed (SomeError)` or `an API request failed (SomeError)` | by design the log names only the error's type: its text can carry an event title or a URL. To see the traceback, run the daemon once with `CALSYNC_DEBUG=1` (for example `CALSYNC_DEBUG=1 calsync daemon`), which logs it at DEBUG level and turns on calsync's own debug lines (never the HTTP library's). **Debug logs may contain event titles and URLs**: don't share them unedited, and turn it off again afterwards |

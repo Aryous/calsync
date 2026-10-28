@@ -10,22 +10,25 @@ pytestmark = pytest.mark.browser
 
 def test_the_live_daemon_serves_the_seeded_state(live: LiveDaemon) -> None:
     status = live.get("/api/status")
-    assert [r["name"] for r in status["rules"]] == ["family-home", "school-home", "family-mine", "work-mine"]
+    assert [r["name"] for r in status["rules"]] == ["life-shared", "course-shared", "life-me", "work-me"]
     assert {a["name"]: a["host"] for a in status["accounts"]} == {
-        "personal": "Google Calendar",
+        "main": "Google Calendar",
         "work": "Google Calendar",
-        "family-icloud": "iCloud",
-        "my-icloud": "iCloud",
+        "icloud-shared": "iCloud",
+        "icloud-me": "iCloud",
     }
-    personal = next(a for a in status["accounts"] if a["name"] == "personal")
-    assert sorted(c["name"] for c in personal["calendars"]) == sorted(["家庭日程", "孩子学校", "中国节假日"])
+    main = next(a for a in status["accounts"] if a["name"] == "main")
+    assert sorted(c["name"] for c in main["calendars"]) == sorted(
+        ["alex@example.com", "生活", "课程", "中国节假日"]
+    )
+    assert main["email"] == "alex@example.com"
     assert status["daemon"]["running"] is True and status["daemon"]["cycles"] >= 2
     events = live.get("/api/events", **{"from": "2026-10-26", "to": "2026-11-02"})["events"]
     lunch = next(e for e in events if e["title"] == PENDING_TITLE)
     states = {d["rule"]: d["state"] for d in lunch["deliveries"]}
-    assert states == {"family-home": "delivered", "family-mine": "pending"}
+    assert states == {"life-shared": "delivered", "life-me": "pending"}
     titles = {e["title"] for e in events}
-    assert {"晨跑", "交物业费", "钢琴课", "周会", "秋游"} <= titles
+    assert {"晨跑", "交物业费", "钢琴课", "周会", "团建"} <= titles
 
 
 def test_a_page_pairs_through_the_key_link(paired_page: Page, live: LiveDaemon) -> None:

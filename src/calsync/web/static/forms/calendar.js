@@ -48,6 +48,6 @@ export function CalendarForm({ route, onClose }) {
       </div>
       <div class="fs"><a class="btn" href=${newLineHref(pill)}><${Icon} name="plus"/>${source ? t("New line from this calendar") : t("Sync into this calendar")}</a></div>
       ${source ? null : html`<div class="fs"><span class="lb">${t("Other events in this calendar")}</span>
-        <p class="hp flush">${t("calsync only manages the events it wrote itself. Events the family adds here are never changed or deleted.")}</p></div>`}
+        <p class="hp flush">${t("calsync changes only the events it wrote.")}</p></div>`}
     </div>`;
 }

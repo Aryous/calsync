@@ -15,14 +15,17 @@ web
 
 ## Users
 
-- **Primary user:** the person who runs calsync for the household (confirmed 2026-10-25).
-  - An AI assistant (for example ChatGPT's Google Calendar connector) writes events into their Google Calendar.
-  - calsync copies those events to iCloud calendars that family members see on their iPhones.
+- **Primary user:** anyone who keeps their calendar in Google and wants it in another calendar
+  service too (iCloud today, more services later). A product for the general public, not for one
+  household (the user's decision, 2026-10-29).
+  - They, or an AI assistant acting for them, write events into Google Calendar.
+  - calsync copies them one way to the target calendars. Who reads a target (the user on their
+    own iPhone, a colleague, a family member) is the user's business: the UI never assumes it.
 - **How they use the UI:**
   - Mostly on the phone, a quick check: is sync working, what changed, will the alerts arrive?
   - On the desktop for configuration: the map is also where lines, accounts and settings are changed.
   - They act only when something needs them.
-- **Family members never use the UI.** They only see the result in the iPhone Calendar app.
+- **Whoever reads a target calendar** never needs the UI: they see the result in their own calendar app.
 
 ## Product Purpose
 
@@ -40,16 +43,16 @@ calsync is a self-hosted, one-way mirror from Google Calendar to CalDAV/iCloud:
 - **Alerts** are copied or set per rule.
 - **Edits made on the target are reverted** to the source.
 
-It runs on the user's own machine; no hosted service ever holds their family's calendar data.
+It runs on the user's own machine; no hosted service ever holds their calendar data.
 
 ## Operating Context
 
 - **Where it runs:** a Mac (later a Mac mini) as a launchd service. The UI is reached on localhost, over Tailscale, or over Surge Ponte, from an iPhone or a laptop.
 - **Pairing:** by a key link or QR code. No passwords over plain HTTP.
-- **What the user is doing:** checking whether today's events and alerts reached the family, usually right after asking an AI assistant to change the schedule.
+- **What the user is doing:** checking whether today's events and alerts reached the target calendars, usually right after they (or an AI assistant) changed the schedule.
 - **Terminology:**
   - sync line = rule
-  - source (Google) and target (iCloud)
+  - source (Google) and target (iCloud today; other services later)
   - alerts
   - delivered / pending
   - reverted (an edit on the target was replaced by the source version)
@@ -68,7 +71,7 @@ It runs on the user's own machine; no hosted service ever holds their family's c
   - the account wizard (connect Google / iCloud), reconnect and remove;
   - the blocked-delete flow: see the list, approve exactly that set, or leave it.
 - **Data and changes:** reads `GET /api/*`; every change goes through `POST /api/ops/<name>` (recorded with source `ui`, the same operations the CLI runs), written to `config.toml` with a backup and an undo.
-- **The UI never edits events** in this phase. Editing events (in the Google original, never the iCloud copy) is a later proposal (phase C).
+- **Events are written to the Google original** (create, change by form or drag, delete), never to the copy; the copy follows at the sync each write requests (phase C).
 - **No secrets in the browser (D10):** no password, token or app-specific password field anywhere. Every step that needs a person shows the command to run on the Mac (with a copy button) and waits until the state changes.
 - **Plain HTTP:** nothing needs a secure context; copy buttons select the text and fall back to `execCommand("copy")`.
 - **Privacy:** event titles may be shown in the UI and the JSON API, never in logs; the browser console gets errors by kind only.
@@ -86,13 +89,22 @@ It runs on the user's own machine; no hosted service ever holds their family's c
   3. Quiet creativity: low saturation, thin lines, large whitespace, slow motion with a slight breathing; no glow, no 3D, no neon.
 - **Palette (Moodboard 01):** white `#FFFFFF`, pale `#F8FAFC`, cool grey `#E5E8EE`, slate `#CBD6E1`, soft blue `#AEB8D9`, charcoal `#1F2937`; the full light and dark token set is in the concept and `styles.css`.
 - **Type:** Instrument Sans (self-hosted, OFL) for Latin, numerals and the wordmark; the system PingFang SC for Chinese.
-- **Naming rule:** a calendar name is never shown without its service icon and account.
+- **Naming rule:** a calendar name is never shown without its service icon and account. An
+  account is named by its email (a Google account's address, an Apple ID); the config's name for
+  it is secondary, shown where a terminal command needs it. An account's own calendar (Google
+  names it after the email) is shown as 主日历, never as the email, so it cannot be mistaken for the
+  account.
+- **Copy rule (2026-10-29):** no explanation of what a person sees at a glance; a hint stays only
+  where it prevents a mistake (a delete, a secret, a refusal) or names an empty or loading state.
+  General flows never name a target service (no "iCloud", "iPhone", "家人"): they say 副本 /
+  目标日历, or the line's own service by name. Only service-specific steps (connecting an iCloud
+  account) name the service.
 - The direction contract is `.impeccable/surfaces/src-calsync-web-static-index-html.md`; the approved concept is `.impeccable/mocks/canvas/index.html`.
 
 ## Evidence on Hand
 
 - Real state: one rule, about 17 synced series, more than 100 run records.
-  - Real event titles are personal (a family member's schedule). Never put them in screenshots committed to the repo, in fixtures or in docs.
+  - Real event titles are personal. Never put them in screenshots committed to the repo, in fixtures or in docs.
   - Demo and test data must be synthetic.
 - No testimonials, users, metrics or press exist. Do not invent any.
 

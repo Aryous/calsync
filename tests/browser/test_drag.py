@@ -32,7 +32,7 @@ def hour(page: Page) -> float:
 
 
 def google(daemon: LiveDaemon, event_id: str) -> dict[str, Any]:
-    return daemon.in_loop(lambda: daemon.world.google["personal"].event(FAMILY, event_id))
+    return daemon.in_loop(lambda: daemon.world.google["main"].event(FAMILY, event_id))
 
 
 def drag(page: Page, target: Locator, dx: float, dy: float, *, at: float = 0.3) -> None:
@@ -101,11 +101,11 @@ def test_a_repeating_event_asks_and_cancel_puts_it_back(open_page: OpenPage, fre
     sheet.get_by_role("button", name="取消").click()
     expect(sheet).to_have_count(0)
     expect(calendar(page).locator(".ev.ghost")).to_have_count(0)
-    assert fresh_live.in_loop(lambda: fresh_live.world.google["personal"].writes) == []
+    assert fresh_live.in_loop(lambda: fresh_live.world.google["main"].writes) == []
     drag(page, block(page, "2026-10-26", "晨跑"), 0, hour(page))
     sheet.get_by_role("button", name="只改这一次").click()
     expect(block(page, "2026-10-26", "晨跑")).to_have_attribute("aria-label", re.compile("08:00–08:45"))
-    fake = fresh_live.world.google["personal"]
+    fake = fresh_live.world.google["main"]
     moved = [
         e
         for e in fresh_live.in_loop(lambda: fake.events(FAMILY))
@@ -119,17 +119,17 @@ def test_a_click_still_opens_the_detail(open_page: OpenPage, fresh_live: LiveDae
     page = open_week(open_page, fresh_live)
     block(page, "2026-10-27", "社区活动").click()
     expect(page).to_have_url(re.compile(r"#/event/"))
-    assert fresh_live.in_loop(lambda: fresh_live.world.google["personal"].writes) == []
+    assert fresh_live.in_loop(lambda: fresh_live.world.google["main"].writes) == []
 
 
 def test_an_invitation_does_not_move(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
-    fake = fresh_live.world.google["personal"]
+    fake = fresh_live.world.google["main"]
     invite = google_event(
         "invite", "同学聚会", "2026-10-29T18:00:00+08:00", "2026-10-29T20:00:00+08:00",
         tz="Asia/Shanghai", organizer={"email": "classmate@example.com"},
     )  # fmt: skip
     fresh_live.in_loop(lambda: fake.put_event(FAMILY, invite))
-    fresh_live.trigger("family-home")
+    fresh_live.trigger("life-shared")
     page = open_week(open_page, fresh_live)
     party = block(page, "2026-10-29", "同学聚会")
     expect(party).not_to_have_class(re.compile(r"\bdrag\b"))
@@ -157,7 +157,7 @@ def test_touch_needs_a_hold_and_a_swipe_does_not_drag(open_page: OpenPage, fresh
     h = hour(page)
     dentist.evaluate(TOUCH, [h, 50])  # a swipe: no hold
     page.wait_for_timeout(300)
-    assert fresh_live.in_loop(lambda: fresh_live.world.google["personal"].writes) == []
+    assert fresh_live.in_loop(lambda: fresh_live.world.google["main"].writes) == []
     dentist.evaluate(TOUCH, [h, 600])  # hold, then drag an hour down
     expect(block(page, "2026-10-27", "社区活动")).to_have_attribute("aria-label", re.compile("15:00–16:00"))
 
@@ -211,4 +211,4 @@ def test_escape_cancels_and_the_release_opens_nothing(open_page: OpenPage, fresh
     page.mouse.up()
     page.wait_for_timeout(200)
     expect(page).not_to_have_url(re.compile(r"#/event/"))
-    assert fresh_live.in_loop(lambda: fresh_live.world.google["personal"].writes) == []
+    assert fresh_live.in_loop(lambda: fresh_live.world.google["main"].writes) == []

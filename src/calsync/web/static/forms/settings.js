@@ -364,7 +364,6 @@ export function SettingsForm({ onClose, active = true }) {
     <div class="ib">
       ${notice ? html`<div class="note warn" data-role="conflict">${t("config.toml was just changed elsewhere; it has been read again here. Make the change once more if you still want it.")}</div>` : null}
       <div class="fs" data-key="notify"><span class="lb">${t("Tell me when something goes wrong")}</span>
-        <p class="hp">${t("A push to your iPhone through Bark (or a webhook). It stays quiet otherwise.")}</p>
         <${UrlSetting} id="notify.bark_url" name="Bark" value=${notify.bark_url} placeholder=${t("The address the Bark app shows")}
             error=${errors["notify.bark_url"]} onSave=${(v) => set("notify.bark_url", v)} onClear=${() => set("notify.bark_url", "")}/>
         <${UrlSetting} id="notify.webhook_url" name="Webhook" value=${notify.webhook_url} placeholder=${t("The webhook's address")}
@@ -385,7 +384,6 @@ export function SettingsForm({ onClose, active = true }) {
               error=${errors["runtime.interval"]} onCommit=${(v) => set("runtime.interval", /^\d+$/.test(v) ? `${v}s` : v)}/>
           ${t("seconds, calsync asks Google what changed")}</div>
         ${errors["runtime.interval"] ? html`<p class="errt" role="alert">${errors["runtime.interval"]}</p>` : null}
-        <p class="hp after">${t("When nothing changed, a check is only a few small requests.")}</p>
       </div>
       <div class="fs" data-key="web"><span class="lb">${t("Open on another device")}</span>
         <p class="hp">${t("Run this on the computer calsync runs on, then open the link it prints (or scan its QR code) on the other device; it stays signed in.")}</p>
@@ -398,7 +396,6 @@ export function SettingsForm({ onClose, active = true }) {
         ${errors["web.allowed_hosts"] ? html`<p class="errt" role="alert">${errors["web.allowed_hosts"]}</p>` : null}
       </div>
       <div class="fs" data-key="config"><span class="lb">${t("Config file")}</span>
-        <p class="hp">${t("This page, the terminal and editing by hand all change the same config.toml. Every change is recorded here, and the last one can be undone.")}</p>
         <${History} changes=${changes} onUndone=${load}/>
       </div>
     </div>

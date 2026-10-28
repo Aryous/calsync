@@ -29,7 +29,7 @@ from calsync.mirror import Mirror
 from calsync.sources.base import CalendarPull
 from calsync.targets.base import CachedObject, TargetCache, TargetCalendar
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 RUN_RETENTION = 500  # newest runs kept per rule
 CHANGE_RETENTION = timedelta(days=90)  # change rows older than this (vs. the newest run) are pruned
 CONFIG_CHANGE_RETENTION = 200  # newest config_change rows kept
@@ -109,6 +109,9 @@ _V6_SCHEMA = (
     "CREATE INDEX event_write_at ON event_write (at)",
     "CREATE TABLE account_access (account TEXT PRIMARY KEY, scopes TEXT NOT NULL, seen_at TEXT NOT NULL)",
 )
+# Version 7: which calendar of an account is its own (Google's primary). One step, shared by a
+# fresh schema and the 6 -> 7 upgrade.
+_V7_SCHEMA = ("ALTER TABLE account_calendar ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0",)
 _TABLES = (
     "meta",
     "source_state",
@@ -198,6 +201,7 @@ class AccountCalendar:
     name: str
     role: str | None  # Google accessRole / CalDAV "rw" | "ro"
     fetched_at: datetime
+    primary: bool = False  # the account's own calendar (Google's primary)
 
 
 @dataclass(frozen=True, slots=True)
@@ -302,7 +306,7 @@ class Store:
             for table in _TABLES:
                 db.execute(f"DROP TABLE IF EXISTS {table}")
             # executescript() would commit our open transaction, so run statements one by one.
-            for statement in (*_SCHEMA.split(";"), *_V5_SCHEMA, *_V6_SCHEMA):
+            for statement in (*_SCHEMA.split(";"), *_V5_SCHEMA, *_V6_SCHEMA, *_V7_SCHEMA):
                 if statement.strip():
                     db.execute(statement)
             db.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
@@ -734,8 +738,9 @@ class Store:
         with self._tx():
             self._db.execute("DELETE FROM account_calendar WHERE account = ?", (account,))
             self._db.executemany(
-                "INSERT INTO account_calendar (account, id, name, role, fetched_at) VALUES (?, ?, ?, ?, ?)",
-                [(account, c.id, c.name, c.role, _utc(at)) for c in calendars],
+                "INSERT INTO account_calendar (account, id, name, role, fetched_at, is_primary) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(account, c.id, c.name, c.role, _utc(at), int(c.primary)) for c in calendars],
             )
 
     def latest_runs(self) -> list[RunRecord]:
@@ -783,8 +788,19 @@ def _upgrade_5(db: sqlite3.Connection) -> None:
         db.execute(statement)
 
 
+def _upgrade_6(db: sqlite3.Connection) -> None:
+    """6 -> 7: the primary flag of cached calendars (unknown until the next refresh: 0)."""
+    for statement in _V7_SCHEMA:
+        db.execute(statement)
+
+
 # version -> the step that turns a database of that version into the next one
-_UPGRADES: dict[int, Callable[[sqlite3.Connection], None]] = {3: _upgrade_3, 4: _upgrade_4, 5: _upgrade_5}
+_UPGRADES: dict[int, Callable[[sqlite3.Connection], None]] = {
+    3: _upgrade_3,
+    4: _upgrade_4,
+    5: _upgrade_5,
+    6: _upgrade_6,
+}
 
 
 def _upgradable(version: int) -> bool:

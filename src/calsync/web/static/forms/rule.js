@@ -213,18 +213,16 @@ function Settings({ rule, view, set, errors }) {
           <${NumberField} label=${t("Days in the future")} value=${days(fileWindow.future)} error=${errors["window.future"]}
               onCommit=${(text) => set("window.future", "window", `${window_.past}:${text}d`, { ...window_, future: `${text}d` }, text)}/>
           ${t("days ahead")}</div>`
-        : html`<p class="hp after">${t("Every event, past and future, and every occurrence of a repeating one.")}</p>`}
+        : null}
       <${Errors} errors=${errors} keys=${["window", "window.past", "window.future"]}/>
     </div>
     <div class="fs" data-key="alarms"><span class="lb">${t("Reminders")}</span>
-      <p class="hp">${t("When the family's iPhones ring.")}</p>
       <${Alarms} value=${view("alarms")} onSet=${(v) => set("alarms", "alarms", Array.isArray(v) ? v.join(",") : v, v)}/>
       <${Errors} errors=${errors} keys=${["alarms"]}/>
     </div>
     <div class="fs" data-key="fields.content"><span class="lb">${t("What is shown")}</span>
       <${Seg} label=${t("What is shown")} value=${content} onPick=${(v) => set("fields.content", "fields.content", v, v)}
           options=${[["full", t("Full content")], ["busy", t("Only “busy”")]]}/>
-      <p class="hp after">${content === "busy" ? t("They see only that the time is taken: no title, place or notes.") : t("Title, time, place and notes are all copied.")}</p>
       <${Errors} errors=${errors} keys=${["fields.content"]}/>
     </div>
     <div class="fs" data-key="fields.attendees"><span class="lb">${t("Attendees")}</span>
@@ -240,7 +238,6 @@ function Settings({ rule, view, set, errors }) {
     </div>
     <div class="fs" data-key="on_target_edit"><span class="lb">${t("When the target is edited")}</span>
       <div class="locked"><${Icon} name="lock"/>${t("Change it back to the Google version")}</div>
-      <p class="hp after">${t("So the family sees what you wrote. Deleted on an iPhone, it comes back too.")}</p>
     </div>
     <div class="fs" data-key="delete_guard"><span class="lb">${t("Delete guard")}</span>
       <div class="inl first">${t("When one sync would delete more than")}

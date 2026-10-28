@@ -463,7 +463,7 @@ function Footer() {
   const lang = getLang();
   const hash = window.location.hash || "";
   return html`<footer class="foot">
-    <span>calsync · ${t("One-way sync from Google Calendar to iCloud.")}</span>
+    <span>calsync · ${t("One-way sync from Google Calendar.")}</span>
     <nav class="langs" aria-label=${t("Language")}>
       <a href=${`?lang=zh${hash}`} lang="zh-CN" aria-current=${lang === "zh" ? "true" : "false"}>中文</a>
       <a href=${`?lang=en${hash}`} lang="en" aria-current=${lang === "en" ? "true" : "false"}>English</a>
