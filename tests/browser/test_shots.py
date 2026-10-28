@@ -83,6 +83,21 @@ def _scope(page: Page) -> None:
     page.locator('aside.insp [data-key="alarms"] .seg button').nth(2).click()
 
 
+def _move_scope(page: Page) -> None:
+    """A repeating event dragged an hour later: the question, before anything is written."""
+    run = page.locator('#pane-calendar .dcol[data-day="2026-10-26"] .ev', has_text="晨跑")
+    run.scroll_into_view_if_needed()
+    box = run.bounding_box()
+    assert box is not None
+    hour = page.locator("#pane-calendar .dcol").first.evaluate("el => el.getBoundingClientRect().height / 24")
+    x, y = box["x"] + box["width"] / 2, box["y"] + 8
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x, y + hour, steps=6)
+    page.mouse.up()
+    page.locator('[data-role="move-scope"]').wait_for()
+
+
 # ``focus``: a line's inspector open, the map dimmed around that line. ``rule``, ``calendar``,
 # ``newline`` (with its preview) and ``delete``: the inspectors of Task 3. Each state is a path
 # and what to do there (read-only: the preview writes nothing).
@@ -108,6 +123,7 @@ STATES: dict[str, tuple[str, Callable[[Page], None] | None]] = {
     "event-edit": (f"/#/event-edit/{RUN}", _scope),
     "event-delete": (f"/#/event/{RUN}", _delete_event),
     "event-new": ("/#/event-new?start=2026-10-27T15:00", None),
+    "move-scope": ("/", _move_scope),
 }
 
 
@@ -136,7 +152,7 @@ def test_screenshot(open_page: OpenPage, browser_name: str, size: str, theme: st
     if act is not None:
         act(page)
     settle(page)
-    if state:
+    if state and state != "move-scope":
         # WebKit paints the SVG <use> icons of a panel that has just become visible a few frames
         # late (the close button's ✕ was missing at 0 ms, present from 300 ms on).
         page.locator("aside.insp .ih button").wait_for(state="visible")

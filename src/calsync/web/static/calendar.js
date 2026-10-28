@@ -11,10 +11,12 @@
 import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
 import { t, getLang } from "/static/i18n.js";
 import { clockTime, serviceOf, ymd } from "/static/format.js";
-import { get, useStatus } from "/static/api.js";
+import { get, op, useStatus } from "/static/api.js";
+import { Command } from "/static/command.js";
+import { useDrag } from "/static/drag.js";
 import { CalendarName, Icon } from "/static/icons.js";
 import { mapModel } from "/static/map.js";
-import { writableCalendars } from "/static/forms/edit.js";
+import { writableCalendars, writeFailure } from "/static/forms/edit.js";
 
 const PHONE = "(max-width: 760px), (hover: none) and (pointer: coarse) and (max-width: 1024px)";
 /** An hour's height in px: the --hourH token as the stylesheet sets it now (44 on the phone). */
@@ -200,7 +202,16 @@ function eventLabel(e, colourName) {
   return [e.title, time, colourName, stateWord(e.look)].filter(Boolean).join(", ");
 }
 
-function Block({ e, colour, day, now, hour }) {
+const movable = (e) => Boolean(e.editable && e.editable.ok);
+
+/** A click that ended a drag does not open the detail. */
+function opener(e, drag) {
+  return () => {
+    if (!(drag && drag.wasDrag())) openEvent(e.id);
+  };
+}
+
+function Block({ e, colour, day, now, hour, drag }) {
   const start = startOfDay(day);
   const from = Math.max(e.s, start);
   const to = Math.min(e.e, addDays(start, 1));
@@ -208,24 +219,48 @@ function Block({ e, colour, day, now, hour }) {
   const height = Math.max(22, ((to - from) / 36e5) * hour - 3);
   const width = 100 / e.lanes;
   const style = { top: `${top + 1}px`, height: `${height}px`, left: `calc(${width * e.lane}% + 3px)`, width: `calc(${width}% - 6px)` };
-  const cls = ["ev", colour, e.e < now ? "past" : "", e.look !== "ok" ? `st-${e.look}` : ""].filter(Boolean).join(" ");
+  const can = drag && movable(e);
+  const moving = drag && drag.ghost && drag.ghost.id === e.id;
+  const cls = ["ev", colour, e.e < now ? "past" : "", e.look !== "ok" ? `st-${e.look}` : "", can ? "drag" : "", moving ? "dragging" : ""].filter(Boolean).join(" ");
   return html`<button class=${cls} type="button" style=${style} data-ev=${e.id} aria-label=${eventLabel(e, e.source.calendar_name)}
-      onClick=${() => openEvent(e.id)}>
+      aria-description=${can ? t("Drag it to change its time, or open it to change it") : null}
+      onClick=${opener(e, drag)} ...${can ? drag.bind(e, "time") : {}}>
     ${e.look === "pending" || e.look === "held" ? html`<i class=${`flag ${e.look}`} aria-hidden="true"></i>` : null}
     <b>${e.title}</b>${height < 40 ? null : html`<small class="num">${clockTime(e.s)}–${clockTime(e.e)}${e.location ? ` · ${e.location}` : ""}</small>`}
+    ${can && to === e.e.getTime() ? html`<span class="rs" aria-hidden="true" ...${drag.bind(e, "resize")}></span>` : null}
   </button>`;
 }
 
-function Chip({ e, colour, flat }) {
-  const cls = ["chip", flat ? "flat" : colour, !flat && e.look !== "ok" ? `st-${e.look}` : ""].filter(Boolean).join(" ");
-  return html`<button class=${cls} type="button" data-ev=${e.id} aria-label=${eventLabel(e, e.source.calendar_name)} onClick=${() => openEvent(e.id)}>
+/** Where a drag would put the event in this day's column (or the move being saved). */
+function Ghost({ g, day, hour, colour }) {
+  const start = startOfDay(day);
+  const end = addDays(start, 1);
+  if (!(g.start < end && g.end > start)) return null;
+  const from = Math.max(g.start, start);
+  const to = Math.min(g.end, end);
+  const top = ((from - start) / 36e5) * hour;
+  const height = Math.max(22, ((to - from) / 36e5) * hour - 3);
+  const style = { top: `${top + 1}px`, height: `${height}px`, left: "3px", width: "calc(100% - 6px)" };
+  // The new time first: it is what a person watches while dragging.
+  return html`<div class=${`ev ghost ${colour}${g.saving ? " saving" : ""}`} style=${style} aria-hidden="true" data-role="ghost">
+    <b class="num">${clockTime(g.start)}–${clockTime(g.end)}</b>${height < 40 ? null : html`<small>${g.ev.title}</small>`}
+  </div>`;
+}
+
+function Chip({ e, colour, flat, drag }) {
+  const can = drag && movable(e);
+  const moving = drag && drag.ghost && drag.ghost.id === e.id;
+  const cls = ["chip", flat ? "flat" : colour, !flat && e.look !== "ok" ? `st-${e.look}` : "", can ? "drag" : "", moving ? "dragging" : ""].filter(Boolean).join(" ");
+  return html`<button class=${cls} type="button" data-ev=${e.id} aria-label=${eventLabel(e, e.source.calendar_name)}
+      aria-description=${can ? t("Drag it to another day, or open it to change it") : null}
+      onClick=${opener(e, drag)} ...${can ? drag.bind(e, "day") : {}}>
     ${flat ? html`<i class=${`dot ${colour}`} aria-hidden="true"></i><time class="num">${clockTime(e.s)}</time>` : null}
     <span>${e.title}</span>
     ${flat && e.look !== "ok" ? html`<i class=${`st ${e.look}`} aria-hidden="true"></i>` : null}
   </button>`;
 }
 
-function TimeGrid({ dayList, events, colourOf, now, onDay, phone, canCreate }) {
+function TimeGrid({ dayList, events, colourOf, now, onDay, phone, canCreate, drag }) {
   const scroller = useRef(null);
   const hour = useMemo(() => hourHeight(), [phone]);
   const showNow = dayList.some((d) => sameDay(d, now));
@@ -243,7 +278,11 @@ function TimeGrid({ dayList, events, colourOf, now, onDay, phone, canCreate }) {
         <span>${weekdayName(d)}</span><b class="num">${d.getDate()}</b></button>`)}
     </div>
     <div class="tg-all"><div class="gut">${t("All day")}</div>
-      ${dayList.map((d) => html`<div>${on(events, d).filter((e) => e.all_day).map((e) => html`<${Chip} e=${e} colour=${colourOf(e)}/>`)}</div>`)}
+      ${dayList.map((d) => {
+        const g = drag && drag.ghost;
+        const drop = g && g.mode === "day" && g.ev.all_day && g.day === ymd(d);
+        return html`<div data-day=${ymd(d)} class=${drop ? "drop" : null}>${on(events, d).filter((e) => e.all_day).map((e) => html`<${Chip} e=${e} colour=${colourOf(e)} drag=${drag}/>`)}</div>`;
+      })}
     </div>
     <div class="tg-scroll" ref=${scroller}>
       <div class="tg-body">
@@ -261,13 +300,14 @@ function TimeGrid({ dayList, events, colourOf, now, onDay, phone, canCreate }) {
           }));
           // A click on an empty part of the column: a new event at that half hour.
           const create = (e) => {
-            if (!canCreate || e.target !== e.currentTarget) return;
+            if (!canCreate || e.target !== e.currentTarget || (drag && drag.wasDrag())) return;
             const y = e.clientY - e.currentTarget.getBoundingClientRect().top;
             const minutes = Math.min(23 * 60 + 30, Math.max(0, Math.floor((y / hour) * 2) * 30));
             window.location.hash = newEventHref(d, minutes);
           };
           return html`<div class=${[0, 6].includes(d.getDay()) ? "dcol wknd" : "dcol"} data-day=${ymd(d)} onClick=${create}>
-            ${lanes(timed).map((e) => html`<${Block} e=${e} colour=${colourOf(e)} day=${d} now=${now} hour=${hour}/>`)}
+            ${lanes(timed).map((e) => html`<${Block} e=${e} colour=${colourOf(e)} day=${d} now=${now} hour=${hour} drag=${drag}/>`)}
+            ${drag && drag.ghost && drag.ghost.mode !== "day" ? html`<${Ghost} g=${drag.ghost} day=${d} hour=${hour} colour=${colourOf(drag.ghost.ev)}/>` : null}
             ${showNow ? html`<div class=${sameDay(d, now) ? "nowl" : "nowl faint"} style=${{ top: `${nowTop}px` }} aria-hidden="true"></div>` : null}
           </div>`;
         })}
@@ -276,7 +316,7 @@ function TimeGrid({ dayList, events, colourOf, now, onDay, phone, canCreate }) {
   </div>`;
 }
 
-function WeekGrid({ from, weeks, month, events, colourOf, now, onDay }) {
+function WeekGrid({ from, weeks, month, events, colourOf, now, onDay, drag }) {
   const max = weeks === 2 ? 6 : 3;
   const cells = days(from, addDays(from, weeks * 7));
   const heads = cells.slice(0, 7);
@@ -286,9 +326,11 @@ function WeekGrid({ from, weeks, month, events, colourOf, now, onDay }) {
         const list = on(events, d).sort(byTime);
         const out = month != null && d.getMonth() !== month;
         const label = d.getDate() === 1 ? shortDay(d) : String(d.getDate());
-        return html`<div class=${["wc", sameDay(d, now) ? "today" : "", out ? "out" : ""].filter(Boolean).join(" ")} data-day=${ymd(d)}>
+        const g = drag && drag.ghost;
+        const drop = g && g.mode === "day" && g.day === ymd(d);
+        return html`<div class=${["wc", sameDay(d, now) ? "today" : "", out ? "out" : "", drop ? "drop" : ""].filter(Boolean).join(" ")} data-day=${ymd(d)}>
           <button class="dn num" type="button" onClick=${() => onDay(d)} aria-label=${t("Open {day}", { day: `${shortDay(d)} ${weekdayName(d)}` })}>${label}</button>
-          ${list.slice(0, max).map((e) => html`<${Chip} e=${e} colour=${colourOf(e)} flat=${!e.all_day}/>`)}
+          ${list.slice(0, max).map((e) => html`<${Chip} e=${e} colour=${colourOf(e)} flat=${!e.all_day} drag=${drag}/>`)}
           ${list.length > max ? html`<button class="more" type="button" onClick=${() => onDay(d)}>${t("{n} more", { n: list.length - max })}</button>` : null}
           <div class="dots" aria-hidden="true">${list.slice(0, 5).map((e) => html`<i class=${`dot ${colourOf(e)}`}></i>`)}</div>
         </div>`;
@@ -341,8 +383,72 @@ function stampOf(status) {
   return `${cycles}|${(status.rules || []).map((r) => `${r.name}:${r.health}`).join(",")}`;
 }
 
+/** After a drag of a repeating event: only this time, or every time? */
+function MoveSheet({ ask, onPick, onCancel }) {
+  const first = useRef(null);
+  useEffect(() => {
+    if (first.current) first.current.focus();
+    const key = (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onCancel();
+      }
+    };
+    window.addEventListener("keydown", key);
+    return () => window.removeEventListener("keydown", key);
+  }, []);
+  return html`<div class="move-sheet" role="dialog" aria-modal="false" aria-labelledby="move-title" data-role="move-scope">
+    <p id="move-title"><b>${t("This is a repeating event")}</b><span class="num">${ask.ev.title} → ${dayLabelOf(ask.start)} ${ask.ev.all_day ? "" : clockTime(ask.start)}</span></p>
+    <div class="move-acts">
+      <button class="btn" type="button" ref=${first} onClick=${() => onPick("this")}>${t("Only this one")}</button>
+      <button class="btn" type="button" onClick=${() => onPick("series")}>${t("The whole series")}</button>
+      <button class="btn quiet" type="button" onClick=${onCancel}>${t("Cancel")}</button>
+    </div>
+  </div>`;
+}
+
+function dayLabelOf(d) {
+  return `${shortDay(d)} ${weekdayName(d)}`;
+}
+
+/** The API's arguments for a move to [start, end). */
+function movedTimes(ev, start, end) {
+  if (ev.all_day) return { start: ymd(start), end: ymd(end), all_day: true };
+  return { start: start.toISOString(), end: end.toISOString(), all_day: false };
+}
+
 export function CalendarPane() {
-  const { status } = useStatus();
+  const { status, refresh } = useStatus();
+  const [ask, setAsk] = useState(null); // a repeating event dropped: {ev, start, end}
+  const [moveNote, setMoveNote] = useState(null); // {text} or {command}
+  const save = async (ev, start, end, scope) => {
+    setMoveNote(null);
+    const expect = scope === "series" ? ev.series_updated : ev.updated;
+    try {
+      const result = await op("event.edit", {
+        id: ev.id,
+        ...(scope ? { scope } : {}),
+        ...(expect ? { expect_updated: expect } : {}),
+        ...movedTimes(ev, start, end),
+        move: true,
+        wait: true,
+      });
+      if (result.needs_human) setMoveNote({ command: result.command });
+      cache.current.clear();
+      refresh();
+      await reload();
+    } catch (e) {
+      if (e.kind !== "unpaired") setMoveNote({ text: writeFailure(e) });
+    }
+    drag.clear();
+  };
+  const drag = useDrag({
+    hour: hourHeight(),
+    onDrop: (ev, start, end) => {
+      if (ev.recurring) setAsk({ ev, start, end });
+      else save(ev, start, end, null);
+    },
+  });
   const phone = usePhone();
   const [view, setView] = useState(() => (window.matchMedia(PHONE).matches ? "day" : "week"));
   const [anchor, setAnchor] = useState(() => startOfDay(new Date()));
@@ -357,16 +463,9 @@ export function CalendarPane() {
   const key = `${ymd(range.from)}/${ymd(range.to)}`;
   const stamp = stampOf(status);
 
-  useEffect(() => {
-    if (!status) return; // read once the lines are known: their states are part of the answer
-    const cached = cache.current.get(key);
-    if (cached && cached.stamp === stamp) {
-      setData(cached);
-      return;
-    }
-    if (cached) setData(cached); // shown while it is read again
+  const reload = () => {
     const mine = ++reads.current;
-    get("/api/events", { from: ymd(range.from), to: ymd(range.to) })
+    return get("/api/events", { from: ymd(range.from), to: ymd(range.to) })
       .then((body) => {
         const entry = { key, stamp, events: body.events || [], truncated: Boolean(body.truncated) };
         cache.current.set(key, entry);
@@ -378,6 +477,16 @@ export function CalendarPane() {
       .catch((e) => {
         if (mine === reads.current && e.kind !== "aborted" && e.kind !== "unpaired") setFailed(true);
       });
+  };
+  useEffect(() => {
+    if (!status) return; // read once the lines are known: their states are part of the answer
+    const cached = cache.current.get(key);
+    if (cached && cached.stamp === stamp) {
+      setData(cached);
+      return;
+    }
+    if (cached) setData(cached); // shown while it is read again
+    reload();
   }, [key, stamp, Boolean(status)]);
 
   // Layers: one per target calendar a line writes to; the legend: the sources of the shown layers.
@@ -446,12 +555,12 @@ export function CalendarPane() {
   let body;
   if (shownView === "day" || shownView === "2day" || shownView === "week") {
     body = html`<${TimeGrid} dayList=${days(range.from, range.to)} events=${events} colourOf=${colourOf} now=${now} onDay=${goDay}
-        phone=${phone} canCreate=${canCreate}/>`;
+        phone=${phone} canCreate=${canCreate} drag=${drag}/>`;
   } else if (shownView === "2week") {
-    body = html`<${WeekGrid} from=${range.from} weeks=${2} events=${events} colourOf=${colourOf} now=${now} onDay=${goDay}/>`;
+    body = html`<${WeekGrid} from=${range.from} weeks=${2} events=${events} colourOf=${colourOf} now=${now} onDay=${goDay} drag=${drag}/>`;
   } else if (shownView === "month") {
     body = html`<${WeekGrid} from=${range.from} weeks=${Math.round((range.to - range.from) / 864e5 / 7)} month=${anchor.getMonth()}
-        events=${events} colourOf=${colourOf} now=${now} onDay=${goDay}/>`;
+        events=${events} colourOf=${colourOf} now=${now} onDay=${goDay} drag=${drag}/>`;
   } else {
     body = html`<${ListView} from=${range.from} events=${events} colourOf=${colourOf} now=${now} onDay=${goDay}
         sourceService=${sourceService} layerNames=${layers}/>`;
@@ -482,6 +591,19 @@ export function CalendarPane() {
     </div>
     ${data && data.truncated ? html`<p class="note warn cal-note" role="status">${t("Too many events in this period: only part of them is shown.")}</p>` : null}
     ${failed && !data ? html`<p class="note cal-note" role="status">${t("Can't read the events right now.")}</p>` : null}
+    ${moveNote ? html`<div class="note bad cal-note" role="status" data-role="move-note">
+        ${moveNote.command
+          ? html`<p>${t("calsync may not change Google events for this account yet. Allow it once, in a terminal on the computer calsync runs on:")}</p><${Command} command=${moveNote.command}/>`
+          : moveNote.text}
+      </div>` : null}
     <div class="cal-frame" aria-busy=${data && data.key === key ? "false" : "true"}>${body}</div>
+    ${ask ? html`<${MoveSheet} ask=${ask} onPick=${(scope) => {
+        const a = ask;
+        setAsk(null);
+        save(a.ev, a.start, a.end, scope);
+      }} onCancel=${() => {
+        setAsk(null);
+        drag.clear();
+      }}/>` : null}
   </div>`;
 }
