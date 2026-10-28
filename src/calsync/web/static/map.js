@@ -105,11 +105,18 @@ export function mapModel(status) {
         const key = `${spec.account}/${spec.calendar}`;
         pill = pills.get(key);
         if (!pill) {
-          const group = groups[side].find((g) => g.name === spec.account);
-          const service = group ? group.service : side === "src" ? "google" : "caldav";
-          pill = { key, account: spec.account, id: spec.calendar, name: spec.calendar_name || spec.calendar, service, side, series: null, rules: [], colour: "none" };
+          let group = groups[side].find((g) => g.name === spec.account);
+          if (!group) {
+            // An account the status does not list: drawn anyway, marked, never dropped.
+            group = { name: spec.account, service: side === "src" ? "google" : "caldav", side, auth: "unknown", pills: [], missing: true };
+            groups[side].push(group);
+          }
+          pill = {
+            key, account: spec.account, id: spec.calendar, name: spec.calendar_name || spec.calendar, service: group.service,
+            side, series: null, rules: [], colour: "none", missing: true,
+          };
           pills.set(key, pill);
-          if (group) group.pills.push(pill);
+          group.pills.push(pill);
         }
         pill.rules.push(rule.name);
       }
@@ -117,13 +124,79 @@ export function mapModel(status) {
     }
     return { name: rule.name, health: rule.health, state: wireState(rule.health), from: ends.source, to: ends.target };
   });
-  let colour = 0;
-  for (const group of groups.src) {
-    for (const pill of group.pills) {
-      if (pill.rules.length) pill.colour = COLOURS[colour++ % COLOURS.length];
-    }
-  }
+  assignColours(groups.src.flatMap((g) => g.pills).filter((p) => p.rules.length));
   return { sources: groups.src, targets: groups.tgt, rules: lines, pills };
+}
+
+/** A key's preferred palette slot (FNV-1a), the same in every browser and on every load. */
+function slotOf(key) {
+  let h = 0x811c9dc5;
+  for (const ch of key) {
+    h ^= ch.codePointAt(0);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h % COLOURS.length;
+}
+
+/** Colours for the synced source calendars. A calendar's first colour is its key's preferred
+ * slot, unless that colour is already used more than another (then the next least-used one),
+ * taking calendars in sorted key order: the same in every browser for the same lines. Once given,
+ * a colour is remembered (this browser's storage, "calsync.colours") and kept while the calendar
+ * syncs, so adding or removing lines never recolours the calendars that stay: with three colours
+ * a purely computed choice could not promise that. */
+const COLOUR_STORE = "calsync.colours";
+const COLOUR_MEMORY = 64; // calendars remembered
+
+function readColours() {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(COLOUR_STORE) || "{}");
+    return stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function writeColours(memory) {
+  try {
+    const keys = Object.keys(memory);
+    for (const key of keys.slice(0, Math.max(0, keys.length - COLOUR_MEMORY))) delete memory[key];
+    window.localStorage.setItem(COLOUR_STORE, JSON.stringify(memory));
+  } catch (e) {
+    // no storage (a private window): the computed colours still apply
+  }
+}
+
+function assignColours(pills) {
+  const memory = readColours();
+  const used = COLOURS.map(() => 0);
+  const sorted = [...pills].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  const fresh = [];
+  for (const pill of sorted) {
+    const slot = COLOURS.indexOf(memory[pill.key]);
+    if (slot < 0) {
+      fresh.push(pill);
+      continue;
+    }
+    used[slot] += 1;
+    pill.colour = COLOURS[slot];
+  }
+  for (const pill of fresh) {
+    const want = slotOf(pill.key);
+    const least = Math.min(...used);
+    let slot = want;
+    for (let i = 0; i < COLOURS.length; i++) {
+      const s = (want + i) % COLOURS.length;
+      if (used[s] === least) {
+        slot = s;
+        break;
+      }
+    }
+    used[slot] += 1;
+    pill.colour = COLOURS[slot];
+    delete memory[pill.key]; // re-inserted last: the newest are kept
+    memory[pill.key] = pill.colour;
+  }
+  if (fresh.length) writeColours(memory);
 }
 
 /** The colour of each source calendar (by pill key), as the map paints its dot: the calendar
@@ -184,11 +257,14 @@ function measure(canvas, model) {
   const anchors = {};
   for (const side of ["src", "tgt"]) {
     const list = wired(side);
+    for (const p of list) anchors[p.key] = anchor(p.key, side);
+    // Ports top to bottom in the order of their pills, so no two wires cross outside the hub.
+    list.sort((a, b) => anchors[a.key].y - anchors[b.key].y);
     list.forEach((p, i) => {
       ports[p.key] = { x: side === "src" ? H.l : H.r, y: portY(i, list.length) };
-      anchors[p.key] = anchor(p.key, side);
     });
   }
+  canvas.dataset.measured = String(Number(canvas.dataset.measured || 0) + 1); // for the tests
   return { w: r1(cb.width), h: r1(cb.height), H, rad, ports, anchors };
 }
 
@@ -208,30 +284,36 @@ function outerOf(geo, line) {
   return `M ${A.x} ${A.y} ${curve(A, P)} M ${Q.x} ${Q.y} ${curve(Q, B)}`;
 }
 
+/** The geometry, measured when the model changes (a poll) and when anything on the map resizes
+ * (the window, the inspector's shift, fonts): never on hover or a tooltip move. One observer for
+ * the map's life. */
 function useGeometry(canvasRef, model) {
   const [geo, setGeo] = useState(null);
   const last = useRef("");
+  const current = useRef(model);
+  current.current = model;
   const update = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !model) return;
-    const next = measure(canvas, model);
+    if (!canvas || !current.current) return;
+    const next = measure(canvas, current.current);
     const key = JSON.stringify(next);
     if (key !== last.current) {
       last.current = key;
       setGeo(next);
     }
-  }, [model]);
+  }, []);
 
-  useLayoutEffect(update); // after every render: pills may have moved
+  useLayoutEffect(update, [model]);
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || typeof ResizeObserver === "undefined") return undefined;
     const observer = new ResizeObserver(() => update());
     observer.observe(canvas);
     for (const el of canvas.querySelectorAll(".col, .hub")) observer.observe(el);
+    canvas.dataset.observers = String(Number(canvas.dataset.observers || 0) + 1); // for the tests
     if (document.fonts && document.fonts.ready) document.fonts.ready.then(update);
     return () => observer.disconnect();
-  }, [update]);
+  }, []);
   return geo;
 }
 
@@ -242,11 +324,11 @@ function reducedMotion() {
 }
 
 /** A comet: a short accent stroke travelling along ``d`` (a Web Animation of its dash offset). */
-function comet(layer, d, duration, delay = 0) {
+function comet(layer, d, duration, delay = 0, wave = false) {
   if (!layer || reducedMotion() || typeof Element.prototype.animate !== "function") return;
   const path = document.createElementNS(layer.namespaceURI, "path"); // the SVG namespace
   path.setAttribute("d", d);
-  path.setAttribute("class", "comet");
+  path.setAttribute("class", wave ? "comet wave" : "comet");
   layer.appendChild(path);
   const length = path.getTotalLength();
   const seg = 34;
@@ -289,12 +371,14 @@ function useMotion(layerRef, hubRef, geo, model, waving, still) {
 
   const wave = useCallback(() => {
     const { geo: g, model: m, still: s } = now.current;
-    if (!g || !m || s || document.hidden) return;
+    const layer = layerRef.current;
+    if (!g || !m || s || document.hidden || !layer || reducedMotion()) return;
     m.rules.filter(flows).forEach((line, i) => {
       const d = routeOf(g, line);
-      if (d) comet(layerRef.current, d, 2200, i * 160);
+      if (d) comet(layer, d, 2200, i * 160, true);
     });
     beat(hubRef.current);
+    layer.dataset.waves = String(Number(layer.dataset.waves || 0) + 1); // for the tests
   }, []);
 
   const drawn = Boolean(geo);
@@ -357,11 +441,15 @@ function Pill({ pill, focus, selected }) {
     metaText = idle ? t("not synced") : pill.series == null ? "" : t("{n} series", { n: pill.series });
   } else {
     const sources = new Set(pill.rules).size;
-    meta = t("{n} sources", { n: sources });
+    meta = sources === 1 ? t("1 source") : t("{n} sources", { n: sources });
     metaText = meta;
   }
+  if (pill.missing) {
+    meta = t("not listed");
+    metaText = t("not in the account's calendar list");
+  }
   const lit = focus ? pill.rules.some((r) => focus.includes(r)) : null;
-  const cls = ["cal", idle ? "idle" : "", lit === false ? "dim" : "", selected ? "sel" : ""].filter(Boolean).join(" ");
+  const cls = ["cal", idle ? "idle" : "", pill.missing ? "missing" : "", lit === false ? "dim" : "", selected ? "sel" : ""].filter(Boolean).join(" ");
   return html`<a class=${cls} href=${calendarHref(pill)} data-cal=${pill.key} title=${label}
       aria-label=${metaText ? `${label} · ${metaText}` : label}>
     <i class=${`dot ${pill.colour}`} aria-hidden="true"></i><span class="nm">${pill.name}</span>${meta ? html`<em class="num" aria-hidden="true">${meta}</em>` : null}
@@ -370,10 +458,14 @@ function Pill({ pill, focus, selected }) {
 
 function AccountGroup({ group, focus, route }) {
   let sub;
-  if (group.auth === "failed") sub = html`<small class="bad">${t("authorisation expired")}</small>`;
+  if (group.missing) sub = html`<small class="bad">${t("not in the account list")}</small>`;
+  else if (group.auth === "failed") sub = html`<small class="bad">${t("authorisation expired")}</small>`;
   else {
     const n = group.pills.filter((p) => p.rules.length).length;
-    sub = html`<small>${group.side === "src" ? t("{n} calendars syncing", { n }) : t("{n} calendars receiving", { n })}</small>`;
+    let text;
+    if (group.side === "src") text = n === 1 ? t("1 calendar syncing") : t("{n} calendars syncing", { n });
+    else text = n === 1 ? t("1 calendar receiving") : t("{n} calendars receiving", { n });
+    sub = html`<small>${text}</small>`;
   }
   const selected = (p) => route && route.name === "calendar" && route.account === p.account && route.calendar === p.id;
   return html`<div class="acct" data-acct=${group.name}>
@@ -446,7 +538,10 @@ export function SyncMap({ status, route, waving, stale }) {
   const geo = useGeometry(canvasRef, model);
   const [hover, setHoverState] = useState(null); // the lines under the pointer or keyboard focus
   const setHover = (names) => setHoverState((current) => (String(current) === String(names) ? current : names));
-  const [tip, setTip] = useState(null); // {text, x, y}
+  const tipRef = useRef(null); // the tooltip's setter
+  const setTip = (tip) => {
+    if (tipRef.current) tipRef.current(tip);
+  };
   useMotion(layerRef, hubRef, geo, model, waving, stale);
 
   const selected = selectedLines(route, model);
@@ -464,7 +559,7 @@ export function SyncMap({ status, route, waving, stale }) {
       setHover([hit.dataset.rule]);
       return;
     }
-    setTip((current) => (current === null ? current : null));
+    setTip(null);
     const cal = e.target.closest && e.target.closest(".cal[data-cal]");
     const names = cal ? linesOfPill(model, cal.dataset.cal) : [];
     setHover(names.length ? names : null);
@@ -475,7 +570,9 @@ export function SyncMap({ status, route, waving, stale }) {
   };
   const onFocusIn = (e) => {
     const cal = e.target.closest && e.target.closest(".cal[data-cal]");
-    if (cal && model) {
+    // Lit on keyboard focus only: focus returned to a pill when its inspector closes after a
+    // click must not keep the map dimmed.
+    if (cal && model && cal.matches(":focus-visible")) {
       const names = linesOfPill(model, cal.dataset.cal);
       setHover(names.length ? names : null);
     }
@@ -501,6 +598,15 @@ export function SyncMap({ status, route, waving, stale }) {
       ${model ? model.targets.map((g) => html`<${AccountGroup} key=${g.name} group=${g} focus=${focus} route=${route}/>`) : null}
       <a class="add-acct" href="#/connect/icloud"><${Icon} name="plus"/>${t("Connect an iCloud account")}</a>
     </div>
-    <div class=${tip ? "tip on" : "tip"} aria-hidden="true" style=${tip ? { left: tip.x, top: tip.y } : {}}>${tip ? tip.text : ""}</div>
+    <${Tip} setter=${tipRef}/>
   </section>`;
+}
+
+/** The wire's tooltip ({text, x, y} or null), set through ``setter`` so that following the
+ * pointer re-renders this alone. */
+function Tip({ setter }) {
+  const [tip, set] = useState(null);
+  setter.current = (next) =>
+    set((now) => (now === next || (now && next && now.text === next.text && now.x === next.x && now.y === next.y) ? now : next));
+  return html`<div class=${tip ? "tip on" : "tip"} aria-hidden="true" style=${tip ? { left: tip.x, top: tip.y } : {}}>${tip ? tip.text : ""}</div>`;
 }

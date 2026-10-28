@@ -194,6 +194,10 @@ def seed_work(fake: FakeGoogle) -> None:
     fake.put_event(WORK, _timed("client", "客户电话", "2026-10-28", "14:00", "15:00"))
 
 
+# The seeded accounts without a single line (the map's empty state).
+CONFIG_WITHOUT_LINES = CONFIG.split("[[rules]]", 1)[0]
+
+
 def pending_event() -> dict[str, Any]:
     return _timed("lunch", PENDING_TITLE, "2026-10-26", "12:30", "13:30", location="国贸")
 
@@ -308,8 +312,9 @@ class LiveDaemon:
     fixture), so the session's stays as seeded.
     """
 
-    def __init__(self, root: Path, *, config: str = CONFIG, now: datetime = NOW) -> None:
+    def __init__(self, root: Path, *, config: str = CONFIG, now: datetime = NOW, stage: bool = True) -> None:
         self.root = root
+        self.stage = stage  # stage the pending change (needs the seeded rules)
         self.state_dir = root  # short (under /tmp): the API socket's path must fit 104 bytes
         self.config_path = root / "config.toml"
         self.config_path.write_text(config, encoding="utf-8")
@@ -338,9 +343,12 @@ class LiveDaemon:
         self._thread.start()
         if not self._started.wait(timeout):
             raise RuntimeError("the daemon's loop did not start")
-        self._until(lambda: self.daemon.web_address is not None and self.cycles() >= 1, timeout)
+        # The first cycle runs the seeded lines; a config without lines has none to wait for.
+        first = 1 if self.stage else 0
+        self._until(lambda: self.daemon.web_address is not None and self.cycles() >= first, timeout)
         self._until(self._answers, timeout)
-        self._stage_pending()
+        if self.stage:
+            self._stage_pending()
         return self
 
     def _main(self) -> None:

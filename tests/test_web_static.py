@@ -273,3 +273,10 @@ async def test_other_assets_are_served_with_their_type(
     response = await served.get(f"/static/{path}")
     assert response.status_code == 200
     assert response.headers["content-type"].split(";")[0].strip() == kind
+
+
+def test_the_wires_take_their_colours_from_tokens() -> None:
+    """Every colour on the map's wires is a token (light and dark set it once each)."""
+    css = _source(STATIC / "styles.css")
+    for rule in re.findall(r"^[^{}]*\.wires[^{}]*\{[^}]*\}", css, flags=re.M):
+        assert not re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(", rule), rule

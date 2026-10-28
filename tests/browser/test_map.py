@@ -20,7 +20,7 @@ from tests.browser.conftest import (
     sync_button,
     watch_of,
 )
-from tests.browser.live import LiveDaemon
+from tests.browser.live import CONFIG_WITHOUT_LINES, LiveDaemon, live_daemon
 
 pytestmark = pytest.mark.browser
 
@@ -152,7 +152,9 @@ def test_the_map_shows_every_account_calendar_and_line(
         expect(page.get_by_role("link", name="连接 iCloud 账号")).to_be_visible()
     # Source pills are coloured by calendar; the unused one has no colour.
     dots = source.locator(".cal .dot").evaluate_all("els => els.map(e => e.getAttribute('class'))")
-    assert dots == ["dot blue", "dot sage", "dot none", "dot violet"]
+    # (the three synced ones distinct: three calendars, three colours).
+    assert dots[2] == "dot none"
+    assert sorted(dots[:2] + dots[3:]) == ["dot blue", "dot sage", "dot violet"]
     # Each pill opens its calendar; each header its account (ids with # and / are encoded).
     expect(source.locator(".cal", has_text="中国节假日")).to_have_attribute(
         "href", "#/calendar/personal/zh.china%23holiday%40group.v.calendar.google.com"
@@ -384,12 +386,14 @@ def test_sync_now_runs_a_cycle_and_the_sentence_updates(open_page: OpenPage, fre
     before = fresh_live.get("/api/status")["summary"]["delivered_today"]
     expect(page.locator(".result .detail a")).to_have_text(f"{before} 处改动")
     cycles = fresh_live.cycles()
+    waves = first_wave_over(page)
     fresh_live.hold_cycles()
     try:
         sync_button(page).click()
         expect(sync_button(page)).to_have_accessible_name("同步中…")
-        # The sync wave: a comet on every line that runs.
-        page.wait_for_function("() => document.querySelectorAll('.canvas .comets path').length >= 4")
+        # The sync wave 立即同步 sent: a comet on every line that runs.
+        expect(page.locator(".canvas .comets")).not_to_have_attribute("data-waves", str(waves))
+        page.wait_for_function("() => document.querySelectorAll('.canvas .comets path.wave').length >= 4")
     finally:
         fresh_live.release_cycles()
     expect(page.locator("[data-role=result-note]")).to_have_text("同步完成，送达了 1 处改动")
@@ -397,6 +401,35 @@ def test_sync_now_runs_a_cycle_and_the_sentence_updates(open_page: OpenPage, fre
     assert after == before + 1 and fresh_live.cycles() == cycles + 1
     expect(page.locator(".result .detail a")).to_have_text(f"{after} 处改动")
     expect(sync_button(page)).to_have_accessible_name("立即同步")
+
+
+def first_wave_over(page: Page) -> str:
+    """The wave the map sends when first drawn has been sent and has ended: the next wave is
+    someone else's. The number of waves so far (``data-waves`` on the comets layer)."""
+    page.wait_for_function(
+        """() => {
+          const layer = document.querySelector(".canvas .comets");
+          return layer && Number(layer.dataset.waves || 0) >= 1 && !layer.querySelector("path.wave");
+        }""",
+        timeout=10_000,
+    )
+    return page.locator(".canvas .comets").get_attribute("data-waves") or ""
+
+
+def test_a_cycle_the_daemon_runs_sends_a_wave(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
+    """No click: the daemon runs a cycle (the poll shows cycle_started_at) and the wires carry it."""
+    page = open_page(daemon=fresh_live)
+    ready(page)
+    waves = first_wave_over(page)
+    fresh_live.hold_cycles()
+    try:
+        assert fresh_live.in_loop(lambda: fresh_live.daemon.request_cycle()) is True
+        refresh_status(page)
+        expect(sync_button(page)).to_have_accessible_name("同步中…")
+        expect(page.locator(".canvas .comets")).not_to_have_attribute("data-waves", str(waves))
+        page.wait_for_function("() => document.querySelectorAll('.canvas .comets path.wave').length >= 4")
+    finally:
+        fresh_live.release_cycles()
 
 
 # ----- attention cards ---------------------------------------------------------------------------
@@ -510,3 +543,267 @@ def test_the_phone_map_keeps_three_columns(open_page: OpenPage, viewport: dict[s
         "els => els.map(e => e.getBoundingClientRect().toJSON())"
     ):
         assert box["height"] >= 44, box
+
+
+# ----- fix round 1 ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("side,calendar", [("src", "工作"), ("tgt", "家庭")])
+def test_closing_a_calendar_with_the_mouse_leaves_nothing_dimmed(
+    paired_page: Page, side: str, calendar: str
+) -> None:
+    """The inspector gives focus back to the pill that opened it; a mouse close must not leave the
+    map lit for that pill (only keyboard focus lights it)."""
+    page = paired_page
+    ready(page)
+    page.locator(f".canvas .col.{side} .cal", has_text=calendar).click()
+    expect(page).to_have_url(re.compile(r"#/calendar/"))
+    expect(page.locator(".canvas .cal.dim").first).to_be_visible()  # the open calendar's lines are lit
+    page.locator("aside.insp").get_by_role("button", name="关闭").click()
+    expect(page.locator("aside.insp")).not_to_have_class(OPEN)
+    page.wait_for_timeout(200)
+    expect(page.locator(".canvas .cal.dim")).to_have_count(0)
+    expect(page.locator(".canvas .wires .dim")).to_have_count(0)
+
+
+def test_a_pill_lights_its_lines_on_keyboard_focus(paired_page: Page) -> None:
+    page = paired_page
+    ready(page)
+    page.keyboard.press("Shift")  # the keyboard is in use (WebKit's Tab skips links by default)
+    pill = page.locator(".canvas .cal", has_text="工作")
+    pill.focus()
+    expect(pill).to_be_focused()
+    expect(page.locator(".canvas .t[data-rule='work-mine']")).to_have_class(re.compile(r"\bhot\b"))
+    expect(page.locator(".canvas .t[data-rule='family-home']")).to_have_class(re.compile(r"\bdim\b"))
+
+
+# The headline from the lines' states: (healths, Chinese, English).
+HEADLINES = [
+    ([], "还没有线路", "No line yet"),
+    (["ok"], "唯一的线路在正常工作", "The only line is working"),
+    (["ok"] * 4, "四条线路都在正常工作", "All 4 lines are working"),
+    (["ok"] * 12, "12 条线路都在正常工作", "All 12 lines are working"),
+    (["auth"], "唯一的线路停了", "The only line has stopped"),
+    (["auth", "failing", "blocked"], "所有线路都停了", "Every line has stopped"),
+    (["auth", "ok", "ok", "ok"], "一条线路停了，其他都正常", "One line has stopped; the others are fine"),
+    (["failing", "blocked", "ok"], "两条线路停了，其他都正常", "2 lines have stopped; the others are fine"),
+    (
+        ["auth", "paused", "ok", "ok"],
+        "一条线路停了，一条暂停中，两条正常",
+        "One line has stopped, 1 paused, 2 working",
+    ),
+    (["blocked", "paused"], "一条线路停了，一条暂停中", "One line has stopped, 1 paused"),
+    (["paused", "ok", "ok", "ok"], "一条线路暂停中，其他都正常", "One line is paused; the others are fine"),
+    (["paused"], "唯一的线路暂停了", "The only line is paused"),
+    (["paused", "paused"], "所有线路都暂停了", "Every line is paused"),
+    (["paused", "retiring"], "一条线路暂停中，一条正在移除", "One line is paused, 1 being removed"),
+    (["retiring", "ok"], "一条线路正在移除，其他都正常", "One line is being removed; the others are fine"),
+    (["retiring"], "唯一的线路正在移除", "The only line is being removed"),
+    (["never_run", "never_run"], "还没有同步过", "Not synced yet"),
+    (
+        ["never_run", "ok", "ok"],
+        "一条线路还没同步过，其他都正常",
+        "One line has not synced yet; the others are fine",
+    ),
+    (
+        ["never_run", "paused", "ok"],
+        "一条线路暂停中，一条还没同步过，一条正常",
+        "One line is paused, 1 not synced yet, 1 working",
+    ),
+]
+
+
+def test_the_headline_counts_every_state(paired_page: Page) -> None:
+    """Paused, retiring and never-synced lines are not called working; "其他都正常" only when
+    every other line is ok."""
+    page = paired_page
+    ready(page)
+    got = page.evaluate(
+        """async (cases) => {
+          const { headline } = await import("/static/sentence.js");
+          const root = document.documentElement;
+          const out = [];
+          for (const healths of cases) {
+            const rules = healths.map((health, i) => ({ name: `r${i}`, health }));
+            root.lang = "zh-CN";
+            const zh = headline(rules);
+            root.lang = "en";
+            out.push([zh, headline(rules)]);
+          }
+          root.lang = "zh-CN";
+          return out;
+        }""",
+        [healths for healths, _, _ in HEADLINES],
+    )
+    assert got == [[zh, en] for _, zh, en in HEADLINES]
+
+
+def test_a_stopped_line_beside_a_paused_one_is_not_called_fine(
+    open_page: OpenPage, fresh_live: LiveDaemon
+) -> None:
+    fresh_live.pause("school-home")
+    fresh_live.stage_auth()
+    page = open_page(daemon=fresh_live)
+    ready(page)
+    expect(page.locator(".result h1")).to_have_text("一条线路停了，一条暂停中，两条正常")
+
+
+def test_with_no_line_yet_the_sentence_invites_a_first_one(open_page: OpenPage, session_seal: None) -> None:
+    with live_daemon(config=CONFIG_WITHOUT_LINES, stage=False) as empty:
+        page = open_page(daemon=empty)
+        expect(page.locator(".result h1")).to_have_text("还没有线路")
+        expect(page.locator(".hub-cap small")).to_have_text("0 条线路")
+        # Both kinds of account are connected: the first step is a line.
+        expect(page.locator(".result .detail")).to_have_text("从这里开始：新建一条线路")
+        expect(page.locator(".result .detail a")).to_have_attribute("href", "#/new")
+        expect(page.locator(".canvas .hit")).to_have_count(0)
+        expect(page.locator(".canvas .col.src .acct-h .an")).to_have_text(["personal", "work"])
+
+
+@pytest.mark.parametrize("viewport", [PHONE, DESKTOP], ids=VIEWPORT_IDS)
+def test_ports_follow_their_pills_top_to_bottom(open_page: OpenPage, viewport: dict[str, int]) -> None:
+    page = open_page(viewport=viewport)
+    ready(page)
+    geo = geometry(page)
+    for side in ("s", "t"):
+        ports = {k[2:]: p for k, p in geo["ports"].items() if k.startswith(f"{side}:")}
+        by_pill = sorted(ports, key=lambda key: geo["pills"][key]["top"])
+        by_port = sorted(ports, key=lambda key: ports[key]["y"])
+        assert by_pill == by_port, (side, by_pill, by_port)
+
+
+def edited_status(page: Page, edit: Any) -> None:
+    """Serve the live /api/status through ``edit(status) -> status`` from now on, and refetch."""
+
+    def handle(route: Any) -> None:
+        response = route.fetch()
+        route.fulfill(response=response, json=edit(response.json()))
+
+    page.route("**/api/status", handle)
+    refresh_status(page)
+
+
+def test_a_line_whose_account_or_calendar_is_missing_is_still_drawn(paired_page: Page) -> None:
+    """The status lacks the work account and 家庭 is not in family-icloud's calendar list: their
+    lines still have pills (marked) and wires."""
+    page = paired_page
+    ready(page)
+
+    def edit(status: dict[str, Any]) -> dict[str, Any]:
+        status["accounts"] = [a for a in status["accounts"] if a["name"] != "work"]
+        for account in status["accounts"]:
+            if account["name"] == "family-icloud":
+                account["calendars"] = []
+        return status
+
+    edited_status(page, edit)
+    work = page.locator(".canvas .col.src .acct").filter(has=page.locator(".an", has_text="work"))
+    expect(work.locator(".acct-h small")).to_have_text("不在账号列表里")
+    for key in ("work/工作", "family-icloud/家庭"):
+        assert "missing" in (classes(page, ".canvas .cal", "data-cal", key) or "").split(), key
+    page.wait_for_function("() => document.querySelectorAll('.canvas .hit:not(.in)').length === 4")
+    geo = geometry(page)
+    assert geo["routes"]["work-mine"]["from"] == "work/工作"
+    assert {geo["routes"][r]["to"] for r in ("family-home", "school-home")} == {"family-icloud/家庭"}
+    pill = geo["pills"]["work/工作"]
+    start = geo["routes"]["work-mine"]["ends"][0]
+    assert near(start, pill["right"], pill["top"] + pill["height"] / 2)
+
+
+def source_colours(page: Page) -> dict[str, str]:
+    return dict(
+        page.locator(".canvas .col.src .cal").evaluate_all(
+            "els => els.map(e => [e.dataset.cal, e.querySelector('.dot').getAttribute('class')])"
+        )
+    )
+
+
+def without(rule: str) -> Any:
+    """A status edit: ``rule`` removed (from the rules and from its calendars)."""
+
+    def edit(status: dict[str, Any]) -> dict[str, Any]:
+        status["rules"] = [r for r in status["rules"] if r["name"] != rule]
+        for account in status["accounts"]:
+            for calendar in account["calendars"]:
+                calendar["rules"] = [r for r in calendar["rules"] if r != rule]
+        return status
+
+    return edit
+
+
+@pytest.mark.parametrize("rule", ["school-home", "family-mine", "work-mine"])
+def test_removing_a_line_keeps_the_other_colours(paired_page: Page, rule: str) -> None:
+    page = paired_page
+    ready(page)
+    before = source_colours(page)
+    edited_status(page, without(rule))
+    expect(page.locator(".hub-cap small")).to_have_text("3 条线路")
+    after = source_colours(page)
+    for key, colour in after.items():
+        if colour != "dot none":
+            assert colour == before[key], (key, before, after)
+
+
+def test_hovering_never_remeasures_and_polls_keep_one_observer(paired_page: Page) -> None:
+    page = paired_page
+    ready(page)
+    canvas = page.locator(".canvas")
+    measured = canvas.get_attribute("data-measured")
+    for f in (0.05, 0.08, 0.1, 0.12, 0.14, 0.1, 0.06):
+        x, y = point_on(page, "work-mine", f)
+        page.mouse.move(x, y)
+    expect(page.locator(".canvas .tip")).to_have_class(re.compile(r"\bon\b"))
+    page.mouse.move(5, 5)
+    assert canvas.get_attribute("data-measured") == measured
+    for _ in range(3):
+        with page.expect_response("**/api/status"):
+            refresh_status(page)
+    assert canvas.get_attribute("data-observers") == "1"
+
+
+def test_english_counts_are_singular_at_one(open_page: OpenPage) -> None:
+    page = open_page(path="/?lang=en")
+    expect(page.locator(".hub-cap small")).to_have_text("4 lines")
+    work = page.locator(".canvas .col.src .acct").filter(has=page.locator(".an", has_text="work"))
+    expect(work.locator(".acct-h small")).to_have_text("1 calendar syncing")
+    expect(page.locator(".canvas .col.tgt .acct-h small")).to_have_text(
+        ["1 calendar receiving", "1 calendar receiving"]
+    )
+    edited_status(page, without("school-home"))
+    expect(page.locator(".canvas .col.tgt .cal", has_text="家庭").locator("em")).to_have_text("1 source")
+
+
+def luminance(rgb: str) -> float:
+    def channel(c: float) -> float:
+        c /= 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (float(v) for v in re.findall(r"[\d.]+", rgb)[:3])
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_a_focused_wire_has_a_visible_ring(open_page: OpenPage, theme: str) -> None:
+    """The keyboard focus on a wire: an accent band at least 3 px wide with at least 3:1 against
+    the page (WCAG non-text contrast), in both themes."""
+    page = open_page(color_scheme=theme)
+    ready(page)
+    page.locator(".canvas .hit[data-rule='work-mine']:not(.in)").focus()
+    ring = page.evaluate(
+        """() => {
+          const hit = document.querySelector(".canvas .hit[data-rule='work-mine']:not(.in)");
+          const s = getComputedStyle(hit);
+          return { stroke: s.stroke, opacity: s.strokeOpacity, width: s.strokeWidth,
+                   bg: getComputedStyle(document.body).backgroundColor };
+        }"""
+    )
+    assert float(ring["width"].removesuffix("px")) >= 3, ring
+    # The ring as painted: its colour at its opacity over the page.
+    opacity = float(ring["opacity"])
+    fg = [float(v) for v in re.findall(r"[\d.]+", ring["stroke"])[:3]]
+    bg = [float(v) for v in re.findall(r"[\d.]+", ring["bg"])[:3]]
+    painted = "rgb({})".format(
+        ", ".join(str(opacity * f + (1 - opacity) * b) for f, b in zip(fg, bg, strict=True))
+    )
+    hi, lo = sorted((luminance(painted), luminance(ring["bg"])), reverse=True)
+    assert (hi + 0.05) / (lo + 0.05) >= 3, (ring, painted)

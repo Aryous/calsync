@@ -9,6 +9,7 @@ import { get, op, StatusContext, useStatus, useStatusPoller } from "/static/api.
 import { CalendarName, Icon, Mark, Service, Sprite } from "/static/icons.js";
 import { Command } from "/static/command.js";
 import { SyncMap } from "/static/map.js";
+import { headline } from "/static/sentence.js";
 
 // ----- router ---------------------------------------------------------------------------------
 // #/                              the map (no inspector)
@@ -218,29 +219,6 @@ function Header({ onResult, busy, setBusy }) {
 // refreshed the sentence says so, with the time calsync was last seen, until a poll succeeds.
 // Under it, one card per thing that needs a person (status.attention).
 
-const STOPPED = new Set(["auth", "failing", "blocked"]);
-
-function headline(status) {
-  const rules = status.rules || [];
-  if (rules.length === 0) return t("No line yet");
-  const live = rules.filter((r) => r.health !== "paused" && r.health !== "retiring");
-  const stopped = live.filter((r) => STOPPED.has(r.health)).length;
-  const paused = rules.filter((r) => r.health === "paused").length;
-  if (stopped > 0) {
-    if (stopped === live.length) return live.length === 1 ? t("The line has stopped") : t("Every line has stopped");
-    if (stopped === 1) return t("One line has stopped; the others are fine");
-    return t("{n} lines have stopped; the others are fine", { n: countWord(stopped) });
-  }
-  if (paused > 0) {
-    if (live.length === 0) return paused === 1 ? t("The line is paused") : t("Every line is paused");
-    if (paused === 1) return t("One line is paused; the others are fine");
-    return t("{n} lines are paused; the others are fine", { n: countWord(paused) });
-  }
-  if (live.length > 0 && live.every((r) => r.health === "never_run")) return t("Not synced yet");
-  if (rules.length === 1) return t("The only line is working");
-  return t("All {n} lines are working", { n: countWord(rules.length) });
-}
-
 /** "10:42" today, "10月25日 周日 10:42" another day. */
 function when(value) {
   if (!value) return "";
@@ -257,7 +235,18 @@ function joined(parts) {
   return parts.map((part, i) => html`${i ? " · " : ""}${part}`);
 }
 
+/** No line yet: what to do first (the concept's 连接 … 账号 and 新线路), as links. */
+function startParts(status) {
+  const accounts = status.accounts || [];
+  const steps = [];
+  if (!accounts.some((a) => a.provider === "google")) steps.push(html`<a href="#/connect/google">${t("Connect a Google account")}</a>`);
+  if (!accounts.some((a) => a.provider !== "google")) steps.push(html`<a href="#/connect/icloud">${t("Connect an iCloud account")}</a>`);
+  steps.push(html`<a href="#/new">${t("Add a new line")}</a>`);
+  return [withSlot(t("To start: {step}"), "step", steps[0]), ...steps.slice(1)];
+}
+
 function detailParts(status, cycleRunning) {
+  if (!(status.rules || []).length) return startParts(status);
   const parts = [];
   const summary = status.summary;
   if (cycleRunning) parts.push(t("Syncing now"));
@@ -292,7 +281,7 @@ function Result({ note }) {
     parts = [t("Last seen at {time}", { time: when(status.generated_at) }), offline ? t("retrying") : errorNote(error).text];
     bad = true;
   } else if (status) {
-    title = headline(status);
+    title = headline(status.rules || []);
     parts = detailParts(status, cycleRunning);
   } else if (error) {
     title = error.kind === "offline" ? t("Can't reach calsync") : t("Can't read the sync state");
