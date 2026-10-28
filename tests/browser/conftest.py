@@ -243,9 +243,11 @@ def paired_page(open_page: OpenPage, viewport: dict[str, int]) -> Page:
 
 
 def ready(page: Page) -> None:
-    """The app rendered and read /api/status."""
+    """The app rendered, read /api/status and the calendar tab's events (nothing left in flight
+    that a test changing the page under it could catch)."""
     expect(page.locator(".result h1")).not_to_have_text("正在读取同步状态…")
     expect(page.locator(".hub-cap small")).to_have_text("4 条线路")
+    expect(page.locator("#pane-calendar .cal-frame")).to_have_attribute("aria-busy", "false")
 
 
 def sync_button(page: Page) -> Locator:
