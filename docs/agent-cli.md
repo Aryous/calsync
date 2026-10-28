@@ -144,7 +144,7 @@ file):
 
 | `error.kind` | Exit | Meaning |
 | --- | --- | --- |
-| `config` | 2 | invalid arguments or configuration; `problems` lists every problem. Also `trigger --rule R --wait` for an unknown rule when a daemon runs the cycle (exit 2 as `unknown_rule`) |
+| `config` | 2 | invalid arguments or configuration; `problems` lists every problem. Also `trigger --rule R --wait` for an unknown rule when a daemon runs the cycle (exit 2, like `unknown_rule`) |
 | `conflict` | 2 | the config file changed between calsync reading and writing it ("the file was changed outside calsync; reload and try again"): run the command again |
 | `locked` | 4 | another calsync process holds the run lock |
 | `daemon_lost` | 1 | the daemon accepted the operation and went away before answering: the change **may have been applied**. Check `calsync config history --json` before you retry |
