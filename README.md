@@ -112,9 +112,12 @@ directly in the other person's account.
   writes the Google version back once (reported as `reverted=1`, without an
   edit on the target being needed); if the target rewrites it again, the
   same rule applies.
-- All local state (mirror, cursors, target cache, run history) is a
-  **rebuildable cache**. Delete the state directory and the next run
-  reconciles from both ends without creating duplicates.
+- The local sync state (mirror, cursors, target cache) is a **rebuildable
+  cache**. Delete the state directory and the next run reconciles from both
+  ends without creating duplicates. The same directory also holds what
+  cannot be rebuilt: the run and change history (approvals included), the
+  config history behind `calsync config undo`, and the web UI's pairing key
+  `web.key` (every browser has to pair again).
 - A recurring series with many individually edited instances is written as one
   iCalendar resource with `RECURRENCE-ID` overrides, each carrying its own
   alerts.
@@ -281,10 +284,24 @@ as a service, restart it with `calsync service uninstall` and
 `calsync service install` (the uninstall waits for a running cycle to
 finish).
 
+**Skipping versions?** Then every section below for a version newer than
+yours applies, not only the first. A state database older than schema 3
+(an install from before full sync and reverts) has no upgrade path: it is
+rebuilt once. That first cycle is heavy (every source calendar pulled from Google in
+full, every copy in the target calendars read once), the run, change and
+alert history is lost, and nothing is duplicated (copies are adopted by
+their resource names). Deletes the rebuilt state plans still go through the
+mass-delete guard: after such an upgrade, check `calsync blocked` before
+you approve anything, and approve only a set you understand. The
+`calsync run --dry-run` above already performs the rebuild (it opens the
+state database), so its cycle is the heavy one.
+
 ### Upgrading to the version with configuration commands, notifications and the service
 
-- **The state database is migrated in place** (schema 5). Run and change
-  history are kept and the first cycle costs no more than any other. What
+- **The state database is migrated in place** (schema 5) from schema 3 or 4
+  (the versions with the daemon). Run and change history are kept and the
+  first cycle costs no more than any other. An older database is rebuilt
+  instead (see "Skipping versions" above). What
   calsync wrote for each copy is recorded from now on, so the change details
   (`calsync changes --json`, `calsync event show`) start with the upgrade.
 - **Going back to an older calsync rebuilds its state database.** An older
@@ -443,11 +460,18 @@ calsync config undo                             # undo the newest change not yet
   two cycles and takes effect at once. Otherwise it runs in the command's own
   process.
 - `rule add --preview` reads the source and target now and says how many
-  events the rule would copy, writing nothing. Offsets for `--alarms` that
+  events the rule would copy, writing no config (it may refresh the cached
+  calendar list). Offsets for `--alarms` that
   start with `-` need an `=`: `--alarms=-10m,0m`.
-- `rule remove` leaves the rule's copies in the target calendar;
-  `--delete-copies` deletes them first (over the next cycles, through the
-  mass-delete guard) and then removes the rule.
+- `rule remove` leaves the rule's copies in the target calendar, untouched
+  until a rule of the same name is added again: copies carry their rule's
+  name, so that rule takes them over and deletes those its source does not
+  have (`rule add` warns when it finds such copies). `--delete-copies`
+  deletes them first, those outside the rule's `window` too (over the next
+  cycles, through the mass-delete guard, so a large calendar blocks and
+  needs `calsync approve`), and then removes the rule. Re-pointing a
+  retiring rule's target (by hand or with `config undo`) retires it against
+  the new calendar: the copies in the old one stay.
 - `account add` stores no secret: `calsync auth NAME` does, afterwards.
 - `config history` records changes made with these commands (`cli`), from
   the web UI (`ui`), by the daemon (removing a retired rule) and edits made
@@ -498,8 +522,12 @@ a `calsync run` meanwhile exits with code 4: use `calsync trigger` instead
   through in the daemon's next cycle (a different set blocks again). On a
   terminal `approve` shows the titles and asks you to type the rule name;
   without one it needs `--yes` (and should get `--fingerprint`, as an agent
-  does). Every approval is recorded and sent as a notification. Without a
-  daemon, `approve` runs that cycle itself.
+  does). Every approval that releases a set is recorded in the change
+  history (`calsync changes`: action `approved`, with its origin, `cli` or
+  `ui`) and sent as a notification when a channel is configured. Raising a
+  blocked rule's `delete_guard` also lets its deletes through: that is
+  recorded (`guard_loosened`) and pushed too. Without a daemon, `approve`
+  runs that cycle itself.
 - **Authentication and setup.** After `calsync auth <account>`, or after you
   fix what kept an account from being set up (a credential file's mode, a
   missing OAuth client file), the daemon picks it up at the rule's next
@@ -582,7 +610,8 @@ something needs you:
   and sign-in failures are not counted, they have their own push);
 - an edit you made by hand to the config file is invalid (the number of
   problems; the daemon keeps running the previous configuration);
-- blocked deletes were approved (the rule, the count and where it came from);
+- blocked deletes were approved (the rule, the count and where it came from),
+  or a blocked rule's delete guard was raised;
 - and once more when a problem is over ("recovered").
 
 The same problem is pushed once until it is over. When a rule's blocked set
@@ -608,10 +637,11 @@ language = "en"                                    # "zh" (the default) or "en"
   Sign-in and blocked-delete pushes use Bark's time-sensitive level.
 - **Webhook:** calsync POSTs `{"event", "rule", "account", "title", "body",
   "url", "at"}`; `event` is `auth`, `blocked`, `failing`, `recovered`,
-  `reload_failed`, `approved` or `test`.
+  `reload_failed`, `approved`, `guard_loosened` or `test`.
 - **`calsync notify test`** sends a test push to every configured channel and
   prints how each went: exit 0 when all took it, 1 when one failed, 2 when
-  none is configured.
+  none is configured. The daemon sends at most one test push every 10
+  seconds (`too_soon` otherwise).
 - **Titles leave your machine.** A blocked-deletes push names events, and
   pushes go through Bark's server and Apple's push service, or through your
   webhook's server.
@@ -780,7 +810,8 @@ stale one.
   rule — no creates or updates either — and prints the titles it would have
   deleted. `calsync blocked` lists them, and `calsync approve RULE` lets
   exactly that set through (by its fingerprint; a different set blocks
-  again); every approval is recorded and pushed. Without a daemon,
+  again); every approval that releases a set is recorded in the change
+  history with its origin and pushed when a channel is configured. Without a daemon,
   `calsync run --allow-deletes` (scope it with `--rule`) lets one cycle
   through.
 - **Malformed source data keeps the last good copy.** A series Google returns
@@ -797,7 +828,7 @@ stale one.
 - **Conditional writes.** Every write is `If-None-Match` / `If-Match`; on a
   conflict calsync re-reads before retrying.
 - **Rebuildable state.** Losing the state directory costs one slower cycle,
-  never duplicates.
+  never duplicates (the history and `web.key` in it are lost).
 
 ## Privacy and security
 
@@ -811,7 +842,12 @@ stale one.
   you hand that output to a cloud-hosted AI agent, the titles leave your
   machine with it. The API listens on a 0600 unix
   socket in the state directory and, for the web UI, on TCP behind a pairing
-  cookie (see [Web UI](#web-ui)); by default only on `127.0.0.1`.
+  cookie (see [Web UI](#web-ui)); by default only on `127.0.0.1`. A paired
+  browser can change the configuration as the CLI can, except credentials:
+  among other things it can point the push and webhook URLs anywhere (later
+  pushes, with titles, go there) and set the Google client secret file's
+  path. Rule sources and targets (often a Google calendar ID, which is an
+  e-mail address) are shown to it.
 - Notifications carry titles (a blocked-deletes push names up to five
   events) and pass through Bark's server and Apple's push service, or your
   webhook's server. The Bark URL contains your device key: `calsync config
@@ -840,8 +876,9 @@ stale one.
   against Radicale and a strict fake CalDAV server; a check with a real
   iPhone and iCloud is still pending.
 - **Renaming a rule orphans its events.** Copies written under the old rule
-  name are never updated or deleted again; delete them by hand. Removing a
-  rule leaves its copies too, unless you remove it with
+  name are not updated or deleted again (until a rule of that name is added
+  again, which takes them over); delete them by hand. Removing a rule leaves
+  its copies too, unless you remove it with
   `calsync rule remove NAME --delete-copies`. Two installs using the same
   rule name on the same target calendar would fight over each other's
   events.

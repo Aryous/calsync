@@ -5,9 +5,11 @@ behalf: it writes events into Google Calendar with its own Google tool, then
 uses the `calsync` command line to make sure they reached the CalDAV calendar
 (iCloud, …) that the family reads.
 
-The command line is the agent interface. Every command takes `--json` and
-prints one JSON document with stable keys; every command that changes the
-configuration also takes `--dry-run`. The HTTP API the daemon serves is for
+The command line is the agent interface. Every command an agent uses takes
+`--json` and prints one JSON document with stable keys (`config get` always
+does); `config check`, `auth`, `run`, `daemon` and `web` have no `--json`
+(they are for people). Every command that changes the configuration also
+takes `--dry-run`. The HTTP API the daemon serves is for
 the web UI and the CLI itself: do not script against it. There is no MCP
 server.
 
@@ -49,6 +51,11 @@ added in later versions; existing keys keep their meaning.
   credentials or how calsync runs on their machine.
 - **Pass `--json`** and read the exit code. Text output is for people and may
   change.
+- **Never change the delete guard to get past a block.** Raising a blocked
+  rule's `delete_guard.max_count` or `max_ratio` lets its deletes through
+  without the person seeing them; calsync records and pushes it, but the
+  way past a block is `blocked` + `approve` (see
+  [Approving blocked deletes](#approving-blocked-deletes)).
 
 ## The loop
 
@@ -116,7 +123,7 @@ rule does not read its source), then trigger once more.
 | Exit | Meaning | What to do |
 | --- | --- | --- |
 | 0 | ok | — |
-| 1 | failed: a rule failed or was blocked, a network or server error, a refused trigger (paused rule), `stale` approval, no such event, lost contact with the daemon | read the JSON; retry later for transient errors |
+| 1 | failed: a rule failed or was blocked, a network or server error, a refused trigger (paused rule), `stale` approval, no such event, no state database yet, lost contact with the daemon, a test push too soon | read the JSON; retry later for transient errors |
 | 2 | configuration error, a write refused by validation, a config conflict, bad arguments, `approve` without `--yes`, nothing to approve | fix the arguments; for a conflict, read again and redo the change |
 | 3 | authentication: an account's credential is missing, expired or revoked | relay the `calsync auth ACCOUNT` command to a person |
 | 4 | another calsync holds the lock (a `calsync run` in progress), or another daemon serves this state directory | wait and retry; never kill it |
@@ -124,7 +131,8 @@ rule does not read its source), then trigger once more.
 With several rules, the most actionable code wins: 3, then 2, then 1.
 
 A command that could not run at all prints an error object instead of its
-usual JSON:
+usual JSON (with `--json`; read commands too, also for an invalid config
+file):
 
 ```json
 {"error": {"kind": "config", "message": "runtime.interval: invalid duration 'soon'; expected e.g. 30s, 5m, 2h, 7d, -15m", "problems": ["runtime.interval: invalid duration 'soon'; expected e.g. 30s, 5m, 2h, 7d, -15m"]}}
@@ -132,18 +140,25 @@ usual JSON:
 
 | `error.kind` | Exit | Meaning |
 | --- | --- | --- |
-| `config` | 2 | invalid arguments or configuration; `problems` lists every problem |
+| `config` | 2 | invalid arguments or configuration; `problems` lists every problem. Also `trigger --rule R` for an unknown rule when the cycle runs in this process (through the daemon it is `unknown_rule`; exit 2 either way) |
 | `conflict` | 2 | the config file changed between calsync reading and writing it ("the file was changed outside calsync; reload and try again"): run the command again |
 | `locked` | 4 | another calsync process holds the run lock |
 | `daemon_lost` | 1 | the daemon accepted the operation and went away before answering: the change **may have been applied**. Check `calsync config history --json` before you retry |
 | `paused` | 1 | `trigger --rule R` for a paused rule |
-| `unknown_rule`, `unknown_target`, `bad_request` | 2 | `events` arguments (a range longer than 62 days, or more than 10 years from today, is `bad_request`) |
+| `read_only` | 1 | `trigger` through a daemon started with `--no-sync` (it runs no cycles) |
+| `unavailable` | 1 | `trigger` through a daemon that is stopping |
+| `too_soon` | 1 | `notify test` through the daemon less than 10 seconds after the last one |
+| `unknown_rule` | 2 | `--rule R` names no configured rule (`events`, `blocked`, `upcoming`, `trigger` through the daemon) |
+| `unknown_target`, `bad_request` | 2 | `events` arguments (a range longer than 62 days, or more than 10 years from today, is `bad_request`) |
 | `not_found` | 1 | `event show`: no such event (now) |
+| `no_state` | 1 | no state database yet (calsync never ran): run a cycle (`calsync trigger --wait`) |
+| `state_unreadable` | 1 | the state database could not be read (not a database, corrupt, locked) |
 | `auth` | 3 | `calendars --refresh`: the account's credential failed (`command` / `reason` say what a person runs) |
+| `other` | 1 | `calendars --refresh`: the list could not be fetched (a network or server error) |
 | `error` | 1 | anything else |
 
-When there is no state database yet (calsync never ran), the read commands
-print `no state yet: run \`calsync run\` or start the daemon` and exit 1.
+Without `--json`, the same errors are one line of text (for example `no
+state yet: run \`calsync run\` or start the daemon`).
 
 ## When a person is needed (`needs_human`)
 
@@ -151,8 +166,8 @@ calsync never asks you for a secret. When something needs a person — signing
 in to Google in a browser, typing an iCloud app-specific password — it tells
 you the exact command to give them. It appears in three places:
 
-- **Operation results** (`account add`, `rule add --preview`, `trigger`, …)
-  have three top-level keys:
+- **Operation results** (`account add`, `rule add --preview`, …) have three
+  top-level keys:
 
   ```json
   {
@@ -203,8 +218,11 @@ A `blocked` attention is the exception: an agent may approve it, carefully
 The mass-delete guard blocks a rule's cycle when it would delete more than
 `delete_guard.max_count` copies (default 10) or, from 3 deletions on, more
 than `max_ratio` (default half) of the rule's copies. A blocked rule makes no
-changes at all until someone decides. Agents may approve, and every approval
-sends a notification to the person and is recorded (origin `cli`).
+changes at all until someone decides. Agents may approve. Every approval
+that releases a set is recorded in the change history (`calsync changes`:
+action `approved`, `object_id` the fingerprint, `title` such as `12 deletes
+approved (cli)`) and sent to the person as a notification when a push
+channel is configured.
 
 1. **Read the blocked set:**
 
@@ -271,6 +289,7 @@ sends a notification to the person and is recorded (origin `cli`).
 | `would_approve` | 0 | `--dry-run`: nothing approved |
 | `stale` | 1 | the blocked set is different now (`fingerprint` and `count` give the new one; `approved_fingerprint` the one you sent). Nothing was deleted. Go back to step 1 |
 | `failed` | 1 | the approval cycle failed; nothing more was approved |
+| `synced` | 0 | the guard no longer held anything back when the cycle ran (the set shrank): the rule synced as usual, `deleted` says how many copies went; the approval was not needed (nothing recorded as approved) |
 | `not_blocked` | 2 | nothing to approve |
 
 A paused rule cannot be approved (exit 2): resume it first. Without a daemon,
@@ -340,8 +359,9 @@ state database directly; they work with or without a daemon.
 ### Operation results
 
 Every write command (`config set|undo`, `rule add|set|remove`, `pause`,
-`resume`, `account add|remove`, `approve`, `trigger`, `calendars --refresh`,
-`notify test`) answers with the same envelope:
+`resume`, `account add|remove`, `approve`, `trigger`, `notify test`)
+answers with the same envelope (`calendars --refresh` answers as
+[`calendars`](#calendars)):
 
 | Key | Meaning |
 | --- | --- |
@@ -450,18 +470,18 @@ series appears once per instance.
 }
 ```
 
-`deliveries[].state` — the first that applies:
+`deliveries[].state` — the first that applies, in this order:
 
 | State | Meaning | What to do |
 | --- | --- | --- |
-| `delivered` | the copy is what calsync would write now | nothing |
-| `pending` | not written yet | `trigger --wait`, then look again |
-| `failing` | not delivered, and the rule's latest run failed (auth too) | `status --json` → `attention` |
-| `blocked` | not delivered, and the rule is blocked by the delete guard | [approve](#approving-blocked-deletes) or ask the person |
-| `out_of_window` | outside the rule's `window`: never copied | nothing (or widen the window) |
+| `unknown` | the state database comes from another calsync version | run a cycle |
 | `paused` | the rule is paused | resume it if the person wants it synced |
 | `retiring` | the rule is being removed with its copies | nothing |
-| `unknown` | the state database comes from another calsync version | run a cycle |
+| `out_of_window` | outside the rule's `window`: never copied | nothing (or widen the window) |
+| `delivered` | the copy is what calsync would write now | nothing |
+| `blocked` | not delivered, and the rule is blocked by the delete guard | [approve](#approving-blocked-deletes) or ask the person |
+| `failing` | not delivered, and the rule's latest run failed (auth too) | `status --json` → `attention` |
+| `pending` | not written yet | `trigger --wait`, then look again |
 
 `delivered_at` is the last time calsync wrote the copy (`null`: never
 recorded); it stays set while the rule is paused. `alarms_minutes_before` on
@@ -526,8 +546,13 @@ next N hours (default 24) with their alarms and a simpler delivery state
 
   `action`: `created`, `updated`, `reverted` (an edit on the target written
   back), `deleted`, `protected` (a source series calsync cannot parse: its
-  copy is kept), `blocked`. `detail` (or `null`) lists the fields that
-  changed as `[before, after]`.
+  copy is kept), `blocked`, `approved` (an approval released a blocked set:
+  `object_id` is its fingerprint, `title` e.g. `12 deletes approved (cli)`)
+  and `guard_loosened` (a config write raised a blocked rule's delete guard:
+  `object_id` is `guard`, `title` e.g. `delete guard loosened (ui)`). The
+  last two are records of a decision, not of a copy. `detail` (or `null`)
+  lists the fields that changed as `[before, after]`. `--since` keeps the
+  changes recorded at or after that time, whatever their order.
 
 Both exit 0; `--rule` may name a rule removed since.
 
@@ -559,8 +584,9 @@ other).
 
 - `calsync config get --json` prints the parsed configuration (always JSON).
   URLs are cut to scheme and host and accounts show only `name`, `provider`,
-  `host` and `credential_configured`. `--reveal` shows them in full: do not
-  use it unless the person asks, and never forward its output.
+  `host` and `credential_configured`. `--reveal` shows them in full (the
+  same keys plus `server_url`, `username`, `credential`, …): do not use it
+  unless the person asks, and never forward its output.
 - `calsync config history [--limit N] --json` → `{"changes": [{"id", "at",
   "source", "summary", "after_fingerprint", "undoes"}]}`, newest first (200
   kept). `source` is `cli`, `ui`, `daemon` (it removed a retired rule) or
@@ -597,7 +623,8 @@ with `=`: `--alarms=-10m,0m`. `--window 30d:365d` keeps only events from 30
 days back to a year ahead (default: everything). `--create-target` creates
 the target calendar if it does not exist.
 
-`--preview` reads the source and target now and writes nothing:
+`--preview` reads the source and target now and writes no config (a
+preview may refresh calsync's cached calendar list):
 
 ```json
 {
@@ -616,6 +643,11 @@ An account it cannot reach is reported in `data` (`error`, `error_kind`,
 the preview with the person before you add a rule that would create many
 copies.
 
+If copies left by an earlier rule of the same name are recorded, `rule add`
+says so in its `summary` and in `data.earlier_copies` (a count): the new
+rule takes those copies over and deletes the ones its source does not have
+(through the delete guard). Tell the person before you go on.
+
 #### `rule set`
 
 `calsync rule set NAME KEY VALUE [--dry-run] --json`. Keys: `window`
@@ -630,12 +662,15 @@ needs `--` before the positional arguments:
 #### `rule remove`
 
 `calsync rule remove NAME [--delete-copies] [--dry-run] --json`. Without
-`--delete-copies` the rule goes and its copies stay in the target calendar
-(calsync never touches them again). With it, the rule is marked `retire =
-true`: the next cycles delete its copies (through the delete guard, so a
-large calendar blocks and needs an [approval](#approving-blocked-deletes))
-and then remove the rule from the config (`config history` shows `source:
-"daemon"`). Its health is `retiring` meanwhile.
+`--delete-copies` the rule goes and its copies stay in the target calendar,
+untouched until a rule of the same name is added again (which takes them
+over, see `rule add`). With it, the rule is marked `retire = true`: the next
+cycles delete all its copies, also those outside its `window` (through the
+delete guard, so a large calendar blocks and needs an
+[approval](#approving-blocked-deletes)), and then remove the rule from the
+config (`config history` shows `source: "daemon"`). Its health is
+`retiring` meanwhile. Do not change a retiring rule's target: it would
+retire against the new calendar and leave the copies in the old one.
 
 #### `pause` / `resume`
 
@@ -647,7 +682,10 @@ See [Pausing a rule](#pausing-a-rule). `--dry-run` shows the diff.
   adds the account with a keychain credential reference; a person then has to
   run `calsync auth NAME` (the result says so in `needs_human`).
 - `calsync account remove NAME [--delete-credential] [--dry-run] --json`
-  refuses (exit 2) while a rule uses the account. Leave
+  refuses (exit 2) while a rule uses the account. `data.credential` says
+  what became of its credential: `kept`, `deleted`, `failed` (the keychain
+  refused; the summary says what to remove by hand), `manual` (an `env` or
+  `file` credential, which a person removes) or `none`. Leave
   `--delete-credential` to the person.
 
 ### Configuration
@@ -676,7 +714,8 @@ See [Pausing a rule](#pausing-a-rule). `--dry-run` shows the diff.
 
 Each channel is `ok`, `failed (<ErrorType>)` or `not configured`. Exit 0 when
 every configured channel took it, 1 when one failed, 2 when none is
-configured.
+configured. Through the daemon, a second test push within 10 seconds is
+refused (`too_soon`, exit 1).
 
 ### The service
 
@@ -710,11 +749,15 @@ Installing or removing the service is the person's decision.
   `--query`, a narrow `--from`/`--to`) and do not quote calendar contents
   into places the person did not ask for.
 - Event ids encode the source calendar's id (often an e-mail address). Treat
-  them like the titles.
+  them like the titles. Rule sources and targets (`status`, `config get`,
+  `config history` summaries, operation summaries) may be calendar ids too,
+  that is addresses.
 - Notifications (Bark, webhook) carry titles too: a blocked-deletes push
   names up to five of them. They pass through Bark's servers and Apple's
   push service, or the webhook's server.
 - Never print or store passwords, tokens or the web UI's pairing key, and
   never ask the person to give you one. `calsync web pair` prints a link that
   grants access to the web UI: do not run it for the person unless asked, and
-  do not forward the link.
+  do not forward the link. A paired browser can change the configuration
+  much as the CLI can (not credentials): it could point the push and webhook
+  URLs elsewhere.

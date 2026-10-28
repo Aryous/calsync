@@ -59,7 +59,8 @@ the CLI and the API:
   `pause` / `resume`; `rule add --preview`; retiring a rule with its copies
   (`rule remove --delete-copies`).
 - `blocked` and `approve` (by fingerprint; agents may approve; every approval
-  pushed and recorded).
+  that releases a set recorded in the change history with its origin, and
+  pushed; raising a blocked rule's guard recorded and pushed the same way).
 - `events` / `event show`: events by date with a delivery state per rule;
   copy summaries and change details; `trigger --wait`; a cached calendar list
   (`calendars [--refresh]`); URL-free stored errors; status additions.
