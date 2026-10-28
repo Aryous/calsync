@@ -84,10 +84,18 @@ function remember(entry, url) {
 function useRoute() {
   const [route, setRoute] = useState(() => parseRoute(window.location.hash) || ROOT);
   const entry = useRef(null); // the current history entry's {depth, mapBehind}
-  const toMap = useRef(false); // closing: the next entry we arrive at becomes the map
+  const toMap = useRef(false); // closing: the entry we arrive at becomes the map
+  const closing = useRef(0); // a close's traversal is under way (timer id): further closes wait
 
-  useEffect(() => {
-    const onHash = () => {
+  // A layout effect: it runs within the first render, so the listeners and the first entry's
+  // info exist before anything can change the hash (a passive effect waits for a paint).
+  useLayoutEffect(() => {
+    // Routing follows the history entry. A traversal between two entries with the same fragment
+    // fires only popstate, a new fragment fires both: both run this, which is idempotent (the
+    // second sees the entry info the first stored).
+    const onEntry = () => {
+      window.clearTimeout(closing.current);
+      closing.current = 0;
       const next = parseRoute(window.location.hash);
       if (next === null || toMap.current) {
         toMap.current = false;
@@ -101,19 +109,26 @@ function useRoute() {
       if (!stored) remember(entry.current);
       setRoute((current) => (current.key === next.key ? current : next));
     };
-    window.addEventListener("hashchange", onHash);
-    // Effects run after the first paint: the hash may have changed since the first render.
-    onHash();
-    return () => window.removeEventListener("hashchange", onHash);
+    window.addEventListener("popstate", onEntry);
+    window.addEventListener("hashchange", onEntry);
+    onEntry();
+    return () => {
+      window.removeEventListener("popstate", onEntry);
+      window.removeEventListener("hashchange", onEntry);
+    };
   }, []);
 
   const closeInspector = useCallback(() => {
+    if (closing.current) return; // the first close is still travelling back
     const here = entry.current || MAP_ENTRY;
-    if (here.mapBehind && here.depth > 0) {
-      window.history.go(-here.depth);
-    } else if (here.depth > 1) {
-      toMap.current = true;
-      window.history.go(-(here.depth - 1));
+    const back = here.mapBehind ? here.depth : here.depth - 1;
+    if (back > 0) {
+      toMap.current = !here.mapBehind;
+      // Cleared by the entry we arrive at; the timer only guards a traversal that never comes.
+      closing.current = window.setTimeout(() => {
+        closing.current = 0;
+      }, 1000);
+      window.history.go(-back);
     } else {
       remember(MAP_ENTRY, "#/");
       entry.current = MAP_ENTRY;
@@ -178,7 +193,7 @@ function SyncButton({ onResult }) {
   };
 
   return html`<button class=${pending ? "btn busy" : "btn"} type="button" aria-label=${label}
-      aria-busy=${pending ? "true" : "false"} disabled=${pending} onClick=${run}>
+      aria-busy=${pending ? "true" : "false"} aria-disabled=${pending ? "true" : "false"} onClick=${run}>
     <${Icon} name="sync"/><span class="lbl">${label}</span>
   </button>`;
 }

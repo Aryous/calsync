@@ -3,6 +3,8 @@ concept's tokens and font, themes before first paint, fits a 360 px phone, opens
 inspector, runs a cycle from 立即同步, and sends an unpaired browser to the pair page."""
 
 import re
+import time
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -339,28 +341,63 @@ def refresh_status(page: Page) -> None:
     page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
 
 
+def until(condition: Callable[[], bool], timeout: float = 10) -> None:
+    """Wait, Python-side, for something in the daemon."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "the condition never became true"
+        time.sleep(0.02)
+
+
 def test_sync_now_waits_while_a_cycle_runs(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
-    """A cycle the daemon is running (the poll's cycle_started_at) shows 同步中… and disables the
-    button: a second trigger cannot fire."""
+    """A cycle the daemon is running (the poll's cycle_started_at) shows 同步中… and makes the
+    button aria-disabled: a second trigger cannot fire."""
     page = open_page(daemon=fresh_live)
     ready(page)
     fresh_live.hold_cycles()
+    fresh_live.hold_cycles()  # holding twice keeps one gate: the release below frees the cycle
     before = fresh_live.cycles()
     try:
         assert fresh_live.in_loop(lambda: fresh_live.daemon.request_cycle()) is True
         refresh_status(page)
         button = sync_button(page)
         expect(button).to_have_accessible_name("同步中…")
-        expect(button).to_be_disabled()
+        expect(button).to_have_attribute("aria-disabled", "true")
         expect(button).to_have_attribute("aria-busy", "true")
-        button.click(force=True)  # a disabled button sends nothing
+        button.click(force=True)  # aria-disabled only: still clickable, and the guard sends nothing
     finally:
         fresh_live.release_cycles()
+    until(lambda: fresh_live.cycles() == before + 1)
     refresh_status(page)
     expect(sync_button(page)).to_have_accessible_name("立即同步")
-    expect(sync_button(page)).to_be_enabled()
-    assert fresh_live.cycles() == before + 1
+    expect(sync_button(page)).to_have_attribute("aria-disabled", "false")
     expect(page.locator("[data-role=result-note]")).to_have_text("")
+    page.wait_for_timeout(300)
+    assert fresh_live.cycles() == before + 1  # the click during the cycle requested nothing
+
+
+def test_focus_stays_on_sync_now_while_it_runs(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
+    """From the keyboard: Enter starts a sync, focus stays on the button through 同步中… (it is
+    aria-disabled, not disabled), a second Enter sends nothing, and the result is announced."""
+    page = open_page(daemon=fresh_live)
+    ready(page)
+    button = sync_button(page)
+    button.focus()
+    fresh_live.hold_cycles()
+    before = fresh_live.cycles()
+    try:
+        page.keyboard.press("Enter")
+        expect(button).to_have_accessible_name("同步中…")
+        expect(button).to_have_attribute("aria-disabled", "true")
+        expect(button).to_be_focused()
+        page.keyboard.press("Enter")
+    finally:
+        fresh_live.release_cycles()
+    expect(page.locator("[data-role=result-note]")).to_have_text("同步完成，送达了 1 处改动")
+    expect(button).to_have_accessible_name("立即同步")
+    expect(button).to_be_focused()
+    page.wait_for_timeout(300)
+    assert fresh_live.cycles() == before + 1
 
 
 def test_closing_leaves_no_inspector_behind_in_history(open_page: OpenPage) -> None:
@@ -398,3 +435,80 @@ def test_closing_a_linked_inspector_chain_turns_it_into_the_map(open_page: OpenP
     expect(page).to_have_url(re.compile(r"\?lang=zh#/$"))
     page.go_back()  # to the page before this document: no inspector of ours reopens
     expect(page).not_to_have_url(re.compile(r"#/(settings|account)"))
+
+
+def frames(page: Page) -> None:
+    """Two painted frames: the app's effects have run, as for a person who acts after seeing it."""
+    page.evaluate("new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
+
+
+def in_app(page: Page, live: LiveDaemon) -> None:
+    """Still this app's document: the page did not leave it."""
+    assert page.url.startswith(live.url), page.url
+    expect(page.locator(".brand")).to_have_text("calsync")
+
+
+def test_closing_a_linked_chain_back_to_the_same_inspector(open_page: OpenPage, live: LiveDaemon) -> None:
+    """Loaded at #/settings, then #/account/personal, then #/settings again: the first close
+    travels to the first entry (same fragment: only popstate fires) and closes there; further
+    closes are harmless and the page never leaves the app."""
+    page = open_page()
+    ready(page)
+    page.goto("/?lang=zh#/settings")
+    inspector = page.locator("aside.insp")
+    expect(inspector.locator("h2")).to_have_text("设置")
+    frames(page)
+    page.evaluate("location.hash = '#/account/personal'")
+    expect(inspector.locator("h2")).to_have_text("账号")
+    frames(page)
+    page.evaluate("location.hash = '#/settings'")
+    expect(inspector.locator("h2")).to_have_text("设置")
+    page.keyboard.press("Escape")
+    expect(inspector).not_to_have_class(re.compile(r"\bopen\b"))
+    expect(page).to_have_url(re.compile(r"\?lang=zh#/$"))
+    page.keyboard.press("Escape")  # nothing open: nothing happens
+    page.wait_for_timeout(300)
+    in_app(page, live)
+    expect(page).to_have_url(re.compile(r"\?lang=zh#/$"))
+
+
+@pytest.mark.parametrize(
+    "steps",
+    [
+        ["#/settings"],
+        ["#/settings", "#/rule/family-home"],
+        ["#/settings", "#/account/personal", "#/settings"],
+        ["#/activity", "#/settings", "#/settings"],
+        ["#/rule/family-home", "#/", "#/settings", "#/account/work", "#/settings", "#/account/work"],
+    ],
+    ids=lambda steps: "-".join(step.strip("#/").replace("/", ".") or "map" for step in steps),
+)
+@pytest.mark.parametrize("loaded", [False, True], ids=["from-map", "from-link"])
+def test_after_any_close_the_app_is_loaded_and_closed(
+    open_page: OpenPage, live: LiveDaemon, steps: list[str], loaded: bool
+) -> None:
+    """Whatever the trail of hashes (from the map, or from a page loaded with the first one),
+    one close leaves the inspector closed in this app, and a quick second close changes nothing."""
+    page = open_page()
+    ready(page)
+    trail = list(steps)
+    if loaded:
+        page.goto(f"/?lang=zh{trail.pop(0)}")
+    for step in trail:
+        frames(page)
+        page.evaluate(f"location.hash = {step!r}")
+    page.wait_for_timeout(100)
+    inspector = page.locator("aside.insp")
+    if "open" not in (inspector.get_attribute("class") or ""):
+        return  # the trail ended on the map: nothing to close
+    inspector.get_by_role("button", name="关闭").click()
+    page.keyboard.press("Escape")  # a second close at once, while the first may still travel
+    expect(inspector).not_to_have_class(re.compile(r"\bopen\b"))
+    page.wait_for_timeout(300)
+    in_app(page, live)
+    expect(inspector).not_to_have_class(re.compile(r"\bopen\b"))
+    assert parse_hash(page) in {"", "#/", "#/activity"}
+
+
+def parse_hash(page: Page) -> str:
+    return page.evaluate("location.hash")

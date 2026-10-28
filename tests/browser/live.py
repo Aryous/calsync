@@ -351,10 +351,12 @@ class LiveDaemon:
             loop.close()
 
     def hold_cycles(self) -> None:
-        """From now on a cycle waits at its first Google request until ``release_cycles``."""
+        """From now on a cycle waits at its first Google request until ``release_cycles``. Holding
+        again while held keeps the one gate (a new one would strand the requests on the old)."""
 
         def close() -> None:
-            self.world.gate = asyncio.Event()
+            if self.world.gate is None:
+                self.world.gate = asyncio.Event()
 
         self.in_loop(close)
 
