@@ -314,7 +314,7 @@ const zh = {
   "In the Google Cloud console, create a project and enable the Google Calendar API.": "在 Google Cloud 控制台新建一个项目，启用 Google Calendar API。",
   "Under Credentials, create an OAuth client of type “Desktop app”, download its JSON file and put it on the computer calsync runs on.": "在“凭据”里创建一个 OAuth 客户端，类型选“桌面应用”，下载它的 JSON 文件，放到运行 calsync 的那台电脑上。",
   "Publish the app (“In production”): while it is in “testing”, its authorisation has to be renewed every 7 days.": "把应用发布为“正式版”：还在“测试”状态时，授权每 7 天就要重新做一次。",
-  "In a terminal on that computer, run this, with <path> replaced by the JSON file's path:": "在那台电脑的终端里运行下面的命令，把 <path> 换成 JSON 文件的路径：",
+  "In a terminal on that computer, run this; if the file is not in Downloads under that name, change the path to where it is:": "在那台电脑的终端里运行下面的命令；如果文件不在“下载”文件夹或名字不同，把路径改成它实际的位置：",
   "Once it is set, this page goes on by itself.": "设置好后这里会自动继续。",
   "Server": "服务器",
   "Another CalDAV server": "其他 CalDAV 服务器",

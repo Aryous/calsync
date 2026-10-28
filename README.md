@@ -13,8 +13,9 @@ Google Calendar ──► calsync (your machine) ──► iCloud / any CalDAV �
 > **Status: early.** The sync engine, the `calsync` command line (with
 > `--json` for scripts and [AI agents](docs/agent-cli.md)), the
 > `calsync daemon` background process with push notifications, and the
-> launchd service installer are complete and tested. The web UI works but is
-> being rewritten (see [Roadmap](docs/ROADMAP.md)).
+> launchd service installer are complete and tested, and so is the web UI (the
+> sync map, the calendar, activity and settings). Editing events from the web UI
+> is next (see [Roadmap](docs/ROADMAP.md)).
 
 ---
 
@@ -651,12 +652,36 @@ language = "en"                                    # "zh" (the default) or "en"
 
 ## Web UI
 
-The web UI is being rewritten; the page described here is the first
-version.
+![The sync map with the calendar below it](docs/images/web-map.png)
 
-The daemon also serves a web page with the sync status, the events due in the
-next 24 hours, recent changes and the run history, and a "sync now" button. By
-default it listens on `127.0.0.1:8766` (only this computer); set `[web]
+The daemon serves a web page that shows where your events flow and lets you
+change it:
+
+- **The sync map.** Your Google calendars on the left, the iCloud calendars on
+  the right, a wire for each sync line. A wire's look says how the line is
+  doing (healthy, paused, failing, waiting for you); one sentence under the map
+  sums it up, and a card appears for anything that needs you. Tap a line, a
+  calendar or an account to see and change it; **新线路** adds a line after a
+  preview of what it would write.
+- **The calendar.** Day, two days, week, two weeks, month and list views (the
+  phone has day, two days, month and list), one layer per target calendar, and
+  the delivery state on every event: delivered, waiting, paused or outside the
+  sync range. An event's detail puts the Google original next to each copy.
+- **Activity.** What calsync changed, its syncs, and the changes to the config,
+  newest first.
+- **Settings.** Push notifications (with a test push), how often to check,
+  other devices, allowed addresses, and the config's history with an undo.
+- **Blocked deletes.** When a sync would delete more copies than a line allows,
+  the page lists them and deletes exactly that list once you confirm.
+
+Everything the page changes goes through the same operations as the command
+line and lands in `config.toml`. The page never asks for a password: a step
+that needs you (signing in to Google, an app-specific password) shows the
+command to run on the Mac, with a copy button. Chinese is the default; add
+`?lang=en` (or use the footer) for English. It follows the system's light or
+dark mode.
+
+By default it listens on `127.0.0.1:8766` (only this computer); set `[web]
 listen` or pass `calsync daemon --listen HOST:PORT` to change that. To turn
 the web UI off, set `listen = "off"` or pass `calsync daemon --no-web` (or
 `--listen off`); the local API socket (and `calsync trigger`) keeps working. If the daemon cannot

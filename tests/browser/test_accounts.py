@@ -384,7 +384,7 @@ def test_the_google_wizard_sets_up_the_client_secret_first(
         expect(second).to_contain_text("桌面应用")
         expect(second).to_contain_text("Google Calendar API")
         expect(second.locator(".cmd code")).to_have_text(
-            "calsync config set google.client_secret_file <path>"
+            "calsync config set google.client_secret_file ~/Downloads/client_secret.json"
         )
         expect(second.locator("[data-role=waiting]")).to_contain_text("设置好后这里会自动继续")
         add = second.get_by_role("button", name="添加账号")

@@ -148,7 +148,7 @@ function leading(groups, account) {
   return [...groups.filter((g) => g.account === account), ...groups.filter((g) => g.account !== account)];
 }
 
-export function NewLineForm({ route, onClose, onCreated, onReplace }) {
+export function NewLineForm({ route, onClose, onCreated, onReplace, active = true }) {
   const { status, refresh } = useStatus();
   const q = route.query || {};
   // ?source=<account> or ?target=<account> without a calendar: that account comes first, and its
@@ -172,6 +172,11 @@ export function NewLineForm({ route, onClose, onCreated, onReplace }) {
   const [stage, setStage] = useState(""); // what creating does now (the old copies first)
   const seq = useRef(0);
   const alive = useRef(true);
+  // Closed — by ✕, Esc or Back, even while the panel still slides out: a sync that finishes
+  // later opens nothing.
+  useEffect(() => {
+    if (!active) alive.current = false;
+  }, [active]);
   useEffect(() => () => {
     alive.current = false;
   }, []);
