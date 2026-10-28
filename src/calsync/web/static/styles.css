@@ -137,7 +137,7 @@ svg.svc.xs { width: 15px; height: 15px; }
 .btn.quiet { border-color: transparent; box-shadow: none; background: transparent; color: var(--ink-2); }
 .btn.quiet:hover { background: var(--sunk); color: var(--ink); }
 .btn[disabled], .btn[aria-disabled="true"] { opacity: .5; cursor: default; }
-.btn.busy { opacity: 1; cursor: progress; }
+.btn.busy { opacity: 1; cursor: progress; } /* busy (spinning) shows at full strength, over aria-disabled's .5 */
 .btn.busy svg { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -649,6 +649,13 @@ a.ar:hover { background: linear-gradient(90deg, transparent, var(--sunk) 12%, va
   .af .seg button { flex: 1; min-height: 44px; }
 }
 
+/* ----- the phone: 44 px tap targets ------------------------------------------------------------ */
+@media (max-width: 760px), (hover: none) and (pointer: coarse) and (max-width: 1024px) {
+  .tab { min-width: 44px; }
+  .navbtns .btn { min-height: 44px; }
+  .navbtns .btn.icon, .cmd .btn.icon { min-width: 44px; }
+}
+
 /* ----- phone ------------------------------------------------------------------------------ */
 @media (max-width: 760px), (hover: none) and (pointer: coarse) and (max-width: 1024px) {
   :root { --hourH: 44px; --gutter: 16px; }
@@ -672,7 +679,7 @@ a.ar:hover { background: linear-gradient(90deg, transparent, var(--sunk) 12%, va
   .result h1 { font-size: 19px; }
   .lower { margin-top: 36px; }
   .insp {
-    top: auto; left: 0; right: 0; bottom: 0; width: auto; max-height: 88vh; height: 88vh;
+    top: auto; left: 0; right: 0; bottom: 0; width: auto; max-height: 88vh; height: 88vh; max-height: 88dvh; height: 88dvh; /* dvh: below Safari's toolbar */
     border-radius: 22px 22px 0 0; border-bottom: 0;
     transform: translateY(105%); padding-bottom: env(safe-area-inset-bottom);
   }

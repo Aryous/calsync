@@ -4,7 +4,6 @@
 // opened from); closed, it is inert. Each route's body is a form of its own (forms/*.js).
 
 import { html, useEffect, useLayoutEffect, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
-import { t } from "/static/i18n.js";
 import { Head } from "/static/forms/parts.js";
 import { RuleForm } from "/static/forms/rule.js";
 import { CalendarForm } from "/static/forms/calendar.js";
@@ -14,17 +13,9 @@ import { SettingsForm } from "/static/forms/settings.js";
 import { EventForm } from "/static/forms/event.js";
 import { BlockedForm } from "/static/forms/blocked.js";
 
-/** The title and subtitle of a route whose inspector comes with a later task. */
-function placeholderHead(route) {
-  switch (route.name) {
-    default:
-      return ["", ""];
-  }
-}
-
-function Placeholder({ route, onClose }) {
-  const [title, sub] = placeholderHead(route);
-  return html`<${Head} title=${title} sub=${sub} onClose=${onClose}/><div class="ib"></div>`;
+/** A route with no form of its own (none today): an empty panel that can be closed. */
+function Placeholder({ onClose }) {
+  return html`<${Head} title="" sub="" onClose=${onClose}/><div class="ib"></div>`;
 }
 
 const FORMS = { rule: RuleForm, calendar: CalendarForm, new: NewLineForm, account: AccountForm, connect: ConnectForm, settings: SettingsForm, event: EventForm, blocked: BlockedForm };
