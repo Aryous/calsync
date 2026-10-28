@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, overload
 import tomlkit
 
 from calsync import configfile, credentials, debug
-from calsync.config import Config, CredentialRef
+from calsync.config import Config, CredentialRef, Rule
 from calsync.errors import AuthError, CalsyncError, ConfigError, RulePaused, plain_error
 from calsync.store import CONFIG_CHANGE_RETENTION, AccountCalendar, Store
 
@@ -450,6 +450,7 @@ _RULE_ADD_ARGS = {
     "content",
     "attendees",
     "conference",
+    "retire",
 }
 
 
@@ -478,6 +479,10 @@ def _rule_table(
     }
     if fields:
         table["fields"] = fields
+    if a.flag("retire"):
+        # A line that only removes the copies its name left behind (the guard applies), then
+        # disappears: how copies of a line removed with "keep the copies" are cleaned up later.
+        table["retire"] = True
     return name, table, source, target
 
 
@@ -1384,6 +1389,7 @@ async def _rule_preview(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> 
     data: dict[str, Any] = dict.fromkeys(
         ("series", "instances_in_window", "target_exists", "target_would_be_created", "source_mirrored")
     )
+    data["leftover"] = _leftover(ctx, config, rule)
     try:
         raw, meta, data["source_mirrored"] = await _preview_source(
             ctx, config, rule.source.account, rule.source.calendar
@@ -1417,6 +1423,19 @@ async def _rule_preview(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> 
     data["target_exists"] = found is not None
     data["target_would_be_created"] = found is None and rule.target.create_if_missing
     return OpResult(op, False, _preview_summary(data, found[1] if found else rule.target.calendar), data=data)
+
+
+def _leftover(ctx: OpContext, config: Config, rule: Rule) -> list[dict[str, Any]]:
+    """Copies in ``rule``'s target calendar left by lines that are gone (removed with their
+    copies kept): the new line would write its own beside them. Each ``{"name", "copies"}``,
+    most first; ``name`` is the earlier line's (from the run history), None when unknown."""
+    from calsync.naming import rule_tag
+
+    live = {rule_tag(r.name) for r in config.rules}
+    names = {rule_tag(n): n for n in ctx.store.rule_names_seen()}
+    left = ctx.store.leftover_copies(rule.target.account, rule.target.calendar, live)
+    found = [{"name": names.get(tag), "copies": n} for tag, n in left.items()]
+    return sorted(found, key=lambda x: (-x["copies"], x["name"] or ""))
 
 
 AsyncOp = Callable[[OpContext, dict[str, Any], bool], Coroutine[Any, Any, OpResult]]

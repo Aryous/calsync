@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#0D1B3D">
+<meta name="theme-color" content="#F8FAFC" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0F1217" media="(prefers-color-scheme: dark)">
 <meta name="referrer" content="no-referrer">
 <title>calsync · 配对 Pair</title>
 <script src="/static/theme.js"></script>
@@ -13,23 +14,25 @@
 <link rel="stylesheet" href="/static/pair.css">
 </head>
 <body>
-<header class="bar"><div class="bar__in"><span class="wordmark">calsync</span></div></header>
-<main class="pair">
-  <!-- calsync:notice -->
-  <div class="pair__card">
-    <div class="pair__top">
+<div class="wrap">
+  <header class="top">
+    <span class="brand"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect class="mark-tile" width="24" height="24" rx="7"/><path class="mark-trace" d="M4.5 9.5h4.2c2.4 0 2.4 5 4.8 5h6M4.5 14.5h4.2c2.4 0 2.4-5 4.8-5h6"/><circle class="mark-port" cx="12" cy="12" r="1.6"/></svg>calsync</span>
+  </header>
+  <main class="pair">
+    <!-- calsync:notice -->
+    <div class="pair__card">
       <h1><span lang="zh-CN">连接这个浏览器</span><span lang="en">Pair this browser</span></h1>
       <p class="pair__lede">
         <span lang="zh-CN">在运行 calsync 的电脑上执行 <code>calsync web pair</code>，打开它给出的链接；或者把链接里 <code>k=</code> 后面的密钥粘贴到下面。</span>
         <span lang="en">On the computer that runs calsync, run <code>calsync web pair</code> and open the link it prints, or paste the key after <code>k=</code> below.</span>
       </p>
+      <form method="post" action="/pair">
+        <label for="key"><span lang="zh-CN">配对密钥</span><span lang="en">Pairing key</span></label>
+        <input id="key" name="key" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" required>
+        <button type="submit"><span lang="zh-CN">配对</span><span lang="en">Pair</span></button>
+      </form>
     </div>
-    <form method="post" action="/pair">
-      <label for="key"><span lang="zh-CN">配对密钥</span><span lang="en">Pairing key</span></label>
-      <input id="key" name="key" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" required>
-      <button type="submit"><span lang="zh-CN">配对</span><span lang="en">Pair</span></button>
-    </form>
-  </div>
-</main>
+  </main>
+</div>
 </body>
 </html>

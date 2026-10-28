@@ -74,6 +74,11 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--attendees", choices=("none", "notes"), help="attendees into the notes or dropped")
     add.add_argument("--conference", choices=("copy", "none"), help="the meeting link")
     add.add_argument(
+        "--retire",
+        action="store_true",
+        help="only remove the copies this name left (a line removed with its copies kept), then go",
+    )
+    add.add_argument(
         "--preview", action="store_true", help="show what the rule would sync and stop (writes no config)"
     )
     change = _writer(rule_sub, "set", "change one setting of a rule")
@@ -532,6 +537,7 @@ def _op_for(args: argparse.Namespace) -> tuple[str, dict[str, object]]:
                 "content",
                 "attendees",
                 "conference",
+                "retire",
             )
             given = {n: getattr(args, n) for n in names if getattr(args, n) not in (None, False)}
             return "rule.preview" if args.preview else "rule.add", {"name": args.name, **given}

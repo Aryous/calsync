@@ -18,7 +18,7 @@ import json
 import os
 import sqlite3
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -577,6 +577,23 @@ class Store:
         """The copies of rule ``tag`` recorded in any target calendar."""
         row = self._db.execute("SELECT COUNT(*) FROM target_object WHERE rule_tag = ?", (tag,)).fetchone()
         return int(row[0])
+
+    def leftover_copies(self, account: str, calendar: str, live: Set[str]) -> dict[str, int]:
+        """Copies recorded in the target calendar ``calendar`` of ``account`` (named by a rule's
+        reference, the calendar's name or its href) whose rule tag is none of ``live``: left by
+        lines removed with their copies kept. ``{rule tag: count}``."""
+        rows = self._db.execute(
+            "SELECT o.rule_tag, COUNT(DISTINCT o.href) FROM target_object o JOIN target_calendar c "
+            "ON o.account = c.account AND o.calendar_href = c.href "
+            "WHERE c.account = ? AND (c.ref = ? OR c.name = ? OR c.href = ?) GROUP BY o.rule_tag",
+            (account, calendar, calendar, calendar),
+        ).fetchall()
+        return {str(tag): int(n) for tag, n in rows if tag not in live}
+
+    def rule_names_seen(self) -> set[str]:
+        """Every rule name the run and change history know (lines removed since included)."""
+        rows = self._db.execute("SELECT rule FROM run UNION SELECT rule FROM change").fetchall()
+        return {str(r[0]) for r in rows}
 
     def record_config_change(
         self,

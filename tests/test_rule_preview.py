@@ -126,11 +126,27 @@ def test_preview_from_the_mirror(setup: Setup) -> None:
         "target_exists": False,
         "target_would_be_created": True,
         "source_mirrored": True,
+        "leftover": [],
     }
     assert result.summary == 'would create 3 series in "Kids" (calendar would be created)'
     assert not result.changed
     assert setup.accounts.builds == [{"dav"}]  # the target list, refreshed once; no Google pull
     unchanged(setup)
+
+
+def test_preview_names_copies_a_removed_line_left_in_the_target(setup: Setup) -> None:
+    """``family`` synced 3 copies into dav:Family, then was removed with its copies kept: a new
+    line into that calendar would write its own beside them."""
+    asyncio.run(setup.sync_family())
+    setup.config.write_text(CONFIG.split("[[rules]]", 1)[0])
+    result = setup.preview(source="me:Family", target="dav:Family")
+    assert result.data["leftover"] == [{"name": "family", "copies": 3}]
+
+
+def test_preview_does_not_count_the_copies_of_live_lines(setup: Setup) -> None:
+    asyncio.run(setup.sync_family())
+    result = setup.preview(source="me:Work", target="dav:Family")
+    assert result.data["leftover"] == []
 
 
 def test_preview_counts_the_window(setup: Setup) -> None:

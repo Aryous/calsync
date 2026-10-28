@@ -16,6 +16,23 @@ import httpx._utils as httpx_utils  # pyright: ignore[reportPrivateUsage]
 import pytest
 
 
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Browser tests (``@pytest.mark.browser``, ``tests/browser``) run only when ``-m`` names
+    them (``uv run pytest -m browser``): they need installed browsers and take longer. A plain
+    ``uv run pytest`` deselects them."""
+    if "browser" in (config.getoption("markexpr") or ""):
+        return
+    browser_dir = Path(__file__).resolve().parent / "browser"
+
+    def is_browser(item: pytest.Item) -> bool:
+        return item.get_closest_marker("browser") is not None or browser_dir in Path(item.path).parents
+
+    dropped = [item for item in items if is_browser(item)]
+    if dropped:
+        config.hook.pytest_deselected(items=dropped)
+        items[:] = [item for item in items if not is_browser(item)]
+
+
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"

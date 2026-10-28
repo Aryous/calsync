@@ -81,12 +81,14 @@ a home server or VPS.
 The feasibility review of concept v4 is in
 [`specs/2026-10-27-concept-v4-feasibility.md`](superpowers/specs/2026-10-27-concept-v4-feasibility.md).
 
-- **Phase B — the GUI rewrite.** The pages of concept v4 (overview with the
-  connection map and attention cards, calendar view with delivery states,
-  rule detail, history, settings, onboarding), phone-first, in Chinese,
-  served by the daemon and built on the phase A operations. Wording follows
-  what calsync can know ("delivered" means written to the server, not seen on
-  the phone). Secrets are entered only on localhost or HTTPS.
+- **Phase B — the GUI rewrite (done).** The sync map as home page and
+  configuration surface (lines, calendars, accounts, settings, a new line with
+  a preview), the result sentence and attention cards, the calendar in six
+  views with delivery states and the event detail, the activity timeline, the
+  account wizard and the blocked-delete approval; phone-first, Chinese by
+  default, built on the phase A operations. No secret is typed into the
+  browser: steps that need a person show the command to run. See
+  [`DESIGN.md`](../DESIGN.md).
 - **Phase C — editing events.** Creating and changing events from the GUI,
   written to Google (calsync stays one way: the copy follows); read-only
   Google calendars (by their `role`) greyed out.

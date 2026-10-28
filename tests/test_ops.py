@@ -344,6 +344,12 @@ def test_rule_add_warns_about_copies_an_earlier_rule_of_that_name_left(env: Env)
     assert env.run("rule.add", name="other", source="me-google:O", target="family-icloud:O").data == {}
 
 
+def test_rule_add_can_add_a_line_that_only_removes_its_copies(env: Env) -> None:
+    """``retire``: the line removes the copies its name left, then disappears (guard applies)."""
+    env.run("rule.add", name="old-kids", source="me-google:Kids", target="family-icloud:Kids", retire=True)
+    assert env.rule("old-kids").retire is True
+
+
 def test_rule_add_problems(env: Env) -> None:
     assert _problems(env, "rule.add", name="x", source="ghost:Kids", target="family-icloud:Kids") == [
         "rules[x].source.account: unknown account 'ghost'"

@@ -624,7 +624,7 @@ either way.
 ```sh
 calsync rule add NAME --source ACCOUNT:CALENDAR --target ACCOUNT:CALENDAR \
     [--create-target] [--window all|PAST:FUTURE] [--alarms copy|strip|-10m,0m] \
-    [--content full|busy] [--attendees none|notes] [--conference copy|none] [--preview] [--dry-run] --json
+    [--content full|busy] [--attendees none|notes] [--conference copy|none] [--retire] [--preview] [--dry-run] --json
 ```
 
 `CALENDAR` is a name or an id from `calendars`. Write negative alarm offsets
@@ -642,7 +642,8 @@ preview may refresh calsync's cached calendar list):
   "summary": "would create 41 series in \"Family\" (calendar not found; add --create-target to create it)",
   "diff": "",
   "data": {"series": 41, "instances_in_window": null, "target_exists": false,
-           "target_would_be_created": false, "source_mirrored": true},
+           "target_would_be_created": false, "source_mirrored": true,
+           "leftover": [{"name": "family-old", "copies": 12}]},
   "needs_human": false, "command": null, "reason": null
 }
 ```
@@ -656,6 +657,16 @@ If copies left by an earlier rule of the same name are recorded, `rule add`
 says so in its `summary` and in `data.earlier_copies` (a count): the new
 rule takes those copies over and deletes the ones its source does not have
 (through the delete guard). Tell the person before you go on.
+
+The preview's `data.leftover` lists copies in the target calendar left by
+rules that are gone (removed with their copies kept), each with the earlier
+rule's `name` (null when the history does not know it) and `copies`. A new
+rule of another name writes its own copies beside them: duplicates. Ask the
+person which they want, then either take the copies over (add the rule under
+that earlier `name`) or clean them up first: `rule add <earlier name>
+--source … --target … --retire` adds a rule that only deletes those copies
+(through the delete guard) and then disappears; add the new rule after it is
+gone.
 
 #### `rule set`
 
