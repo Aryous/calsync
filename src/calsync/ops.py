@@ -60,6 +60,11 @@ class DaemonHooks(Protocol):
         a future of that cycle's result (None: the cycle failed)."""
         ...
 
+    def preapprove(self, rule: str, object_ids: frozenset[str]) -> None:
+        """Let the copies ``object_ids`` of ``rule`` be deleted past the guard: a person deleted
+        their originals in the web UI. Only operations with origin ``ui`` call it."""
+        ...
+
     def push(self, alerts: list["Alert"]) -> None:
         """Send ``alerts`` in the daemon's background outbox."""
         ...

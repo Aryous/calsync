@@ -3,7 +3,8 @@
 Most tables are caches that can be rebuilt from both ends (the source mirror and cursors, the
 target objects and cursors): losing them costs one heavy cycle, never data. History is not: the
 ``run`` rows, the ``change`` audit log (the only place a deleted event's title survives) and the
-``config_change`` history cannot be rebuilt, so a schema change keeps them.
+``config_change`` history and the ``event_write`` history cannot be rebuilt, so a schema change
+keeps them.
 
 Schema versions: an older database is upgraded in place, one ``_UPGRADES`` step per version,
 in one transaction. A version with no path to ``SCHEMA_VERSION`` (older than the first step,
@@ -28,10 +29,11 @@ from calsync.mirror import Mirror
 from calsync.sources.base import CalendarPull
 from calsync.targets.base import CachedObject, TargetCache, TargetCalendar
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 RUN_RETENTION = 500  # newest runs kept per rule
 CHANGE_RETENTION = timedelta(days=90)  # change rows older than this (vs. the newest run) are pruned
 CONFIG_CHANGE_RETENTION = 200  # newest config_change rows kept
+EVENT_WRITE_RETENTION = 500  # newest event_write rows kept
 
 _SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -94,6 +96,19 @@ _V5_SCHEMA = (
 )""",
     "CREATE INDEX config_change_at ON config_change (at)",
 )
+# Version 6: writes to Google made through calsync (the web UI or the CLI) and the scopes each
+# Google account's grant was last seen with. Shared by a fresh schema and the 5 -> 6 upgrade.
+_V6_SCHEMA = (
+    # origin: cli | ui; op: create | edit | move | delete | apply; status: ok | partial | failed.
+    # ``title`` and ``detail`` (JSON) are event content, like the change log's.
+    """CREATE TABLE event_write (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, origin TEXT NOT NULL, op TEXT NOT NULL,
+    account TEXT NOT NULL, calendar TEXT NOT NULL, event_id TEXT, title TEXT, detail TEXT,
+    status TEXT NOT NULL
+)""",
+    "CREATE INDEX event_write_at ON event_write (at)",
+    "CREATE TABLE account_access (account TEXT PRIMARY KEY, scopes TEXT NOT NULL, seen_at TEXT NOT NULL)",
+)
 _TABLES = (
     "meta",
     "source_state",
@@ -105,6 +120,8 @@ _TABLES = (
     "alert",
     "account_calendar",
     "config_change",
+    "event_write",
+    "account_access",
 )
 
 
@@ -153,6 +170,23 @@ class ConfigChangeRecord:
     before: str | None
     after_fingerprint: str
     undoes: int | None  # the id of the change this one undid
+
+
+@dataclass(frozen=True, slots=True)
+class WriteRecord:
+    """One write to Google made through calsync. ``title`` and ``detail`` are event content:
+    stored and shown in --json/API output, never logged."""
+
+    at: datetime
+    origin: str  # cli | ui
+    op: str  # create | edit | move | delete | apply
+    account: str
+    calendar: str  # the Google calendar id
+    event_id: str | None  # calsync's event id (None for a batch)
+    title: str | None
+    detail: Mapping[str, Any] | None
+    status: str  # ok | partial | failed
+    id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +302,7 @@ class Store:
             for table in _TABLES:
                 db.execute(f"DROP TABLE IF EXISTS {table}")
             # executescript() would commit our open transaction, so run statements one by one.
-            for statement in (*_SCHEMA.split(";"), *_V5_SCHEMA):
+            for statement in (*_SCHEMA.split(";"), *_V5_SCHEMA, *_V6_SCHEMA):
                 if statement.strip():
                     db.execute(statement)
             db.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
@@ -629,6 +663,68 @@ class Store:
         ).fetchall()
         return [ConfigChangeRecord(r[0], datetime.fromisoformat(r[1]), *r[2:]) for r in rows]
 
+    # ----- writes to Google --------------------------------------------
+    def record_write(self, row: WriteRecord) -> int:
+        """Record one write and prune to the newest ``EVENT_WRITE_RETENTION``; the new id."""
+        with self._tx():
+            cursor = self._db.execute(
+                "INSERT INTO event_write (at, origin, op, account, calendar, event_id, title, detail, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _utc(row.at),
+                    row.origin,
+                    row.op,
+                    row.account,
+                    row.calendar,
+                    row.event_id,
+                    row.title,
+                    None if row.detail is None else json.dumps(row.detail, ensure_ascii=False),
+                    row.status,
+                ),
+            )
+            assert cursor.lastrowid is not None
+            self._db.execute(
+                "DELETE FROM event_write WHERE id NOT IN (SELECT id FROM event_write ORDER BY id DESC LIMIT ?)",
+                (EVENT_WRITE_RETENTION,),
+            )
+        return cursor.lastrowid
+
+    def writes(self, limit: int = 50) -> list[WriteRecord]:
+        """Writes to Google, newest first."""
+        rows = self._db.execute(
+            "SELECT at, origin, op, account, calendar, event_id, title, detail, status, id FROM event_write "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            WriteRecord(
+                at=datetime.fromisoformat(r[0]),
+                origin=r[1],
+                op=r[2],
+                account=r[3],
+                calendar=r[4],
+                event_id=r[5],
+                title=r[6],
+                detail=json.loads(r[7]) if r[7] else None,
+                status=r[8],
+                id=r[9],
+            )
+            for r in rows
+        ]
+
+    def save_scopes(self, account: str, scopes: Set[str], at: datetime) -> None:
+        """The scopes the account's grant was seen with at ``at`` (a token refresh)."""
+        with self._tx():
+            self._db.execute(
+                "INSERT OR REPLACE INTO account_access (account, scopes, seen_at) VALUES (?, ?, ?)",
+                (account, " ".join(sorted(scopes)), _utc(at)),
+            )
+
+    def scopes(self, account: str) -> frozenset[str] | None:
+        """The scopes last seen for ``account``; None: never seen."""
+        row = self._db.execute("SELECT scopes FROM account_access WHERE account = ?", (account,)).fetchone()
+        return frozenset(row[0].split()) if row else None
+
     # ----- calendar cache ----------------------------------------------
     def save_account_calendars(
         self, account: str, calendars: Sequence[AccountCalendar], at: datetime
@@ -679,8 +775,16 @@ def _upgrade_4(db: sqlite3.Connection) -> None:
         db.execute(statement)
 
 
+def _upgrade_5(db: sqlite3.Connection) -> None:
+    """5 -> 6: the write history and the account scopes; every row is kept."""
+    for table in ("event_write", "account_access"):  # left behind by a v5 calsync's rebuild
+        db.execute(f"DROP TABLE IF EXISTS {table}")
+    for statement in _V6_SCHEMA:
+        db.execute(statement)
+
+
 # version -> the step that turns a database of that version into the next one
-_UPGRADES: dict[int, Callable[[sqlite3.Connection], None]] = {3: _upgrade_3, 4: _upgrade_4}
+_UPGRADES: dict[int, Callable[[sqlite3.Connection], None]] = {3: _upgrade_3, 4: _upgrade_4, 5: _upgrade_5}
 
 
 def _upgradable(version: int) -> bool:

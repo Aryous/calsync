@@ -68,10 +68,15 @@ def delete_fingerprint(object_ids: Iterable[str]) -> str:
 @dataclass(frozen=True, slots=True)
 class Approval:
     """Blocked deletes a person or an agent let through: the set's fingerprint and where the
-    approval came from (``cli``, ``ui``), recorded with the cycle that releases the set."""
+    approval came from (``cli``, ``ui``), recorded with the cycle that releases the set.
 
-    fingerprint: str
+    ``covers``: copies whose deletes a person asked for in the web UI (they deleted the
+    original there), pre-approved before any guard saw them. They do not count for the guard;
+    the rest of the planned deletes are judged as always. ``fingerprint`` None: covers only."""
+
+    fingerprint: str | None
     origin: str
+    covers: frozenset[str] = frozenset()
 
 
 # Change action: an approval (or ``--allow-deletes``) released a set the guard holds back (object
@@ -117,6 +122,8 @@ class RuleResult:
     # approval's origin (``cli``, ``ui``), or ``run`` for ``--allow-deletes`` past a set the guard
     # would have blocked. The ``approved`` change row and push go with it.
     approved_by: str | None = None
+    # The pre-approved copies (``Approval.covers``) this cycle deleted: the daemon forgets them.
+    released_covers: frozenset[str] = frozenset()
     changes: list[ChangeRecord] = field(default_factory=list)  # carries titles: never log
     # This cycle's protected / blocked object ids, for the engine's dedup memory: committed only
     # once ``changes`` is written. None: not reached (dry run, or the rule failed earlier).
@@ -556,13 +563,26 @@ class Engine:
         result.plan = plan(desired, actual, window, frozenset(protected))
         result.out_of_window = result.plan.out_of_window
         # The guard counts only non-protected actuals. An approval lets exactly the set it names
-        # through (by fingerprint); any other set is judged by the guard as always.
+        # through (by fingerprint); pre-approved copies (covers) do not count; any other set is
+        # judged by the guard as always.
         deletable = len(actual.keys() - protected)
         fingerprint = delete_fingerprint(a.object_id for a in result.plan.delete)
         result.approved = (
-            approval is not None and bool(result.plan.delete) and approval.fingerprint == fingerprint
+            approval is not None
+            and approval.fingerprint is not None
+            and bool(result.plan.delete)
+            and approval.fingerprint == fingerprint
         )
-        guard = check_delete_guard(result.plan, deletable, rule.delete_guard)
+        covers = approval.covers if approval is not None else frozenset()
+        covered = frozenset(a.object_id for a in result.plan.delete) & covers
+        judged = replace(result.plan, delete=[a for a in result.plan.delete if a.object_id not in covered])
+        guard = check_delete_guard(judged, deletable, rule.delete_guard)
+        # The covers mattered: without them the guard would have held the deletes back.
+        covers_released = (
+            bool(covered)
+            and guard is None
+            and check_delete_guard(result.plan, deletable, rule.delete_guard) is not None
+        )
         reason = None if allow_deletes or result.approved else guard
         if reason:
             result.status, result.error, result.error_kind = "blocked", reason, "guard"
@@ -591,6 +611,7 @@ class Engine:
             return
         if not dry_run:
             result.seen_blocked = frozenset()  # a later block of the same set is new again
+            result.released_covers = covered
         # Who let the set through: an approval, or ``--allow-deletes`` past a set the guard
         # would have blocked (origin ``run``). Recorded in the activity record (before its
         # deletes) whether or not a push channel is configured; ``approved_by`` raises its push.
@@ -599,6 +620,19 @@ class Engine:
             released_by = approval.origin
         elif allow_deletes and guard:
             released_by = ALLOW_DELETES
+        if released_by is None and covers_released and approval is not None and not dry_run:
+            # Recorded (the guard would have stopped them) but not pushed: the person who
+            # deleted the originals in the web UI knows.
+            count = len(covered)
+            result.changes.append(
+                ChangeRecord(
+                    rule.name,
+                    delete_fingerprint(covered),
+                    APPROVED,
+                    self._clock(),
+                    f"{count} delete{'' if count == 1 else 's'} approved ({approval.origin})",
+                )
+            )
         if released_by is not None and not dry_run:
             result.approved_by = released_by
             count = len(result.plan.delete)

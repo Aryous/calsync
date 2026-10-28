@@ -108,6 +108,8 @@ WATCH_INTERVAL = 2.0
 EXTERNAL_SUMMARY = "edited outside calsync"
 # How often the daemon fetches every account's calendar list into the cache.
 CALENDAR_REFRESH = timedelta(hours=6)
+# How long pre-approved copy deletes (a delete in the web UI) wait for the cycle that deletes them.
+COVER_TTL = timedelta(hours=24)
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -222,6 +224,10 @@ class Daemon:
         # Approved blocked sets (rule -> fingerprint), consumed by the rule's next cycle; and
         # the operations waiting for the next cycle of some rules (None: of any rule).
         self._approvals: dict[str, Approval] = {}
+        # Pre-approved copy deletes (rule -> object id -> until when): the copies of originals a
+        # person deleted in the web UI. Kept until a cycle deletes them, at most ``COVER_TTL``.
+        self._covers: dict[str, dict[str, datetime]] = {}
+        self._scopes_seen: dict[str, frozenset[str]] = {}  # last scopes stored per Google account
         self._scheduling = False  # the scheduler runs: something will run the cycles requested
         self._scheduled = False  # the scheduler has ended: nothing will run a cycle any more
         self._calendars_due: datetime | None = None  # next calendar-list refresh; None: now (at start)
@@ -470,6 +476,24 @@ class Daemon:
         log.info("rule %s: %d deletes approved (%s)", rule, count, origin)
         return self._wait_for_cycle({rule}) if wait else None
 
+    def preapprove(self, rule: str, object_ids: frozenset[str]) -> None:
+        """``ops.DaemonHooks.preapprove``: the copies ``object_ids`` of ``rule`` may be deleted
+        past the guard (a person deleted their originals in the web UI). The caller holds
+        ``_cycle_lock``; the next cycles of the rule carry them until one deletes them."""
+        if not object_ids:
+            return
+        until = self._clock() + COVER_TTL
+        self._covers.setdefault(rule, {}).update(dict.fromkeys(object_ids, until))
+
+    def _live_covers(self, rule: str) -> frozenset[str]:
+        now = self._clock()
+        kept = {oid: until for oid, until in self._covers.get(rule, {}).items() if until > now}
+        if kept:
+            self._covers[rule] = kept
+        else:
+            self._covers.pop(rule, None)
+        return frozenset(kept)
+
     def push(self, alerts: list[notify.Alert]) -> None:
         """``ops.DaemonHooks.push``: an operation's pushes (a loosened delete guard)."""
         self._notify(alerts)
@@ -656,6 +680,7 @@ class Daemon:
             self._scheduling = False
             self._scheduled = True
             self._approvals.clear()
+            self._covers.clear()
             waiters, self._waiters = self._waiters, []
             for waiter in waiters:
                 if not waiter.future.done():
@@ -873,6 +898,7 @@ class Daemon:
         names = set(self._rules)
         self._pending &= names
         self._reauth &= names
+        self._covers = {n: c for n, c in self._covers.items() if n in names}
         gone = {n for n in self._approvals if n not in names}
         held = {r.name for r in config.rules if r.paused} & set(self._approvals)
         for name in sorted(gone | held):
@@ -936,8 +962,15 @@ class Daemon:
 
     async def _locked_cycle(self, cycle: int, rules: list[str]) -> None:
         assert self._engine is not None and self._store is not None
-        # This cycle consumes the approvals of its rules, whatever its outcome.
+        # This cycle consumes the approvals of its rules, whatever its outcome. Pre-approved copies
+        # stay until a cycle deletes them (or they expire).
         approvals = {r: self._approvals.pop(r) for r in rules if r in self._approvals}
+        for r in rules:
+            if covers := self._live_covers(r):
+                given = approvals.get(r)
+                approvals[r] = Approval(
+                    given.fingerprint if given else None, given.origin if given else "ui", covers
+                )
         try:
             reauth = [r for r in rules if r in self._reauth]
             if reauth:
@@ -962,8 +995,26 @@ class Daemon:
             debug.details(log, "sync cycle failed", exc)
             self._resolve_waiters(cycle, rules, None)
             return
+        for name, r in result.rules.items():
+            if r.released_covers and name in self._covers:
+                left = {o: u for o, u in self._covers[name].items() if o not in r.released_covers}
+                if left:
+                    self._covers[name] = left
+                else:
+                    del self._covers[name]
+        self._save_scopes()
         self._record(cycle, result)
         await self._remove_retired(result)
+
+    def _save_scopes(self) -> None:
+        """Store the scopes each Google account's token refresh reported, when they changed."""
+        if self._store is None:
+            return
+        for name, source in self._adapters.sources.items():
+            scopes = getattr(source, "scopes", None)
+            if scopes and self._scopes_seen.get(name) != scopes:
+                self._store.save_scopes(name, scopes, self._clock())
+                self._scopes_seen[name] = scopes
 
     async def _remove_retired(self, result: CycleResult) -> None:
         """Remove the retiring rules this cycle finished (still under ``_cycle_lock``). A failed
