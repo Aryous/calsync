@@ -2,7 +2,8 @@
 // the changes it delivered (GET /api/changes: created, updated with what changed, deleted,
 // changed back after an iPhone edit, deletes approved, a delete guard raised), its sync cycles
 // (GET /api/runs, the runs of one cycle as one row; quiet cycles of a day folded into one) and
-// the config's changes (GET /api/config/history). Filters: 全部 / 改动 / 同步 / 异常.
+// the config's changes (GET /api/config/history) and the writes to Google made through calsync
+// (GET /api/writes: from this page or the terminal). Filters: 全部 / 改动 / 同步 / 异常.
 
 import { html, useEffect, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
 import { t, getLang } from "/static/i18n.js";
@@ -256,7 +257,56 @@ function fold(items) {
   return out;
 }
 
-export function timeline({ changes, runs, history, status }) {
+const WRITE_ICON = { create: "plus", edit: "pen", move: "pen", delete: "minus", apply: "plus" };
+
+/** "时间改为 09:30 · 原来是 10:00" for a write's first change. */
+function writeChangeText(changes) {
+  const c = (changes || [])[0];
+  if (!c) return "";
+  if (c.field === "time") {
+    const [b] = c.before || [];
+    const [a] = c.after || [];
+    const allDay = typeof a === "string" && a.length === 10;
+    const show = (v) => (allDay ? timeOf(v, true) : `${timeOf(v, true)} ${clockTime(v)}`);
+    return t("{what} changed to {after} · it was {before}", { what: t("Time"), after: show(a), before: show(b) });
+  }
+  if (c.field === "title") return t("Renamed “{after}” · it was “{before}”", { after: c.after || "", before: c.before || "" });
+  if (c.field === "location") return t("{what} changed to {after} · it was {before}", { what: t("Location"), after: c.after || t("nothing"), before: c.before || t("nothing") });
+  if (c.field === "alarms") return t("Reminder changed");
+  return "";
+}
+
+function countsText(counts) {
+  const c = counts || {};
+  const parts = [];
+  if (c.create) parts.push(t("{n} added", { n: c.create }));
+  if (c.update) parts.push(t("{n} changed", { n: c.update }));
+  if (c.delete) parts.push(t("{n} deleted", { n: c.delete }));
+  if (c.failed) parts.push(t("{n} failed", { n: c.failed }));
+  return parts.join(getLang() === "zh" ? "，" : ", ");
+}
+
+function writeItem(w) {
+  const title = w.title || t("(no title)");
+  const who = t("From {who}", { who: origin(w.origin) });
+  const where = w.calendar_name ? html`<${CalendarName} service="google" account=${w.account} name=${w.calendar_name}/>` : w.account;
+  const base = { kind: "change", at: new Date(w.at), icon: WRITE_ICON[w.op] || "pen", key: `w${w.id}`, where, cls: w.status === "ok" ? "" : "bad" };
+  const link = w.event_id && w.op !== "delete" ? `#/event/${encodeURIComponent(w.event_id)}` : null;
+  switch (w.op) {
+    case "create":
+      return { ...base, link, head: t("Added “{title}” in Google", { title }), sub: who };
+    case "move":
+      return { ...base, link, head: t("Moved “{title}” in Google", { title }), sub: [writeChangeText(w.changes), who].filter(Boolean).join(" · ") };
+    case "delete":
+      return { ...base, head: t("Deleted “{title}” in Google", { title }), sub: who };
+    case "apply":
+      return { ...base, head: t("Wrote many events to Google: {counts}", { counts: countsText(w.counts) }), sub: who };
+    default:
+      return { ...base, link, head: t("Changed “{title}” in Google", { title }), sub: [writeChangeText(w.changes), who].filter(Boolean).join(" · ") };
+  }
+}
+
+export function timeline({ changes, runs, history, writes = [], status }) {
   const lines = linesOf(status);
   const cycleOf = new Map(runs.map((r) => [r.id, r.started_at]));
   const merged = fold(mergeTargets(changes.map((c) => changeItem(c, lines, cycleOf))).map((i) => (i.busy ? { ...i, head: busyHead(i), sub: "" } : i.heldBack ? { ...i, head: heldHead(i), sub: t("Waiting for you to confirm") } : i)));
@@ -264,6 +314,7 @@ export function timeline({ changes, runs, history, status }) {
     ...merged,
     ...cycleItems(runs, lines),
     ...history.map((h) => ({ kind: "config", at: new Date(h.at), icon: "gear", key: `h${h.id}`, head: changeText(h.summary), sub: t("Settings · from {who}", { who: sourceName(h.source) }) })),
+    ...writes.map(writeItem),
   ];
   const said = new Set(merged.filter((i) => i.heldBack).map((i) => `${i.cycle}|${i.rule}`));
   return items.filter((i) => !(i.runBlocked && said.has(i.runBlocked))).sort((a, b) => b.at - a.at);
@@ -287,6 +338,7 @@ function Row({ item, lines }) {
     <span class="grow">
       <b>${item.head}</b>
       ${item.sub ? html`<small>${item.sub}</small>` : null}
+      ${item.where ? html`<small class="from" data-role="written-to">${item.where}</small>` : null}
       ${line ? html`<small class="from"><${CalendarName} service=${line.source.service} account=${line.source.account} name=${line.source.name}/>
         <span class="arrow" aria-hidden="true">→</span><span class="vh">${t("to")}</span>
         ${targets.map((l) => html`<${CalendarName} service=${l.target.service} account=${l.target.account} name=${l.target.name}/>`)}</small>` : null}
@@ -309,10 +361,10 @@ export function ActivityPane() {
   useEffect(() => {
     if (!status) return undefined; // the lines name the rows: read once they are known
     const mine = ++reads.current;
-    Promise.all([get("/api/changes", { limit: 200 }), get("/api/runs", { limit: 200 }), get("/api/config/history", { limit: 50 })])
-      .then(([c, r, h]) => {
+    Promise.all([get("/api/changes", { limit: 200 }), get("/api/runs", { limit: 200 }), get("/api/config/history", { limit: 50 }), get("/api/writes", { limit: 100 })])
+      .then(([c, r, h, w]) => {
         if (mine !== reads.current) return;
-        setData({ changes: c.changes || [], runs: r.runs || [], history: h.changes || [] });
+        setData({ changes: c.changes || [], runs: r.runs || [], history: h.changes || [], writes: w.writes || [] });
         setFailed(false);
       })
       .catch((e) => {

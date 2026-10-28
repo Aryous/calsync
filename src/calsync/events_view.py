@@ -13,13 +13,13 @@ instance of a recurring series (the start as the event's ``start`` shows it).
 import base64
 import binascii
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
 from calsync.config import Config, Rule
 from calsync.model import Alarm, Instance, Series, When, expand, expand_instances, series_span
-from calsync.views import RuleReading, RunView, StateReader, _iso, is_ok, source_series
+from calsync.views import RuleReading, RunView, StateReader, _iso, is_ok
 
 # Most days one events query may span (the GUI's widest view is a month, plus its edges).
 MAX_EVENT_DAYS = 62
@@ -202,10 +202,14 @@ class Event:
     instance: Instance  # the source's own occurrence
     source: dict[str, Any]
     deliveries: tuple[EventDelivery, ...]
+    # What a write needs and an agent reasons with (``_facts``): the source ids and versions,
+    # the key, the repetition, and whether calsync may change it.
+    facts: dict[str, Any] = field(default_factory=dict)
 
     def _json(self, *, detail: bool) -> dict[str, Any]:
         i = self.instance
         return {
+            **self.facts,
             "id": self.id,
             "title": i.title,
             "start": _when(i.start),
@@ -265,6 +269,56 @@ class _Calendar:
     name: str
     entry: dict[str, Any]
     rules: list[_RuleCopies]
+    role: str | None = None  # the cached accessRole
+    can_write: bool | None = None  # the account's grant may change events (None: not seen)
+
+
+READ_ONLY_ROLES = frozenset({"reader", "freeBusyReader"})
+
+
+class _Raws:
+    """A calendar's raw mirror rows: masters by id, exceptions by (series id, start instant)."""
+
+    def __init__(self, raws: list[dict[str, Any]], tz: str) -> None:
+        from calsync.sources.google_map import parse_when
+
+        self.rows = raws
+        self.by_id = {r["id"]: r for r in raws if isinstance(r.get("id"), str)}
+        self.exceptions: dict[tuple[str, datetime], dict[str, Any]] = {}
+        for r in raws:
+            series = r.get("recurringEventId")
+            if not series or r.get("status") == "cancelled" or "start" not in r:
+                continue
+            try:
+                self.exceptions[(series, parse_when(r["start"], tz).utc())] = r
+            except (KeyError, ValueError, TypeError):
+                continue
+
+    def facts(self, cal: "_Calendar", item: Series, inst: Instance) -> dict[str, Any]:
+        master = self.by_id.get(item.source_id) or {}
+        own = self.exceptions.get((item.source_id, inst.start.utc())) if inst.recurring else None
+        organizer = master.get("organizer")
+        reason: str | None = None
+        if cal.role in READ_ONLY_ROLES:
+            reason = "read_only_calendar"
+        elif isinstance(organizer, dict) and organizer and not organizer.get("self"):
+            reason = "invitation"
+        private = (master.get("extendedProperties") or {}).get("private") or {}
+        key = private.get("calsync_key")
+        return {
+            "source_id": item.source_id,
+            "updated": (own or master).get("updated"),
+            "series_updated": master.get("updated") if inst.recurring else None,
+            "created": master.get("created"),
+            "key": key if isinstance(key, str) else None,
+            "repeats": list(item.recurrence) or None,
+            "editable": {
+                "ok": reason is None,
+                "reason": reason,
+                "write_access": cal.can_write,
+                "command": f"calsync auth {cal.account} --write" if cal.can_write is False else None,
+            },
+        }
 
 
 def _calendars(
@@ -287,9 +341,14 @@ def _calendars(
             continue
         key = (r.source.account, reading.cid)
         if key not in found:
+            from calsync.views import can_write
+
             entry = reading.entry
             name = entry.get("summary_override") or entry.get("summary") or r.source.calendar
-            found[key] = _Calendar(key[0], key[1], r.source.calendar, name, dict(entry), [])
+            role = next((c.role for c in reader.account_calendars(key[0]) if c.id == key[1]), None)
+            found[key] = _Calendar(
+                key[0], key[1], r.source.calendar, name, dict(entry), [], role, can_write(reader, key[0])
+            )
         found[key].rules.append(_RuleCopies(reading, config, reader))
     return list(found.values())
 
@@ -343,7 +402,8 @@ def build_events(
     for cal in _calendars(config, reader, now, rule=rule, target=target):
         source = _source_json(config, cal)
         targets = [_target_json(c) for c in cal.rules]
-        for item in source_series(reader, cal.account, cal.cid, cal.entry):
+        raws = _Raws(reader.source_events(cal.account, cal.cid), str(cal.entry.get("timezone") or "UTC"))
+        for item in _series(raws.rows, cal.entry):
             expansion = expand(item, start, end)
             truncated = truncated or expansion.truncated
             instances = expansion.instances
@@ -365,7 +425,8 @@ def build_events(
                     )
                     for c, t, state, _, oid in per_rule
                 )
-                events.append(Event(_instance_id(cal.account, cal.cid, item, inst), inst, source, deliveries))
+                eid = _instance_id(cal.account, cal.cid, item, inst)
+                events.append(Event(eid, inst, source, deliveries, raws.facts(cal, item, inst)))
     events.sort(key=lambda e: (e.instance.start.utc(), e.instance.title, e.id))
     return EventsView(
         start=start,
@@ -415,42 +476,88 @@ def _occurrence(item: Series, rest: str, now: datetime) -> Instance | None:
     return next((i for i in expand_instances(item, lo, hi) if _when(i.start) == text), None)
 
 
-def build_event(config: Config, reader: StateReader, eid: str, now: datetime) -> EventDetail:
-    """The event ``eid`` names, with the source series' own fields (``original``) and, per
-    delivery, the stored summary of the copy and the fields it differs in. ``NotFound``: a
-    malformed id, or no such occurrence now."""
-    from calsync.render import changed_fields, summary_of
+@dataclass(frozen=True, slots=True)
+class Located:
+    """Where an event id points in the mirror: what a write to Google needs."""
 
+    account: str
+    cid: str  # the source calendar id
+    calendar: str  # as the first rule syncing it names it
+    calendar_name: str
+    source_id: str  # the series (or single event) id
+    instance: Instance  # the occurrence the id names
+    instance_start: str | None  # its start as the id carries it (None: a single event)
+    timezone: str  # the calendar's zone (the mirror's meta)
+    rules: tuple[str, ...]  # the rules that sync the calendar, in config order
+
+
+def _series(raws: list[dict[str, Any]], entry: dict[str, Any]) -> list[Series]:
+    """The calendar's series from its raw rows, as the engine builds them."""
+    from calsync.sources.google import meta_from_state
+    from calsync.sources.google_map import build_series
+
+    return build_series(raws, meta_from_state(entry))
+
+
+def _find(
+    config: Config, reader: StateReader, eid: str, now: datetime
+) -> tuple[_Calendar, Series, Instance, str | None, _Raws]:
     key = _decode(eid)
     for cal in _calendars(config, reader, now):
         prefix = f"{cal.account}/{cal.cid}/"
         if not key.startswith(prefix):
             continue
         rest = key[len(prefix) :]
-        for item in source_series(reader, cal.account, cal.cid, cal.entry):
+        raws = _Raws(reader.source_events(cal.account, cal.cid), str(cal.entry.get("timezone") or "UTC"))
+        for item in _series(raws.rows, cal.entry):
             inst = _occurrence(item, rest, now)
-            if inst is None:
-                continue
-            span = _span(cal, item)
-            deliveries: list[EventDelivery] = []
-            for copies in cal.rules:
-                state, shaped, oid = copies.state(item, span)
-                copy = reader.copy_summary(copies.reading.tag, oid)
-                differs: tuple[str, ...] = ()
-                if copy is not None and state != "delivered":
-                    differs = tuple(changed_fields(copy, summary_of(shaped)))
-                deliveries.append(
-                    EventDelivery(
-                        rule=copies.rule.name,
-                        target=_target_json(copies),
-                        state=state,
-                        delivered_at=copies.times.get(oid),
-                        content=copies.rule.fields.content,
-                        alarms_minutes_before=copies.alarms(inst),
-                        copy=copy,
-                        differs=differs,
-                    )
-                )
-            event = Event(eid, inst, _source_json(config, cal), tuple(deliveries))
-            return EventDetail(event, summary_of(item))
+            if inst is not None:
+                return cal, item, inst, (rest[len(item.source_id) + 1 :] if inst.recurring else None), raws
     raise NotFound(eid)
+
+
+def locate(config: Config, reader: StateReader, eid: str, now: datetime) -> Located:
+    """The event ``eid`` names, for a write. ``NotFound``: a malformed id, or no such occurrence."""
+    cal, item, inst, start, _ = _find(config, reader, eid, now)
+    return Located(
+        account=cal.account,
+        cid=cal.cid,
+        calendar=cal.ref,
+        calendar_name=cal.name,
+        source_id=item.source_id,
+        instance=inst,
+        instance_start=start,
+        timezone=str(cal.entry.get("timezone") or "UTC"),
+        rules=tuple(c.rule.name for c in cal.rules),
+    )
+
+
+def build_event(config: Config, reader: StateReader, eid: str, now: datetime) -> EventDetail:
+    """The event ``eid`` names, with the source series' own fields (``original``) and, per
+    delivery, the stored summary of the copy and the fields it differs in. ``NotFound``: a
+    malformed id, or no such occurrence now."""
+    from calsync.render import changed_fields, summary_of
+
+    cal, item, inst, _, raws = _find(config, reader, eid, now)
+    span = _span(cal, item)
+    deliveries: list[EventDelivery] = []
+    for copies in cal.rules:
+        state, shaped, oid = copies.state(item, span)
+        copy = reader.copy_summary(copies.reading.tag, oid)
+        differs: tuple[str, ...] = ()
+        if copy is not None and state != "delivered":
+            differs = tuple(changed_fields(copy, summary_of(shaped)))
+        deliveries.append(
+            EventDelivery(
+                rule=copies.rule.name,
+                target=_target_json(copies),
+                state=state,
+                delivered_at=copies.times.get(oid),
+                content=copies.rule.fields.content,
+                alarms_minutes_before=copies.alarms(inst),
+                copy=copy,
+                differs=differs,
+            )
+        )
+    event = Event(eid, inst, _source_json(config, cal), tuple(deliveries), raws.facts(cal, item, inst))
+    return EventDetail(event, summary_of(item))

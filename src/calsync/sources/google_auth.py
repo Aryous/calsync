@@ -59,6 +59,8 @@ class RefreshTokenProvider:
         self._token: str | None = None
         self._expires_at = 0.0
         self._lock = asyncio.Lock()
+        # The scopes the last refresh reported (Google's ``scope``); None until one succeeded.
+        self.scopes: frozenset[str] | None = None
 
     def _fresh(self) -> bool:
         return self._token is not None and self._clock() < self._expires_at - REFRESH_MARGIN
@@ -80,14 +82,16 @@ class RefreshTokenProvider:
             response = await request_with_retry(
                 self._client, "POST", self._url, kind="google-token", data=self._form
             )
-            token, lifetime = _parse_token_response(response)
+            token, lifetime, scopes = _parse_token_response(response)
             self._token = token
+            if scopes is not None:
+                self.scopes = scopes
             self._expires_at = self._clock() + lifetime
             return token
 
 
-def _parse_token_response(response: httpx.Response) -> tuple[str, float]:
-    """(access token, lifetime in seconds). Only an OAuth error from Google itself (a JSON
+def _parse_token_response(response: httpx.Response) -> tuple[str, float, frozenset[str] | None]:
+    """(access token, lifetime in seconds, the scopes granted if the response names them). Only an OAuth error from Google itself (a JSON
     ``error`` on 400/401, e.g. invalid_grant) is an AuthError; anything else that is not a
     usable token - a captive portal, a proxy page, a mangled body - is transient."""
     status = response.status_code
@@ -110,7 +114,9 @@ def _parse_token_response(response: httpx.Response) -> tuple[str, float]:
         lifetime = None
     if not isinstance(token, str) or not token or lifetime is None:
         raise TransientError("Google token endpoint: response has no usable access_token")
-    return token, lifetime
+    scope = data.get("scope")
+    scopes = frozenset(scope.split()) if isinstance(scope, str) and scope.strip() else None
+    return token, lifetime, scopes
 
 
 def load_client_secret(path: Path) -> tuple[str, str]:

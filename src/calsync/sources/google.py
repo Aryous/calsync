@@ -10,8 +10,8 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import timedelta
-from typing import Any
-from urllib.parse import quote
+from typing import TYPE_CHECKING, Any
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -36,12 +36,18 @@ from calsync.sources.base import (
 from calsync.sources.google_auth import TokenProvider
 from calsync.sources.google_map import alarms_from_reminders, build_series, master_ids
 
+if TYPE_CHECKING:
+    from calsync.sources.google_write import GoogleWriter
+
 BASE_URL = "https://www.googleapis.com/calendar/v3"
 
 EVENT_FIELDS = (
     "id,status,updated,summary,description,location,start,end,"
     "originalStartTime,recurringEventId,recurrence,reminders,transparency,"
-    "attendees(email,displayName,resource),hangoutLink,conferenceData(entryPoints(entryPointType,uri))"
+    "attendees(email,displayName,resource),hangoutLink,conferenceData(entryPoints(entryPointType,uri)),"
+    # For writes (phase C): its etag (conditional writes), who organises it (only the organiser
+    # may change it), when it was created, and an agent's key for the event.
+    "etag,created,organizer(self),extendedProperties(private)"
 )
 # Identical for the initial full sync and every incremental call, as Google
 # requires. ``fields`` MUST keep nextSyncToken/nextPageToken or incremental
@@ -135,6 +141,24 @@ class GoogleSource:
         self._client = client
         self._token = token
         self._base = base_url.rstrip("/")
+
+    @property
+    def token(self) -> TokenProvider:
+        """The account's token provider (a writer for the same account shares it)."""
+        return self._token
+
+    @property
+    def scopes(self) -> frozenset[str] | None:
+        """The scopes Google reported at the last token refresh; None: not known (yet)."""
+        return getattr(self._token, "scopes", None)
+
+    def writer(self) -> "GoogleWriter":
+        """A writer for the same account: the same client, token and API root."""
+        from calsync.sources.google_write import GoogleWriter
+
+        parts = urlsplit(self._base)
+        batch = f"{parts.scheme}://{parts.netloc}/batch{parts.path}"
+        return GoogleWriter(self._client, self._token, base_url=self._base, batch_url=batch)
 
     async def _get(self, path: str, params: Mapping[str, str], kind: str) -> dict[str, Any]:
         response = await self._send(path, params, kind)

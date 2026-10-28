@@ -89,9 +89,18 @@ The feasibility review of concept v4 is in
   default, built on the phase A operations. No secret is typed into the
   browser: steps that need a person show the command to run. See
   [`DESIGN.md`](../DESIGN.md).
-- **Phase C — editing events.** Creating and changing events from the GUI,
-  written to Google (calsync stays one way: the copy follows); read-only
-  Google calendars (by their `role`) greyed out.
+- **Phase C — writing originals (done).** Write access per account
+  (`calsync auth <account> --write`); creating, changing (this occurrence or
+  the whole series, by form or by dragging in the calendar) and deleting
+  events in Google from the web UI and the CLI; an idempotent batch command
+  for agents (`calsync event apply`); the write history in the activity
+  timeline; read-only calendars and invitations greyed out. calsync stays one
+  way: the copy follows at the sync each write requests. A delete made in the
+  web UI releases its own copy past the mass-delete guard; deletes from the
+  CLI meet the guard. Duplicates are left to agents (a recipe in
+  `docs/agent-cli.md`).
+- **Not yet:** "this and following" (cutting a series in two), editing
+  attendees or sending invitations.
 
 ## Later
 

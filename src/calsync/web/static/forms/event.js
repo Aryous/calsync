@@ -1,14 +1,17 @@
 // The event detail (#/event/<id>): the event, where it comes from, where it is delivered and in
 // what state, and whether each copy matches the original (GET /api/event: ``original``, each
-// delivery's ``copy`` and ``differs``). Editing comes later (phase C): the footer says where to
-// change it.
+// delivery's ``copy`` and ``differs``). Its footer changes the original in Google (修改 opens
+// #/event-edit/<id>) or deletes it, unless calsync may not (a read-only calendar, an
+// invitation: the footer says why).
 
 import { html, useCallback, useEffect, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
 import { t, getLang } from "/static/i18n.js";
 import { clockTime, serviceName, serviceOf, serviceShort, when, ymd } from "/static/format.js";
-import { get, useStatus } from "/static/api.js";
+import { get, op, useStatus } from "/static/api.js";
+import { Command } from "/static/command.js";
 import { Icon, Service } from "/static/icons.js";
 import { Head, Seg, accountOf } from "/static/forms/parts.js";
+import { ScopeChoice, writeFailure } from "/static/forms/edit.js";
 
 function parseWhen(text, allDay) {
   if (allDay) {
@@ -105,8 +108,59 @@ function Compare({ ev, delivery, status }) {
     ${copy && differs.size ? html`<p class="hp after">${t("The copy catches up at the next sync.")}</p>` : null}`;
 }
 
+/** 删除: a confirmation (and, for a repeating event, which times) before anything is written. */
+function DeleteConfirm({ ev, onCancel, onDone }) {
+  const { refresh } = useStatus();
+  const [scope, setScope] = useState(ev.recurring ? null : "single");
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState(null);
+  const [human, setHuman] = useState(null);
+  const box = useRef(null);
+  useEffect(() => {
+    if (box.current) box.current.scrollIntoView({ block: "nearest" });
+  }, []);
+  const confirm = async () => {
+    if (busy || !scope) return;
+    setBusy(true);
+    setNote(null);
+    try {
+      const expect = scope === "series" ? ev.series_updated : ev.updated;
+      const result = await op("event.delete", { id: ev.id, ...(ev.recurring ? { scope } : {}), ...(expect ? { expect_updated: expect } : {}), wait: true });
+      if (result.needs_human) {
+        setHuman(result);
+        return;
+      }
+      refresh();
+      onDone();
+    } catch (e) {
+      if (e.kind !== "unpaired") setNote(writeFailure(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return html`<div class="del" data-role="delete" ref=${box} role="group" aria-labelledby="del-title">
+    <h3 id="del-title">${t("Delete “{title}” in Google?", { title: ev.title || t("(no title)") })}</h3>
+    <p class="hp">${t("Its copies in iCloud are deleted at the same sync.")}</p>
+    ${ev.recurring ? html`<${ScopeChoice} value=${scope} onPick=${setScope} verb="delete"/>` : null}
+    ${human ? html`<div class="note warn"><p>${t("This needs you, in a terminal on the computer calsync runs on:")}</p><${Command} command=${human.command}/></div>` : null}
+    <p class="inote bad" role="status" data-role="delete-outcome">${note || ""}</p>
+    <div class="del-acts">
+      <button class="btn quiet" type="button" onClick=${onCancel}>${t("Cancel")}</button>
+      <button class=${busy ? "btn danger-solid busy" : "btn danger-solid"} type="button" data-role="confirm-delete"
+          aria-disabled=${busy || !scope ? "true" : "false"} onClick=${confirm}>${busy ? t("Deleting…") : t("Delete")}</button>
+    </div>
+  </div>`;
+}
+
+/** Why calsync may not change this event, for a person. */
+function lockedText(reason) {
+  if (reason === "invitation") return t("Someone invited you to this event: only its organiser can change it.");
+  return t("This calendar is read-only: calsync cannot change its events.");
+}
+
 export function EventForm({ route, onClose, active = true }) {
   const { status } = useStatus();
+  const [deleting, setDeleting] = useState(false);
   const [ev, setEv] = useState(undefined); // null: no such event
   const [pick, setPick] = useState(null); // the delivery the table compares
   const reads = useRef(0);
@@ -141,7 +195,7 @@ export function EventForm({ route, onClose, active = true }) {
   const withCopy = deliveries.find((d) => (d.differs || []).length) || deliveries.find((d) => d.copy) || deliveries[0];
   const chosen = deliveries.find((d) => d.rule === pick) || withCopy;
   const sub = [whenText(ev), ev.location].filter(Boolean).join(" · ");
-  const next = status && status.daemon && status.daemon.next_cycle_at;
+  const editable = ev.editable || { ok: false, reason: "read_only_calendar" };
   return html`<${Head} title=${ev.title || t("(no title)")} sub=${sub} onClose=${onClose}/>
     <div class="ib">
       <div class="src-row" data-role="source">
@@ -167,8 +221,18 @@ export function EventForm({ route, onClose, active = true }) {
             options=${deliveries.map((d) => [d.rule, d.target.calendar_name])}/>` : null}
         <${Compare} ev=${ev} delivery=${chosen} status=${status}/>
       </div>` : null}
+      ${deleting ? html`<${DeleteConfirm} ev=${ev} onCancel=${() => setDeleting(false)} onDone=${onClose}/>` : null}
+      ${editable.ok && editable.write_access === false ? html`<div class="note warn" data-role="write-access">
+          <p>${t("calsync may not change Google events for this account yet. Allow it once, in a terminal on the computer calsync runs on:")}</p>
+          <${Command} command=${editable.command || `calsync auth ${ev.source.account} --write`}/></div>` : null}
     </div>
-    <div class="ifoot"><span class="fh"><${Icon} name="pen"/>${next
-      ? t("Change it in Google Calendar; it reaches iCloud at the next check ({time}).", { time: clockTime(next) })
-      : t("Change it in Google Calendar; it reaches iCloud at the next check.")}</span></div>`;
+    ${deleting
+      ? null
+      : editable.ok
+      ? html`<div class="ifoot" data-role="actions">
+          <button class="btn danger" type="button" data-role="delete-event" aria-expanded=${deleting ? "true" : "false"}
+              onClick=${() => setDeleting(true)}>${t("Delete")}</button>
+          <a class="btn primary" href=${`#/event-edit/${encodeURIComponent(ev.id)}`} data-role="edit-event"><${Icon} name="pen"/>${t("Change it")}</a>
+        </div>`
+      : html`<div class="ifoot"><span class="fh" data-role="locked"><${Icon} name="lock"/>${lockedText(editable.reason)}</span></div>`}`;
 }

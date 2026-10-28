@@ -423,8 +423,8 @@ def test_v3_database_is_upgraded_in_place(tmp_path: Path) -> None:
             [ChangeRecord("a", "o1", "created", T1, "Lunch")],
         )
         assert store.last_title("a", "o1") == "Lunch"
-    assert store_mod.SCHEMA_VERSION == 5
-    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("5",)]
+    assert store_mod.SCHEMA_VERSION == 6
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
     run_columns = [r[1] for r in _rows(db, "PRAGMA table_info(run)")]
     assert run_columns[-5:] == ["reverted", "protected", "out_of_window", "error_kind", "error_account"]
     assert _rows(db, "SELECT rule, reverted, protected, out_of_window, error_kind FROM run ORDER BY id") == [
@@ -453,15 +453,15 @@ def test_upgrade_after_a_rollback_drops_the_stale_change_table(tmp_path: Path) -
     with Store(db) as store:
         assert [r.rule for r in store.latest_runs()] == ["a"]
         assert store.last_title("a", "o1") is None  # its run ids no longer exist: dropped
-    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("5",)]
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
     assert _count(db, "SELECT COUNT(*) FROM change") == 0
 
 
-@pytest.mark.parametrize("old", ["3", "4"])
+@pytest.mark.parametrize("old", ["3", "4", "5"])
 def test_upgraded_schema_equals_a_fresh_one(tmp_path: Path, old: str) -> None:
     """The upgrade steps and a fresh schema describe the same tables, columns and indexes.
     This is the drift guard: the fresh DDL and the steps are written separately."""
-    (_v3_database if old == "3" else _v4_database)(tmp_path / "old.db")
+    {"3": _v3_database, "4": _v4_database, "5": _v5_database}[old](tmp_path / "old.db")
     Store(tmp_path / "old.db").close()
     Store(tmp_path / "new.db").close()
 
@@ -479,7 +479,7 @@ def test_upgraded_schema_equals_a_fresh_one(tmp_path: Path, old: str) -> None:
         }
 
     old_shape, new_shape = shape(tmp_path / "old.db"), shape(tmp_path / "new.db")
-    assert {"account_calendar", "config_change"} <= set(new_shape)
+    assert {"account_calendar", "config_change", "event_write", "account_access"} <= set(new_shape)
     assert new_shape["config_change"]["indexes"][0][0] == "config_change_at"
     assert old_shape == new_shape
 
@@ -502,7 +502,7 @@ def test_failed_upgrade_leaves_the_v3_database_as_it_was(
     assert _count(db, "SELECT COUNT(*) FROM run") == 1
 
 
-@pytest.mark.parametrize("version", ["2", "6"])
+@pytest.mark.parametrize("version", ["2", "7"])
 def test_version_without_an_upgrade_path_is_rebuilt(tmp_path: Path, version: str) -> None:
     """Older than the first step or newer than this code: dropped and rebuilt, as before."""
     db = tmp_path / "s.db"
@@ -510,7 +510,7 @@ def test_version_without_an_upgrade_path_is_rebuilt(tmp_path: Path, version: str
     with Store(db) as store:
         assert store.latest_runs() == []
         assert store.load_source("g") == ({}, {})
-    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("5",)]
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
     assert _count(db, "SELECT COUNT(*) FROM change") == 0
 
 
@@ -597,7 +597,7 @@ def test_v4_database_is_upgraded_in_place(tmp_path: Path) -> None:
         )
         assert store.last_title("a", "o1") == "Lunch"
         assert store.config_changes() == []
-    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("5",)]
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
     assert _rows(db, "SELECT summary FROM target_object") == [(None,)]
     assert _rows(db, "SELECT detail FROM change") == [(None,)]
     assert _rows(db, "SELECT error_account FROM run") == [(None,)]
@@ -622,7 +622,7 @@ def test_upgrade_after_a_rollback_drops_the_stale_v5_tables(tmp_path: Path) -> N
     with Store(db) as store:
         assert store.config_changes() == []
         assert [r.rule for r in store.latest_runs()] == ["a"]
-    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("5",)]
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
     assert "stale" not in [r[1] for r in _rows(db, "PRAGMA table_info(account_calendar)")]
     assert _count(db, "SELECT COUNT(*) FROM account_calendar") == 0
 
@@ -710,3 +710,77 @@ def test_save_account_calendars_replaces_the_accounts_rows(tmp_path: Path) -> No
         ("d", "/cal/x/", "X", "rw", T0.isoformat()),
         ("g", "cal-c", "Holidays", None, T1.isoformat()),
     ]
+
+
+def _v5_database(path: Path) -> None:
+    """A version-5 database: the v4 one upgraded by the 4 -> 5 step alone, with one config change."""
+    _v4_database(path)
+    with closing(sqlite3.connect(path)) as conn:
+        store_mod._upgrade_4(conn)  # pyright: ignore[reportPrivateUsage]
+        conn.execute("UPDATE meta SET value = '5' WHERE key = 'schema_version'")
+        conn.execute(
+            "INSERT INTO config_change (at, source, summary, before, after_fingerprint) "
+            "VALUES (?, 'cli', 'x', NULL, 'f')",
+            (T0.isoformat(),),
+        )
+        conn.commit()
+
+
+def test_v5_database_is_upgraded_in_place(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    _v5_database(db)
+    with Store(db) as store:
+        assert store.last_title("a", "o1") == "Lunch"
+        assert [c.summary for c in store.config_changes()] == ["x"]
+        assert store.writes() == [] and store.scopes("g") is None
+    assert _rows(db, "SELECT value FROM meta WHERE key = 'schema_version'") == [("6",)]
+    assert _count(db, "SELECT COUNT(*) FROM run") == 1
+
+
+def test_upgrade_after_a_rollback_drops_the_stale_v6_tables(tmp_path: Path) -> None:
+    db = tmp_path / "s.db"
+    _v5_database(db)
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("CREATE TABLE event_write (id INTEGER PRIMARY KEY, stale TEXT)")
+        conn.execute("CREATE TABLE account_access (account TEXT, stale TEXT)")
+        conn.commit()
+    with Store(db) as store:
+        assert store.writes() == []
+    assert "stale" not in [r[1] for r in _rows(db, "PRAGMA table_info(event_write)")]
+
+
+def test_writes_round_trip_newest_first_and_are_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from calsync.store import WriteRecord
+
+    monkeypatch.setattr(store_mod, "EVENT_WRITE_RETENTION", 3)
+    with Store(tmp_path / "s.db") as store:
+        for i in range(5):
+            store.record_write(
+                WriteRecord(
+                    at=T0 + timedelta(minutes=i),
+                    origin="ui" if i % 2 else "cli",
+                    op="edit",
+                    account="g",
+                    calendar="cal",
+                    event_id=f"ev{i}",
+                    title=f"T{i}",
+                    detail={"changes": [{"field": "title", "before": "a", "after": "b"}]},
+                    status="ok",
+                )
+            )
+        rows = store.writes()
+        assert [r.event_id for r in rows] == ["ev4", "ev3", "ev2"]
+        assert rows[0].detail == {"changes": [{"field": "title", "before": "a", "after": "b"}]}
+        assert rows[0].at == T0 + timedelta(minutes=4) and rows[0].id is not None
+        assert rows[1].origin == "ui"
+
+
+def test_scopes_round_trip(tmp_path: Path) -> None:
+    with Store(tmp_path / "s.db") as store:
+        assert store.scopes("g") is None
+        store.save_scopes("g", frozenset({"b", "a"}), T0)
+        assert store.scopes("g") == frozenset({"a", "b"})
+        store.save_scopes("g", frozenset({"a"}), T1)
+        assert store.scopes("g") == frozenset({"a"})

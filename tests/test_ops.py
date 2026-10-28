@@ -248,9 +248,17 @@ def test_op_names() -> None:
         "rule.preview",
         "trigger",
         "notify.test",
+        "event.create",
+        "event.edit",
+        "event.delete",
+        "events.apply",
     }
     # They talk to the accounts or the push channels, or wait for a cycle that does.
     assert set(ops.ASYNC_OPS) == {
+        "event.create",
+        "event.edit",
+        "event.delete",
+        "events.apply",
         "account.remove",
         "calendars.refresh",
         "rule.preview",

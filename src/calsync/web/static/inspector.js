@@ -12,13 +12,14 @@ import { AccountForm, ConnectForm } from "/static/forms/account.js";
 import { SettingsForm } from "/static/forms/settings.js";
 import { EventForm } from "/static/forms/event.js";
 import { BlockedForm } from "/static/forms/blocked.js";
+import { EditForm } from "/static/forms/edit.js";
 
 /** A route with no form of its own (none today): an empty panel that can be closed. */
 function Placeholder({ onClose }) {
   return html`<${Head} title="" sub="" onClose=${onClose}/><div class="ib"></div>`;
 }
 
-const FORMS = { rule: RuleForm, calendar: CalendarForm, new: NewLineForm, account: AccountForm, connect: ConnectForm, settings: SettingsForm, event: EventForm, blocked: BlockedForm };
+const FORMS = { rule: RuleForm, calendar: CalendarForm, new: NewLineForm, account: AccountForm, connect: ConnectForm, settings: SettingsForm, event: EventForm, "event-edit": EditForm, "event-new": EditForm, blocked: BlockedForm };
 
 /** ``open``: the route opens an inspector. ``onCreated(rule)``: a new line was added.
  * ``onReplace(hash)``: this inspector becomes another, in the same history entry. A form gets

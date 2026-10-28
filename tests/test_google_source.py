@@ -552,3 +552,28 @@ async def test_state_from_different_params_forces_a_full_pull() -> None:
     pull = again.calendars["Family"]
     assert pull.full and sorted(e["id"] for e in pull.upserts) == ["e1", "e2"]
     assert again.state["events_params"] == EVENTS_PARAMS_ID
+
+
+def test_events_carry_what_writes_need() -> None:
+    fields = google_mod.EVENTS_LIST_PARAMS["fields"]
+    for name in ("etag", "created", "organizer(self)", "extendedProperties(private)"):
+        assert name in fields
+
+
+async def test_refresh_records_the_granted_scopes() -> None:
+    answers = [
+        {"access_token": "a", "expires_in": 1, "scope": "s.readonly s.events"},
+        {"access_token": "b", "expires_in": 1},  # no scope named: the last one known stays
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=answers.pop(0))
+
+    client = make_client(RequestLog(), transport=httpx.MockTransport(handler))
+    token = RefreshTokenProvider(client, client_id="c", client_secret="s", refresh_token="r")
+    assert token.scopes is None
+    await token()
+    assert token.scopes == frozenset({"s.readonly", "s.events"})
+    token.invalidate()
+    await token()
+    assert token.scopes == frozenset({"s.readonly", "s.events"})

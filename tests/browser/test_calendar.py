@@ -211,7 +211,9 @@ def test_a_pending_event_says_when_it_will_arrive(open_page: OpenPage, live: Liv
     expect(insp.locator('[data-key="deliveries"] .row[data-state="pending"]').first).to_contain_text(
         "等待送达 · 下次检查"
     )
-    expect(insp.locator(".ifoot")).to_contain_text("在 Google 日历里修改")
+    actions = insp.locator('.ifoot[data-role="actions"]')
+    expect(actions.get_by_role("link", name="修改")).to_be_visible()
+    expect(actions.get_by_role("button", name="删除")).to_be_visible()
 
 
 def test_an_unknown_event_says_it_is_gone(open_page: OpenPage) -> None:
