@@ -81,7 +81,9 @@ function valuesOf(ev) {
     const s = localParts(ev.start);
     const e = localParts(ev.end);
     date = s.date;
-    endDate = e.date;
+    // Ending the next day by less than a day: "次日" on the end time, no second date field.
+    const overnight = addDays(s.date, 1) === e.date && new Date(ev.end) - new Date(ev.start) < 86400_000;
+    endDate = overnight ? s.date : e.date;
     startTime = s.time;
     endTime = e.time;
   }
@@ -100,7 +102,8 @@ function newValues(start) {
   const e = new Date(s.getTime() + 3600_000);
   const a = localParts(s);
   const b = localParts(e);
-  return { title: "", allDay: false, date: a.date, endDate: b.date, startTime: a.time, endTime: b.time, location: "", alarmMode: "default", alarms: [] };
+  // An hour that runs past midnight shows as "次日", not as a second day.
+  return { title: "", allDay: false, date: a.date, endDate: a.date, startTime: a.time, endTime: b.time, location: "", alarmMode: "default", alarms: [] };
 }
 
 function instant(date, time) {
@@ -120,9 +123,20 @@ function times(v) {
   }
   if (!v.startTime || !v.endTime) return { error: t("Pick a start and an end") };
   const s = instant(v.date, v.startTime);
-  let e = instant(v.date, v.endTime);
-  if (e <= s) e = new Date(e.getTime() + 86400_000);
-  return { start: s.toISOString(), end: e.toISOString(), nextDay: ymd(e) !== ymd(s) };
+  const lastDay = v.endDate && v.endDate > v.date ? v.endDate : v.date;
+  let e = instant(lastDay, v.endTime);
+  if (e <= s) {
+    if (lastDay !== v.date) return { error: t("The end is before the start") };
+    e = new Date(e.getTime() + 86400_000); // an end earlier in the day: the next day
+  }
+  return { start: s.toISOString(), end: e.toISOString(), nextDay: lastDay === v.date && ymd(e) !== ymd(s) };
+}
+
+/** Whole days from date text ``a`` to ``b``. */
+function daysFrom(a, b) {
+  const [y1, m1, d1] = a.split("-").map(Number);
+  const [y2, m2, d2] = b.split("-").map(Number);
+  return Math.round((new Date(y2, m2 - 1, d2) - new Date(y1, m1 - 1, d1)) / 86400_000);
 }
 
 function sameTime(a, b) {
@@ -162,6 +176,7 @@ export function writeFailure(e) {
     case "auth":
       return t("The Google authorisation failed: connect the account again.");
     case "config":
+      if ((e.problems || []).some((p) => p.includes("set by its rule"))) return t("This series repeats on set days: only this time can move to another day.");
       return (e.problems && e.problems.length) ? t("calsync refused it: {why}", { why: e.problems[0] }) : failureText(e);
     default:
       return failureText(e);
@@ -179,6 +194,14 @@ export function writableCalendars(status) {
     }
   }
   return out;
+}
+
+/** 32 characters of Google's id alphabet (hex is part of it). crypto.getRandomValues works over
+ * plain HTTP too (randomUUID needs a secure context). */
+function eventId() {
+  const bytes = new Uint8Array(16);
+  window.crypto.getRandomValues(bytes);
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 const CAL_KEY = "calsync.newEventCalendar";
@@ -229,7 +252,14 @@ function Alarms({ value, onChange }) {
 
 function Fields({ value, onChange, disabled }) {
   const set = (key) => (e) => onChange({ ...value, [key]: e.currentTarget.value });
+  // A new first day moves the last day with it: the event keeps its length.
+  const setDate = (e) => {
+    const date = e.currentTarget.value;
+    const endDate = value.date && date && value.endDate ? addDays(value.endDate, daysFrom(value.date, date)) : date;
+    onChange({ ...value, date, endDate });
+  };
   const when = times(value);
+  const multiDay = Boolean(value.endDate && value.date && value.endDate > value.date);
   return html`<fieldset class="ef-set" disabled=${disabled}>
     <div class="fs" data-key="title">
       <${Field} id="ev-title" label=${t("Title")}>
@@ -241,12 +271,13 @@ function Fields({ value, onChange, disabled }) {
         options=${[["timed", t("At a time")], ["day", t("All day")]]}/>
       ${value.allDay
         ? html`<div class="ef-row">
-            <${Field} id="ev-date" label=${t("First day")}><input class="field" id="ev-date" type="date" value=${value.date} onInput=${set("date")}/></${Field}>
+            <${Field} id="ev-date" label=${t("First day")}><input class="field" id="ev-date" type="date" value=${value.date} onInput=${setDate}/></${Field}>
             <${Field} id="ev-end-date" label=${t("Last day")}><input class="field" id="ev-end-date" type="date" value=${value.endDate} onInput=${set("endDate")}/></${Field}>
           </div>`
         : html`<div class="ef-row">
-            <${Field} id="ev-date" label=${t("Date")}><input class="field" id="ev-date" type="date" value=${value.date} onInput=${set("date")}/></${Field}>
+            <${Field} id="ev-date" label=${multiDay ? t("First day") : t("Date")}><input class="field" id="ev-date" type="date" value=${value.date} onInput=${setDate}/></${Field}>
             <${Field} id="ev-start" label=${t("Starts")}><input class="field" id="ev-start" type="time" step="300" value=${value.startTime} onInput=${set("startTime")}/></${Field}>
+            ${multiDay ? html`<${Field} id="ev-end-date" label=${t("Last day")}><input class="field" id="ev-end-date" type="date" value=${value.endDate} onInput=${set("endDate")}/></${Field}>` : null}
             <${Field} id="ev-end" label=${t("Ends")} hint=${when.nextDay ? t("the next day") : null}>
               <input class="field" id="ev-end" type="time" step="300" value=${value.endTime} onInput=${set("endTime")}/></${Field}>
           </div>`}
@@ -290,6 +321,9 @@ export function EditForm({ route, onClose, onReplace, active = true }) {
   const [note, setNote] = useState(null); // {text, bad, reload}
   const [human, setHuman] = useState(null);
   const calendars = useMemo(() => writableCalendars(status), [status]);
+  // The new event's Google id, chosen once per form: saving again after a lost answer finds the
+  // event already made instead of making a second one.
+  const sourceId = useMemo(() => eventId(), []);
   const [calendar, setCalendar] = useState(() => (creating ? rememberedCalendar() : null));
   const reads = useRef(0);
 
@@ -310,7 +344,7 @@ export function EditForm({ route, onClose, onReplace, active = true }) {
   }, [creating, route.event]);
   useEffect(() => {
     if (active) load();
-  }, [load]);
+  }, [load, active]);
 
   // 重新读取: Google changed meanwhile, so sync its calendar first (calsync reads Google there),
   // then read the event again; the form starts over from it.
@@ -360,7 +394,7 @@ export function EditForm({ route, onClose, onReplace, active = true }) {
       let result;
       if (creating) {
         rememberCalendar(`${chosen.account}:${chosen.id}`);
-        result = await op("event.create", { account: chosen.account, calendar: chosen.id, ...argsOf(value, null), wait: true });
+        result = await op("event.create", { account: chosen.account, calendar: chosen.id, source_id: sourceId, ...argsOf(value, null), wait: true });
       } else {
         const expect = recurring && scope === "series" ? ev.series_updated : ev.updated;
         result = await op("event.edit", { id: ev.id, ...(recurring ? { scope } : {}), ...(expect ? { expect_updated: expect } : {}), ...changes, wait: true });

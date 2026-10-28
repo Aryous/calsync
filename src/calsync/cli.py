@@ -1049,13 +1049,13 @@ async def _auth(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
         out.write(f"verification failed, credentials not stored (existing ones unchanged): {exc}\n")
         return exit_code_for(exc)
     write_secret(account.credential, secret)
-    from calsync.sources.google_write import WRITE_SCOPE
+    from calsync.sources.google_write import WRITE_SCOPES
 
     access = ""
     if google and scopes is not None:
-        access = " (read and write)" if WRITE_SCOPE in scopes else " (read only)"
+        access = " (read and write)" if scopes & WRITE_SCOPES else " (read only)"
     out.write(f"ok: credentials stored{access}, {len(found)} calendars visible\n")
-    if google and args.write and scopes is not None and WRITE_SCOPE not in scopes:
+    if google and args.write and scopes is not None and not scopes & WRITE_SCOPES:
         out.write(
             "write access was not granted: on Google's page, tick the box for changing events, "
             f"then run `calsync auth {args.account} --write` again\n"

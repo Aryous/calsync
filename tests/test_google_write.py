@@ -333,3 +333,36 @@ async def test_a_failing_call_is_only_its_own_reply() -> None:
     assert replies[0].ok and not replies[1].ok and replies[1].reason() == "conditionNotMet"
     assert replies[2].gone
     assert fake.event(CAL, "e1")["summary"] == "ok"
+
+
+async def test_an_insert_resent_after_a_lost_answer_makes_one_event() -> None:
+    fake = seeded()
+    lost = {"done": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        response = fake.handler(request)
+        if request.method == "POST" and not lost["done"]:
+            lost["done"] = True  # Google made it; the answer never arrives
+            raise httpx.ReadTimeout("lost", request=request)
+        return response
+
+    client = make_client(RequestLog(), transport=httpx.MockTransport(handler))
+    made = await GoogleWriter(client, StaticToken("t"), base_url=BASE_URL).insert(
+        CAL, {"summary": "Once", "start": {"date": "2026-11-01"}, "end": {"date": "2026-11-02"}}
+    )
+    assert made["summary"] == "Once"
+    assert [e["summary"] for e in fake.events(CAL)].count("Once") == 1
+
+
+async def test_a_batch_insert_whose_id_exists_counts_as_made() -> None:
+    fake = seeded()
+    w = writer(fake)
+    body = {
+        "id": "abcdef12345",
+        "summary": "x",
+        "start": {"date": "2026-11-01"},
+        "end": {"date": "2026-11-02"},
+    }
+    first = await w.batch([BatchCall("POST", CAL, body=body)])
+    again = await w.batch([BatchCall("POST", CAL, body=body)])
+    assert first[0].ok and again[0].exists

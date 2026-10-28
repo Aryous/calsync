@@ -288,3 +288,94 @@ async def test_create_refuses_bad_fields(live: Live) -> None:
             },
         )
     assert live.world.fake.writes == []
+
+
+# ----- review fixes: moving a whole series ---------------------------------------------------------
+
+
+def _target_at(start: str, zone: str) -> Any:
+    from datetime import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    from calsync.event_ops import Target
+    from calsync.events_view import Located
+    from calsync.model import Instance, When
+
+    at = dt.fromisoformat(start).astimezone(ZoneInfo(zone))
+    inst = Instance(When(at, zone), When(at, zone), "x", "", (), True)
+    located = Located("me", "cal", "cal", "Cal", "s1", inst, start, zone, ("family",))
+    return Target(located, "owner", None, None, "x")
+
+
+def _moved(start: str, end: str, zone: str) -> Any:
+    from datetime import datetime as dt
+    from zoneinfo import ZoneInfo
+
+    from calsync.model import When
+    from calsync.sources.google_write import EventFields
+
+    z = ZoneInfo(zone)
+    return EventFields(
+        start=When(dt.fromisoformat(start).astimezone(z), zone),
+        end=When(dt.fromisoformat(end).astimezone(z), zone),
+    )
+
+
+def test_a_series_moved_across_a_dst_change_keeps_its_hour() -> None:
+    from calsync.event_ops import _series_shift  # pyright: ignore[reportPrivateUsage]
+
+    zone = "Europe/Berlin"
+    live = {
+        "start": {"dateTime": "2026-07-01T09:00:00+02:00", "timeZone": zone},
+        "recurrence": ["RRULE:FREQ=DAILY"],
+    }
+    # The Saturday occurrence (summer time) dragged to Sunday 09:00, the day winter time begins.
+    target = _target_at("2026-10-24T09:00:00+02:00", zone)
+    out = _series_shift(
+        _moved("2026-10-25T09:00:00+01:00", "2026-10-25T09:30:00+01:00", zone), target, live, zone
+    )
+    assert out.start is not None and out.end is not None
+    assert out.start.value.isoformat() == "2026-07-02T09:00:00+02:00"  # one day later, still 09:00
+    assert out.end.value.isoformat() == "2026-07-02T09:30:00+02:00"
+    # An hour later on the same day: every occurrence an hour later.
+    out = _series_shift(
+        _moved("2026-10-24T10:00:00+02:00", "2026-10-24T10:30:00+02:00", zone), target, live, zone
+    )
+    assert out.start is not None and out.start.value.isoformat() == "2026-07-01T10:00:00+02:00"
+
+
+def test_a_series_whose_rule_fixes_its_days_moves_in_time_only() -> None:
+    from calsync.errors import ConfigError
+    from calsync.event_ops import _series_shift  # pyright: ignore[reportPrivateUsage]
+
+    zone = "Asia/Shanghai"
+    live = {
+        "start": {"dateTime": "2026-10-05T09:30:00+08:00", "timeZone": zone},
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+    }
+    target = _target_at("2026-10-26T09:30:00+08:00", zone)
+    with pytest.raises(ConfigError, match="set by its rule"):
+        _series_shift(
+            _moved("2026-10-27T09:30:00+08:00", "2026-10-27T10:30:00+08:00", zone), target, live, zone
+        )
+    out = _series_shift(
+        _moved("2026-10-26T11:00:00+08:00", "2026-10-26T12:00:00+08:00", zone), target, live, zone
+    )
+    assert out.start is not None and out.start.value.isoformat() == "2026-10-05T11:00:00+08:00"
+
+
+async def test_create_takes_the_callers_id_and_a_second_save_finds_the_event(live: Live) -> None:
+    args = {
+        "account": "me",
+        "calendar": "Family",
+        "title": "Dentist",
+        "start": "2026-10-27T10:00",
+        "end": "2026-10-27T10:30",
+        "source_id": "abc0123456789",
+    }
+    first = await live.op("event.create", args)
+    again = await live.op("event.create", args)  # the answer to the first was lost: saved again
+    assert first.data["event"]["source_id"] == again.data["event"]["source_id"] == "abc0123456789"
+    assert [e["summary"] for e in live.world.fake.events(GCAL)].count("Dentist") == 1
+    with pytest.raises(Exception, match="source_id"):
+        await live.op("event.create", {**args, "source_id": "UPPER-case"})

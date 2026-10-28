@@ -384,8 +384,12 @@ function stampOf(status) {
 }
 
 /** After a drag of a repeating event: only this time, or every time? */
+const RULE_DAYS = /\bBY(DAY|MONTHDAY|YEARDAY|WEEKNO|MONTH|SETPOS)=/i;
+
 function MoveSheet({ ask, onPick, onCancel }) {
   const first = useRef(null);
+  // A rule that fixes the days (every Monday) keeps the series there: only this time can move.
+  const fixedDays = ymd(ask.start) !== ymd(ask.ev.s) && (ask.ev.repeats || []).some((line) => RULE_DAYS.test(line));
   useEffect(() => {
     if (first.current) first.current.focus();
     const key = (e) => {
@@ -399,9 +403,10 @@ function MoveSheet({ ask, onPick, onCancel }) {
   }, []);
   return html`<div class="move-sheet" role="dialog" aria-modal="false" aria-labelledby="move-title" data-role="move-scope">
     <p id="move-title"><b>${t("This is a repeating event")}</b><span class="num">${ask.ev.title} → ${dayLabelOf(ask.start)} ${ask.ev.all_day ? "" : clockTime(ask.start)}</span></p>
+    ${fixedDays ? html`<p class="hp" data-role="fixed-days">${t("This series repeats on set days: only this time can move to another day.")}</p>` : null}
     <div class="move-acts">
       <button class="btn" type="button" ref=${first} onClick=${() => onPick("this")}>${t("Only this one")}</button>
-      <button class="btn" type="button" onClick=${() => onPick("series")}>${t("The whole series")}</button>
+      <button class="btn" type="button" disabled=${fixedDays} onClick=${() => onPick("series")}>${t("The whole series")}</button>
       <button class="btn quiet" type="button" onClick=${onCancel}>${t("Cancel")}</button>
     </div>
   </div>`;

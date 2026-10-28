@@ -254,6 +254,8 @@ class FakeGoogle:
             body = json.loads(content or b"{}")
             self._new += 1
             body["id"] = body.get("id") or f"new{self._new}"
+            if body["id"] in cal.events:
+                return self._err(409, "duplicate")
             body.setdefault("status", "confirmed")
             body.setdefault("organizer", {"self": True})
             body["created"] = (_EPOCH + timedelta(seconds=self._seq + 1)).isoformat().replace("+00:00", "Z")

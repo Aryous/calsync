@@ -437,7 +437,7 @@ class _Endpoints:
             except NotFoundError:
                 raise ApiError(404, "not_found", "Google has no such event (any more).") from None
             except AuthError as exc:  # the grant itself failed (revoked, expired)
-                account = args.get("account") if isinstance(args.get("account"), str) else None
+                account = _account_of(args)
                 extra = {
                     "needs_human": True,
                     "command": f"calsync auth {account}" if account else "calsync auth",
@@ -450,6 +450,20 @@ class _Endpoints:
             return JSONResponse(result.to_json())
 
         return endpoint
+
+
+def _account_of(args: Mapping[str, Any]) -> str | None:
+    """The account an event write names: ``account``, or the one its event ``id`` belongs to."""
+    if isinstance(args.get("account"), str):
+        return args["account"]
+    eid = args.get("id")
+    if not isinstance(eid, str):
+        return None
+    try:
+        key = events_view._decode(eid)  # pyright: ignore[reportPrivateUsage]
+    except events_view.NotFound:
+        return None
+    return key.split("/", 1)[0] or None
 
 
 def _terminal_only(name: str, args: Mapping[str, Any]) -> dict[str, str] | None:

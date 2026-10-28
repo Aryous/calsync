@@ -43,8 +43,11 @@ function shiftDays(d, n) {
  * saved): {id, mode, start, end, day, saving}; ``wasDrag()`` tells a click that ended a drag. */
 export function useDrag({ hour, onDrop }) {
   const [ghost, setGhost] = useState(null);
+  const ghostRef = useRef(null);
+  ghostRef.current = ghost;
   const press = useRef(null); // {ev, mode, x, y, day, pointerId, type, timer, active}
   const dragged = useRef(false);
+  const swallow = useRef(null); // the pointer of a drag Escape cancelled: its release is no click
   const hourRef = useRef(hour);
   hourRef.current = hour;
   const dropRef = useRef(onDrop);
@@ -87,6 +90,12 @@ export function useDrag({ hour, onDrop }) {
     };
     const up = (e) => {
       const p = press.current;
+      if (!p && swallow.current === e.pointerId) {
+        swallow.current = null;
+        dragged.current = true;
+        window.setTimeout(() => (dragged.current = false), 0);
+        return;
+      }
       if (!p || e.pointerId !== p.pointerId) return;
       press.current = null;
       window.clearTimeout(p.timer);
@@ -111,6 +120,7 @@ export function useDrag({ hour, onDrop }) {
     const key = (e) => {
       if (e.key === "Escape" && press.current && press.current.active) {
         e.preventDefault();
+        swallow.current = press.current.pointerId;
         cancel();
       }
     };
@@ -134,7 +144,8 @@ export function useDrag({ hour, onDrop }) {
 
   const bind = (ev, mode) => ({
     onPointerDown: (e) => {
-      if (e.button !== 0 || press.current) return;
+      // One move at a time: not while another is being saved.
+      if (e.button !== 0 || press.current || (ghostRef.current && ghostRef.current.saving)) return;
       if (mode === "resize") e.stopPropagation();
       const p = { ev, mode, x: e.clientX, y: e.clientY, day: dayOf(e.currentTarget), pointerId: e.pointerId, type: e.pointerType, timer: 0, active: false };
       if (!p.day) return;

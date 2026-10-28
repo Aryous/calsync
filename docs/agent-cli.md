@@ -230,7 +230,7 @@ answers with it in `data.cycle`, shaped like `trigger`'s `data`).
 
 | Command | What it does |
 | --- | --- |
-| `calsync event new --account A --calendar C --title T --start S --end E [--all-day] [--location L] [--description D] [--alarms X] [--repeat RRULE…] [--key K]` | one new event |
+| `calsync event new --account A --calendar C --title T --start S --end E [--all-day] [--location L] [--description D] [--alarms X] [--repeat RRULE…] [--key K]` | one new event (not idempotent: for writes you may repeat, use `event apply` with keys) |
 | `calsync event edit ID [--this \| --series] [--expect ETAG \| --expect-updated TIME] [fields…]` | change one event, one occurrence or the whole series |
 | `calsync event delete ID [--this \| --series] [--expect… ]` | delete it |
 | `calsync event apply FILE\|- [--account A] [--calendar C] [--prune-prefix P]` | many writes in batches of 50, idempotent |
@@ -246,8 +246,10 @@ All take `--json`, `--dry-run` (reads Google, writes nothing) and `--wait`.
   them (`-10m,0m`). At most 5, at most four weeks before.
 - **Repeating events.** An `ID` from `events --json` names one occurrence.
   `--this` changes or deletes only it; `--series` all of them (a new time for
-  the occurrence moves the whole series by the same offset). One of the two
-  is required for a repeating event. "This and following" is not offered.
+  the occurrence moves the whole series by the same offset, on the wall clock
+  of the event's zone). One of the two is required for a repeating event. A
+  series whose rule fixes its days (`BYDAY=MO`, …) can move in time but not
+  to another day (exit 2). "This and following" is not offered.
 - **Conflicts.** Pass what you read: `--expect-updated` with the event's
   `updated` (for `--series`, its `series_updated`) or `--expect` with an
   etag. If the event changed in Google since, nothing is written: exit 1,
@@ -269,8 +271,16 @@ The file is a list of items, or `{"account", "calendar", "events": [...],
 - by `"key"`: your own identity for it (stored in the event's private
   extended properties). calsync creates it if no event has the key, updates
   it if a field differs, else leaves it (`unchanged`);
-- or by `"id"`: an existing single event or whole series from `events
-  --json` (update or delete only).
+- or by `"id"`: an existing event from `events --json` (update or delete
+  only). The id of one occurrence of a repeating event needs `"scope":
+  "series"` and then names the whole series (no new times for a series here:
+  use `event edit --series`); one occurrence alone is `event edit` / `event
+  delete --this`. `"expect_updated"` (the `updated` you read) makes the item
+  fail with `"conflict"` if the event changed since.
+
+Items naming an invitation fail with `"invitation"`. New events get an id of
+calsync's choosing, so a batch resent after a lost answer does not make them
+twice.
 
 `"delete": true` deletes (an absent key is `absent`, not an error).
 `prune_prefix` also deletes the keyed events whose key starts with it and
@@ -303,8 +313,8 @@ calsync has no duplicates command; compose one from the commands above.
    `delivered`, else the oldest `created`.
 4. **Show the groups to the person and get their yes.**
 5. Delete the rest in one call: `event apply` with `{"id": …, "delete":
-   true}` items (an occurrence's id with no `scope` deletes the whole series:
-   only do that for a duplicated series).
+   true, "expect_updated": …}` items (for a duplicated repeating series, its
+   occurrence's id with `"scope": "series"`).
 6. If more than 10 copies go, the rule is blocked: `calsync blocked --json`
    shows the set; it should be exactly the duplicates' copies. Then
    `calsync approve <rule>` (or ask the person to press 放行 in the web UI).

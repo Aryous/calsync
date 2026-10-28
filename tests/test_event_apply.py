@@ -152,3 +152,72 @@ async def test_repeating_items(live: Live) -> None:
     assert keyed(live)["plan-a/000"]["recurrence"] == ["RRULE:FREQ=DAILY;COUNT=14"]
     again = await apply(live, [item])
     assert again.data["counts"]["unchanged"] == 1
+
+
+async def test_invitations_are_refused_per_item(live: Live) -> None:
+    from tests.factories import google_event
+
+    fake = live.world.fake
+    fake.put_event(
+        GCAL,
+        google_event(
+            "inv",
+            "Invite",
+            "2026-10-25T15:00:00+08:00",
+            "2026-10-25T16:00:00+08:00",
+            organizer={"email": "x@example.com"},
+        ),
+    )
+    await live.cycle()
+    result = await apply(live, [{"id": live.event_id("Invite"), "delete": True}])
+    assert (
+        result.data["items"][0]["reason"] == "invitation" and fake.event(GCAL, "inv")["status"] == "confirmed"
+    )
+
+
+async def test_an_occurrence_id_needs_scope_series_and_no_new_times(live: Live) -> None:
+    drops = live.event_id("Reminder")
+    bare = await apply(live, [{"id": drops, "title": "x"}])
+    assert bare.data["items"][0]["status"] == "failed" and "scope" in bare.data["items"][0]["reason"]
+    timed = await apply(
+        live, [{"id": drops, "scope": "series", "start": "2026-10-25T10:00", "end": "2026-10-25T10:05"}]
+    )
+    assert "event edit --series" in timed.data["items"][0]["reason"]
+    assert live.world.fake.event(GCAL, "drops")["start"]["dateTime"] == "2026-10-24T08:00:00+08:00"
+    renamed = await apply(live, [{"id": drops, "scope": "series", "title": "Eye drops"}])
+    assert (
+        renamed.data["counts"]["update"] == 1
+        and live.world.fake.event(GCAL, "drops")["summary"] == "Eye drops"
+    )
+
+
+async def test_expect_updated_per_item(live: Live) -> None:
+    lunch = live.world.fake.event(GCAL, "lunch")
+    live.world.fake.touch(GCAL, "lunch", location="Elsewhere")
+    result = await apply(
+        live, [{"id": live.event_id("Lunch"), "delete": True, "expect_updated": lunch["updated"]}]
+    )
+    assert (
+        result.data["items"][0]["reason"] == "conflict"
+        and live.world.fake.event(GCAL, "lunch")["status"] == "confirmed"
+    )
+
+
+async def test_a_moved_occurrence_of_a_keyed_series_does_not_stand_for_it(live: Live) -> None:
+    item = {**reminder(0), "repeat": ["RRULE:FREQ=DAILY;COUNT=5"]}
+    await apply(live, [item], wait=True)
+    master = keyed(live)["plan-a/000"]
+    # A person moved one occurrence in Google: the exception carries the series' properties.
+    exception = {
+        **{k: v for k, v in master.items() if k not in ("recurrence", "etag", "updated")},
+        "id": f"{master['id']}_20261102T000000Z",
+        "recurringEventId": master["id"],
+        "originalStartTime": {"dateTime": "2026-11-02T08:00:00+08:00"},
+        "start": {"dateTime": "2026-11-02T09:00:00+08:00", "timeZone": "Asia/Shanghai"},
+        "end": {"dateTime": "2026-11-02T09:05:00+08:00", "timeZone": "Asia/Shanghai"},
+    }
+    live.world.fake.put_event(GCAL, exception)
+    await live.cycle()
+    renamed = await apply(live, [{**item, "title": "Reminder (renamed)"}])
+    assert [i["source_id"] for i in renamed.data["items"]] == [master["id"]]
+    assert live.world.fake.event(GCAL, master["id"])["summary"] == "Reminder (renamed)"

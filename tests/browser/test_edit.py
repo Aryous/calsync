@@ -156,3 +156,31 @@ def test_the_form_fits_the_phone(open_page: OpenPage, fresh_live: LiveDaemon) ->
         if target.is_visible():
             box = target.bounding_box()
             assert box is not None and box["height"] >= 44, target.evaluate("e => e.outerHTML")
+
+
+def test_a_long_timed_event_keeps_its_last_day(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
+    fake = fresh_live.world.google["personal"]
+    trip = google_event(
+        "trip", "出差", "2026-10-28T10:00:00+08:00", "2026-10-30T12:00:00+08:00", tz="Asia/Shanghai"
+    )
+    fresh_live.in_loop(lambda: fake.put_event(FAMILY, trip))
+    fresh_live.trigger("family-home")
+    page, _ = open_detail(open_page, fresh_live, "出差", "2026-10-28")
+    insp(page).locator('[data-role="edit-event"]').click()
+    form = insp(page)
+    expect(form.locator("#ev-end-date")).to_have_value("2026-10-30")
+    form.locator("#ev-start").fill("11:00")
+    form.locator('[data-role="save"]').click()
+    expect(insp(page).locator("#insp-title")).to_have_text("出差")
+    stored = google(fresh_live, "trip")
+    assert stored["start"]["dateTime"] == "2026-10-28T11:00:00+08:00"
+    assert stored["end"]["dateTime"] == "2026-10-30T12:00:00+08:00"
+
+
+def test_a_new_first_day_moves_the_last_day_with_it(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
+    page, _ = open_detail(open_page, fresh_live, "交物业费", "2026-10-29")
+    insp(page).locator('[data-role="edit-event"]').click()
+    form = insp(page)
+    expect(form.locator("#ev-end-date")).to_have_value("2026-10-29")
+    form.locator("#ev-date").fill("2026-10-31")
+    expect(form.locator("#ev-end-date")).to_have_value("2026-10-31")

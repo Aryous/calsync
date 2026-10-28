@@ -12,6 +12,7 @@ request; the replies come back in request order, each with its own status.
 import json
 import re
 import secrets
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -30,6 +31,8 @@ from calsync.sources.google_map import parse_when
 
 READ_SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
 WRITE_SCOPE = "https://www.googleapis.com/auth/calendar.events"
+# Scopes that may change events: calsync asks for the first; the full calendar scope also does.
+WRITE_SCOPES = frozenset({WRITE_SCOPE, "https://www.googleapis.com/auth/calendar"})
 BATCH_URL = "https://www.googleapis.com/batch/calendar/v3"
 BATCH_SIZE = 50
 KEY_PROPERTY = "calsync_key"  # extendedProperties.private: an agent's identity for an event
@@ -215,6 +218,24 @@ def as_when(value: datetime | date, tzid: str | None) -> When:
     return When(value)
 
 
+_EVENT_ID = re.compile(r"^[a-v0-9]{5,1024}$")
+
+
+def new_event_id() -> str:
+    """An event id for an insert: Google's alphabet (base32hex: a-v, 0-9), 32 characters."""
+    return uuid.uuid4().hex  # hex is a subset of base32hex
+
+
+def valid_event_id(text: str) -> bool:
+    return bool(_EVENT_ID.match(text))
+
+
+def with_event_id(body: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(body)
+    out.setdefault("id", new_event_id())
+    return out
+
+
 # ----- the client --------------------------------------------------------------------------------
 
 
@@ -240,6 +261,11 @@ class BatchReply:
     def gone(self) -> bool:
         """No such event (a delete of it has nothing left to do)."""
         return self.status in (404, 410)
+
+    @property
+    def exists(self) -> bool:
+        """An insert whose id is taken: made by an earlier attempt of the same insert."""
+        return self.status == 409
 
     def reason(self) -> str:
         error = self.body.get("error") if isinstance(self.body, dict) else None
@@ -366,10 +392,16 @@ class GoogleWriter:
         return items[0]
 
     async def insert(self, calendar_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Create the event. Its ``id`` is calsync's choice (``new_event_id``) unless ``body``
+        names one: a retry after a lost answer finds the event made (Google answers 409) instead
+        of making a second one."""
+        body = with_event_id(body)
         path = self._path(calendar_id)
         response = await self._send(
-            "POST", path, "google-event-insert", params={"sendUpdates": "none"}, json=dict(body)
+            "POST", path, "google-event-insert", params={"sendUpdates": "none"}, json=body
         )
+        if response.status_code == 409:  # made by an earlier attempt of this very insert
+            return await self.get(calendar_id, body["id"])
         _check(response, path)
         return _json(response, path)
 

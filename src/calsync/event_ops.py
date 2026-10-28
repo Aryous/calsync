@@ -18,6 +18,7 @@ in line (each successful write requests that cycle). Rules of the house:
 
 import asyncio
 import contextlib
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -40,13 +41,19 @@ from calsync.sources.google_write import (
     check_fields,
     field_changes,
     from_resource,
+    new_event_id,
     to_resource,
+    valid_event_id,
 )
 from calsync.store import WriteRecord
 from calsync.wiring import state_paths
 
 WRITE_TIMEOUT = 60.0  # seconds: one operation's requests to Google, all together
 READ_ONLY_ROLES = frozenset({"reader", "freeBusyReader"})
+SERIES_DAYS = (
+    "the days of this repeating event are set by its rule: move only this occurrence, "
+    "or change the rule in Google Calendar"
+)
 WRITE_REASON = "a person allows calsync to change events in Google (one consent page)"
 FIELD_ARGS = {"title", "start", "end", "all_day", "location", "description", "alarms"}
 
@@ -440,7 +447,7 @@ def _calendar_for(
 async def event_create(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
     """A new event in a Google calendar. ``data.event_id``: calsync's id for it."""
     op = "event.create"
-    a = _Args(op, args, {"account", "calendar", "tz", "wait", "repeat", "key", *FIELD_ARGS})
+    a = _Args(op, args, {"account", "calendar", "tz", "wait", "repeat", "key", "source_id", *FIELD_ARGS})
     config = _config_now(ctx)
     account = a.text("account")
     if account not in config.accounts or config.accounts[account].provider != "google":
@@ -457,6 +464,11 @@ async def event_create(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> O
             )
         tz = "UTC"
     fields = parse_fields(op, a, args, tz=tz, insert=True)
+    # The Google id: the caller's (the web UI keeps one per form, so saving again after a lost
+    # answer finds the event made) or calsync's own.
+    source_id = a.opt_text("source_id") or new_event_id()
+    if not valid_event_id(source_id):
+        raise ConfigError([f'{op}: "source_id": 5 to 1024 characters, a-v and 0-9'])
     rules = syncing_rules(ctx, config, account, cid)
     data: dict[str, Any] = {
         "account": account,
@@ -474,7 +486,10 @@ async def event_create(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> O
         )
     try:
         made = await with_writer(
-            ctx, config, account, lambda w: w.insert(cid, to_resource(fields, patch=False))
+            ctx,
+            config,
+            account,
+            lambda w: w.insert(cid, {**to_resource(fields, patch=False), "id": source_id}),
         )
     except NoWriteAccess:
         return no_write_access(op, account)
@@ -533,29 +548,46 @@ def _instant(text: Any) -> datetime | str | None:
         return text
 
 
+_RULE_DAYS = re.compile(r"\bBY(DAY|MONTHDAY|YEARDAY|WEEKNO|MONTH|SETPOS)=", re.IGNORECASE)
+
+
 def _series_shift(fields: EventFields, target: Target, live: Mapping[str, Any], tz: str) -> EventFields:
     """A new time for one occurrence, applied to the whole series: the series' own start moves by
-    the same offset, the length follows the occurrence's new length."""
+    the same number of days and the same change of the clock, on the wall clock of the event's
+    zone (so a move across a DST change keeps every occurrence at its hour); the length follows
+    the occurrence's new length. A series whose rule fixes its days (BYDAY=MO, …) cannot move to
+    another day this way: the rule would keep the old days."""
     if fields.start is None or fields.end is None:
         return fields
     old = target.located.instance.start
     if fields.start.all_day != old.all_day:
         raise ConfigError(["a whole series cannot switch between all day and timed; change one occurrence"])
     master_start = parse_when(live["start"], tz)
-    length = fields.end.utc() - fields.start.utc() if not fields.start.all_day else None
+    rule_days = any(_RULE_DAYS.search(line) for line in live.get("recurrence") or [])
     if fields.start.all_day:
         first = _as_date(fields.start.value)
         days = first - _as_date(old.value)
+        if days and rule_days:
+            raise ConfigError([SERIES_DAYS])
         span = _as_date(fields.end.value) - first
         moved_day = _as_date(master_start.value) + days
         new_start, new_end = When(moved_day), When(moved_day + span)
     else:
-        assert length is not None and isinstance(master_start.value, datetime)
-        shift = fields.start.utc() - old.utc()
+        assert isinstance(master_start.value, datetime)
+        assert isinstance(fields.start.value, datetime) and isinstance(old.value, datetime)
         zone = master_start.tzid or tz
-        moved = (master_start.value + shift).astimezone(_zone(zone))
+        z = _zone(zone)
+        was = old.value.astimezone(z)
+        now = fields.start.value.astimezone(z)
+        days = now.date() - was.date()
+        if days and rule_days:
+            raise ConfigError([SERIES_DAYS])
+        clock = datetime.combine(date.min, now.time()) - datetime.combine(date.min, was.time())
+        master = master_start.value.astimezone(z).replace(tzinfo=None)
+        moved = (master + days + clock).replace(tzinfo=z)  # wall clock in the zone, then aware
+        length = fields.end.utc() - fields.start.utc()
         new_start = When(moved, zone)
-        new_end = When((moved + length).astimezone(_zone(zone)), zone)
+        new_end = When((moved + length).astimezone(z), zone)
     return EventFields(
         title=fields.title,
         start=new_start,
@@ -694,7 +726,7 @@ async def event_delete(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> O
 # ----- a batch ---------------------------------------------------------------------------------------
 
 MAX_ITEMS = 2000  # items in one events.apply call
-ITEM_ARGS = {"key", "id", "delete", "repeat", *FIELD_ARGS}
+ITEM_ARGS = {"key", "id", "scope", "expect_updated", "delete", "repeat", *FIELD_ARGS}
 
 
 @dataclass(slots=True)
@@ -710,6 +742,8 @@ class _Item:
     status: str = "planned"  # planned | ok | failed
     reason: str | None = None
     changes: list[dict[str, Any]] | None = None
+    scope: str | None = None  # an occurrence's id: "series" names its whole series
+    expect_updated: str | None = None  # the version the caller read
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {"index": self.index, "action": self.action, "status": self.status}
@@ -752,16 +786,23 @@ def _items(op: str, raw: Any, tz: str) -> list[_Item]:
                 if eid in ids:
                     raise ConfigError([f"{where}: the same id appears twice"])
                 ids.add(eid)
+            scope = a.opt_text("scope")
+            if scope is not None and (eid is None or scope != "series"):
+                raise ConfigError([f'{where}: "scope" is only "series", with an "id"'])
             if delete:
-                if set(entry) - {"key", "id", "delete"}:
-                    raise ConfigError([f"{where}: a delete takes only its key or id"])
+                if set(entry) - {"key", "id", "delete", "scope", "expect_updated"}:
+                    raise ConfigError(
+                        [f"{where}: a delete takes only its key or id (and scope, expect_updated)"]
+                    )
                 fields = EventFields()
             else:
                 insert = key is not None
                 fields = parse_fields(where, a, entry, tz=tz, insert=insert)
                 if key is not None:
                     fields = EventFields(**{**_as_dict(fields), "key": key})
-            items.append(_Item(index, key, eid, delete, fields))
+            item = _Item(index, key, eid, delete, fields)
+            item.scope, item.expect_updated = scope, a.opt_text("expect_updated")
+            items.append(item)
         except ConfigError as exc:
             problems.extend(exc.problems)
     if problems:
@@ -808,18 +849,28 @@ def _plan(
     """Each item's action against ``live``; with ``prune``, deletes for the keyed events not named."""
     from calsync.sources.google_write import event_key
 
-    by_key = {k: raw for raw in live.values() if (k := event_key(raw))}
+    # Keys name single events and whole series: a moved occurrence of a keyed series carries the
+    # series' properties too, and must not stand for it.
+    by_key = {k: raw for raw in live.values() if not raw.get("recurringEventId") and (k := event_key(raw))}
     for item in items:
+        wanted = "delete" if item.delete else "update"
+        raw: dict[str, Any] | None
         if item.key is not None:
             raw = by_key.get(item.key)
         else:
-            raw = _by_calsync_id(item, live, account, cid)
+            raw, why = _by_calsync_id(item, live, account, cid)
             if raw is None:
-                item.action, item.status, item.reason = (
-                    ("delete" if item.delete else "update"),
-                    "failed",
-                    "no such event",
-                )
+                item.action, item.status, item.reason = wanted, "failed", why
+                continue
+        if raw is not None:
+            organizer = raw.get("organizer")
+            if isinstance(organizer, dict) and organizer and not organizer.get("self"):
+                item.action, item.status, item.reason = wanted, "failed", "invitation"
+                continue
+            if item.expect_updated is not None and _instant(item.expect_updated) != _instant(
+                raw.get("updated")
+            ):
+                item.action, item.status, item.reason = wanted, "failed", "conflict"
                 continue
         if item.delete:
             if raw is None:
@@ -849,24 +900,34 @@ def _plan(
 
 def _by_calsync_id(
     item: _Item, live: Mapping[str, dict[str, Any]], account: str, cid: str
-) -> dict[str, Any] | None:
-    """The live event (a single event or a whole series) a calsync id names in this calendar."""
+) -> tuple[dict[str, Any] | None, str]:
+    """The live event a calsync id names in this calendar: a single event, or (``scope:
+    "series"``, not with new times) the whole series of an occurrence. None and why otherwise."""
     import base64
 
     assert item.id is not None
     try:
         text = base64.urlsafe_b64decode(item.id + "=" * (-len(item.id) % 4)).decode()
     except (ValueError, UnicodeDecodeError):
-        return None
+        return None, "no such event"
     prefix = f"{account}/{cid}/"
     if not text.startswith(prefix):
-        return None
+        return None, "no such event"
     rest = text[len(prefix) :]
     if rest in live:
-        return live[rest]
-    series = rest.split("@", 1)[0]
-    raw = live.get(series)
-    return raw if raw is not None and raw.get("recurrence") else None
+        return live[rest], ""
+    series_id, sep, _ = rest.partition("@")
+    raw = live.get(series_id)
+    if not sep or raw is None or not raw.get("recurrence"):
+        return None, "no such event"
+    if item.scope != "series":
+        return (
+            None,
+            'an occurrence of a repeating event: give "scope": "series" for the whole series, or use event edit / delete for one',
+        )
+    if item.fields.start is not None:
+        return None, "new times for a whole series: use event edit --series"
+    return raw, ""
 
 
 async def events_apply(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
@@ -900,7 +961,13 @@ async def events_apply(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> O
         calls: list[BatchCall] = []
         for item in todo:
             if item.action == "create":
-                calls.append(BatchCall("POST", cid, body=to_resource(item.fields, patch=False)))
+                # An id of calsync's choice: a batch resent after a lost answer finds these made.
+                item.source_id = new_event_id()
+                calls.append(
+                    BatchCall(
+                        "POST", cid, body={**to_resource(item.fields, patch=False), "id": item.source_id}
+                    )
+                )
             elif item.action == "update":
                 assert item.source_id is not None
                 calls.append(
@@ -918,10 +985,12 @@ async def events_apply(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> O
         ):
             raise NoWriteAccess("no write access")
         for item, reply in zip(todo, replies, strict=True):
-            if reply.ok or (item.action == "delete" and reply.gone):
+            if (
+                reply.ok
+                or (item.action == "delete" and reply.gone)
+                or (item.action == "create" and reply.exists)
+            ):
                 item.status = "ok"
-                if item.action == "create":
-                    item.source_id = reply.body.get("id")
             else:
                 item.status, item.reason = "failed", reply.reason()
         return planned

@@ -606,6 +606,8 @@ const zh = {
   "calsync may not change Google events for this account yet. Allow it once, in a terminal on the computer calsync runs on:": "这个账号还没允许 calsync 修改 Google 日程。在运行 calsync 的电脑上打开终端，授权一次：",
   "calsync refused it: {why}": "calsync 没有执行：{why}",
   "the next day": "次日",
+  "The end is before the start": "结束早于开始",
+  "This series repeats on set days: only this time can move to another day.": "这个系列按规则固定在某几天，换到别的日子只能改这一次。",
   "Added “{title}” in Google": "在 Google 新建了「{title}」",
   "Moved “{title}” in Google": "在 Google 挪动了「{title}」",
   "Deleted “{title}” in Google": "在 Google 删除了「{title}」",

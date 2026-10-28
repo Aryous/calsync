@@ -180,3 +180,35 @@ def test_a_chip_moves_to_another_day_in_the_month(open_page: OpenPage, fresh_liv
     expect(calendar(page).locator('.wc[data-day="2026-10-30"] .chip', has_text="交物业费")).to_be_visible()
     stored = google(fresh_live, "fees")
     assert stored["start"] == {"date": "2026-10-30"} and stored["end"] == {"date": "2026-10-31"}
+
+
+def test_a_series_on_set_days_moves_to_another_day_only_once(
+    open_page: OpenPage, fresh_live: LiveDaemon
+) -> None:
+    page = open_week(open_page, fresh_live)
+    weekly = block(page, "2026-10-26", "周会")  # every Monday (BYDAY=MO)
+    width = calendar(page).locator('.dcol[data-day="2026-10-27"]').bounding_box()["width"]  # type: ignore[index]
+    drag(page, weekly, width, 0)
+    sheet = page.locator('[data-role="move-scope"]')
+    expect(sheet.locator('[data-role="fixed-days"]')).to_be_visible()
+    expect(sheet.get_by_role("button", name="改整个系列")).to_be_disabled()
+    sheet.get_by_role("button", name="取消").click()
+
+
+def test_escape_cancels_and_the_release_opens_nothing(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
+    page = open_week(open_page, fresh_live)
+    dentist = block(page, "2026-10-27", "社区活动")
+    dentist.scroll_into_view_if_needed()
+    box = dentist.bounding_box()
+    assert box is not None
+    x, y = box["x"] + box["width"] / 2, box["y"] + 10
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x, y + hour(page), steps=5)
+    expect(calendar(page).locator(".ev.ghost")).to_have_count(1)
+    page.keyboard.press("Escape")
+    expect(calendar(page).locator(".ev.ghost")).to_have_count(0)
+    page.mouse.up()
+    page.wait_for_timeout(200)
+    expect(page).not_to_have_url(re.compile(r"#/event/"))
+    assert fresh_live.in_loop(lambda: fresh_live.world.google["personal"].writes) == []

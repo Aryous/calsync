@@ -1229,10 +1229,10 @@ def _account_view(
 
 def can_write(reader: StateReader, account: str) -> bool | None:
     """Whether the account's grant may change Google events (None: not seen yet)."""
-    from calsync.sources.google_write import WRITE_SCOPE
+    from calsync.sources.google_write import WRITE_SCOPES
 
     scopes = reader.scopes(account)
-    return None if scopes is None else WRITE_SCOPE in scopes
+    return None if scopes is None else bool(scopes & WRITE_SCOPES)
 
 
 def _midnight(now: datetime) -> datetime:
