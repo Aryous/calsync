@@ -5,7 +5,8 @@
 //
 // Delivery on a block: delivered unmarked; pending amber outline and flag; paused, blocked,
 // failing or retiring hatched; out of the sync range faded. Tapping an event opens its detail
-// (#/event/<id>); tapping a day's number opens that day.
+// (#/event/<id>); tapping a day's number opens that day. 新建日程 (and a click on an empty hour of
+// the day and week grids) opens #/event-new at that time.
 
 import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
 import { t, getLang } from "/static/i18n.js";
@@ -13,6 +14,7 @@ import { clockTime, serviceOf, ymd } from "/static/format.js";
 import { get, useStatus } from "/static/api.js";
 import { CalendarName, Icon } from "/static/icons.js";
 import { mapModel } from "/static/map.js";
+import { writableCalendars } from "/static/forms/edit.js";
 
 const PHONE = "(max-width: 760px), (hover: none) and (pointer: coarse) and (max-width: 1024px)";
 /** An hour's height in px: the --hourH token as the stylesheet sets it now (44 on the phone). */
@@ -177,6 +179,14 @@ function openEvent(id) {
   window.location.hash = `#/event/${id}`;
 }
 
+const pad2 = (n) => String(n).padStart(2, "0");
+
+/** #/event-new at ``day``'s ``minutes`` after midnight (local), or with no time: the next half hour. */
+function newEventHref(day, minutes) {
+  if (day == null) return "#/event-new";
+  return `#/event-new?start=${encodeURIComponent(`${ymd(day)}T${pad2(Math.floor(minutes / 60))}:${pad2(minutes % 60)}`)}`;
+}
+
 function stateWord(look) {
   if (look === "pending") return t("Waiting to be delivered");
   if (look === "held") return t("Held back");
@@ -215,7 +225,7 @@ function Chip({ e, colour, flat }) {
   </button>`;
 }
 
-function TimeGrid({ dayList, events, colourOf, now, onDay, phone }) {
+function TimeGrid({ dayList, events, colourOf, now, onDay, phone, canCreate }) {
   const scroller = useRef(null);
   const hour = useMemo(() => hourHeight(), [phone]);
   const showNow = dayList.some((d) => sameDay(d, now));
@@ -249,7 +259,14 @@ function TimeGrid({ dayList, events, colourOf, now, onDay, phone }) {
             top: Math.max(e.s, start) - start,
             bottom: Math.min(e.e, addDays(start, 1)) - start,
           }));
-          return html`<div class=${[0, 6].includes(d.getDay()) ? "dcol wknd" : "dcol"} data-day=${ymd(d)}>
+          // A click on an empty part of the column: a new event at that half hour.
+          const create = (e) => {
+            if (!canCreate || e.target !== e.currentTarget) return;
+            const y = e.clientY - e.currentTarget.getBoundingClientRect().top;
+            const minutes = Math.min(23 * 60 + 30, Math.max(0, Math.floor((y / hour) * 2) * 30));
+            window.location.hash = newEventHref(d, minutes);
+          };
+          return html`<div class=${[0, 6].includes(d.getDay()) ? "dcol wknd" : "dcol"} data-day=${ymd(d)} onClick=${create}>
             ${lanes(timed).map((e) => html`<${Block} e=${e} colour=${colourOf(e)} day=${d} now=${now} hour=${hour}/>`)}
             ${showNow ? html`<div class=${sameDay(d, now) ? "nowl" : "nowl faint"} style=${{ top: `${nowTop}px` }} aria-hidden="true"></div>` : null}
           </div>`;
@@ -418,6 +435,9 @@ export function CalendarPane() {
     setHidden(next);
   };
 
+  const canCreate = writableCalendars(status).length > 0;
+  // 新建日程: today at the next half hour, another day of the view at 09:00.
+  const newHref = sameDay(anchor, now) || shownView === "list" ? newEventHref(null) : newEventHref(anchor, 9 * 60);
   const last = addDays(range.to, -1);
   const rangeText = shownView === "day" ? `${shortDay(anchor)} ${weekdayName(anchor)}` : shownView === "month" ? "" : spanText(range.from, last);
   const titleDay = shownView === "month" ? anchor : range.from;
@@ -425,7 +445,8 @@ export function CalendarPane() {
 
   let body;
   if (shownView === "day" || shownView === "2day" || shownView === "week") {
-    body = html`<${TimeGrid} dayList=${days(range.from, range.to)} events=${events} colourOf=${colourOf} now=${now} onDay=${goDay} phone=${phone}/>`;
+    body = html`<${TimeGrid} dayList=${days(range.from, range.to)} events=${events} colourOf=${colourOf} now=${now} onDay=${goDay}
+        phone=${phone} canCreate=${canCreate}/>`;
   } else if (shownView === "2week") {
     body = html`<${WeekGrid} from=${range.from} weeks=${2} events=${events} colourOf=${colourOf} now=${now} onDay=${goDay}/>`;
   } else if (shownView === "month") {
@@ -439,6 +460,7 @@ export function CalendarPane() {
   return html`<div class="calendar" data-view=${shownView}>
     <div class="cbar">
       <div class="ttl"><h2 data-role="cal-title">${monthTitle(titleDay)}</h2><span class="rng num" data-role="cal-range">${rangeText}</span></div>
+      ${canCreate ? html`<a class="btn new-ev" href=${newHref} data-role="new-event"><${Icon} name="plus"/>${t("New event")}</a>` : null}
       <div class="navbtns">
         <button class="btn icon quiet" type="button" aria-label=${t("Earlier")} onClick=${() => step(-1)}><${Icon} name="left"/></button>
         <button class="btn" type="button" onClick=${() => setAnchor(startOfDay(new Date()))}>${t("Today")}</button>

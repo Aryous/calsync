@@ -604,6 +604,7 @@ a.row:hover { background: linear-gradient(90deg, transparent, var(--sunk) 12%, v
   .seg.views { order: 3; width: 100%; }
   .seg.views button { flex: 1; min-height: 44px; }
   .layers { order: 4; }
+  .cbar .new-ev { min-height: 44px; }
   .layer { min-height: 44px; }
   .legend .push { margin-left: 0; }
   .tg-head, .tg-all, .tg-body { grid-template-columns: 44px repeat(var(--n), minmax(0, 1fr)); }
