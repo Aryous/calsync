@@ -610,8 +610,10 @@ something needs you:
   and sign-in failures are not counted, they have their own push);
 - an edit you made by hand to the config file is invalid (the number of
   problems; the daemon keeps running the previous configuration);
-- blocked deletes were approved (the rule, the count and where it came from),
-  or a blocked rule's delete guard was raised;
+- blocked deletes were let through (the rule, the count and where it came
+  from: `approve` from the command line or the web UI, or `calsync run
+  --allow-deletes`), sent by the cycle that deleted them, or a blocked
+  rule's delete guard was raised;
 - and once more when a problem is over ("recovered").
 
 The same problem is pushed once until it is over. When a rule's blocked set
@@ -640,8 +642,9 @@ language = "en"                                    # "zh" (the default) or "en"
   `reload_failed`, `approved`, `guard_loosened` or `test`.
 - **`calsync notify test`** sends a test push to every configured channel and
   prints how each went: exit 0 when all took it, 1 when one failed, 2 when
-  none is configured. The daemon sends at most one test push every 10
-  seconds (`too_soon` otherwise).
+  none is configured. The daemon sends one test push at a time, and none
+  within 10 seconds of the last one that reached a channel (`too_soon`
+  otherwise; a test whose channels all failed does not count).
 - **Titles leave your machine.** A blocked-deletes push names events, and
   pushes go through Bark's server and Apple's push service, or through your
   webhook's server.
@@ -811,9 +814,12 @@ stale one.
   deleted. `calsync blocked` lists them, and `calsync approve RULE` lets
   exactly that set through (by its fingerprint; a different set blocks
   again); every approval that releases a set is recorded in the change
-  history with its origin and pushed when a channel is configured. Without a daemon,
-  `calsync run --allow-deletes` (scope it with `--rule`) lets one cycle
-  through.
+  history with its origin and pushed when a channel is configured, by the
+  cycle that releases it (an approval that goes stale or fails pushes
+  nothing). Without a daemon, a person at the terminal can let one cycle
+  through with `calsync run --allow-deletes` (scope it with `--rule`); a set
+  the guard would have blocked is then recorded and pushed the same way,
+  origin `run`.
 - **Malformed source data keeps the last good copy.** A series Google returns
   but calsync cannot parse — or one with an unparseable instance — is never
   updated or deleted in the target; it is reported as `protected` /
@@ -897,7 +903,7 @@ stale one.
 | `auth` for iCloud: rejected by every iCloud region | wrong Apple ID or app-specific password (often a pasted space); create a new password |
 | sync stops after about a week with exit code 3 | the Google OAuth consent screen is still in "Testing"; publish it, then `calsync auth` again |
 | Google sign-in says "access blocked" | your account is not a test user of a "Testing" consent screen; publish it or add yourself |
-| `status=blocked` | the mass-delete guard fired; check `calsync blocked --rule NAME`, then `calsync approve NAME` if intended (without a daemon, `calsync run --rule NAME --allow-deletes` works too) |
+| `status=blocked` | the mass-delete guard fired; check `calsync blocked --rule NAME`, then `calsync approve NAME` if intended (without a daemon, a person at the terminal can also use `calsync run --rule NAME --allow-deletes`, recorded and pushed as an approval from `run`; agents never use it) |
 | `approve` says the blocked set changed (`stale`) | more or other copies would be deleted now than the set you approved; nothing was deleted. Look at `calsync blocked` again and approve the new set if it is intended |
 | a config command says "the file was changed outside calsync; reload and try again" | the file changed between calsync reading and writing it (an editor, or the daemon removing a retired rule); run the command again |
 | the daemon log says the config file is invalid and nothing changes | a hand edit has a problem; the daemon keeps the previous configuration. `calsync config check` lists the problems; `calsync config history` shows the last changes |

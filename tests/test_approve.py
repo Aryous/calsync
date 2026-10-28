@@ -157,9 +157,36 @@ async def test_a_grown_set_blocks_again_with_a_new_fingerprint(tmp_path: Path) -
 
 
 async def test_allow_deletes_keeps_working(tmp_path: Path) -> None:
-    h, _, _, _ = await blocked_engine(tmp_path)
+    h, result, _, _ = await blocked_engine(tmp_path)
     done = (await h.engine.cycle(allow_deletes=True)).rules["family"]
-    assert (done.status, done.deleted) == ("ok", COUNT)
+    assert (done.status, done.deleted, done.approved_by) == ("ok", COUNT, "run")
+    # A set the guard would have blocked, let through: recorded like an approval, origin "run".
+    with StateReader(tmp_path / "state.db") as reader:
+        [row] = [c for c in reader.changes("family") if c.action == "approved"]
+    assert (row.object_id, row.title) == (result.blocked_fingerprint, "12 deletes approved (run)")
+    h.store.close()
+
+
+async def test_allow_deletes_the_guard_would_not_block_records_nothing(tmp_path: Path) -> None:
+    h, _, fake, ids = await blocked_engine(tmp_path)
+    dry = (await h.engine.cycle(dry_run=True, allow_deletes=True)).rules["family"]
+    assert (dry.status, dry.approved_by) == ("ok", None)  # a dry run releases nothing
+    seed(fake)  # all back, then two gone: under the guard
+    for event_id in ids[:2]:
+        fake.cancel_event(GCAL, event_id)
+    done = (await h.engine.cycle(allow_deletes=True)).rules["family"]
+    assert (done.status, done.deleted, done.approved_by) == ("ok", 2, None)
+    with StateReader(tmp_path / "state.db") as reader:
+        assert [c for c in reader.changes("family") if c.action == "approved"] == []
+    h.store.close()
+
+
+async def test_an_approval_names_its_origin_on_the_result(tmp_path: Path) -> None:
+    h, result, _, _ = await blocked_engine(tmp_path)
+    done = (await h.engine.cycle(approvals={"family": Approval(result.blocked_fingerprint, "ui")})).rules[
+        "family"
+    ]
+    assert (done.approved, done.approved_by) == (True, "ui")
     h.store.close()
 
 

@@ -174,7 +174,17 @@ async def test_blocked_deletes_are_recorded_once(tmp_path: Path) -> None:
     mark = last_id(tmp_path)
     res = (await h.engine.cycle(allow_deletes=True)).rules["family"]
     assert res.deleted == 4
-    assert changes(tmp_path, mark) == sorted((oid(f"e{i}"), "deleted", f"Standup {i}") for i in range(4))
+    # The set the guard held back, let through: recorded as approved (origin run), then deleted.
+    from calsync.engine import delete_fingerprint
+
+    fingerprint = delete_fingerprint(oid(f"e{i}") for i in range(4))
+    assert res.approved_by == "run"
+    assert changes(tmp_path, mark) == sorted(
+        [
+            *((oid(f"e{i}"), "deleted", f"Standup {i}") for i in range(4)),
+            (fingerprint, "approved", "4 deletes approved (run)"),
+        ]
+    )
     assert change_run_ids_match(tmp_path)
 
 

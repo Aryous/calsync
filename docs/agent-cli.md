@@ -56,6 +56,10 @@ added in later versions; existing keys keep their meaning.
   without the person seeing them; calsync records and pushes it, but the
   way past a block is `blocked` + `approve` (see
   [Approving blocked deletes](#approving-blocked-deletes)).
+- **Never use `calsync run --allow-deletes`; use `blocked` + `approve`.** It
+  lets a cycle through the guard without showing anyone the set (it is for a
+  person at the terminal); calsync records and pushes it as an approval from
+  `run`, but you would not have checked what it deleted.
 
 ## The loop
 
@@ -140,15 +144,15 @@ file):
 
 | `error.kind` | Exit | Meaning |
 | --- | --- | --- |
-| `config` | 2 | invalid arguments or configuration; `problems` lists every problem. Also `trigger --rule R` for an unknown rule when the cycle runs in this process (through the daemon it is `unknown_rule`; exit 2 either way) |
+| `config` | 2 | invalid arguments or configuration; `problems` lists every problem. Also `trigger --rule R --wait` for an unknown rule when a daemon runs the cycle (exit 2 as `unknown_rule`) |
 | `conflict` | 2 | the config file changed between calsync reading and writing it ("the file was changed outside calsync; reload and try again"): run the command again |
 | `locked` | 4 | another calsync process holds the run lock |
 | `daemon_lost` | 1 | the daemon accepted the operation and went away before answering: the change **may have been applied**. Check `calsync config history --json` before you retry |
 | `paused` | 1 | `trigger --rule R` for a paused rule |
 | `read_only` | 1 | `trigger` through a daemon started with `--no-sync` (it runs no cycles) |
 | `unavailable` | 1 | `trigger` through a daemon that is stopping |
-| `too_soon` | 1 | `notify test` through the daemon less than 10 seconds after the last one |
-| `unknown_rule` | 2 | `--rule R` names no configured rule (`events`, `blocked`, `upcoming`, `trigger` through the daemon) |
+| `too_soon` | 1 | `notify test` through the daemon while one is being sent, or less than 10 seconds after the last one that reached a channel |
+| `unknown_rule` | 2 | `--rule R` names no configured rule (`events`, `blocked`, `upcoming`, `trigger`) |
 | `unknown_target`, `bad_request` | 2 | `events` arguments (a range longer than 62 days, or more than 10 years from today, is `bad_request`) |
 | `not_found` | 1 | `event show`: no such event (now) |
 | `no_state` | 1 | no state database yet (calsync never ran): run a cycle (`calsync trigger --wait`) |
@@ -222,7 +226,10 @@ changes at all until someone decides. Agents may approve. Every approval
 that releases a set is recorded in the change history (`calsync changes`:
 action `approved`, `object_id` the fingerprint, `title` such as `12 deletes
 approved (cli)`) and sent to the person as a notification when a push
-channel is configured.
+channel is configured. Both come from the cycle that releases the set: an
+approval that goes `stale`, `failed` or `synced` (or is dropped because the
+rule was paused or removed, or the daemon stopped) records and pushes
+nothing; a set that blocks again is pushed as blocked again.
 
 1. **Read the blocked set:**
 
@@ -546,8 +553,10 @@ next N hours (default 24) with their alarms and a simpler delivery state
 
   `action`: `created`, `updated`, `reverted` (an edit on the target written
   back), `deleted`, `protected` (a source series calsync cannot parse: its
-  copy is kept), `blocked`, `approved` (an approval released a blocked set:
-  `object_id` is its fingerprint, `title` e.g. `12 deletes approved (cli)`)
+  copy is kept), `blocked`, `approved` (an approval, or `calsync run
+  --allow-deletes`, released a set the guard holds back: `object_id` is its
+  fingerprint, `title` e.g. `12 deletes approved (cli)`, origin `run` for
+  `--allow-deletes`)
   and `guard_loosened` (a config write raised a blocked rule's delete guard:
   `object_id` is `guard`, `title` e.g. `delete guard loosened (ui)`). The
   last two are records of a decision, not of a copy. `detail` (or `null`)
@@ -714,8 +723,10 @@ See [Pausing a rule](#pausing-a-rule). `--dry-run` shows the diff.
 
 Each channel is `ok`, `failed (<ErrorType>)` or `not configured`. Exit 0 when
 every configured channel took it, 1 when one failed, 2 when none is
-configured. Through the daemon, a second test push within 10 seconds is
-refused (`too_soon`, exit 1).
+configured. Through the daemon, a test push while one is being sent, or within
+10 seconds of the last one that reached a channel, is refused (`too_soon`,
+exit 1); a refused request or a test whose every channel failed does not
+count.
 
 ### The service
 

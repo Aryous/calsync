@@ -74,7 +74,10 @@ class Approval:
     origin: str
 
 
-APPROVED = "approved"  # change action: an approval released a blocked set (object id: its fingerprint)
+# Change action: an approval (or ``--allow-deletes``) released a set the guard holds back (object
+# id: its fingerprint).
+APPROVED = "approved"
+ALLOW_DELETES = "run"  # the origin recorded for ``calsync run --allow-deletes``
 
 
 def error_kind_for(exc: BaseException) -> ErrorKind:
@@ -110,6 +113,10 @@ class RuleResult:
     blocked_titles_complete: bool = True  # False: the lookup failed or some bodies were unreadable
     blocked_fingerprint: str | None = None  # set when status == "blocked": the set's identity
     approved: bool = False  # an approval named exactly this cycle's planned deletes
+    # Set when this cycle let its planned deletes through the guard (not in a dry run): the
+    # approval's origin (``cli``, ``ui``), or ``run`` for ``--allow-deletes`` past a set the guard
+    # would have blocked. The ``approved`` change row and push go with it.
+    approved_by: str | None = None
     changes: list[ChangeRecord] = field(default_factory=list)  # carries titles: never log
     # This cycle's protected / blocked object ids, for the engine's dedup memory: committed only
     # once ``changes`` is written. None: not reached (dry run, or the rule failed earlier).
@@ -555,11 +562,8 @@ class Engine:
         result.approved = (
             approval is not None and bool(result.plan.delete) and approval.fingerprint == fingerprint
         )
-        reason = (
-            None
-            if allow_deletes or result.approved
-            else check_delete_guard(result.plan, deletable, rule.delete_guard)
-        )
+        guard = check_delete_guard(result.plan, deletable, rule.delete_guard)
+        reason = None if allow_deletes or result.approved else guard
         if reason:
             result.status, result.error, result.error_kind = "blocked", reason, "guard"
             result.blocked_fingerprint = fingerprint
@@ -587,9 +591,16 @@ class Engine:
             return
         if not dry_run:
             result.seen_blocked = frozenset()  # a later block of the same set is new again
-        if result.approved and approval is not None and not dry_run:
-            # Who let the set through, in the activity record (before its deletes), whether or
-            # not a push channel is configured.
+        # Who let the set through: an approval, or ``--allow-deletes`` past a set the guard
+        # would have blocked (origin ``run``). Recorded in the activity record (before its
+        # deletes) whether or not a push channel is configured; ``approved_by`` raises its push.
+        released_by: str | None = None
+        if result.approved and approval is not None:
+            released_by = approval.origin
+        elif allow_deletes and guard:
+            released_by = ALLOW_DELETES
+        if released_by is not None and not dry_run:
+            result.approved_by = released_by
             count = len(result.plan.delete)
             result.changes.append(
                 ChangeRecord(
@@ -597,7 +608,7 @@ class Engine:
                     fingerprint,
                     APPROVED,
                     self._clock(),
-                    f"{count} delete{'' if count == 1 else 's'} approved ({approval.origin})",
+                    f"{count} delete{'' if count == 1 else 's'} approved ({released_by})",
                 )
             )
         if not dry_run and not result.plan.empty:
@@ -903,7 +914,9 @@ class Engine:
     ) -> CycleResult:
         """One cycle of ``rules`` (None: every rule not paused). ``approvals``: rule -> the
         approval (fingerprint of the planned deletes, origin) to let through the guard this
-        cycle; one that releases its set is recorded as an ``approved`` change."""
+        cycle; one that releases its set is recorded as an ``approved`` change (``approved_by``
+        on its result). ``allow_deletes`` skips the guard for every rule; a set it would have
+        blocked is recorded the same way, origin ``run``."""
         approvals = approvals or {}
         started = self._clock()
         mark = self._log.mark() if self._log else 0

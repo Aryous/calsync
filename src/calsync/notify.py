@@ -16,9 +16,14 @@ Alerts:
   for the account);
 - ``reload_failed``: an edit made by hand is invalid (the count of problems, never their text);
   another invalid text while it is open is damped as a blocked set is;
-- ``approved``: blocked deletes were approved (rule, count, origin). Never deduplicated; the
-  approval closes the rule's ``blocked`` key, so a successful approval cycle sends no
-  ``recovered`` for it (one push per act) and a set that blocks again is pushed again;
+- ``approved`` (rule, count, origin): a cycle let a set the guard holds back through, by an
+  approval (``cli``, ``ui``) or ``calsync run --allow-deletes`` past a set the guard would have
+  blocked (``run``). Raised by the cycle that writes its ``approved`` change row
+  (``RuleResult.approved_by``), never by the approval itself: one that goes stale, fails, is
+  not needed (``synced``) or is abandoned pushes nothing (the next ``blocked`` push tells the
+  person). Never deduplicated. Approving closes the rule's ``blocked`` key at once
+  (``approving``), and a release closes it too, silently: a successful approval cycle sends no
+  ``recovered`` for the block (one push per act), and a set that blocks again is pushed again;
 - ``guard_loosened``: a config write (``rule set``, ``config undo``) raised a blocked rule's
   ``delete_guard.max_count`` or ``max_ratio`` (rule, origin): the other way past a block, so
   it is pushed like an approval. Never deduplicated.
@@ -92,6 +97,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "origin.cli": "命令行",
         "origin.ui": "界面",
         "origin.daemon": "calsync",
+        "origin.run": "calsync run --allow-deletes",
         "auth.title": "「{account}」需要重新连接",
         "auth.body": "运行 calsync auth {account}",
         "failing.title": "「{rule}」连续 {count} 次同步失败",
@@ -119,6 +125,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "origin.cli": "the command line",
         "origin.ui": "the web UI",
         "origin.daemon": "calsync",
+        "origin.run": "calsync run --allow-deletes",
         "auth.title": "Account {account} needs to be connected again",
         "auth.body": "Run: calsync auth {account}",
         "failing.title": "{rule} failed to sync {count} time{s} in a row",
@@ -217,6 +224,11 @@ def _blocked_keys(name: str, keys: Iterable[str]) -> set[str]:
     return {k for k in _rule_keys(name, keys) if k.startswith("blocked:")}
 
 
+def blocked_open(store: Store, rule: str) -> bool:
+    """Whether a ``blocked`` push of ``rule`` is open (its set not released nor replaced)."""
+    return bool(_blocked_keys(rule, store.open_alerts()))
+
+
 def _damped(previous: OpenAlert | None, now: datetime) -> bool:
     """Whether a key that replaces the open ``previous`` is pushed no sooner than
     ``DAMPING`` after ``previous``'s push."""
@@ -263,6 +275,11 @@ def _evaluate(
     plain: list[str] = []
     for name, r in results.items():
         rule = by_name.get(name)
+        if r.approved_by is not None and r.plan is not None:
+            # The set was let through (its ``approved`` row is written), whatever the writes did
+            # then; the block it ends closes without a ``recovered``.
+            alerts.append(approved(name, len(r.plan.delete), r.approved_by, config, now))
+            closed |= _blocked_keys(name, was_open)
         if is_ok(r.status, r.failed):
             mine = _rule_keys(name, was_open) - closed
             if mine:
@@ -369,7 +386,8 @@ def _blocked(text: _Texts, config: Config, now: datetime, r: "RuleResult") -> Al
 
 
 def approved(rule: str, count: int, origin: str, config: Config, now: datetime) -> Alert:
-    """``approved``: sent for every approval (no key)."""
+    """``approved``: ``count`` held-back deletes were let through, from ``origin`` (no key:
+    every release). ``evaluate`` raises it for the cycle that released them."""
     text = _Texts(config)
     where = text(f"origin.{origin}") if f"origin.{origin}" in TEXTS["en"] else origin
     return Alert(
@@ -398,10 +416,11 @@ def guard_loosened(rule: str, origin: str, config: Config, now: datetime) -> Ale
 
 
 def approving(store: Store, rule: str) -> None:
-    """An approval of ``rule``'s blocked set was taken (its ``approved`` push is the one for
-    this act): the rule's ``blocked`` keys close, without a push. A successful approval cycle
-    then sends no ``recovered`` for the block, and a set that blocks again is pushed again.
-    Called by the lock holder; contained like ``evaluate``."""
+    """An approval of ``rule``'s blocked set was taken: the rule's ``blocked`` keys close,
+    without a push. A successful approval cycle then sends no ``recovered`` for the block (its
+    ``approved`` push is the one for this act), and a set that blocks again (the approval went
+    stale or its cycle failed) is pushed again. Called by the lock holder; contained like
+    ``evaluate``."""
     try:
         keys = _blocked_keys(rule, store.open_alerts())
         if keys:

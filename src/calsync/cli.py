@@ -1073,7 +1073,9 @@ def cmd_trigger(args: argparse.Namespace, out: TextIO) -> int:
                 read_timeout=args.timeout + opsclient.TRIGGER_MARGIN,
             )
         else:
-            _load(args)  # a config problem stops it before the state directory is touched
+            config = _load(args)  # a config problem stops it before the state directory is touched
+            if args.rule and args.rule not in {r.name for r in config.rules}:  # as the daemon answers
+                return _refuse(args, out, "unknown_rule", f"unknown rule(s): {args.rule}", EXIT_CONFIG)
             result = opsclient.run_in_process(
                 "trigger", op_args, dry_run=False, config_path=_config_path(args), state_dir=state_dir
             )

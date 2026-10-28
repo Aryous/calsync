@@ -94,8 +94,9 @@ class OpsUnavailable(CalsyncError):
 
 
 class TooSoon(CalsyncError):
-    """``notify.test`` again within ``NOTIFY_TEST_COOLDOWN`` in the daemon (the API answers 429
-    ``too_soon``): a paired browser cannot push without limit."""
+    """``notify.test`` in the daemon while one is being sent, or within ``NOTIFY_TEST_COOLDOWN``
+    of the last one that reached a channel (the API answers 429 ``too_soon``): a paired browser
+    cannot push without limit."""
 
     def __init__(self) -> None:
         super().__init__(
@@ -103,7 +104,7 @@ class TooSoon(CalsyncError):
         )
 
 
-NOTIFY_TEST_COOLDOWN = 10.0  # seconds between the daemon's test pushes
+NOTIFY_TEST_COOLDOWN = 10.0  # seconds after a daemon's test push that reached a channel
 
 
 class DaemonStopping(OpsUnavailable):
@@ -373,7 +374,7 @@ def _check_guards(ctx: OpContext, before: str, after: str) -> None:
             for r in new.rules
             if (was := guards.get(r.name)) is not None
             and (r.delete_guard.max_count > was.max_count or r.delete_guard.max_ratio > was.max_ratio)
-            and next(iter(ctx.store.statuses(r.name)), ("",))[0] == "blocked"
+            and _held_back(ctx.store, r.name)
         ]
         if not loosened:
             return
@@ -394,6 +395,17 @@ def _check_guards(ctx: OpContext, before: str, after: str) -> None:
     except Exception as exc:
         log.warning("loosened delete guard not recorded (%s)", type(exc).__name__)
         debug.details(log, "loosened delete guard not recorded", exc)
+
+
+def _held_back(store: Store, rule: str) -> bool:
+    """Whether ``rule`` holds a blocked set back: its ``blocked`` push is still open, or its
+    newest run that did not fail was blocked (a transient failure since leaves the set held
+    back, and the next good cycle would delete it)."""
+    from calsync import notify
+
+    if notify.blocked_open(store, rule):
+        return True
+    return next((status for status, _, _ in store.statuses(rule) if status != "failed"), None) == "blocked"
 
 
 def _send_now(config: Config, alerts: Sequence["Alert"]) -> None:
@@ -823,13 +835,11 @@ def _approve(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
         )
     log.info("rule %s: %d deletes approved (%s)", name, blocked.count, ctx.source)
     from calsync import notify
-
-    notify.approving(ctx.store, name)  # the approval is this block's push: its key closes now
-    approval = notify.approved(name, blocked.count, ctx.source, config, ctx.clock())
     from calsync.engine import Approval
 
+    notify.approving(ctx.store, name)  # its push comes from the cycle, if it releases the set
     approvals = {name: Approval(fingerprint, ctx.source)}
-    result, removed = asyncio.run(_cycle_here(ctx, config, [name], approvals, alerts=[approval]))
+    result, removed = asyncio.run(_cycle_here(ctx, config, [name], approvals))
     outcome = _outcome(op, name, fingerprint, blocked.count, result)
     if removed:
         return dataclasses.replace(outcome, summary=outcome.summary + "; " + "; ".join(removed))
@@ -917,13 +927,11 @@ async def _cycle_here(
     config: Config,
     rules: list[str],
     approvals: Mapping[str, "Approval"] | None = None,
-    *,
-    alerts: Sequence["Alert"] = (),
 ) -> tuple["CycleResult", list[str]]:
     """One cycle for ``rules`` (paused ones are skipped) in this process (the caller holds the
     run lock), with ``approvals``; then, as ``calsync run`` does, the removal of the rules
-    that retired, and the pushes: ``alerts`` and what the cycle raised (``notify``), sent
-    before returning."""
+    that retired, and the pushes the cycle raised (``notify``: an approval's ``approved`` among
+    them when it released its set), sent before returning."""
     from calsync import notify, wiring
     from calsync.cycle import remove_retired, retired, run_cycle
 
@@ -947,7 +955,7 @@ async def _cycle_here(
     removed = [
         done.summary for n in retired(config, result, ctx.store) if (done := remove_retired(removal, n))
     ]
-    await send_contained(config, [*alerts, *raised])
+    await send_contained(config, raised)
     return result, removed
 
 

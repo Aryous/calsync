@@ -502,6 +502,46 @@ def test_the_guard_of_a_rule_that_is_not_blocked_changes_quietly(env: Env, pushe
     assert _loosened(env) == [] and pushed == []
 
 
+def _run(env: Env, status: str, rule: str = "family") -> None:
+    failed = status == "partial"
+    error = "TransientError: boom" if status in ("failed", "partial") else None
+    env.store.record_runs(
+        [
+            RunRecord(
+                rule, NOW, NOW, status, 0, 0, 0, int(failed), 1, error, error_kind="other" if error else None
+            )
+        ]
+    )
+
+
+def test_a_failed_run_after_the_block_still_counts_as_blocked(env: Env, pushed: list[Any]) -> None:
+    """Blocked, then a transient failure: the set is still held back and the next good cycle
+    would delete it, so raising the guard is recorded and pushed."""
+    _block(env)
+    _run(env, "failed")
+    env.run("rule.set", name="family", key="delete_guard.max_count", value=100)
+    assert [r.title for r in _loosened(env)] == ["delete guard loosened (cli)"]
+    assert [a.event for a in pushed] == ["guard_loosened"]
+
+
+def test_an_open_blocked_alert_counts_as_blocked(env: Env, pushed: list[Any]) -> None:
+    from calsync.store import OpenAlert
+
+    _block(env)
+    _run(env, "partial")  # not the guard's run any more, but its push is still open
+    env.store.update_alerts(opened={"blocked:family:0123456789abcdef": OpenAlert(NOW, {"count": 12})})
+    env.run("rule.set", name="family", key="delete_guard.max_ratio", value=0.9)
+    assert [a.event for a in pushed] == ["guard_loosened"]
+
+
+def test_a_rule_that_synced_after_its_block_changes_its_guard_quietly(env: Env, pushed: list[Any]) -> None:
+    _block(env)
+    _run(env, "ok")
+    _run(env, "failed")
+    env.run("rule.set", name="family", key="delete_guard.max_count", value=100)
+    assert _loosened(env) == [] and pushed == []
+
+
 # ----- accounts --------------------------------------------------------------------------
 
 

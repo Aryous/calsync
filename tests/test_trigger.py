@@ -435,8 +435,11 @@ def test_trigger_without_a_daemon_honours_paused_rules(
     assert here.cli("--rule", "work") == (EXIT_FAILED, 'rule "work" is paused\n')
     code, out = here.cli("--json")
     assert code == EXIT_OK and list(json.loads(out)["data"]["rules"]) == ["family"]
-    code, out = here.cli("--rule", "nope")
-    assert code == EXIT_CONFIG and 'unknown rule "nope"' in out
+    # As through the daemon: the same kind and exit code.
+    assert here.cli("--rule", "nope") == (EXIT_CONFIG, "unknown rule(s): nope\n")
+    code, out = here.cli("--rule", "nope", "--json")
+    assert code == EXIT_CONFIG
+    assert json.loads(out) == {"error": {"kind": "unknown_rule", "message": "unknown rule(s): nope"}}
 
 
 def test_trigger_without_a_daemon_exits_by_the_rules(

@@ -37,6 +37,7 @@ BARK = "https://bark.example.com/DEVICEKEY0123"
 HOOK = "https://hooks.example.com/calsync/s3cr3t"
 SECRET_TITLE = "Dentist appointment 7731"  # synthetic; must never reach a log line
 TITLES = [SECRET_TITLE, *(f"Event {i}" for i in range(1, 7))]  # seven planned deletes
+APPROVED = "calsync 放行了删除"  # the ``approved`` push's title
 
 
 def notified(*, language: str = "zh", public_url: str | None = None, threshold: int = 3) -> Config:
@@ -360,6 +361,49 @@ def test_every_approval_notifies(cycles: Cycles) -> None:
     assert second.body == "已放行 23 个删除（来自 界面）"
     assert (first.event, first.rule) == ("approved", "family")
     assert cycles.store.open_alerts() == {}  # nothing to deduplicate
+
+
+def released(origin: str = "ui", *, deletes: int = 3, status: str = "ok", failed: int = 0) -> RuleResult:
+    """A run whose cycle let a blocked set through: an approval (``approved_by`` its origin) or
+    ``calsync run --allow-deletes`` (``run``)."""
+    r = result(status=status, failed=failed)
+    r.approved, r.approved_by = origin != "run", origin
+    r.plan = Plan(delete=[Actual(f"o{i}", f"h{i}", None, None, None) for i in range(deletes)])
+    return r
+
+
+def test_the_cycle_that_releases_a_set_pushes_the_approval(cycles: Cycles) -> None:
+    assert len(cycles.run(result(status="blocked"))) == 1
+    notify.approving(cycles.store, "family")  # as approve does, with the lock
+    [alert] = cycles.run(released())
+    assert (alert.event, alert.rule, alert.body) == ("approved", "family", "已放行 3 个删除（来自 界面）")
+    assert alert.title == "calsync 放行了删除"
+    assert cycles.store.open_alerts() == {}  # nothing to deduplicate: every release pushes
+
+
+def test_a_release_whose_writes_then_fail_is_still_pushed(cycles: Cycles) -> None:
+    """The set was let through (its ``approved`` row is written): pushed whatever the writes did."""
+    alerts = cycles.run(released("cli", status="partial", failed=1))
+    assert kinds(alerts) == [("approved", "family", None)]
+
+
+def test_a_cycle_that_releases_nothing_pushes_no_approval(cycles: Cycles) -> None:
+    assert len(cycles.run(result(status="blocked"))) == 1
+    notify.approving(cycles.store, "family")
+    # Stale (blocks again with another set), failed, synced without the approval: no ``approved``.
+    assert kinds(cycles.run(result(status="blocked", fingerprint="fp-b"))) == [("blocked", "family", None)]
+    notify.approving(cycles.store, "family")
+    assert cycles.run(result(status="failed")) == []
+    assert cycles.run(result()) == []
+
+
+def test_allow_deletes_past_a_block_pushes_an_approval_and_no_recovered(cycles: Cycles) -> None:
+    assert len(cycles.run(result(status="blocked"))) == 1
+    [alert] = cycles.run(released("run", deletes=12))  # no approve: the block's key is open
+    assert (alert.event, alert.body) == ("approved", "已放行 12 个删除（来自 calsync run --allow-deletes）")
+    assert cycles.store.open_alerts() == {}  # the block closed with the release, silently
+    english = notify.approved("family", 12, "run", notified(language="en"), NOW)
+    assert english.body == "12 deletions approved (from calsync run --allow-deletes)"
 
 
 def test_a_reload_failure_alerts_once_and_is_damped(cycles: Cycles) -> None:
@@ -723,7 +767,7 @@ async def test_the_daemon_notifies_approvals_and_reload_failures(
     assert pushes.bodies()[0]["title"] == "calsync 拦下了一批删除"
     assert (await d.approve(rule="family", wait=True)).data["status"] == "approved"
     await eventually(lambda: len(pushes.bodies()) == 2)
-    assert pushes.bodies()[1]["body"] == "已放行 12 个删除（来自 命令行）"
+    assert pushes.bodies()[1]["body"] == "已放行 12 个删除（来自 命令行）"  # from the cycle that released it
     d.path.write_text(text + "\n[[rules]]\nname = 5\n")  # an invalid edit
     d.daemon.request_cycle()  # the check before the cycle sees it
     await eventually(lambda: len(pushes.bodies()) == 3)
@@ -732,6 +776,67 @@ async def test_the_daemon_notifies_approvals_and_reload_failures(
     await d.cycle("work")
     assert len(pushes.bodies()) == 3  # the same text is not reported twice
     await d.stop()
+    assert [b["title"] for b in pushes.bodies()].count(APPROVED) == 1
+
+
+def _notified_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Pushes]:
+    """``test_approve.Running`` with a Bark channel, and the pushes it sends."""
+    from tests.test_approve import Running
+
+    pushes = Pushes()
+    monkeypatch.setattr(notify, "TRANSPORT", pushes.transport())
+    text = TEXT + f'\n[notify]\nbark_url = "{BARK}"\n'
+    d = Running(tmp_path)
+    d.path.write_text(text)
+    d.daemon = d.world.daemon(configfile.validate_text(text, tmp_path), tmp_path, config_path=d.path)
+    return d, pushes
+
+
+@pytest.mark.parametrize("case", ["stale", "failed", "synced", "paused", "removed", "stopping"])
+async def test_the_daemon_pushes_no_approval_that_releases_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """The ``approved`` push comes from the cycle that lets the set through, never from the
+    approval itself: one that goes stale, fails, is not needed, or is abandoned sends none."""
+    from calsync import daemon as daemon_module
+    from tests.test_approve import COUNT, seed
+    from tests.test_daemon_reload import write
+
+    d, pushes = _notified_daemon(tmp_path, monkeypatch)
+    fingerprint = await d.start(cancel=COUNT - 1 if case == "stale" else COUNT)
+    await eventually(lambda: len(pushes.bodies()) == 1)  # blocked
+    if case in ("stale", "failed", "synced"):
+        if case == "stale":
+            d.world.on_google = lambda: d.world.fake.cancel_event(GCAL, d.ids[-1])
+        elif case == "synced":
+
+            def shrink() -> None:
+                seed(d.world.fake)
+                for event_id in d.ids[:2]:
+                    d.world.fake.cancel_event(GCAL, event_id)
+
+            d.world.on_google = shrink
+        else:
+
+            async def broken(*args: Any, **kwargs: Any) -> Any:
+                raise RuntimeError("the state database is gone")
+
+            monkeypatch.setattr(daemon_module, "run_cycle", broken)
+        assert (await d.approve(rule="family", wait=True)).data["status"] == case
+    else:
+        daemon = d.daemon
+        async with daemon._cycle_lock:  # pyright: ignore[reportPrivateUsage]  # no cycle meanwhile
+            daemon.approve("family", fingerprint, COUNT, "cli", wait=False)
+            if case == "stopping":
+                d.world.stop.set()
+            else:
+                text = d.path.read_text()
+                paused = text.replace('name = "family"', 'name = "family"\npaused = true', 1)
+                write(d.path, paused if case == "paused" else text.replace(FAMILY, "", 1))
+                await daemon._check_config()  # pyright: ignore[reportPrivateUsage]
+    await d.stop()  # the pushes in flight are sent first
+    assert APPROVED not in [b["title"] for b in pushes.bodies()]
+    assert d.family_copies() == (COUNT - 2 if case == "synced" else COUNT)
 
 
 async def test_the_daemon_pushes_and_records_a_guard_loosened_while_blocked(
@@ -804,8 +909,67 @@ def test_calsync_run_trigger_and_approve_send_in_process(
     assert len(here.titles()) == 1
     code, out = here.files.cli("approve", "family", "--yes")
     assert code == EXIT_OK, out
-    assert here.titles()[1:] == ["calsync 放行了删除"]  # one push per act: no "recovered" after it
+    assert here.titles()[1:] == [APPROVED]  # one push per act: no "recovered" after it
+    assert pushes.bodies()[1]["body"] == "已放行 13 个删除（来自 命令行）"
     assert_private(caplog)
+
+
+@pytest.mark.parametrize("case", ["stale", "synced"])
+def test_an_in_process_approval_that_releases_nothing_pushes_no_approval(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch, pushes: Pushes, case: str
+) -> None:
+    from tests.test_approve import COUNT, seed
+
+    here = Here(short_dir, monkeypatch, pushes)
+    ids = seed(here.world.fake)
+    assert here.files.cli("run")[0] == EXIT_OK
+    for event_id in ids[: COUNT - 1] if case == "stale" else ids:
+        here.world.fake.cancel_event(GCAL, event_id)
+    assert here.files.cli("run")[0] == EXIT_FAILED  # blocked
+    assert here.titles() == ["calsync 拦下了一批删除"]
+
+    def change() -> None:  # as the approval cycle reads Google
+        if case == "stale":
+            here.world.fake.cancel_event(GCAL, ids[-1])  # one more: another set
+        else:
+            seed(here.world.fake)  # all back, but two: under the guard
+            for event_id in ids[:2]:
+                here.world.fake.cancel_event(GCAL, event_id)
+
+    here.world.on_google = change
+    code, out = here.files.cli("approve", "family", "--yes", "--json")
+    assert (code, json.loads(out)["data"]["status"]) == (EXIT_FAILED if case == "stale" else EXIT_OK, case)
+    assert APPROVED not in here.titles()
+
+
+def test_run_allow_deletes_past_a_block_is_recorded_and_pushed(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch, pushes: Pushes
+) -> None:
+    """``calsync run --allow-deletes`` is a release like an approval: an ``approved`` row with
+    origin ``run`` and its push (not a "recovered" one that reads as good news)."""
+    from tests.test_approve import seed
+
+    here = Here(short_dir, monkeypatch, pushes)
+    ids = seed(here.world.fake)
+    assert here.files.cli("run")[0] == EXIT_OK
+    for event_id in ids:
+        here.world.fake.cancel_event(GCAL, event_id)
+    assert here.files.cli("run")[0] == EXIT_FAILED  # blocked
+    assert here.files.cli("run", "--allow-deletes")[0] == EXIT_OK
+    assert here.titles() == ["calsync 拦下了一批删除", APPROVED]
+    assert pushes.bodies()[1]["body"] == "已放行 12 个删除（来自 calsync run --allow-deletes）"
+    code, out = here.files.cli("changes", "--rule", "family", "--json")
+    rows = [c for c in json.loads(out)["changes"] if c["action"] == "approved"]
+    assert code == EXIT_OK and [c["title"] for c in rows] == ["12 deletes approved (run)"]
+    # A cycle the guard would not have blocked releases nothing: no row, no push.
+    seed(here.world.fake)
+    assert here.files.cli("run")[0] == EXIT_OK
+    for event_id in ids[:2]:
+        here.world.fake.cancel_event(GCAL, event_id)
+    assert here.files.cli("run", "--allow-deletes")[0] == EXIT_OK
+    assert len(here.titles()) == 2
+    code, out = here.files.cli("changes", "--rule", "family", "--json")
+    assert len([c for c in json.loads(out)["changes"] if c["action"] == "approved"]) == 1
 
 
 def test_an_approval_whose_cycle_fails_leaves_a_new_block_audible(
@@ -822,9 +986,10 @@ def test_an_approval_whose_cycle_fails_leaves_a_new_block_audible(
     here.world.deny.add("me")  # the approval cycle fails
     code, out = here.files.cli("approve", "family", "--yes")
     assert code != EXIT_OK, out
-    assert here.titles()[1:] == ["calsync 放行了删除", "「me」需要重新连接"]
+    # Nothing was released: no "approved" push, only what the failed cycle raised.
+    assert here.titles()[1:] == ["「me」需要重新连接"]
     assert here.files.cli("run")[0] == EXIT_FAILED  # the same set blocks again: pushed again
-    assert here.titles()[3:] == ["calsync 拦下了一批删除", "「me」恢复正常"]
+    assert here.titles()[2:] == ["calsync 拦下了一批删除", "「me」恢复正常"]
 
 
 def test_a_push_that_raises_never_fails_a_command(
@@ -890,6 +1055,47 @@ async def test_a_daemon_without_sync_sends_a_test_push(
     viewer._last_test_push -= ops.NOTIFY_TEST_COOLDOWN  # pyright: ignore[reportPrivateUsage, reportOptionalOperand]
     await asyncio.wait_for(viewer.run_op("notify.test", {}, False, source="ui"), 5)
     assert len(pushes.requests) == 4
+
+
+async def test_a_test_push_that_is_refused_or_fails_leaves_the_cooldown_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a test push that reached someone starts the cooldown: a refused request (bad
+    arguments) or a channel that failed (a wrong Bark URL, fixed and tried again) does not."""
+    from calsync.daemon import Daemon
+
+    pushes = Pushes(lambda request: httpx.Response(500))
+    monkeypatch.setattr(notify, "TRANSPORT", pushes.transport())
+    viewer = Daemon(configfile.validate_text(TEXT + BOTH, tmp_path), tmp_path, sync=False)
+    with pytest.raises(ConfigError, match="unknown argument"):
+        await viewer.run_op("notify.test", {"extra": 1}, False, source="ui")
+    failed = await asyncio.wait_for(viewer.run_op("notify.test", {}, False, source="ui"), 5)
+    assert failed.data == {"channels": {"bark": "failed (PushRefused)", "webhook": "failed (PushRefused)"}}
+    pushes.answer = Pushes.ok  # the URL is fixed
+    done = await asyncio.wait_for(viewer.run_op("notify.test", {}, False, source="ui"), 5)
+    assert done.data == {"channels": {"bark": "ok", "webhook": "ok"}}
+    with pytest.raises(ops.TooSoon):  # this one reached the person: the cooldown starts
+        await viewer.run_op("notify.test", {}, False, source="ui")
+    assert len(pushes.requests) == 4
+
+
+async def test_concurrent_test_pushes_send_one(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from calsync.daemon import Daemon
+
+    release = asyncio.Event()
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        await release.wait()
+        return Pushes.ok(request)
+
+    monkeypatch.setattr(notify, "TRANSPORT", httpx.MockTransport(slow))
+    viewer = Daemon(configfile.validate_text(TEXT + BOTH, tmp_path), tmp_path, sync=False)
+    first = asyncio.create_task(viewer.run_op("notify.test", {}, False, source="ui"))
+    await asyncio.sleep(0)
+    with pytest.raises(ops.TooSoon):  # one is in flight
+        await viewer.run_op("notify.test", {}, False, source="ui")
+    release.set()
+    assert (await asyncio.wait_for(first, 5)).data["channels"]["bark"] == "ok"
 
 
 def test_trigger_in_process_sends(short_dir: Path, monkeypatch: pytest.MonkeyPatch, pushes: Pushes) -> None:

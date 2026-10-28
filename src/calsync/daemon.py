@@ -39,7 +39,10 @@ running engine the new config (``Engine.replace_config``), all under ``_cycle_lo
 
 Approving blocked deletes (``ops`` ``approve``): the approval (rule -> fingerprint of the blocked
 set) is kept in memory for the rule's next cycle, which is requested at once and consumes it
-whatever its outcome; the engine lets through only a set with that fingerprint. An operation
+whatever its outcome; the engine lets through only a set with that fingerprint. Its ``approved``
+push is raised by that cycle (``notify.evaluate`` in ``_record``) only when the set is released:
+an approval that goes stale, fails, is not needed, or is dropped (the rule removed or paused,
+the scheduler stopping) pushes nothing. An operation
 that waits for that cycle (``wait``) waits after the lock is released, so the cycle can run.
 Waiters (``approve`` and ``trigger`` with ``wait``) are answered by the first cycle that starts
 after they were registered and includes their rule (``_record``; None when that cycle failed),
@@ -228,7 +231,9 @@ class Daemon:
         self._waiters: list[_Waiter] = []
         # Pushes in flight (``notify``): sent in the background, drained when the daemon stops.
         self._outbox = notify.Outbox()
-        self._last_test_push: float | None = None  # time.monotonic() of the last notify.test
+        # time.monotonic() of the last notify.test that reached a channel; one runs at a time
+        self._last_test_push: float | None = None
+        self._test_in_flight = False
 
     # ----- interface ----------------------------------------------------------
     async def run(self, stop: asyncio.Event) -> None:
@@ -338,7 +343,12 @@ class Daemon:
         The operation runs on the event loop's thread: the store's sqlite connection belongs to
         it, and an operation is one small file write and one row; the lock keeps cycles out."""
         if name == "notify.test" and not dry_run:
-            self._throttle_test_push()
+            return await self._test_push(args, source=source)
+        return await self._run_op(name, args, dry_run, source=source)
+
+    async def _run_op(
+        self, name: str, args: dict[str, Any], dry_run: bool, *, source: ops.Source
+    ) -> ops.OpResult:
         if self._store is None:
             if name == "notify.test":  # needs only the config: a viewer daemon can test its pushes
                 return await ops.notify_test(self._config, args, dry_run)
@@ -363,12 +373,23 @@ class Daemon:
             return await ctx.followup()
         return result
 
-    def _throttle_test_push(self) -> None:
-        """At most one ``notify.test`` per ``NOTIFY_TEST_COOLDOWN`` (``TooSoon`` otherwise)."""
+    async def _test_push(self, args: dict[str, Any], *, source: ops.Source) -> ops.OpResult:
+        """``notify.test``: one at a time, and none within ``NOTIFY_TEST_COOLDOWN`` of the last
+        one that reached a channel (``TooSoon`` otherwise). A refused request (bad arguments)
+        or a test whose every channel failed (a wrong URL, being fixed) starts no cooldown."""
         now = time.monotonic()
-        if self._last_test_push is not None and now - self._last_test_push < ops.NOTIFY_TEST_COOLDOWN:
+        recent = self._last_test_push is not None and now - self._last_test_push < ops.NOTIFY_TEST_COOLDOWN
+        if self._test_in_flight or recent:
             raise ops.TooSoon()
-        self._last_test_push = now
+        self._test_in_flight = True
+        try:
+            result = await self._run_op("notify.test", args, False, source=source)
+        finally:
+            self._test_in_flight = False
+        channels: dict[str, str] = result.data.get("channels") or {}
+        if "ok" in channels.values():
+            self._last_test_push = time.monotonic()
+        return result
 
     async def _op(self, ctx: ops.OpContext, name: str, args: dict[str, Any], dry_run: bool) -> ops.OpResult:
         """Run one operation and apply the config it wrote. The caller holds ``_cycle_lock``."""
@@ -444,15 +465,10 @@ class Daemon:
             raise ops.DaemonStopping()
         self.request_cycle(rule)
         self._approvals[rule] = Approval(fingerprint, origin)
-        if self._store is not None:  # the approval is this block's push: its key closes now
+        if self._store is not None:  # its push comes from the cycle that releases the set
             notify.approving(self._store, rule)
-        self._on_approved(rule, count, origin)
-        return self._wait_for_cycle({rule}) if wait else None
-
-    def _on_approved(self, rule: str, count: int, origin: ops.Source) -> None:
-        """Blocked deletes were approved: logged and pushed (``approved``, every time)."""
         log.info("rule %s: %d deletes approved (%s)", rule, count, origin)
-        self._notify([notify.approved(rule, count, origin, self._config, self._clock())])
+        return self._wait_for_cycle({rule}) if wait else None
 
     def push(self, alerts: list[notify.Alert]) -> None:
         """``ops.DaemonHooks.push``: an operation's pushes (a loosened delete guard)."""
