@@ -257,3 +257,14 @@ def until(condition: Callable[[], bool], timeout: float = 10) -> None:
     while not condition():
         assert time.monotonic() < deadline, "the condition never became true"
         time.sleep(0.02)
+
+
+def edited_status(page: Page, edit: Any) -> None:
+    """Serve the live /api/status through ``edit(status) -> status`` from now on, and refetch."""
+
+    def handle(route: Any) -> None:
+        response = route.fetch()
+        route.fulfill(response=response, json=edit(response.json()))
+
+    page.route("**/api/status", handle)
+    refresh_status(page)

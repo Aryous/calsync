@@ -142,7 +142,20 @@ function useRoute() {
     }
   }, []);
 
-  return [route, closeInspector];
+  // An inspector that turns into another in place (a new line, once created, becomes its line):
+  // the history entry is replaced and keeps its place in the chain, so closing and Back behave
+  // as if the new route had been opened where the old one was.
+  const replaceRoute = useCallback((hash) => {
+    const next = parseRoute(hash);
+    if (next === null) return;
+    const here = entry.current || MAP_ENTRY;
+    const info = !opensInspector(next) ? MAP_ENTRY : here.depth ? here : { depth: 1, mapBehind: false };
+    remember(info, hash);
+    entry.current = info;
+    setRoute(next);
+  }, []);
+
+  return [route, closeInspector, replaceRoute];
 }
 
 // ----- header and 立即同步 ------------------------------------------------------------------
@@ -303,7 +316,7 @@ function serviceOfAccount(status, name) {
 function LineName({ status, rule }) {
   const end = (spec) => html`<${CalendarName} service=${serviceOfAccount(status, spec.account)}
       account=${spec.account} name=${spec.calendar_name || spec.calendar}/>`;
-  return html`<span class="route">${end(rule.source)}<span class="arrow" aria-label=${t("to")}>→</span>${end(rule.target)}</span>`;
+  return html`<span class="route">${end(rule.source)}<span class="arrow" aria-hidden="true">→</span><span class="vh">${t("to")}</span>${end(rule.target)}</span>`;
 }
 
 function LineNames({ status, rules }) {
@@ -465,7 +478,7 @@ function Footer() {
 
 function App() {
   const status = useStatusPoller();
-  const [route, closeInspector] = useRoute();
+  const [route, closeInspector, replaceRoute] = useRoute();
   const [note, setNote] = useState(null);
   const [busy, setBusy] = useState(false); // our 立即同步 is running
   const [born, setBorn] = useState(null); // a line just created: {rule, nonce}, for its first comet
@@ -490,7 +503,7 @@ function App() {
       </main>
       <${Footer}/>
     </div>
-    <${Inspector} route=${route} open=${opensInspector(route)} onClose=${closeInspector} onCreated=${onCreated}/>
+    <${Inspector} route=${route} open=${opensInspector(route)} onClose=${closeInspector} onCreated=${onCreated} onReplace=${replaceRoute}/>
   <//>`;
 }
 

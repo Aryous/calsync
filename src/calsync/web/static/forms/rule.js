@@ -56,11 +56,16 @@ function percent(ratio) {
   return String(Math.round(ratio * 1000) / 10);
 }
 
-/** What a refused value of ``field`` means, beside it. */
-function refusal(field) {
+/** What a refused value of ``field`` (``typed``, when a person typed it) means, beside it. */
+function refusal(field, typed = "") {
   switch (field) {
-    case "window":
-      return t("Days must be a number of 0 or more; not saved.");
+    case "window.past":
+    case "window.future": {
+      const what = field === "window.past" ? t("Days in the past") : t("Days in the future");
+      if (/^-/.test(typed)) return t("{what} can't be below 0; not saved.", { what });
+      if (/^\d*\.\d+$/.test(typed)) return t("{what} must be a whole number; not saved.", { what });
+      return t("{what} must be a whole number of 0 or more; not saved.", { what });
+    }
     case "delete_guard.max_count":
       return t("Must be a whole number of 0 or more; not saved.");
     case "delete_guard.max_ratio":
@@ -96,7 +101,14 @@ function StateLine({ live, rule, status }) {
   if (health === "paused") return html`<div class="statl paused"><i></i>${t("Paused · changes wait and arrive together when it resumes")}</div>`;
   if (health === "retiring") {
     const next = status && status.daemon && status.daemon.next_cycle_at;
-    return html`<div class="statl retiring"><i></i><span>${t("Being removed · its {n} copies in the target calendar are deleted first, then the line disappears", { n: copies })}${next ? html` · <span class="num">${t("next check {time}", { time: clockTime(next) })}</span>` : null}</span></div>`;
+    const what = !live
+      ? t("Being removed · its copies in the target calendar are deleted first, then the line disappears")
+      : copies === 0
+        ? t("Being removed · no copies to delete, the line disappears at the next check")
+        : copies === 1
+          ? t("Being removed · its 1 copy in the target calendar is deleted first, then the line disappears")
+          : t("Being removed · its {n} copies in the target calendar are deleted first, then the line disappears", { n: copies });
+    return html`<div class="statl retiring"><i></i><span>${what}${next ? html` · <span class="num">${t("next check {time}", { time: clockTime(next) })}</span>` : null}</span></div>`;
   }
   if (health === "auth") {
     const account = (live.last_run && live.last_run.error_account) || live.source.account;
@@ -121,26 +133,33 @@ function StateLine({ live, rule, status }) {
 function NumberField({ value, label, onCommit, error }) {
   const [text, setText] = useState(value);
   const shown = useRef(value);
+  const input = useRef(null);
+  // The file's value, whenever it changes — unless a person is typing a new one in this field.
   useEffect(() => {
-    setText(value); // the file's value, whenever it changes
+    const el = input.current;
+    const typing = el && document.activeElement === el && el.value.trim() !== shown.current;
     shown.current = value;
+    if (!typing) setText(value);
   }, [value]);
-  const commit = () => {
-    const next = text.trim();
+  // The value comes from the field itself: a key can arrive before the render that follows the
+  // last input, and this render's ``text`` would then be stale.
+  const commit = (e) => {
+    const next = e.currentTarget.value.trim();
     if (next === shown.current) return;
     if (next === "") {
       setText(shown.current); // nothing typed: keep what the file says
       return;
     }
-    // Refused: back to what the file says (the value may not have changed, so no effect does it).
+    setText(next);
+    // Refused: back to what the file says — unless a newer value has been typed since.
     Promise.resolve(onCommit(next)).then((ok) => {
-      if (ok === false) setText(shown.current);
+      if (ok === false && input.current && input.current.value.trim() === next) setText(shown.current);
     });
   };
-  return html`<input class=${error ? "field n num err" : "field n num"} type="text" inputmode="decimal"
+  return html`<input class=${error ? "field n num err" : "field n num"} type="text" inputmode="decimal" ref=${input}
       aria-label=${label} aria-invalid=${error ? "true" : "false"} value=${text}
       onInput=${(e) => setText(e.currentTarget.value)} onChange=${commit}
-      onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); commit(); } }}/>`;
+      onKeyDown=${(e) => { if (e.key === "Enter") { e.preventDefault(); commit(e); } }}/>`;
 }
 
 function Errors({ errors, keys }) {
@@ -178,7 +197,8 @@ function Alarms({ value, onSet }) {
 }
 
 function Settings({ rule, view, set, errors }) {
-  const window_ = view("window");
+  const window_ = view("window"); // with the writes on their way: a bound is written with the other's newest value
+  const fileWindow = rule.window || window_; // what the fields show: the file (just switched on: the default)
   const fields = (key) => view(`fields.${key}`);
   const content = fields("content");
   return html`
@@ -187,14 +207,14 @@ function Settings({ rule, view, set, errors }) {
           onPick=${(v) => set("window", "window", v === "all" ? "all" : "7d:180d", v === "all" ? null : { past: "7d", future: "180d" })}
           options=${[["all", t("Everything")], ["window", t("Only a span of time")]]}/>
       ${window_ ? html`<div class="inl">${t("From")}
-          <${NumberField} label=${t("Days in the past")} value=${days(window_.past)} error=${errors.window}
-              onCommit=${(text) => set("window", "window", `${text}d:${window_.future}`, { ...window_, past: `${text}d` })}/>
+          <${NumberField} label=${t("Days in the past")} value=${days(fileWindow.past)} error=${errors["window.past"]}
+              onCommit=${(text) => set("window.past", "window", `${text}d:${window_.future}`, { ...window_, past: `${text}d` }, text)}/>
           ${t("days ago to")}
-          <${NumberField} label=${t("Days in the future")} value=${days(window_.future)} error=${errors.window}
-              onCommit=${(text) => set("window", "window", `${window_.past}:${text}d`, { ...window_, future: `${text}d` })}/>
+          <${NumberField} label=${t("Days in the future")} value=${days(fileWindow.future)} error=${errors["window.future"]}
+              onCommit=${(text) => set("window.future", "window", `${window_.past}:${text}d`, { ...window_, future: `${text}d` }, text)}/>
           ${t("days ahead")}</div>`
         : html`<p class="hp after">${t("Every event, past and future, and every occurrence of a repeating one.")}</p>`}
-      <${Errors} errors=${errors} keys=${["window"]}/>
+      <${Errors} errors=${errors} keys=${["window", "window.past", "window.future"]}/>
     </div>
     <div class="fs" data-key="alarms"><span class="lb">${t("Reminders")}</span>
       <p class="hp">${t("When the family's iPhones ring.")}</p>
@@ -224,11 +244,11 @@ function Settings({ rule, view, set, errors }) {
     </div>
     <div class="fs" data-key="delete_guard"><span class="lb">${t("Delete guard")}</span>
       <div class="inl first">${t("When one sync would delete more than")}
-        <${NumberField} label=${t("Most copies deleted at once")} value=${String(view("delete_guard.max_count"))}
+        <${NumberField} label=${t("Most copies deleted at once")} value=${String(rule.delete_guard.max_count)}
             error=${errors["delete_guard.max_count"]}
             onCommit=${(text) => set("delete_guard.max_count", "delete_guard.max_count", text, Number(text))}/>
         ${t("copies, or more than")}
-        <${NumberField} label=${t("Most copies deleted at once, as a percentage")} value=${percent(view("delete_guard.max_ratio"))}
+        <${NumberField} label=${t("Most copies deleted at once, as a percentage")} value=${percent(rule.delete_guard.max_ratio)}
             error=${errors["delete_guard.max_ratio"]}
             onCommit=${(text) => {
               const n = /^-?\d+(\.\d+)?$/.test(text) ? Number(text) / 100 : text; // a non-number: the daemon says so
@@ -241,19 +261,23 @@ function Settings({ rule, view, set, errors }) {
 
 // ----- deleting --------------------------------------------------------------------------------------
 
-function DeleteChoice({ live, status, onCancel, onConfirm, busy }) {
+function DeleteChoice({ live, rule, status, onCancel, onConfirm, busy }) {
   const [choice, setChoice] = useState("keep");
   const group = useRef(null);
   useEffect(() => {
     const checked = group.current && group.current.querySelector('[aria-checked="true"]');
     if (checked) checked.focus({ preventScroll: true });
   }, []);
-  const copies = live ? live.copies || 0 : 0;
-  const target = live ? html`<${End} status=${status} spec=${live.target}/>` : t("the target calendar");
+  const copies = live ? live.copies || 0 : null; // null: not known (the status does not list the line)
+  const target = html`<${End} status=${status} spec=${live ? live.target : rule.target}/>`;
   const count = html`<b class="num">${copies === 1 ? t("1 copy") : t("{n} copies", { n: copies })}</b>`;
+  let drop;
+  if (copies === 0) drop = slots(t("calsync has not written any copy into {calendar} yet: the line disappears at the next check."), { calendar: target });
+  else if (copies === null) drop = slots(t("calsync first deletes the copies it wrote into {calendar}; when there are many, it stops and waits for you to confirm. Once the copies are gone, the line disappears."), { calendar: target });
+  else drop = slots(t("calsync first deletes the {copies} it wrote into {calendar}; when there are many, it stops and waits for you to confirm. Once the copies are gone, the line disappears."), { copies: count, calendar: target });
   const choices = [
     ["keep", t("Keep the copies"), slots(t("What was synced stays in {calendar}: no longer updated, and calsync never deletes it. The line disappears at once."), { calendar: target })],
-    ["drop", t("Delete the copies too"), slots(t("calsync first deletes the {copies} it wrote into {calendar}; when there are many, it stops and waits for you to confirm. Once the copies are gone, the line disappears."), { copies: count, calendar: target })],
+    ["drop", t("Delete the copies too"), drop],
   ];
   const onKeyDown = (e) => {
     if (e.key === "Escape") {
@@ -306,15 +330,35 @@ export function RuleForm({ route, onClose }) {
   const [deleting, setDeleting] = useState(false);
   const chain = useRef(Promise.resolve());
   const deleteButton = useRef(null);
+  const unretire = useRef(null);
+  const focusUnretire = useRef(false); // after "delete with the copies": focus 取消移除, not the body
+  const removedHere = useRef(false); // deleted (copies kept) from here: the panel closes as it was
+  const [retired, setRetired] = useState(false); // seen retiring, then gone: its copies were deleted
+  const reads = useRef(0); // only the newest read of the config is shown
+  const current = useRef(undefined); // the rule as last rendered
+  const lastView = useRef(null);
+  current.current = rule;
 
   const load = useCallback(async () => {
+    const mine = ++reads.current;
     try {
       const config = await get("/api/config");
-      setRule((config.rules || []).find((r) => r.name === name) || null);
+      if (mine !== reads.current) return; // a newer read was asked for since
+      const found = (config.rules || []).find((r) => r.name === name) || null;
+      if (found === null && removedHere.current) return;
+      if (found === null && current.current && current.current.retire) setRetired(true);
+      setRule(found);
     } catch (e) {
       // keep what is shown; the sentence under the map says when calsync is out of reach
     }
   }, [name]);
+
+  useEffect(() => {
+    if (focusUnretire.current && unretire.current) {
+      focusUnretire.current = false;
+      unretire.current.focus();
+    }
+  });
   const stamp = status ? status.generated_at : "";
   useEffect(() => {
     load();
@@ -329,10 +373,9 @@ export function RuleForm({ route, onClose }) {
 
   /** Write ``key`` (rule.set) — shown as ``shown`` at once — in order with the other writes;
    * resolves to whether it was saved. */
-  const set = (field, key, value, shown) => {
+  const set = (field, key, value, shown, typed = "") => {
     const token = {};
     setOverlay((o) => ({ ...o, [key]: { value: shown, token } }));
-    setErrors((e) => ({ ...e, [field]: null }));
     let ok = false;
     chain.current = chain.current.then(async () => {
       try {
@@ -340,11 +383,13 @@ export function RuleForm({ route, onClose }) {
         if (result.needs_human) setHuman(result);
         else {
           ok = true;
+          setHuman(null);
           setNotice(false);
+          setErrors((x) => ({ ...x, [field]: null })); // cleared when a write of it lands, not when queued
           flash();
         }
       } catch (e) {
-        if (e.kind === "config") setErrors((x) => ({ ...x, [field]: refusal(field) }));
+        if (e.kind === "config") setErrors((x) => ({ ...x, [field]: refusal(field, typed) }));
         else if (e.kind === "conflict") setNotice(true);
         else if (e.kind !== "unpaired") setErrors((x) => ({ ...x, [field]: failureText(e) }));
       }
@@ -367,8 +412,11 @@ export function RuleForm({ route, onClose }) {
     try {
       const result = await op(opName, args);
       if (result.needs_human) setHuman(result);
-      else if (after) await after(result);
-      else flash();
+      else {
+        setHuman(null);
+        if (after) await after(result);
+        else flash();
+      }
     } catch (e) {
       if (e.kind === "conflict") setNotice(true);
       else if (e.kind !== "unpaired") setNote({ text: failureText(e), bad: true });
@@ -397,22 +445,29 @@ export function RuleForm({ route, onClose }) {
     act("delete", "rule.remove", choice === "drop" ? { name, delete_copies: true } : { name }, async () => {
       setDeleting(false);
       if (choice === "keep") {
+        removedHere.current = true;
         refresh();
         onClose();
-      } else flash();
+      } else {
+        focusUnretire.current = true;
+        flash();
+      }
     });
 
+  if (removedHere.current && lastView.current) return lastView.current; // sliding out as it was
   const head = html`<${Head} title=${t("Line")} sub=${t("Line settings · changes save at once")} onClose=${onClose}/>`;
   if (rule === undefined) return html`${head}<div class="ib"><p class="hp">${t("Reading the line…")}</p></div>`;
   if (rule === null) {
-    return html`${head}<div class="ib"><div class="note">${t("This line is no longer there. It may have been deleted from the terminal or in config.toml.")}</div></div>`;
+    return html`${head}<div class="ib"><div class="note">${retired
+      ? t("Its copies have been deleted, and the line has been removed.")
+      : t("This line is no longer there. It may have been deleted from the terminal or in config.toml.")}</div></div>`;
   }
 
   const paused = view("paused");
   const retiring = Boolean(rule.retire);
   const spec = live || { name, source: rule.source, target: rule.target };
   const syncLabel = syncing ? t("Syncing…") : t("Sync this line now");
-  return html`${head}
+  lastView.current = html`${head}
     <div class="ib">
       <${RouteChip} status=${status} rule=${spec}/>
       <${StateLine} live=${live} rule=${rule} status=${status}/>
@@ -421,7 +476,7 @@ export function RuleForm({ route, onClose }) {
             aria-busy=${syncing ? "true" : "false"} aria-disabled=${syncing || cycleRunning ? "true" : "false"}
             onClick=${() => !cycleRunning && syncOne()}><${Icon} name="sync"/>${syncLabel}</button>
         ${retiring
-          ? html`<button class="btn" type="button" onClick=${() => act("unretire", "rule.set", { name, key: "retire", value: false })}>${t("Stop removing")}</button>`
+          ? html`<button class="btn" type="button" ref=${unretire} onClick=${() => act("unretire", "rule.set", { name, key: "retire", value: false })}>${t("Stop removing")}</button>`
           : html`<button class="btn" type="button" aria-disabled=${working === "pause" ? "true" : "false"}
               onClick=${() => act("pause", paused ? "rule.resume" : "rule.pause", { name })}>${paused ? t("Resume") : t("Pause")}</button>`}
         ${live && live.health === "auth" ? html`<a class="btn" href=${`#/account/${encodeURIComponent((live.last_run && live.last_run.error_account) || live.source.account)}`}>${t("Reconnect")}</a>` : null}
@@ -433,9 +488,10 @@ export function RuleForm({ route, onClose }) {
     </div>
     <div class=${deleting ? "ifoot open" : "ifoot"}>
       ${deleting
-        ? html`<${DeleteChoice} live=${live} status=${status} busy=${working === "delete"} onConfirm=${remove}
+        ? html`<${DeleteChoice} live=${live} rule=${rule} status=${status} busy=${working === "delete"} onConfirm=${remove}
             onCancel=${() => { setDeleting(false); window.requestAnimationFrame(() => deleteButton.current && deleteButton.current.focus()); }}/>`
         : html`${retiring ? html`<span></span>` : html`<button class="btn danger" type="button" ref=${deleteButton} onClick=${() => setDeleting(true)}>${t("Delete this line")}</button>`}
           <${Saved} on=${savedOn}/>`}
     </div>`;
+  return lastView.current;
 }

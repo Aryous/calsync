@@ -5,14 +5,18 @@
 // nothing — and 创建并开始同步 adds the line (``rule.add``), runs it once (``trigger``) and opens
 // it; the map sends one comet along the new wire.
 //
-// The line's name: "<source account>-to-<target account>", with "-2", "-3"… when it is taken —
-// or when an earlier line of that name left copies behind (a dry-run ``rule.add`` says so), since
-// a new line of that name would take those copies over.
+// The line's name: "<source account>-to-<target account>", with "-2", "-3"… when a line in the
+// config has it — or when an earlier line of that name left copies behind (a dry-run ``rule.add``
+// says so), since a new line of that name would take those copies over and prune them. Those
+// copies stay where they are; the preview says so.
+//
+// Picks settle for 250 ms before a preview starts, and a superseded preview's requests are
+// aborted, so quick picks do not queue dry runs at the daemon.
 
 import { html, useEffect, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
 import { t } from "/static/i18n.js";
 import { accountLabel, serviceOf } from "/static/format.js";
-import { get, op, useStatus } from "/static/api.js";
+import { ApiError, get, op, useStatus } from "/static/api.js";
 import { CalendarName, Icon, Service } from "/static/icons.js";
 import { Command } from "/static/command.js";
 import { colourOf } from "/static/map.js";
@@ -37,11 +41,14 @@ function refOf(group, cal) {
   return `${group.account}:${same === 1 ? cal.name : cal.id}`;
 }
 
-/** Keyboard for a radiogroup: arrows move to the next enabled radio and pick it. */
+/** Keyboard for a radiogroup: arrows move to the next enabled radio of this group and pick it.
+ * Groups are never nested; the key stops here all the same. */
 function onRadioKeys(e) {
   const moves = { ArrowDown: 1, ArrowRight: 1, ArrowUp: -1, ArrowLeft: -1 };
   if (!(e.key in moves) || e.target.getAttribute("role") !== "radio") return;
-  const radios = [...e.currentTarget.querySelectorAll('[role="radio"]:not([disabled])')];
+  e.stopPropagation();
+  const radios = [...e.currentTarget.querySelectorAll('[role="radio"]:not([disabled])')]
+    .filter((r) => r.closest('[role="radiogroup"]') === e.currentTarget);
   const i = radios.indexOf(e.target);
   if (i < 0) return;
   e.preventDefault();
@@ -81,6 +88,10 @@ function Picker({ groups, chosen, onPick, isTaken, source, extra, role }) {
 }
 
 function PreviewBlock({ state, target }) {
+  return html`<div data-role="preview" role="status">${previewBody(state, target)}</div>`;
+}
+
+function previewBody(state, target) {
   if (!state) return html`<p class="hp flush">${t("Once both ends are chosen, calsync works out here what would happen. Nothing is written until you confirm.")}</p>`;
   if (state.loading) return html`<p class="hp flush" aria-busy="true">${t("Previewing…")}</p>`;
   if (state.error) {
@@ -98,10 +109,13 @@ function PreviewBlock({ state, target }) {
       : d.target_would_be_created
         ? t("This calendar does not exist yet: creating the line creates it in iCloud.")
         : t("This calendar was not found in the account.")}</p>
+    ${(state.earlier || []).map((e) => html`<p class="earlier" data-role="earlier">${e.copies === 1
+      ? t("An earlier line called {name} left 1 copy behind; it stays in its calendar, and this line does not touch it.", { name: e.name })
+      : t("An earlier line called {name} left {n} copies behind; they stay in their calendar, and this line does not touch them.", { name: e.name, n: e.copies })}</p>`)}
   </div>`;
 }
 
-export function NewLineForm({ route, onClose, onCreated }) {
+export function NewLineForm({ route, onClose, onCreated, onReplace }) {
   const { status, refresh } = useStatus();
   const sources = sideOf(status, true);
   const targets = sideOf(status, false);
@@ -118,11 +132,16 @@ export function NewLineForm({ route, onClose, onCreated }) {
   const [creating, setCreating] = useState(false);
   const [failure, setFailure] = useState("");
   const seq = useRef(0);
+  const alive = useRef(true);
+  useEffect(() => () => {
+    alive.current = false;
+  }, []);
 
   const srcPair = find(sources, src);
   const tgtPair = tgt && tgt !== "new" ? find(targets, tgt) : null;
   const taken = (s, c) => Boolean(s) && (s.rules || []).some((r) => (c.rules || []).includes(r));
   const isTakenTarget = (c) => Boolean(srcPair) && taken(srcPair[1], c);
+  const isTakenSource = (c) => Boolean(tgtPair) && taken(c, tgtPair[1]);
   const newGroups = targets.filter((g) => g.account);
   const newGroup = newGroups.find((g) => g.account === newAccount) || newGroups[0] || null;
 
@@ -155,23 +174,30 @@ export function NewLineForm({ route, onClose, onCreated }) {
       return undefined;
     }
     const mine = ++seq.current;
+    const abort = new AbortController();
+    const { signal } = abort;
     setPreview({ loading: true });
-    (async () => {
+    const from = srcPair[0].account;
+    const to = args.target.split(":")[0];
+    const timer = window.setTimeout(async () => {
       try {
-        const name = await freeName(args, status, srcPair[0].account, args.target.split(":")[0]);
-        const result = await op("rule.preview", { name, ...args });
+        const { name, earlier } = await freeName(args, status, from, to, signal);
+        const result = await op("rule.preview", { name, ...args }, { signal });
         if (mine !== seq.current) return;
         const data = result.data || {};
         if (result.needs_human || data.error) {
-          const account = data.error_account || srcPair[0].account;
+          const account = data.error_account || from;
           setPreview({ error: t("The preview did not finish: calsync can't reach {account}.", { account: accountLabel(account) }), command: result.needs_human ? result.command : null });
-        } else setPreview({ data, name, args });
+        } else setPreview({ data, name, args, earlier });
       } catch (e) {
-        if (mine !== seq.current || e.kind === "unpaired") return;
+        if (mine !== seq.current || e.kind === "unpaired" || e.kind === "aborted") return;
         setPreview({ error: e.kind === "config" ? t("calsync refused this line.") : failureText(e) });
       }
-    })();
-    return undefined;
+    }, 250);
+    return () => {
+      window.clearTimeout(timer);
+      abort.abort();
+    };
   }, [argsKey]);
 
   const ready = Boolean(preview && preview.data && (preview.data.target_exists || preview.data.target_would_be_created));
@@ -200,7 +226,9 @@ export function NewLineForm({ route, onClose, onCreated }) {
         // the line exists; its inspector shows how it is doing
       }
       refresh();
-      window.location.hash = `#/rule/${encodeURIComponent(name)}`;
+      // The line takes this form's place in the history (Back must not return to a form whose
+      // line exists now) — unless the person has left the form meanwhile.
+      if (alive.current) onReplace(`#/rule/${encodeURIComponent(name)}`);
     } catch (e) {
       if (e.kind !== "unpaired") setFailure(e.kind === "config" ? t("calsync refused this line.") : failureText(e));
     } finally {
@@ -212,8 +240,9 @@ export function NewLineForm({ route, onClose, onCreated }) {
   const pickTarget = (g, c) => setTgt(c.key);
   const newCalendar = (tabbable) => html`<${Radio} cls="new" checked=${tgt === "new"} tabbable=${tabbable} onPick=${() => setTgt("new")}>
       <${Icon} name="plus"/><span class="nm">${t("Create a new calendar in iCloud")}</span>
-    <//>
-    ${tgt === "new" ? html`<div class="newcal">
+    <//>`;
+  // Beside the targets' radiogroup, not in it: a radiogroup of its own.
+  const newCalendarDetails = tgt === "new" ? html`<div class="newcal">
       ${newGroups.length > 1 ? html`<div role="radiogroup" aria-label=${t("In which account")} data-role="new-calendar" onKeyDown=${onRadioKeys}>
         ${newGroups.map((g) => html`<${Radio} checked=${newGroup === g} tabbable=${newGroup === g} onPick=${() => setNewAccount(g.account)}>
           <${Service} service=${g.service} small=${true}/><span class="nm">${accountLabel(g.account)}</span>
@@ -221,16 +250,17 @@ export function NewLineForm({ route, onClose, onCreated }) {
       </div>` : null}
       <input class="field w" type="text" aria-label=${t("The new calendar's name")} placeholder=${t("The new calendar's name")}
           value=${newName} onInput=${(e) => setNewName(e.currentTarget.value)}/>
-    </div>` : null}`;
+    </div>` : null;
 
   return html`<${Head} title=${t("New line")} sub=${t("Choose a source, then a target")} onClose=${onClose}/>
     <div class="ib">
       ${status ? null : html`<p class="hp">${t("Reading the sync state…")}</p>`}
       <div class="fs"><span class="lb" id="sources-lb">${t("Source")}</span>
-        <${Picker} role="sources" groups=${sources} chosen=${src} onPick=${pickSource} isTaken=${() => false} source=${true}/>
+        <${Picker} role="sources" groups=${sources} chosen=${src} onPick=${pickSource} isTaken=${isTakenSource} source=${true}/>
       </div>
       <div class="fs"><span class="lb" id="targets-lb">${t("Target")}</span>
         <${Picker} role="targets" groups=${targets} chosen=${tgt} onPick=${pickTarget} isTaken=${isTakenTarget} source=${false} extra=${newCalendar}/>
+        ${newCalendarDetails}
       </div>
       <div class="fs"><span class="lb">${t("Preview")}</span><${PreviewBlock} state=${preview} target=${targetName}/></div>
       ${failure ? html`<p class="errt" role="alert">${failure}</p>` : null}
@@ -242,21 +272,21 @@ export function NewLineForm({ route, onClose, onCreated }) {
     </div>`;
 }
 
-/** A name for the new line that no line has, and that no earlier line left copies under. */
-async function freeName(args, status, from, to) {
-  const used = new Set(((status && status.rules) || []).map((r) => r.name));
+/** A name for the new line that no line in the config (or the status) has, and that no earlier
+ * line left copies under: {name, earlier: [{name, copies}]} (the names passed over for their
+ * copies). A dry-run refusal is a real one: thrown. */
+async function freeName(args, status, from, to, signal) {
+  const config = await get("/api/config", null, { signal });
+  const used = new Set([...(config.rules || []), ...((status && status.rules) || [])].map((r) => r.name));
   const base = `${from}-to-${to}`;
-  for (let i = 1; i <= 20; i += 1) {
+  const earlier = [];
+  for (let i = 1; i <= 50; i += 1) {
     const name = i === 1 ? base : `${base}-${i}`;
     if (used.has(name)) continue;
-    try {
-      const dry = await op("rule.add", { name, ...args }, { dryRun: true });
-      if (dry.data && dry.data.earlier_copies) continue;
-      return name;
-    } catch (e) {
-      if (e.kind === "config" && (e.problems || []).some((p) => /duplicate rule name/.test(p))) continue;
-      throw e;
-    }
+    const dry = await op("rule.add", { name, ...args }, { dryRun: true, signal });
+    const copies = (dry.data && dry.data.earlier_copies) || 0;
+    if (!copies) return { name, earlier };
+    earlier.push({ name, copies });
   }
-  return `${base}-${Date.now() % 100000}`;
+  throw new ApiError("no_name");
 }

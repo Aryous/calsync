@@ -15,6 +15,7 @@ from tests.browser.conftest import (
     PHONE,
     VIEWPORT_IDS,
     OpenPage,
+    edited_status,
     ready,
     refresh_status,
     sync_button,
@@ -690,17 +691,6 @@ def test_ports_follow_their_pills_top_to_bottom(open_page: OpenPage, viewport: d
         by_pill = sorted(ports, key=lambda key: geo["pills"][key]["top"])
         by_port = sorted(ports, key=lambda key: ports[key]["y"])
         assert by_pill == by_port, (side, by_pill, by_port)
-
-
-def edited_status(page: Page, edit: Any) -> None:
-    """Serve the live /api/status through ``edit(status) -> status`` from now on, and refetch."""
-
-    def handle(route: Any) -> None:
-        response = route.fetch()
-        route.fulfill(response=response, json=edit(response.json()))
-
-    page.route("**/api/status", handle)
-    refresh_status(page)
 
 
 def test_a_line_whose_account_is_missing_is_still_drawn(paired_page: Page) -> None:

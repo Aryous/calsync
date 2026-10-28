@@ -4,6 +4,7 @@
 // - "unpaired": 401 (the cookie is gone or the key was reset) — the page reloads to "/", which
 //   serves the pair page;
 // - "offline": the request never got an answer (calsync stopped, the network dropped);
+// - "aborted": the caller gave up on it (its ``signal``), e.g. a preview superseded by a newer one;
 // - "config": 422, the config change was refused; ``problems`` lists why (field by field);
 // - "conflict": 422 config_conflict, the file changed underneath (reload and try again);
 // - any other: the API's own error kind (``paused``, ``read_only``, ``too_soon``, …).
@@ -37,6 +38,7 @@ async function request(path, init) {
   try {
     res = await fetch(path, { credentials: "same-origin", cache: "no-store", ...init });
   } catch (e) {
+    if (e && e.name === "AbortError") throw new ApiError("aborted");
     throw new ApiError("offline");
   }
   if (res.status === 401) throw unpaired();
@@ -59,24 +61,27 @@ function failure(res, body) {
   });
 }
 
-/** GET /api/<path> with query ``params`` (null and undefined left out); the JSON body. */
-export async function get(path, params) {
+/** GET /api/<path> with query ``params`` (null and undefined left out); the JSON body.
+ * ``signal``: an AbortSignal (an aborted request is ApiError "aborted"). */
+export async function get(path, params, { signal } = {}) {
   const url = new URL(path, window.location.origin);
   for (const [key, value] of Object.entries(params || {})) {
     if (value != null) url.searchParams.set(key, String(value));
   }
-  const { res, body } = await request(url.pathname + url.search, { headers: { Accept: "application/json" } });
+  const { res, body } = await request(url.pathname + url.search, { headers: { Accept: "application/json" }, signal });
   if (!res.ok || body == null) throw failure(res, body);
   return body;
 }
 
 /** POST /api/ops/<name> {args, dry_run}: the operation's result ({op, changed, summary, diff,
- * data, needs_human, command, reason}). */
-export async function op(name, args = {}, { dryRun = false } = {}) {
+ * data, needs_human, command, reason}). ``signal``: as for get(). An aborted request may still
+ * have reached the daemon: abort only what writes nothing (a preview, a dry run). */
+export async function op(name, args = {}, { dryRun = false, signal } = {}) {
   const { res, body } = await request(`/api/ops/${encodeURIComponent(name)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
     body: JSON.stringify({ args, dry_run: dryRun }),
+    signal,
   });
   if (res.ok && body) return body;
   const error = (body && body.error) || {};

@@ -52,17 +52,27 @@ export function serviceOfAccount(status, name, fallback = "caldav") {
   return account ? serviceOf(account) : fallback;
 }
 
-/** One end of a line (a status rule's ``source`` or ``target``), named with icon and account. */
+/** The name of the calendar ``ref`` (an id or a name, as the config has it) of ``account``,
+ * from the status's calendar lists; the reference itself only when no list has it (a calendar
+ * to be created, a list not read yet). */
+export function calendarNameOf(status, account, ref) {
+  const listed = accountOf(status, account);
+  const cal = ((listed && listed.calendars) || []).find((c) => c.id === ref || c.name === ref);
+  return cal ? cal.name : ref;
+}
+
+/** One end of a line (a status rule's ``source`` or ``target``, or a config rule's), named with
+ * icon and account — by the calendar's name, never its id when the name is known. */
 export function End({ status, spec, fallback }) {
   return html`<${CalendarName} service=${serviceOfAccount(status, spec.account, fallback)}
-      account=${spec.account} name=${spec.calendar_name || spec.calendar}/>`;
+      account=${spec.account} name=${spec.calendar_name || calendarNameOf(status, spec.account, spec.calendar)}/>`;
 }
 
 /** The line as a chip: [icon] 家庭日程 · personal → [icon] 家庭 · family-icloud. */
 export function RouteChip({ status, rule }) {
   return html`<div class="route-chip">
     <${End} status=${status} spec=${rule.source} fallback="google"/>
-    <span class="arrow" aria-label=${t("to")}>→</span>
+    <span class="arrow" aria-hidden="true">→</span><span class="vh">${t("to")}</span>
     <${End} status=${status} spec=${rule.target}/>
   </div>`;
 }

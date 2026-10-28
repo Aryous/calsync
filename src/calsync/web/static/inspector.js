@@ -35,8 +35,9 @@ function Placeholder({ route, onClose }) {
 
 const FORMS = { rule: RuleForm, calendar: CalendarForm, new: NewLineForm };
 
-/** ``open``: the route opens an inspector. ``onCreated(rule)``: a new line was added. */
-export function Inspector({ route, open, onClose, onCreated }) {
+/** ``open``: the route opens an inspector. ``onCreated(rule)``: a new line was added.
+ * ``onReplace(hash)``: this inspector becomes another, in the same history entry. */
+export function Inspector({ route, open, onClose, onCreated, onReplace }) {
   const panel = useRef(null);
   const returnTo = useRef(null);
   // Closing, the panel slides out with what it showed; then the form goes (no reads behind it).
@@ -76,6 +77,6 @@ export function Inspector({ route, open, onClose, onCreated }) {
   return html`<aside class=${open ? "insp open" : "insp"} ref=${panel} tabindex="-1"
       role="dialog" aria-modal="false" aria-labelledby="insp-title" aria-hidden=${open ? "false" : "true"}
       inert=${!open} data-route=${open ? route.name : ""}>
-    ${Form ? html`<${Form} key=${current.key} route=${current} onClose=${onClose} onCreated=${onCreated}/>` : html`<div class="ih"><div><h2 id="insp-title"></h2></div></div><div class="ib"></div>`}
+    ${Form ? html`<${Form} key=${current.key} route=${current} onClose=${onClose} onCreated=${onCreated} onReplace=${onReplace}/>` : html`<div class="ih"><div><h2 id="insp-title"></h2></div></div><div class="ib"></div>`}
   </aside>`;
 }
