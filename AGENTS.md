@@ -165,6 +165,8 @@ uv sync
 uv run pytest                  # ~10 s; e2e tests spawn a throwaway Radicale
 uv run pytest -W error -q      # must stay clean
 uv run ruff check src tests && uv run ruff format --check src tests && uv run pyright
+uv run playwright install chromium webkit   # once: the browsers for the web UI tests
+uv run pytest -m browser -q    # the web UI in Chromium and WebKit against a live daemon (~20 s)
 ```
 
 - **TDD.** Write the failing test first and record why it fails. Prefer the
@@ -173,6 +175,15 @@ uv run ruff check src tests && uv run ruff format --check src tests && uv run py
   `tests/fakes/target.py` (`FakeTarget`: strict 412, `mode="sync"`).
   `tests/harness.py` builds an engine against FakeGoogle + Radicale
   (`build`) or FakeTarget (`build_fake`).
+- **Browser tests** (`tests/browser`, marker `browser`, deselected unless
+  `-m browser`): `live.py` runs a real `Daemon` in a background thread over a
+  synthetic config (two Google and two iCloud accounts, four rules, events in
+  the week of a pinned clock, one change pending) with the fakes behind it and
+  the web UI on `127.0.0.1:0`; `conftest.py` gives `live` (the session's, keep
+  it as seeded), `fresh_live` (a test's own, for cycles and config changes) and
+  `open_page(...)`, which pairs a page through the key link and fails the test
+  on console errors, uncaught errors or CSP violations it did not `allow`.
+  `CALSYNC_SHOTS=<dir>` makes `test_shots.py` write screenshots.
 - **Sealed tests.** An autouse fixture in `tests/conftest.py` gives every test a
   temporary `HOME`, `CALSYNC_CONFIG` and `CALSYNC_STATE_DIR`, a keychain that
   refuses every call (`PYTHON_KEYRING_BACKEND=keyring.backends.fail.Keyring` for

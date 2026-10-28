@@ -25,6 +25,7 @@ dev = [
     "radicale>=3.8",
     "ruff>=0.8",
     "pyright>=1.1.390",
+    "playwright>=1.64.1",
 ]
 
 [build-system]
@@ -40,6 +41,7 @@ addopts = "-ra"
 markers = [
     "e2e: end-to-end tests against a local Radicale server",
     "network: lifts the sealed environment's network guard (see tests/conftest.py); nothing needs it",
+    "browser: Playwright tests against a live in-process daemon; run only with -m browser (needs `uv run playwright install chromium webkit`)",
 ]
 
 [tool.ruff]
