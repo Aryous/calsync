@@ -276,12 +276,13 @@ function reducedMotion() {
   return window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 }
 
-/** A comet: a short accent stroke travelling along ``d`` (a Web Animation of its dash offset). */
-function comet(layer, d, duration, delay = 0, wave = false) {
+/** A comet: a short accent stroke travelling along ``d`` (a Web Animation of its dash offset).
+ * ``kind``: "wave" (a sync wave's) or "born" (a new line's first). */
+function comet(layer, d, duration, delay = 0, kind = "") {
   if (!layer || reducedMotion() || typeof Element.prototype.animate !== "function") return;
   const path = document.createElementNS(layer.namespaceURI, "path"); // the SVG namespace
   path.setAttribute("d", d);
-  path.setAttribute("class", wave ? "comet wave" : "comet");
+  path.setAttribute("class", kind ? `comet ${kind}` : "comet");
   layer.appendChild(path);
   const length = path.getTotalLength();
   const seg = 34;
@@ -328,7 +329,7 @@ function useMotion(layerRef, hubRef, geo, model, waving, still) {
     if (!g || !m || s || document.hidden || !layer || reducedMotion()) return;
     m.rules.filter(flows).forEach((line, i) => {
       const d = routeOf(g, line);
-      if (d) comet(layer, d, 2200, i * 160, true);
+      if (d) comet(layer, d, 2200, i * 160, "wave");
     });
     beat(hubRef.current);
     layer.dataset.waves = String(Number(layer.dataset.waves || 0) + 1); // for the tests
@@ -358,6 +359,22 @@ function useMotion(layerRef, hubRef, geo, model, waving, still) {
     const again = window.setInterval(wave, WAVE_EVERY);
     return () => window.clearInterval(again);
   }, [waving, drawn]);
+}
+
+/** One comet along a line just created (``born``: {rule, nonce}), once its wire is drawn. */
+function useBorn(layerRef, geo, model, born) {
+  const done = useRef(0);
+  useEffect(() => {
+    if (!born || done.current === born.nonce || !geo || !model) return;
+    const line = model.rules.find((l) => l.name === born.rule);
+    const d = line ? routeOf(geo, line) : null;
+    if (!d) return; // not drawn yet: the next measure brings it
+    done.current = born.nonce;
+    const layer = layerRef.current;
+    if (!layer || reducedMotion()) return;
+    comet(layer, d, 2400, 350, "born");
+    layer.dataset.born = born.rule; // for the tests
+  }, [born, geo, model]);
 }
 
 // ----- focus -------------------------------------------------------------------------------------
@@ -483,7 +500,7 @@ function Wires({ geo, model, focus, layerRef, onHit }) {
 /** The sync map, from ``status`` (null until read). ``route``: the open inspector's (its lines
  * stay lit). ``waving``: a cycle runs (ours or the daemon's). ``stale``: the status could not be
  * refreshed (calsync out of reach): nothing flows. */
-export function SyncMap({ status, route, waving, stale }) {
+export function SyncMap({ status, route, waving, stale, born }) {
   const canvasRef = useRef(null);
   const layerRef = useRef(null);
   const hubRef = useRef(null);
@@ -496,6 +513,7 @@ export function SyncMap({ status, route, waving, stale }) {
     if (tipRef.current) tipRef.current(tip);
   };
   useMotion(layerRef, hubRef, geo, model, waving, stale);
+  useBorn(layerRef, geo, model, born);
 
   const selected = selectedLines(route, model);
   const focus = hover || selected;
@@ -551,6 +569,7 @@ export function SyncMap({ status, route, waving, stale }) {
       ${model ? model.targets.map((g) => html`<${AccountGroup} key=${g.name} group=${g} focus=${focus} route=${route}/>`) : null}
       <a class="add-acct" href="#/connect/icloud"><${Icon} name="plus"/>${t("Connect an iCloud account")}</a>
     </div>
+    <a class="btn new-line" href="#/new"><${Icon} name="plus"/>${t("New line")}</a>
     <${Tip} setter=${tipRef}/>
   </section>`;
 }

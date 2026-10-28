@@ -8,20 +8,45 @@ own with a refused credential (work-mine) and blocked deletes (school-home).
 """
 
 import os
+import re
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 from playwright.sync_api import Page
 
 from tests.browser.conftest import DESKTOP, PHONE, OpenPage, watch_of
-from tests.browser.live import LiveDaemon
+from tests.browser.live import SCHOOL, LiveDaemon
 
 pytestmark = pytest.mark.browser
 
 SHOTS = os.environ.get("CALSYNC_SHOTS")
 SIZES = {"phone": PHONE, "desktop": DESKTOP}
-# ``focus``: a line's inspector open, the map dimmed around that line.
-STATES = {"": "/", "settings": "/#/settings", "focus": "/#/rule/school-home"}
+
+
+def _preview(page: Page) -> None:
+    targets = page.locator("aside.insp [data-role=targets]")
+    targets.get_by_role("radio", name=re.compile("^我的日历")).click()
+    page.locator("aside.insp .preview").wait_for()
+
+
+def _delete(page: Page) -> None:
+    page.locator("aside.insp .ifoot").get_by_role("button", name="删除这条线路").click()
+    page.locator("aside.insp [data-role=delete]").wait_for()
+
+
+# ``focus``: a line's inspector open, the map dimmed around that line. ``rule``, ``calendar``,
+# ``newline`` (with its preview) and ``delete``: the inspectors of Task 3. Each state is a path
+# and what to do there (read-only: the preview writes nothing).
+STATES: dict[str, tuple[str, Callable[[Page], None] | None]] = {
+    "": ("/", None),
+    "settings": ("/#/settings", None),
+    "focus": ("/#/rule/school-home", None),
+    "rule": ("/#/rule/family-mine", None),
+    "calendar": ("/#/calendar/family-icloud/%2Fdav%2Fhome%2F%E5%AE%B6%E5%BA%AD%2F", None),
+    "newline": (f"/#/new?source=personal&calendar={SCHOOL.replace('@', '%40')}", _preview),
+    "delete": ("/#/rule/school-home", _delete),
+}
 
 
 def settle(page: Page) -> None:
@@ -43,8 +68,11 @@ def test_screenshot(open_page: OpenPage, browser_name: str, size: str, theme: st
     assert SHOTS
     out = Path(SHOTS)
     out.mkdir(parents=True, exist_ok=True)
-    page = open_page(viewport=SIZES[size], color_scheme=theme, reduced_motion="reduce", path=STATES[state])
+    path, act = STATES[state]
+    page = open_page(viewport=SIZES[size], color_scheme=theme, reduced_motion="reduce", path=path)
     page.locator(".hub-cap small").wait_for(state="attached")
+    if act is not None:
+        act(page)
     settle(page)
     if state:
         # WebKit paints the SVG <use> icons of a panel that has just become visible a few frames

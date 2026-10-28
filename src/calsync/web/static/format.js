@@ -105,3 +105,9 @@ export function countWord(n) {
   if (n < 1 || n > 10) return `${n} `; // "12 条线路": digits keep their space
   return ["一", "两", "三", "四", "五", "六", "七", "八", "九", "十"][n - 1];
 }
+
+/** "10:42" today, "10月25日 周日 10:42" another day. */
+export function when(value) {
+  if (!value) return "";
+  return ymd(value) === ymd(Date.now()) ? clockTime(value) : `${dayLabel(value)} ${clockTime(value)}`;
+}

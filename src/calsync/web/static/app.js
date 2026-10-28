@@ -4,11 +4,12 @@
 
 import { html, render, useCallback, useEffect, useLayoutEffect, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
 import { t, getLang } from "/static/i18n.js";
-import { accountLabel, ago, clockTime, countWord, dayLabel, serviceOf, ymd } from "/static/format.js";
+import { accountLabel, ago, clockTime, serviceOf, when } from "/static/format.js";
 import { get, op, StatusContext, useStatus, useStatusPoller } from "/static/api.js";
 import { CalendarName, Icon, Mark, Service, Sprite } from "/static/icons.js";
 import { Command } from "/static/command.js";
 import { SyncMap } from "/static/map.js";
+import { Inspector } from "/static/inspector.js";
 import { headline } from "/static/sentence.js";
 
 // ----- router ---------------------------------------------------------------------------------
@@ -218,12 +219,6 @@ function Header({ onResult, busy, setBusy }) {
 // to the activity behind the number — and the next check). When the status can no longer be
 // refreshed the sentence says so, with the time calsync was last seen, until a poll succeeds.
 // Under it, one card per thing that needs a person (status.attention).
-
-/** "10:42" today, "10月25日 周日 10:42" another day. */
-function when(value) {
-  if (!value) return "";
-  return ymd(value) === ymd(Date.now()) ? clockTime(value) : `${dayLabel(value)} ${clockTime(value)}`;
-}
 
 /** ``template`` with ``{slot}`` replaced by ``node`` (a link inside a translated sentence). */
 function withSlot(template, slot, node) {
@@ -454,74 +449,6 @@ function Lower({ route }) {
   </section>`;
 }
 
-// ----- the inspector container ------------------------------------------------------------------
-
-/** The title and subtitle of an inspector route (the bodies come with each inspector's task). */
-function inspectorHead(route) {
-  switch (route.name) {
-    case "settings":
-      return [t("Settings"), t("Shared by every line")];
-    case "rule":
-      return [t("Line"), route.rule];
-    case "calendar":
-      return [t("Calendar"), route.calendar];
-    case "account":
-      return [t("Account"), route.account];
-    case "new":
-      return [t("New line"), t("Choose a source, then a target")];
-    case "event":
-      return [t("Event"), ""];
-    case "blocked":
-      return [t("Blocked deletes"), route.rule];
-    case "connect":
-      return [route.service === "google" ? t("Connect a Google account") : t("Connect an iCloud account"), t("Step by step; passwords stay in the terminal")];
-    default:
-      return ["", ""];
-  }
-}
-
-function Inspector({ route, onClose }) {
-  const open = opensInspector(route);
-  const panel = useRef(null);
-  const returnTo = useRef(null);
-  const [title, sub] = open ? inspectorHead(route) : ["", ""];
-
-  // A layout effect: focus and the Esc key belong to the panel from the frame it opens in.
-  useLayoutEffect(() => {
-    document.body.classList.toggle("insp-open", open);
-    if (open) {
-      if (!returnTo.current) returnTo.current = document.activeElement;
-      if (panel.current) panel.current.focus({ preventScroll: true });
-      const onKey = (e) => {
-        if (e.key === "Escape") {
-          e.preventDefault();
-          onClose();
-        }
-      };
-      document.addEventListener("keydown", onKey);
-      return () => document.removeEventListener("keydown", onKey);
-    }
-    const back = returnTo.current;
-    returnTo.current = null;
-    if (back && back.isConnected && typeof back.focus === "function") back.focus({ preventScroll: true });
-    return undefined;
-  }, [open, route]);
-
-  return html`<aside class=${open ? "insp open" : "insp"} ref=${panel} tabindex="-1"
-      role="dialog" aria-modal="false" aria-labelledby="insp-title" aria-hidden=${open ? "false" : "true"}
-      inert=${!open} data-route=${open ? route.name : ""}>
-    <div class="ih">
-      <div>
-        <h2 id="insp-title">${title}</h2>
-        ${sub ? html`<p>${sub}</p>` : null}
-      </div>
-      <button class="btn icon quiet" type="button" aria-label=${t("Close")} onClick=${onClose}><${Icon} name="x"/></button>
-    </div>
-    <div class="ib"></div>
-    <div class="ifoot"></div>
-  </aside>`;
-}
-
 // ----- footer and root --------------------------------------------------------------------------
 
 function Footer() {
@@ -541,6 +468,8 @@ function App() {
   const [route, closeInspector] = useRoute();
   const [note, setNote] = useState(null);
   const [busy, setBusy] = useState(false); // our 立即同步 is running
+  const [born, setBorn] = useState(null); // a line just created: {rule, nonce}, for its first comet
+  const onCreated = useCallback((rule) => setBorn({ rule, nonce: Date.now() }), []);
   const noteTimer = useRef(0);
 
   const onResult = useCallback((next) => {
@@ -555,13 +484,13 @@ function App() {
       <${Header} onResult=${onResult} busy=${busy} setBusy=${setBusy}/>
       <main>
         <${SyncMap} status=${status.status} route=${opensInspector(route) ? route : null}
-            waving=${busy || status.cycleRunning} stale=${Boolean(status.status && status.error)}/>
+            waving=${busy || status.cycleRunning} stale=${Boolean(status.status && status.error)} born=${born}/>
         <${Result} note=${note}/>
         <${Lower} route=${route}/>
       </main>
       <${Footer}/>
     </div>
-    <${Inspector} route=${route} onClose=${closeInspector}/>
+    <${Inspector} route=${route} open=${opensInspector(route)} onClose=${closeInspector} onCreated=${onCreated}/>
   <//>`;
 }
 
