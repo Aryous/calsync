@@ -24,6 +24,8 @@ import { authReasons } from "/static/forms/parts.js";
 // #/settings                      the settings
 // #/new                           a new line (query: prefill)
 // #/event/<id>                    an event's detail
+// #/event-edit/<id>               change the event in Google
+// #/event-new                     a new event in Google (query: start)
 // #/blocked/<rule>                a rule's blocked deletes
 // #/connect/<google|icloud>       connect an account (the wizard)
 // Anything else is replaced by #/. Segments are URI-encoded; "?k=v" after the path is ``query``.
@@ -36,6 +38,8 @@ const ROUTES = [
   [/^\/settings$/, () => ({ name: "settings" })],
   [/^\/new$/, () => ({ name: "new" })],
   [/^\/event\/([^/]+)$/, (m) => ({ name: "event", event: m[1] })],
+  [/^\/event-edit\/([^/]+)$/, (m) => ({ name: "event-edit", event: m[1] })],
+  [/^\/event-new$/, () => ({ name: "event-new" })],
   [/^\/blocked\/([^/]+)$/, (m) => ({ name: "blocked", rule: m[1] })],
   [/^\/connect\/(google|icloud)$/, (m) => ({ name: "connect", service: m[1] })],
 ];

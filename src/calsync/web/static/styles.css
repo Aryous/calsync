@@ -699,6 +699,35 @@ a.ar:hover { background: linear-gradient(90deg, transparent, var(--sunk) 12%, va
   .new-line { height: 44px; bottom: -10px; }
 }
 
+/* ----- writing originals: the event form, the delete confirmation ------------------------------ */
+.ef-set { border: 0; margin: 0; padding: 0; min-width: 0; }
+.ef-set[disabled] { opacity: .7; }
+.ef { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.ef-l { font-size: 12.5px; color: var(--ink-2); }
+.fs > .ef .ef-l { font-weight: 600; font-size: 13.5px; color: var(--ink); }
+.ef-h { color: var(--ink-3); font-size: 12px; }
+/* The date across, the two times under it; an all-day event's first and last day side by side. */
+.ef-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 10px; margin-top: 12px; }
+.ef-row > :first-child:nth-last-child(3) { grid-column: 1 / -1; }
+.ef .field { width: 100%; min-width: 0; font-variant-numeric: tabular-nums; }
+.fs .hp.bad { color: var(--bad); }
+.alarm-picks { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.pick { height: 32px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--line-2); background: var(--surface); color: var(--ink-2); font-size: 13px; transition: border-color .2s, background .2s, color .2s; }
+.pick:hover { border-color: var(--slate); }
+.pick[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-wash); color: var(--ink); }
+.fs[data-key="scope"] .radio, .fs[data-key="calendar"] .radio { align-items: flex-start; }
+.fs[data-key="scope"] .radio .o, .fs[data-key="calendar"] .radio .o { margin-top: 2px; }
+.fs[data-key="scope"] .radio .txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.fs[data-key="scope"] .radio small { margin-left: 0; white-space: normal; font-size: 12.5px; line-height: 1.5; }
+.fs[data-key="scope"] { padding-top: 6px; border-top: 0; }
+.ib > .del { margin: 18px 0 6px; padding: 16px; border-radius: 14px; background: var(--bad-wash); }
+.ib > .del .hp { margin: 4px 0 4px; }
+.ib > .del .radio { background: var(--surface); }
+.ib > .note.warn { margin-top: 18px; }
+@media (max-width: 760px), (hover: none) and (pointer: coarse) and (max-width: 1024px) {
+  .pick { height: 44px; padding: 0 14px; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }

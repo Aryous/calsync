@@ -16,8 +16,9 @@ from typing import Any
 import pytest
 from playwright.sync_api import Page
 
+from calsync import events_view
 from tests.browser.conftest import DESKTOP, PHONE, OpenPage, refresh_status, watch_of
-from tests.browser.live import SCHOOL, FakeKeychain, LiveDaemon
+from tests.browser.live import FAMILY, SCHOOL, FakeKeychain, LiveDaemon
 
 pytestmark = pytest.mark.browser
 
@@ -67,6 +68,21 @@ def _google_setup(page: Page) -> None:
     page.locator("aside.insp [data-role=waiting]").wait_for()
 
 
+DENTIST = events_view.event_id("personal", FAMILY, "dentist", None)
+RUN = events_view.event_id("personal", FAMILY, "run", "2026-10-26T07:00:00+08:00")
+
+
+def _delete_event(page: Page) -> None:
+    page.locator('aside.insp [data-role="delete-event"]').click()
+    page.locator("aside.insp [data-role=delete]").wait_for()
+
+
+def _scope(page: Page) -> None:
+    page.locator('aside.insp [data-role="scope"] [data-choice="this"]').click()
+    page.locator("aside.insp #ev-title").fill("晨跑（公园）")
+    page.locator('aside.insp [data-key="alarms"] .seg button').nth(2).click()
+
+
 # ``focus``: a line's inspector open, the map dimmed around that line. ``rule``, ``calendar``,
 # ``newline`` (with its preview) and ``delete``: the inspectors of Task 3. Each state is a path
 # and what to do there (read-only: the preview writes nothing).
@@ -86,6 +102,12 @@ STATES: dict[str, tuple[str, Callable[[Page], None] | None]] = {
     "connect-icloud-details": ("/#/connect/icloud", _icloud_details),
     "connect-google-details": ("/#/connect/google", _wizard_details),
     "connect-google-setup": ("/", _google_setup),
+    # Phase C: the detail's actions, the form (a repeating event, then a new one), a delete
+    # (read-only: nothing is saved or deleted).
+    "event": (f"/#/event/{DENTIST}", None),
+    "event-edit": (f"/#/event-edit/{RUN}", _scope),
+    "event-delete": (f"/#/event/{RUN}", _delete_event),
+    "event-new": ("/#/event-new?start=2026-10-27T15:00", None),
 }
 
 

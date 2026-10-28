@@ -9,7 +9,9 @@ from typing import Any
 import pytest
 from playwright.sync_api import Page, expect
 
+from calsync import events_view
 from tests.browser.conftest import OpenPage, ready
+from tests.browser.live import FAMILY
 
 pytestmark = pytest.mark.browser
 
@@ -21,11 +23,17 @@ VIEWPORTS = [
     pytest.param({"width": 1440, "height": 900}, False, id="1440"),
 ]
 
+# A seeded single event (社区活动), by the id calsync gives it.
+DENTIST = events_view.event_id("personal", FAMILY, "dentist", None)
+
 SCREENS = {
     "map": "/",
     "rule": "/#/rule/family-home",
     "settings": "/#/settings",
     "activity": "/#/activity",
+    "event": f"/#/event/{DENTIST}",
+    "event-edit": f"/#/event-edit/{DENTIST}",
+    "event-new": "/#/event-new",
 }
 
 # The page's own problems, measured in the page: what sticks out sideways, which visible buttons
@@ -42,7 +50,7 @@ MEASURE = """() => {
     .map((el) => (el.getAttribute("aria-label") || el.textContent || el.tagName).trim().slice(0, 40));
   const unnamed = [...document.querySelectorAll("button, a[href], input, [role=radio], [role=tab], [tabindex='0']")]
     .filter(visible)
-    .filter((el) => !(el.getAttribute("aria-label") || el.getAttribute("aria-labelledby") || el.textContent.trim() || el.getAttribute("title") || el.getAttribute("placeholder")))
+    .filter((el) => !(el.getAttribute("aria-label") || el.getAttribute("aria-labelledby") || (el.labels && el.labels.length) || el.textContent.trim() || el.getAttribute("title") || el.getAttribute("placeholder")))
     .map((el) => el.outerHTML.slice(0, 80));
   return { overflow: document.documentElement.scrollWidth - vw, clipped, unnamed };
 }"""
@@ -150,7 +158,18 @@ SMALL_TARGETS = """() => [...document.querySelectorAll(
   .map((el) => `${(el.getAttribute("aria-label") || el.textContent).trim().slice(0, 24)} ${Math.round(el.getBoundingClientRect().width)}x${Math.round(el.getBoundingClientRect().height)}`)"""
 
 
-@pytest.mark.parametrize("screen", ["/", "/#/rule/family-home", "/#/settings", "/#/activity", "/#/new"])
+@pytest.mark.parametrize(
+    "screen",
+    [
+        "/",
+        "/#/rule/family-home",
+        "/#/settings",
+        "/#/activity",
+        "/#/new",
+        f"/#/event-edit/{DENTIST}",
+        "/#/event-new",
+    ],
+)
 def test_tap_targets_on_the_phone_are_44px(open_page: OpenPage, screen: str) -> None:
     page = open_page(viewport={"width": 390, "height": 844}, has_touch=True, path=screen)
     ready(page)
