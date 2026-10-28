@@ -805,10 +805,48 @@ def test_changes_text_and_json(synced: list[str]) -> None:
 def test_view_commands_without_state_exit_1(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
     cfg.write_text(VIEWS_CONFIG)
-    for command in (["status"], ["upcoming", "--json"], ["runs"], ["changes"]):
+    for command in (["status"], ["upcoming"], ["runs"], ["changes"]):
         code, text = run(["--config", str(cfg), "--state-dir", str(tmp_path / "none"), *command])
         assert (code, text) == (EXIT_FAILED, "no state yet: run `calsync run` or start the daemon\n")
+    for command in (["status"], ["upcoming"], ["runs"], ["changes"], ["blocked"], ["events"]):
+        code, text = run(["--config", str(cfg), "--state-dir", str(tmp_path / "none"), *command, "--json"])
+        assert code == EXIT_FAILED, command
+        assert json.loads(text) == {
+            "error": {"kind": "no_state", "message": "no state yet: run `calsync run` or start the daemon"}
+        }
     assert not (tmp_path / "none").exists()
+
+
+READ_COMMANDS_JSON = [
+    ["status", "--json"],
+    ["blocked", "--json"],
+    ["events", "--json"],
+    ["event", "show", "abc", "--json"],
+    ["config", "get"],
+    ["config", "get", "--json"],
+    ["calendars", "me", "--json"],
+    ["runs", "--json"],
+    ["changes", "--json"],
+    ["upcoming", "--json"],
+]
+
+
+@pytest.mark.parametrize("command", READ_COMMANDS_JSON, ids=lambda c: " ".join(c))
+def test_read_commands_answer_a_config_error_as_json(tmp_path: Path, command: list[str]) -> None:
+    """An invalid hand edit is exactly when an agent's first call is ``status --json``."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG + '\n[runtime]\ninterval = "soon"\n')
+    code, text = run(["--config", str(cfg), "--state-dir", str(tmp_path / "s"), *command])
+    problem = "runtime.interval: invalid duration 'soon'; expected e.g. 30s, 5m, 2h, 7d, -15m"
+    assert code == EXIT_CONFIG
+    assert json.loads(text) == {"error": {"kind": "config", "message": problem, "problems": [problem]}}
+
+
+def test_read_commands_answer_an_unknown_rule_as_json(synced: list[str]) -> None:
+    for command in (["blocked"], ["upcoming"], ["events"]):
+        code, text = run([*synced, *command, "--rule", "nope", "--json"])
+        assert code == EXIT_CONFIG
+        assert json.loads(text) == {"error": {"kind": "unknown_rule", "message": "unknown rule(s): nope"}}
 
 
 def test_view_commands_reject_unknown_rules_and_bad_config(synced: list[str], tmp_path: Path) -> None:
@@ -844,9 +882,16 @@ def test_view_commands_report_an_unreadable_database(tmp_path: Path) -> None:
     state = tmp_path / "state"
     state.mkdir()
     (state / "state.db").write_bytes(b"not a database, just some text " * 64)
-    for command in (["status"], ["upcoming"], ["runs"], ["changes", "--json"]):
+    for command in (["status"], ["upcoming"], ["runs"], ["changes"]):
         code, text = run(["--config", str(cfg), "--state-dir", str(state), *command])
         assert (code, text) == (EXIT_FAILED, "error: the state database could not be read: DatabaseError\n")
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "changes", "--json"])
+    assert code == EXIT_FAILED and json.loads(text) == {
+        "error": {
+            "kind": "state_unreadable",
+            "message": "the state database could not be read: DatabaseError",
+        }
+    }
 
 
 def test_light_commands_import_no_heavy_modules(tmp_path: Path) -> None:
@@ -1516,3 +1561,23 @@ def test_status_json_daemon_is_null_without_a_daemon(synced: list[str]) -> None:
     import json
 
     assert json.loads(run([*synced, "status", "--json"])[1])["daemon"] is None
+
+
+def test_the_daemon_names_an_escaping_error_by_its_type_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon's output is its log: a ``TransientError`` text can carry a request URL."""
+    from calsync import cli
+    from calsync.errors import ConfigError, TransientError
+
+    async def failing(args: Any, out: Any) -> int:
+        raise TransientError("GET https://dav.example.com/private/calendar/ failed")
+
+    monkeypatch.setattr(cli, "_daemon", failing)
+    assert run(["daemon"]) == (1, "error: TransientError\n")
+
+    async def misconfigured(args: Any, out: Any) -> int:
+        raise ConfigError(["web.listen: not this computer's address"])
+
+    monkeypatch.setattr(cli, "_daemon", misconfigured)
+    assert run(["daemon"]) == (2, "configuration error:\n  - web.listen: not this computer's address\n")

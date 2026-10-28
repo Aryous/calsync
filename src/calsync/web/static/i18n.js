@@ -28,6 +28,8 @@ const zh = {
   "Added": "新增",
   "Changed": "修改",
   "Reverted": "改回",
+  "Approved": "已放行",
+  "Guard loosened": "放宽了删除保护",
   "Deleted": "删除",
   "Protected": "受保护",
   "Partial": "部分完成",

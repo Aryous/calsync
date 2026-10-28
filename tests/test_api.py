@@ -324,7 +324,7 @@ async def test_an_op_runs_in_the_daemon(tmp_path: Path) -> None:
 async def test_op_errors(tmp_path: Path) -> None:
     from calsync.configfile import ConfigConflict
     from calsync.errors import ConfigError, RulePaused
-    from calsync.ops import DaemonStopping, OpsUnavailable
+    from calsync.ops import DaemonStopping, OpsUnavailable, TooSoon
 
     cases: list[tuple[Any, int, dict[str, Any]]] = [
         (ConfigError(["a", "b"]), 422, {"kind": "config", "message": "a; b", "problems": ["a", "b"]}),
@@ -344,6 +344,14 @@ async def test_op_errors(tmp_path: Path) -> None:
             {"kind": "paused", "message": 'rule "family" is paused', "rule": "family"},
         ),
         (DaemonStopping(), 503, {"kind": "unavailable", "message": "The daemon is stopping."}),
+        (
+            TooSoon(),
+            429,
+            {
+                "kind": "too_soon",
+                "message": "A test push was sent less than 10 seconds ago; try again shortly.",
+            },
+        ),
     ]
     for answer, status, error in cases:
         async with client(tmp_path, OpsDaemon(answer)) as c:

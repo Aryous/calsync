@@ -716,27 +716,29 @@ def test_change_since_filters_by_instant(tmp_path: Path) -> None:
     assert [(c["object_id"], c["title"]) for c in changes] == [("b", None)]
 
 
-def test_change_since_stops_at_the_first_older_row(tmp_path: Path) -> None:
+def test_change_since_keeps_rows_whose_ids_do_not_follow_time(tmp_path: Path) -> None:
+    """Rules run concurrently and stamp their own clocks, but one cycle's rows are inserted in
+    config order: a rule earlier in the config may have lower ids and later times."""
+    config = config_for([rule("a"), rule("b", source="B", target="B")])
     with Store(tmp_path / "state.db") as store:
-        for i in range(6):
-            at = NOW - timedelta(hours=5 - i)  # oldest first, as a writer records them
-            store.record_runs(
-                [RunRecord("family", at, at, "ok", 1, 0, 0, 0, 1, None)],
-                [ChangeRecord("family", f"o{i}", "created", at, "Standup")],
-            )
-    read: list[str] = []
+        store.record_runs(
+            [
+                RunRecord("a", NOW, NOW + timedelta(seconds=2), "ok", 1, 0, 0, 0, 1, None),
+                RunRecord("b", NOW, NOW + timedelta(seconds=1), "ok", 1, 0, 0, 0, 1, None),
+            ],
+            [
+                ChangeRecord("a", "late", "created", NOW + timedelta(seconds=2), "Standup"),
+                ChangeRecord("b", "early", "created", NOW + timedelta(seconds=1), "Standup"),
+                ChangeRecord("b", "old", "created", NOW - timedelta(hours=1), "Standup"),
+            ],
+        )
     with reader(tmp_path) as r:
-        rows = r.changes
-
-        def counting(rule: str | None = None, run_id: int | None = None) -> Any:
-            for change in rows(rule, run_id):
-                read.append(change.object_id)
-                yield change
-
-        r.changes = counting  # type: ignore[method-assign]
-        changes = build_changes(family(), r, since=NOW - timedelta(hours=2)).to_json()["changes"]
-    assert [c["object_id"] for c in changes] == ["o5", "o4", "o3"]  # the same as filtering all
-    assert read == ["o5", "o4", "o3", "o2"]  # nothing past the first older row
+        changes = build_changes(config, r, since=NOW + timedelta(milliseconds=1500)).to_json()["changes"]
+        both = build_changes(config, r, since=NOW + timedelta(seconds=1)).to_json()["changes"]
+        limited = build_changes(config, r, since=NOW, limit=1).to_json()["changes"]
+    assert [c["object_id"] for c in changes] == ["late"]
+    assert [c["object_id"] for c in both] == ["early", "late"]  # newest first by id, as before
+    assert [c["object_id"] for c in limited] == ["early"]
 
 
 def test_changes_of_one_run(tmp_path: Path) -> None:
@@ -1112,6 +1114,20 @@ webhook_url = \"\"\"https://hooks.example.com/
 MULTILINE\"\"\"
 failure_threshold = 3  # old bark_url = "https://api.day.app/TRAILING"
 public_url="http://nas.lan:8766/x"
+language = "en"
+
+[[rules]]
+name = "family"
+source = { account = "me", calendar = "family@example.com" }
+target = { account = "icloud", calendar = "Family", create_if_missing = true }
+note = "PRIVATENOTE"
+extra = { password = "INLINEPW" }
+
+[rules.window]
+past = "7d"
+
+[foo]
+password = "FOOPW"
 """
 
 MASKED_TOML = """\
@@ -1145,6 +1161,20 @@ bark_url = "https://api.day.app"
 webhook_url = "(hidden)"
 failure_threshold = 3  # (comment hidden)
 public_url="http://nas.lan:8766"
+language = "en"
+
+[[rules]]
+name = "family"
+source = { account = "me", calendar = "family@example.com" }
+target = { account = "icloud", calendar = "Family", create_if_missing = true }
+note = "(hidden)"
+extra = { password = "(hidden)" }
+
+[rules.window]
+past = "7d"
+
+[foo]
+password = "(hidden)"
 """
 
 
@@ -1166,6 +1196,9 @@ def test_mask_config_text_masks_what_config_json_masks() -> None:
         "TOPTOKEN",
         "HASHHASH",
         "TRAILING",
+        "PRIVATENOTE",
+        "INLINEPW",
+        "FOOPW",
     ):
         assert secret not in masked
     for secret in ("secret.json", "OLDPATH", "MULTILINE", "nas.lan:8766/x"):

@@ -19,7 +19,7 @@ from calsync import api, configfile, opsclient, wiring
 from calsync.cli import EXIT_CONFIG, EXIT_FAILED, EXIT_OK, main
 from calsync.config import Config
 from calsync.daemon import Daemon
-from calsync.engine import delete_fingerprint
+from calsync.engine import Approval, delete_fingerprint
 from calsync.errors import ConfigError
 from calsync.ops import OpResult
 from calsync.store import ChangeRecord, RunRecord, Store
@@ -114,22 +114,40 @@ async def test_blocked_json_shape(tmp_path: Path) -> None:
 
 async def test_an_approval_releases_exactly_the_blocked_set(tmp_path: Path) -> None:
     h, result, _, _ = await blocked_engine(tmp_path)
-    other = (await h.engine.cycle(approvals={"family": "0" * 16})).rules["family"]
+    other = (await h.engine.cycle(approvals={"family": Approval("0" * 16, "cli")})).rules["family"]
     assert (other.status, other.deleted, other.approved) == ("blocked", 0, False)
     assert len(h.target.objects) == COUNT
-    done = (await h.engine.cycle(approvals={"family": result.blocked_fingerprint})).rules["family"]
+    done = (await h.engine.cycle(approvals={"family": Approval(result.blocked_fingerprint, "cli")})).rules[
+        "family"
+    ]
     assert (done.status, done.deleted, done.approved, done.blocked_fingerprint) == ("ok", COUNT, True, None)
     assert h.target.objects == {}
     with StateReader(tmp_path / "state.db") as reader:
-        deleted = [c for c in reader.changes("family") if c.action == "deleted"]
+        changes = list(reader.changes("family"))
+        deleted = [c for c in changes if c.action == "deleted"]
+        approved = [c for c in changes if c.action == "approved"]
     assert len(deleted) == COUNT  # recorded as change rows, as any delete
+    # Who let the set through, with the cycle that released it, before its deletes.
+    [row] = approved
+    assert (row.object_id, row.title) == (result.blocked_fingerprint, "12 deletes approved (cli)")
+    assert row.run_id == deleted[0].run_id and row.id < min(c.id for c in deleted)
+    h.store.close()
+
+
+async def test_an_approval_that_releases_nothing_is_not_recorded(tmp_path: Path) -> None:
+    h, _, _, _ = await blocked_engine(tmp_path)
+    await h.engine.cycle(approvals={"family": Approval("0" * 16, "ui")})
+    with StateReader(tmp_path / "state.db") as reader:
+        assert [c for c in reader.changes("family") if c.action == "approved"] == []
     h.store.close()
 
 
 async def test_a_grown_set_blocks_again_with_a_new_fingerprint(tmp_path: Path) -> None:
     h, first, fake, ids = await blocked_engine(tmp_path, cancel=COUNT - 1)
     fake.cancel_event(GCAL, ids[-1])  # one more delete since the approval was given
-    again = (await h.engine.cycle(approvals={"family": first.blocked_fingerprint})).rules["family"]
+    again = (await h.engine.cycle(approvals={"family": Approval(first.blocked_fingerprint, "cli")})).rules[
+        "family"
+    ]
     assert (again.status, again.deleted, again.approved) == ("blocked", 0, False)
     assert again.blocked_fingerprint not in (None, first.blocked_fingerprint)
     assert len(h.target.objects) == COUNT
@@ -216,6 +234,9 @@ async def test_approve_through_the_daemon_waits_for_the_cycle_without_holding_th
     assert result.changed and result.summary == 'rule "family": 12 copies deleted'
     assert d.family_copies() == 0
     assert "rule family: 12 deletes approved (cli)" in caplog.messages
+    with StateReader(tmp_path / "state.db") as reader:
+        [row] = [c for c in reader.changes("family") if c.action == "approved"]
+    assert (row.object_id, row.title) == (fingerprint, "12 deletes approved (cli)")
     await d.stop()
 
 
@@ -259,6 +280,28 @@ async def test_a_set_that_grew_before_the_cycle_is_stale(tmp_path: Path) -> None
     assert d.family_copies() == COUNT and d.latest().status == "blocked"
     [entry] = blocked_view(tmp_path, d.daemon.config).rules
     assert entry.fingerprint == result.data["fingerprint"]
+    await d.stop()
+
+
+async def test_an_approval_cycle_the_guard_no_longer_blocks_answers_synced(tmp_path: Path) -> None:
+    """The set shrank under the guard before the cycle: the rule syncs as usual (exit 0)."""
+    d = Running(tmp_path)
+    await d.start()
+
+    def shrink() -> None:
+        seed(d.world.fake)  # the events are back, but two
+        for event_id in d.ids[:2]:
+            d.world.fake.cancel_event(GCAL, event_id)
+
+    d.world.on_google = shrink
+    result = await d.approve(rule="family", wait=True)
+    assert result.data == {"rule": "family", "status": "synced", "deleted": 2}
+    assert (
+        result.changed
+        and result.summary == 'rule "family" was no longer blocked; it synced as usual (2 copies deleted)'
+    )
+    with StateReader(tmp_path / "state.db") as reader:
+        assert [c for c in reader.changes("family") if c.action == "approved"] == []  # not needed
     await d.stop()
 
 
@@ -399,6 +442,10 @@ def test_approve_in_process_runs_one_cycle_for_that_rule(
     with StateReader(short_dir / "s" / "state.db") as reader:
         assert [r.status for r in reader.runs("family")] == ["ok", "blocked", "ok"]
         assert len(reader.runs("work")) == 2  # one cycle, for that rule only
+    # Recorded with its origin, with no daemon and no push channel: `calsync changes` shows it.
+    code, out = cli([*base, "changes", "--rule", "family", "--json"])
+    rows = [c for c in json.loads(out)["changes"] if c["action"] == "approved"]
+    assert code == EXIT_OK and [c["title"] for c in rows] == ["12 deletes approved (cli)"]
     code, out = cli([*base, "approve", "family", "--yes", "--json"])
     assert code == EXIT_CONFIG and json.loads(out)["data"]["status"] == "not_blocked"
 
@@ -558,6 +605,7 @@ def test_yes_skips_the_prompt(files: Files, calls: list[Any]) -> None:
         ("stale", EXIT_FAILED),
         ("failed", EXIT_FAILED),
         ("not_blocked", EXIT_CONFIG),
+        ("synced", EXIT_OK),
     ],
 )
 def test_exit_codes(files: Files, calls: list[Any], status: str, code: int) -> None:

@@ -291,9 +291,11 @@ class StateReader:
             )
         )
 
-    def changes(self, rule: str | None = None, run_id: int | None = None) -> Iterator[ChangeView]:
-        """Changes, newest first: of ``rule`` and of the run ``run_id`` when given (a missing
-        ``change`` table: none)."""
+    def changes(
+        self, rule: str | None = None, run_id: int | None = None, since: datetime | None = None
+    ) -> Iterator[ChangeView]:
+        """Changes, newest first: of ``rule``, of the run ``run_id`` and at or after ``since``
+        when given (a missing ``change`` table: none)."""
         present = self.columns("change")
         if not {"id", "run_id", "rule", "object_id", "action", "at", "title"} <= present:
             return
@@ -305,6 +307,13 @@ class StateReader:
         if run_id is not None:
             where.append("run_id = ?")
             params.append(run_id)
+        if since is not None:
+            # Stored in UTC ISO text; the prefilter on the text is a second early (a fraction of
+            # a second changes the width), the exact comparison is on the parsed times. Ids do
+            # not follow time within a cycle (rules stamp their own clocks, rows are inserted in
+            # config order), so nothing may stop at the first older row.
+            where.append("at >= ?")
+            params.append((since.astimezone(UTC) - timedelta(seconds=1)).isoformat())
         detail = "detail" if "detail" in present else "NULL"
         sql = f"SELECT id, run_id, rule, object_id, action, at, title, {detail} FROM change"
         if where:
@@ -312,7 +321,9 @@ class StateReader:
         for cid, rid, name, oid, action, at, title, text in self._db.execute(
             sql + " ORDER BY id DESC", params
         ):
-            yield ChangeView(cid, rid, name, oid, action, _parse_time(at), title, text)
+            change = ChangeView(cid, rid, name, oid, action, _parse_time(at), title, text)
+            if since is None or change.at >= since:
+                yield change
 
     def latest_blocked(self, rule: str) -> tuple[int, list[tuple[str, str | None]]] | None:
         """The most recently recorded blocked set: its run id and (object id, title) rows; None
@@ -532,8 +543,10 @@ def config_json(config: Config, *, reveal: bool = False) -> dict[str, Any]:
 
     accounts: dict[str, dict[str, Any]] = {
         a.name: {
+            "name": a.name,
             "provider": a.provider,
             "host": host_for(a.provider, a.server_url),
+            "credential_configured": bool(a.credential.ref),
             "server_url": a.server_url,
             "username": a.username,
             "credential": {"backend": a.credential.backend, "ref": a.credential.ref},
@@ -650,12 +663,40 @@ def _masked_value(key: str, raw: str) -> str:
     return json.dumps(HIDDEN)
 
 
-# Keys shown as they are inside these tables; every other key there is hidden, so a key
-# calsync does not know (``password = ...`` written by hand) never reaches the web UI.
+# The config's schema as the web UI may see it: for each top-level table, the keys shown as
+# they are (the last part of a dotted key or of a sub-table's name; an inline table's keys
+# count as its table's). Every other key is hidden, and so is every key of a table calsync
+# does not know: a key written by hand (``password = ...``) never reaches the web UI.
 _SHOWN_IN = {
     "accounts": frozenset({"provider", "max_concurrency", "backend"}),
-    "notify": frozenset({"failure_threshold"}),
+    "notify": frozenset({"failure_threshold", "language"}),
     "google": frozenset(),
+    "rules": frozenset(
+        {
+            "name",
+            "source",
+            "target",
+            "account",
+            "calendar",
+            "create_if_missing",
+            "window",
+            "past",
+            "future",
+            "alarms",
+            "fields",
+            "content",
+            "attendees",
+            "conference",
+            "delete_guard",
+            "max_count",
+            "max_ratio",
+            "on_target_edit",
+            "paused",
+            "retire",
+        }
+    ),
+    "runtime": frozenset({"interval", "jitter"}),
+    "web": frozenset({"listen", "allowed_hosts"}),
 }
 _TABLE_HEADER = re.compile(r"^\s*\[\[?\s*(?P<name>[^\]]+?)\s*\]\]?\s*$")
 COMMENT_HIDDEN = "# (comment hidden)"
@@ -692,14 +733,14 @@ def _is_hidden(path: list[str]) -> bool:
     if path[-1] in _MASKED_KEYS:
         return True
     shown = _SHOWN_IN.get(path[0])
-    return shown is not None and path[-1] not in shown
+    return shown is None or path[-1] not in shown
 
 
 def mask_config_text(text: str) -> str:
     """The config file's text with what ``config_json`` masks masked, line by line by TOML key
-    (in an inline table or a dotted key too), every comment's text hidden, and unknown keys
-    in the ``accounts``, ``notify`` and ``google`` tables hidden: what the web UI may see of
-    a diff. A masked multi-line string loses its continuation lines."""
+    (in an inline table or a dotted key too), every comment's text hidden, and every key
+    outside the known schema (``_SHOWN_IN``) hidden: what the web UI may see of a diff. A
+    masked multi-line string loses its continuation lines."""
     out: list[str] = []
     open_quote: str | None = None  # inside a masked multi-line string
     section: list[str] = []
@@ -1407,16 +1448,11 @@ def build_changes(
     limit: int = 100,
     run_id: int | None = None,
 ) -> ChangesView:
-    """Recorded changes, newest first; ``since`` keeps those at or after that instant, ``run_id``
-    those of that run only.
-
-    Rows come newest first by id, and ids follow time (one writer stamps them with its clock as
-    it records), so the scan stops at the first row older than ``since``: the rest are older."""
+    """Recorded changes, newest first (by id); ``since`` keeps those at or after that instant
+    (filtered in SQL: ids do not follow time within a cycle), ``run_id`` those of that run only."""
     found: list[ChangeView] = []
-    for change in reader.changes(rule, run_id):
+    for change in reader.changes(rule, run_id, since):
         if len(found) >= limit:
-            break
-        if since is not None and change.at < since:
             break
         found.append(change)
     return ChangesView(tuple(found))

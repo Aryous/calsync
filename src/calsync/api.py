@@ -409,6 +409,8 @@ class _Endpoints:
                 raise ApiError(503, "unavailable", str(exc)) from None
             except ops.OpsUnavailable as exc:
                 raise ApiError(409, "read_only", str(exc)) from None
+            except ops.TooSoon as exc:
+                raise ApiError(429, "too_soon", str(exc)) from None
             return JSONResponse(result.to_json())
 
         return endpoint

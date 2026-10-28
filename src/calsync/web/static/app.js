@@ -155,6 +155,10 @@ function actionLabel(a) {
       return t("Protected");
     case "blocked":
       return t("Blocked");
+    case "approved":
+      return t("Approved");
+    case "guard_loosened":
+      return t("Guard loosened");
     default:
       return a;
   }

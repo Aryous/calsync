@@ -76,6 +76,7 @@ import logging
 import os
 import random
 import socket
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -86,7 +87,7 @@ from calsync import api, debug, notify, ops, wiring
 from calsync.config import Config
 from calsync.configfile import Snapshot, read_snapshot, validate_text
 from calsync.cycle import counts_line, remove_retired, retired, run_cycle
-from calsync.engine import CycleResult, Engine, RuleResult
+from calsync.engine import Approval, CycleResult, Engine, RuleResult
 from calsync.errors import CalsyncError, ConfigError, RulePaused
 from calsync.http import RequestLog
 from calsync.lock import RunLock
@@ -217,7 +218,7 @@ class Daemon:
         self._cycle_lock = asyncio.Lock()
         # Approved blocked sets (rule -> fingerprint), consumed by the rule's next cycle; and
         # the operations waiting for the next cycle of some rules (None: of any rule).
-        self._approvals: dict[str, str] = {}
+        self._approvals: dict[str, Approval] = {}
         self._scheduling = False  # the scheduler runs: something will run the cycles requested
         self._scheduled = False  # the scheduler has ended: nothing will run a cycle any more
         self._calendars_due: datetime | None = None  # next calendar-list refresh; None: now (at start)
@@ -227,6 +228,7 @@ class Daemon:
         self._waiters: list[_Waiter] = []
         # Pushes in flight (``notify``): sent in the background, drained when the daemon stops.
         self._outbox = notify.Outbox()
+        self._last_test_push: float | None = None  # time.monotonic() of the last notify.test
 
     # ----- interface ----------------------------------------------------------
     async def run(self, stop: asyncio.Event) -> None:
@@ -335,6 +337,8 @@ class Daemon:
 
         The operation runs on the event loop's thread: the store's sqlite connection belongs to
         it, and an operation is one small file write and one row; the lock keeps cycles out."""
+        if name == "notify.test" and not dry_run:
+            self._throttle_test_push()
         if self._store is None:
             if name == "notify.test":  # needs only the config: a viewer daemon can test its pushes
                 return await ops.notify_test(self._config, args, dry_run)
@@ -358,6 +362,13 @@ class Daemon:
         if ctx.followup is not None:
             return await ctx.followup()
         return result
+
+    def _throttle_test_push(self) -> None:
+        """At most one ``notify.test`` per ``NOTIFY_TEST_COOLDOWN`` (``TooSoon`` otherwise)."""
+        now = time.monotonic()
+        if self._last_test_push is not None and now - self._last_test_push < ops.NOTIFY_TEST_COOLDOWN:
+            raise ops.TooSoon()
+        self._last_test_push = now
 
     async def _op(self, ctx: ops.OpContext, name: str, args: dict[str, Any], dry_run: bool) -> ops.OpResult:
         """Run one operation and apply the config it wrote. The caller holds ``_cycle_lock``."""
@@ -432,7 +443,7 @@ class Daemon:
         if not self._scheduling:
             raise ops.DaemonStopping()
         self.request_cycle(rule)
-        self._approvals[rule] = fingerprint
+        self._approvals[rule] = Approval(fingerprint, origin)
         if self._store is not None:  # the approval is this block's push: its key closes now
             notify.approving(self._store, rule)
         self._on_approved(rule, count, origin)
@@ -442,6 +453,10 @@ class Daemon:
         """Blocked deletes were approved: logged and pushed (``approved``, every time)."""
         log.info("rule %s: %d deletes approved (%s)", rule, count, origin)
         self._notify([notify.approved(rule, count, origin, self._config, self._clock())])
+
+    def push(self, alerts: list[notify.Alert]) -> None:
+        """``ops.DaemonHooks.push``: an operation's pushes (a loosened delete guard)."""
+        self._notify(alerts)
 
     def _notify(self, alerts: list[notify.Alert]) -> None:
         """Send ``alerts`` in the background: a slow channel never holds up the schedule."""
@@ -856,8 +871,9 @@ class Daemon:
             self._abandon({name}, RulePaused(name))
         for name in [n for n in self._failures if n not in names]:
             del self._failures[name]
-        # The listener is bound at start; the address is config, not a URL of anyone's data.
-        if (wanted := _web_address(config)) != _web_address(old):
+        # The listener is bound at start (from the config or a ``--listen`` override, so the
+        # effective address is ``_listen``); the address is config, not a URL of anyone's data.
+        if (wanted := _web_address(config)) != _web_address(old) and wanted != self._listen:
             if wanted is None:
                 log.info("restart the daemon to turn the web UI off")
             else:

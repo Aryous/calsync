@@ -20,7 +20,7 @@ from typing import Any
 import httpx
 import pytest
 
-from calsync import configfile, notify, wiring
+from calsync import configfile, notify, ops, wiring
 from calsync.cli import EXIT_CONFIG, EXIT_FAILED, EXIT_OK, main
 from calsync.config import Config, NotifyConfig
 from calsync.engine import RuleResult
@@ -734,6 +734,33 @@ async def test_the_daemon_notifies_approvals_and_reload_failures(
     await d.stop()
 
 
+async def test_the_daemon_pushes_and_records_a_guard_loosened_while_blocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Raising the guard of a blocked rule lets its deletes through without ``approve``: it is
+    pushed (every time) and recorded with its origin, like an approval."""
+    from calsync.views import StateReader
+    from tests.test_approve import Running
+
+    pushes = Pushes()
+    monkeypatch.setattr(notify, "TRANSPORT", pushes.transport())
+    text = TEXT + f'\n[notify]\nbark_url = "{BARK}"\n'
+    d = Running(tmp_path)
+    d.path.write_text(text)
+    d.daemon = d.world.daemon(configfile.validate_text(text, tmp_path), tmp_path, config_path=d.path)
+    await d.start()
+    await eventually(lambda: len(pushes.bodies()) == 1)  # blocked
+    args = {"name": "family", "key": "delete_guard.max_count", "value": 100}
+    await asyncio.wait_for(d.daemon.run_op("rule.set", args, False, source="ui"), 5)
+    await eventually(lambda: len(pushes.bodies()) == 2)
+    assert pushes.bodies()[1]["title"] == "calsync 的删除保护被放宽了"
+    assert "来自 界面" in pushes.bodies()[1]["body"]
+    with StateReader(tmp_path / "state.db") as reader:
+        [row] = [c for c in reader.changes("family") if c.action == "guard_loosened"]
+    assert (row.object_id, row.title) == ("guard", "delete guard loosened (ui)")
+    await d.stop()
+
+
 def _event(event_id: str, title: str) -> dict[str, Any]:
     from tests.factories import google_event
 
@@ -856,6 +883,13 @@ async def test_a_daemon_without_sync_sends_a_test_push(
     assert len(pushes.requests) == 2
     with pytest.raises(ConfigError, match="no dry run"):
         await viewer.run_op("notify.test", {}, True, source="ui")
+    # A paired browser cannot push without limit: one test push per cooldown.
+    with pytest.raises(ops.TooSoon):
+        await viewer.run_op("notify.test", {}, False, source="ui")
+    assert len(pushes.requests) == 2
+    viewer._last_test_push -= ops.NOTIFY_TEST_COOLDOWN  # pyright: ignore[reportPrivateUsage, reportOptionalOperand]
+    await asyncio.wait_for(viewer.run_op("notify.test", {}, False, source="ui"), 5)
+    assert len(pushes.requests) == 4
 
 
 def test_trigger_in_process_sends(short_dir: Path, monkeypatch: pytest.MonkeyPatch, pushes: Pushes) -> None:

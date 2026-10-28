@@ -1610,3 +1610,35 @@ async def test_a_retiring_rule_over_the_guard_blocks(tmp_path: Path) -> None:
     assert sorted(res.blocked_titles) == ["E0", "E1", "E2", "E3"]
     assert len(h.target.objects) == 4
     assert h.store.copies(rule_tag("family"), "dav", "Family") == 4
+
+
+async def test_a_retiring_rule_with_a_window_deletes_copies_outside_it(tmp_path: Path) -> None:
+    """Past events stay on the target of a windowed rule; retiring it must still delete them."""
+    fake = many(1)
+    fake.put_event(GCAL, google_event("old", "Old", "2025-01-10T09:00:00+08:00", "2025-01-10T09:05:00+08:00"))
+    h = build_fake(tmp_path, fake, config_for([rule()]))  # full sync: both copies written
+    await h.engine.cycle()
+    assert len(h.target.objects) == 2
+    windowed = {"window": {"past": "7d", "future": "180d"}}
+    h.engine.replace_config(config_for([rule(**windowed)]))
+    kept = (await h.engine.cycle()).rules["family"]
+    assert (kept.deleted, kept.out_of_window) == (0, 1)  # an ordinary windowed cycle keeps it
+    h.engine.replace_config(config_for([rule(**windowed, retire=True)]))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.deleted) == ("ok", 2) and h.target.objects == {}
+    assert h.store.copies(rule_tag("family"), "dav", "Family") == 0
+
+
+async def test_a_retiring_rule_with_a_window_still_meets_the_guard(tmp_path: Path) -> None:
+    fake = many(2)
+    for i in range(2):
+        fake.put_event(
+            GCAL, google_event(f"old{i}", f"Old{i}", "2025-01-10T09:00:00+08:00", "2025-01-10T09:05:00+08:00")
+        )
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    h.engine.replace_config(config_for([rule(window={"past": "7d", "future": "180d"}, retire=True)]))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.error_kind, res.deleted) == ("blocked", "guard", 0)
+    assert sorted(res.blocked_titles) == ["E0", "E1", "Old0", "Old1"]
+    assert len(h.target.objects) == 4

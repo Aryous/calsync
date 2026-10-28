@@ -18,7 +18,10 @@ Alerts:
   another invalid text while it is open is damped as a blocked set is;
 - ``approved``: blocked deletes were approved (rule, count, origin). Never deduplicated; the
   approval closes the rule's ``blocked`` key, so a successful approval cycle sends no
-  ``recovered`` for it (one push per act) and a set that blocks again is pushed again.
+  ``recovered`` for it (one push per act) and a set that blocks again is pushed again;
+- ``guard_loosened``: a config write (``rule set``, ``config undo``) raised a blocked rule's
+  ``delete_guard.max_count`` or ``max_ratio`` (rule, origin): the other way past a block, so
+  it is pushed like an approval. Never deduplicated.
 
 Deduplication lives in the state DB's ``alert`` table (written only by the run-lock holder): an
 open key (``auth:<account>``, ``blocked:<rule>:<fingerprint>``, ``failing:<rule>``, ``reload``)
@@ -84,6 +87,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "separator": "、",
         "approved.title": "calsync 放行了删除",
         "approved.body": "已放行 {count} 个删除（来自 {origin}）",
+        "guard_loosened.title": "calsync 的删除保护被放宽了",
+        "guard_loosened.body": "「{rule}」被拦截时，删除保护被调宽（来自 {origin}），拦下的删除可能会执行。",
         "origin.cli": "命令行",
         "origin.ui": "界面",
         "origin.daemon": "calsync",
@@ -106,6 +111,11 @@ TEXTS: dict[str, dict[str, str]] = {
         "separator": ", ",
         "approved.title": "calsync let deletions through",
         "approved.body": "{count} deletion{s} approved (from {origin})",
+        "guard_loosened.title": "calsync's delete guard was loosened",
+        "guard_loosened.body": (
+            "The delete guard of {rule} was raised while it was blocked (from {origin}); "
+            "the held-back deletions may now go through."
+        ),
         "origin.cli": "the command line",
         "origin.ui": "the web UI",
         "origin.daemon": "calsync",
@@ -126,7 +136,7 @@ TEXTS: dict[str, dict[str, str]] = {
 
 @dataclass(frozen=True, slots=True)
 class Alert:
-    event: str  # auth, blocked, failing, recovered, reload_failed, approved, test
+    event: str  # auth, blocked, failing, recovered, reload_failed, approved, guard_loosened, test
     title: str
     body: str  # may carry event titles: pushed, never logged
     rule: str | None = None
@@ -368,6 +378,21 @@ def approved(rule: str, count: int, origin: str, config: Config, now: datetime) 
         text("approved.body", count, origin=where),
         rule=rule,
         url=link(config, "rule", rule),
+        at=now,
+    )
+
+
+def guard_loosened(rule: str, origin: str, config: Config, now: datetime) -> Alert:
+    """``guard_loosened``: a blocked rule's delete guard was raised (no key: every time)."""
+    text = _Texts(config)
+    where = text(f"origin.{origin}") if f"origin.{origin}" in TEXTS["en"] else origin
+    return Alert(
+        "guard_loosened",
+        text("guard_loosened.title"),
+        text("guard_loosened.body", rule=rule, origin=where),
+        rule=rule,
+        url=link(config, "rule", rule),
+        level=URGENT,
         at=now,
     )
 

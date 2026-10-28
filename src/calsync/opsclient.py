@@ -171,7 +171,7 @@ def _over_socket(
 def _result(name: str, response: "httpx.Response") -> "OpResult":
     from calsync.configfile import ConfigConflict
     from calsync.errors import RulePaused
-    from calsync.ops import DaemonStopping, OpResult, OpsUnavailable
+    from calsync.ops import DaemonStopping, OpResult, OpsUnavailable, TooSoon
 
     try:
         body: Any = response.json()
@@ -195,6 +195,8 @@ def _result(name: str, response: "httpx.Response") -> "OpResult":
         raise OpsUnavailable(message)
     if response.status_code == 503 and error.get("kind") == "unavailable":
         raise DaemonStopping()
+    if response.status_code == 429 and error.get("kind") == "too_soon":
+        raise TooSoon()
     if response.status_code == 404:
         raise ConfigError([f'unknown operation "{name}"'])
     if response.status_code == 400:

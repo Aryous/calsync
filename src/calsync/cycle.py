@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 
 from calsync import debug, ops
 from calsync.config import Config
-from calsync.engine import CycleResult, Engine, RuleResult
+from calsync.engine import Approval, CycleResult, Engine, RuleResult
 from calsync.naming import rule_tag
 from calsync.store import RunRecord, Store
 from calsync.wiring import Adapters
@@ -25,13 +25,13 @@ async def run_cycle(
     *,
     dry_run: bool,
     allow_deletes: bool,
-    approvals: Mapping[str, str] | None = None,
+    approvals: Mapping[str, Approval] | None = None,
 ) -> CycleResult:
     """Run ``rules`` (None: every rule) and return their results in config order.
 
     A rule whose source or target account has a setup error (``adapters.errors``) fails on its
     own without reaching the engine; the other rules run normally. ``approvals`` go to the
-    engine (rule -> fingerprint of the blocked deletes to let through).
+    engine (rule -> the approval of the blocked deletes to let through).
     """
     selected = [r for r in config.rules if (rules is None or r.name in rules) and not r.paused]
     skipped: dict[str, RuleResult] = {}

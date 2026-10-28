@@ -12,7 +12,8 @@ from calsync import configfile, credentials, ops
 from calsync.configfile import ConfigConflict, Snapshot, read_snapshot, validate_text
 from calsync.errors import ConfigError
 from calsync.ops import OpContext, OpResult, run_op
-from calsync.store import Store
+from calsync.store import ChangeRecord, RunRecord, Store
+from calsync.views import StateReader
 from tests.harness import NOW
 
 TEXT = """\
@@ -111,6 +112,10 @@ class Env:
 
     def rule(self, name: str) -> Any:
         return next(r for r in self.config().rules if r.name == name)
+
+    def store_reader_changes(self) -> list[Any]:
+        with StateReader(self.state_dir / "state.db") as reader:
+            return list(reader.changes())
 
 
 @pytest.fixture
@@ -245,7 +250,13 @@ def test_op_names() -> None:
         "notify.test",
     }
     # They talk to the accounts or the push channels, or wait for a cycle that does.
-    assert set(ops.ASYNC_OPS) == {"calendars.refresh", "rule.preview", "trigger", "notify.test"}
+    assert set(ops.ASYNC_OPS) == {
+        "account.remove",
+        "calendars.refresh",
+        "rule.preview",
+        "trigger",
+        "notify.test",
+    }
     # The daemon runs them without its lock: neither touches the store or the config.
     assert set(ops.UNLOCKED_OPS) == {"trigger", "notify.test"}
 
@@ -308,6 +319,29 @@ def test_rule_add_defaults_to_full_sync(env: Env) -> None:
     assert kids.window is None and kids.alarms == "copy" and kids.target.create_if_missing is False
     env.run("rule.add", name="all-time", source="me-google:Old", target="family-icloud:Old", window="all")
     assert env.rule("all-time").window is None
+
+
+def test_rule_add_warns_about_copies_an_earlier_rule_of_that_name_left(env: Env) -> None:
+    """Copies carry their rule's name: a new rule of the same name takes them over."""
+    from calsync.naming import rule_tag
+    from calsync.targets.base import CachedObject, TargetCache
+
+    objects = {
+        f"/old/calsync-{i}.ics": CachedObject(None, rule_tag("kids"), f"{i:024x}", None, None)
+        for i in range(2)
+    }
+    env.store.save_target_cache("family-icloud", "/old/", TargetCache(None, objects))
+    warning = (
+        '; warning: 2 copies left by an earlier rule "kids" are recorded — this rule takes them over '
+        "and deletes those its source does not have (through the delete guard)"
+    )
+    args = {"name": "kids", "source": "me-google:Kids", "target": "family-icloud:Kids"}
+    dry = env.run("rule.add", dry_run=True, **args)
+    assert dry.summary.endswith(warning) and dry.data["earlier_copies"] == 2
+    result = env.run("rule.add", **args)
+    assert result.summary == 'rule "kids" added: "me-google:Kids" to "family-icloud:Kids"' + warning
+    assert result.data == {"earlier_copies": 2}
+    assert env.run("rule.add", name="other", source="me-google:O", target="family-icloud:O").data == {}
 
 
 def test_rule_add_problems(env: Env) -> None:
@@ -409,6 +443,65 @@ def test_a_removal_from_the_daemon_without_after_retire_is_an_ordinary_one(env: 
     assert result.summary == 'rule "work" removed; its copies stay in "Work"'
 
 
+# ----- loosening the delete guard of a blocked rule ------------------------------------------
+
+
+@pytest.fixture
+def pushed(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """The alerts ``ops`` sends in this process (no channel is reached)."""
+    sent: list[Any] = []
+
+    async def send(config: Any, alerts: Any) -> None:
+        sent.extend(alerts)
+
+    monkeypatch.setattr(ops, "send_contained", send)
+    return sent
+
+
+def _block(env: Env, rule: str = "family") -> None:
+    env.store.record_runs(
+        [RunRecord(rule, NOW, NOW, "blocked", 0, 0, 0, 0, 1, "plan deletes 12 events", error_kind="guard")],
+        [ChangeRecord(rule, f"o{i}", "blocked", NOW, None) for i in range(12)],
+    )
+
+
+def _loosened(env: Env) -> list[Any]:
+    return [c for c in env.store_reader_changes() if c.action == "guard_loosened"]
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("delete_guard.max_count", 100), ("delete_guard.max_ratio", 0.9)],
+)
+def test_raising_a_blocked_rules_guard_is_recorded_and_pushed(
+    env: Env, pushed: list[Any], key: str, value: object
+) -> None:
+    _block(env)
+    env.run("rule.set", name="family", key=key, value=value)
+    [row] = _loosened(env)
+    assert (row.rule, row.object_id, row.title) == ("family", "guard", "delete guard loosened (cli)")
+    with StateReader(env.state_dir / "state.db") as reader:
+        assert row.run_id == reader.runs("family")[0].id  # the blocked run
+    [alert] = pushed
+    assert (alert.event, alert.rule) == ("guard_loosened", "family") and "命令行" in alert.body
+
+
+def test_undo_that_raises_the_guard_counts_too(env: Env, pushed: list[Any]) -> None:
+    env.run("rule.set", name="family", key="delete_guard.max_count", value=3)
+    _block(env)
+    env.run("config.undo")  # back to the default of 10: looser
+    assert [r.title for r in _loosened(env)] == ["delete guard loosened (cli)"]
+    assert [a.event for a in pushed] == ["guard_loosened"]
+
+
+def test_the_guard_of_a_rule_that_is_not_blocked_changes_quietly(env: Env, pushed: list[Any]) -> None:
+    _block(env, "work")  # another rule is blocked
+    env.run("rule.set", name="family", key="delete_guard.max_count", value=100)
+    env.run("rule.set", name="work", key="delete_guard.max_count", value=3)  # tighter: quiet
+    env.run("rule.set", name="family", key="delete_guard.max_count", value=200, dry_run=True)
+    assert _loosened(env) == [] and pushed == []
+
+
 # ----- accounts --------------------------------------------------------------------------
 
 
@@ -474,6 +567,7 @@ def test_account_remove_keeps_the_credential_by_default(env: Env, keychain: Fake
     keychain.store[("calsync:spare-dav", "calsync")] = "pw"
     result = env.run("account.remove", name="spare-dav")
     assert result.summary == 'account "spare-dav" removed; its credential was kept'
+    assert result.data == {"credential": "kept"}
     assert "spare-dav" not in env.config().accounts
     assert keychain.deleted == [] and ("calsync:spare-dav", "calsync") in keychain.store
 
@@ -482,6 +576,7 @@ def test_account_remove_deletes_the_keychain_entry(env: Env, keychain: FakeKeyri
     keychain.store[("calsync:spare-dav", "calsync")] = "pw"
     result = env.run("account.remove", name="spare-dav", delete_credential=True)
     assert result.summary == 'account "spare-dav" removed; its keychain entry was deleted'
+    assert result.data == {"credential": "deleted"}
     assert keychain.store == {}
     [row] = env.store.config_changes()
     assert row.summary == 'account "spare-dav" removed'
@@ -495,6 +590,7 @@ def test_account_remove_with_a_missing_keychain_entry(env: Env, keychain: FakeKe
 def test_account_remove_leaves_file_and_env_credentials_to_a_person(env: Env, keychain: FakeKeyring) -> None:
     result = env.run("account.remove", name="old-dav", delete_credential=True)
     assert result.summary == 'account "old-dav" removed; its credential (file) must be removed by hand'
+    assert result.data == {"credential": "manual"}
     assert keychain.deleted == []
 
 
@@ -514,6 +610,32 @@ def test_a_keychain_failure_after_the_write_is_reported_not_raised(
         'account "spare-dav" removed; its keychain entry "calsync:spare-dav" could not be deleted '
         "(KeyringLocked): remove it by hand"
     )
+    assert result.data == {"credential": "failed"}
+
+
+def test_the_keychain_delete_runs_off_the_event_loop(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """In the daemon an operation runs on its event loop: a keychain prompt must not stall it."""
+    import asyncio
+    import threading
+
+    threads: list[int] = []
+
+    class Recording(FakeKeyring):
+        def delete_password(self, service: str, user: str) -> None:
+            threads.append(threading.get_ident())
+            super().delete_password(service, user)
+
+    fake = Recording()
+    fake.store[("calsync:spare-dav", "calsync")] = "pw"
+    monkeypatch.setattr(credentials, "_keyring", lambda: fake)
+
+    async def remove() -> tuple[OpResult, int]:
+        args = {"name": "spare-dav", "delete_credential": True}
+        return await ops.run_op_async(env.ctx, "account.remove", args, False), threading.get_ident()
+
+    result, loop_thread = asyncio.run(remove())
+    assert result.data == {"credential": "deleted"} and fake.store == {}
+    assert threads and loop_thread not in threads
 
 
 # ----- settings --------------------------------------------------------------------------
@@ -649,6 +771,7 @@ def test_a_credential_another_account_uses_is_kept(env: Env, keychain: FakeKeyri
     )
     result = env.run("account.remove", name="spare-dav", delete_credential=True)
     assert result.summary == 'account "spare-dav" removed' + kept
+    assert result.data == {"credential": "kept"}
     assert keychain.deleted == [] and ("calsync:spare-dav", "calsync") in keychain.store
 
 

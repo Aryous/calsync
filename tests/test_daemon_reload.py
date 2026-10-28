@@ -257,12 +257,33 @@ async def test_a_changed_web_address_needs_a_restart(
     caplog.set_level(logging.INFO, logger="calsync.daemon")
     path, config = setup(tmp_path)
     world = World(stop_after=4)
-    daemon = world.daemon(config, tmp_path, config_path=path)
+    daemon = world.daemon(config, tmp_path, config_path=path, listen=("127.0.0.1", 8765))
     on_wait(world, 1, lambda: write(path, TEXT + '\n[web]\nlisten = "127.0.0.1:9100"\n'))
     on_wait(world, 2, lambda: write(path, TEXT + '\n[web]\nlisten = "off"\n'))
     await daemon.run(world.stop)
     assert "restart the daemon to listen on 127.0.0.1:9100" in caplog.messages
     assert "restart the daemon to turn the web UI off" in caplog.messages
+
+
+async def test_no_restart_hint_for_what_the_daemon_already_does(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``service install --listen off``: a later ``[web] listen = "off"`` needs no restart, and
+    an address the ``--listen`` override already serves neither."""
+    caplog.set_level(logging.INFO, logger="calsync.daemon")
+    path, config = setup(tmp_path)
+    world = World(stop_after=4)
+    daemon = world.daemon(config, tmp_path, config_path=path, listen=None)
+    on_wait(world, 1, lambda: write(path, TEXT + '\n[web]\nlisten = "off"\n'))
+    await daemon.run(world.stop)
+    assert not [m for m in caplog.messages if m.startswith("restart the daemon")]
+    caplog.clear()
+    world = World(stop_after=4)
+    write(path, TEXT)
+    daemon = world.daemon(config, tmp_path, config_path=path, listen=("127.0.0.1", 9100))
+    on_wait(world, 1, lambda: write(path, TEXT + '\n[web]\nlisten = "127.0.0.1:9100"\n'))
+    await daemon.run(world.stop)
+    assert not [m for m in caplog.messages if m.startswith("restart the daemon")]
 
 
 # ----- the daemon's own writes ------------------------------------------------------------

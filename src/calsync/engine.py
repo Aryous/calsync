@@ -65,6 +65,18 @@ def delete_fingerprint(object_ids: Iterable[str]) -> str:
     return hashlib.sha256("\n".join(sorted(object_ids)).encode()).hexdigest()[:16]
 
 
+@dataclass(frozen=True, slots=True)
+class Approval:
+    """Blocked deletes a person or an agent let through: the set's fingerprint and where the
+    approval came from (``cli``, ``ui``), recorded with the cycle that releases the set."""
+
+    fingerprint: str
+    origin: str
+
+
+APPROVED = "approved"  # change action: an approval released a blocked set (object id: its fingerprint)
+
+
 def error_kind_for(exc: BaseException) -> ErrorKind:
     if isinstance(exc, AuthError):
         return "auth"
@@ -481,7 +493,7 @@ class Engine:
         return cal, self._caches[(rule.target.account, cal.href)]
 
     async def _run_rule(
-        self, rule: Rule, result: RuleResult, *, dry_run: bool, allow_deletes: bool, approval: str | None
+        self, rule: Rule, result: RuleResult, *, dry_run: bool, allow_deletes: bool, approval: Approval | None
     ) -> None:
         cal, cache = self._cache_for(rule)
         tag = rule_tag(rule.name)
@@ -490,12 +502,13 @@ class Engine:
             for href, obj in cache.objects.items()
             if obj.rule_tag == tag
         }
+        # A retiring rule syncs to nothing over all of time: every copy is a delete, also one
+        # its window left behind (the guard still applies).
         window = (
             Window.everything()
-            if rule.window is None
+            if rule.retire or rule.window is None
             else Window.around(self._clock(), rule.window.past, rule.window.future)
         )
-        # A retiring rule syncs to nothing: every copy is a delete (the guard still applies).
         desired, unparsed = ({}, frozenset[str]()) if rule.retire else self._desired(rule)
         incomplete = {oid for oid, want in desired.items() if not want.series.complete}
         result.degraded = len(unparsed) + len(incomplete)
@@ -539,7 +552,9 @@ class Engine:
         # through (by fingerprint); any other set is judged by the guard as always.
         deletable = len(actual.keys() - protected)
         fingerprint = delete_fingerprint(a.object_id for a in result.plan.delete)
-        result.approved = approval is not None and bool(result.plan.delete) and approval == fingerprint
+        result.approved = (
+            approval is not None and bool(result.plan.delete) and approval.fingerprint == fingerprint
+        )
         reason = (
             None
             if allow_deletes or result.approved
@@ -572,6 +587,19 @@ class Engine:
             return
         if not dry_run:
             result.seen_blocked = frozenset()  # a later block of the same set is new again
+        if result.approved and approval is not None and not dry_run:
+            # Who let the set through, in the activity record (before its deletes), whether or
+            # not a push channel is configured.
+            count = len(result.plan.delete)
+            result.changes.append(
+                ChangeRecord(
+                    rule.name,
+                    fingerprint,
+                    APPROVED,
+                    self._clock(),
+                    f"{count} delete{'' if count == 1 else 's'} approved ({approval.origin})",
+                )
+            )
         if not dry_run and not result.plan.empty:
             await self._push(rule, cal, cache, result.plan, result)
 
@@ -871,10 +899,11 @@ class Engine:
         rules: Sequence[str] | None = None,
         dry_run: bool = False,
         allow_deletes: bool = False,
-        approvals: Mapping[str, str] | None = None,
+        approvals: Mapping[str, Approval] | None = None,
     ) -> CycleResult:
         """One cycle of ``rules`` (None: every rule not paused). ``approvals``: rule -> the
-        fingerprint of the planned deletes to let through the guard this cycle."""
+        approval (fingerprint of the planned deletes, origin) to let through the guard this
+        cycle; one that releases its set is recorded as an ``approved`` change."""
         approvals = approvals or {}
         started = self._clock()
         mark = self._log.mark() if self._log else 0

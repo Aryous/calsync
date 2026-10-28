@@ -240,6 +240,7 @@ def test_config_get_masks_urls_and_identities(files: Files) -> None:
     assert revealed["notify"]["bark_url"] == "https://bark.example.com/DEVICEKEY"
     assert revealed["accounts"]["family-icloud"]["username"] == "family@example.com"
     assert revealed["accounts"]["family-icloud"]["credential"]["ref"] == "FAMILY_PW"
+    assert revealed["accounts"]["family-icloud"].items() >= family.items()  # keys added, none dropped
     assert revealed["google"]["client_secret_file"].endswith(".json")  # the full path
 
 
@@ -356,6 +357,18 @@ async def test_daemon_errors_come_back_as_errors(files: Files, answer: Exception
             EXIT_FAILED,
             "error: The daemon runs with --no-sync: it changes no configuration.\n",
         )
+
+
+@pytest.mark.anyio
+async def test_a_test_push_too_soon_comes_back_as_too_soon(files: Files) -> None:
+    from calsync.ops import TooSoon
+
+    files.state.mkdir()
+    async with _serve(files.state, FakeOpsDaemon(TooSoon())):
+        with pytest.raises(TooSoon):
+            await anyio.to_thread.run_sync(lambda: _call(files, "notify.test", {}))
+        code, out = await anyio.to_thread.run_sync(lambda: files.cli("notify", "test", "--json"))
+    assert code == EXIT_FAILED and json.loads(out)["error"]["kind"] == "too_soon"
 
 
 @pytest.mark.anyio

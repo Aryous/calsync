@@ -17,7 +17,7 @@ from calsync import credentials, service
 from calsync.config import CredentialRef, default_config_path, default_state_dir, load_config
 from calsync.errors import ConfigError
 from calsync.http import RequestLog, make_client
-from tests.conftest import KEYRING_REFUSED, LAUNCHCTL_REFUSED, Seal
+from tests.conftest import BROWSER_REFUSED, KEYRING_REFUSED, LAUNCHCTL_REFUSED, Seal
 
 REAL_GETADDRINFO = socket.getaddrinfo  # taken at import, before any test patches it
 REAL_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -61,6 +61,17 @@ def test_the_real_launchctl_is_refused(sealed: Seal) -> None:
         service.SystemLaunchctl().list()
     with pytest.raises(AssertionError, match=LAUNCHCTL_REFUSED):
         service.system_launchctl().print("gui/501/dev.calsync.daemon")
+    assert len(sealed.refused) == 2
+    sealed.refused.clear()
+
+
+def test_a_real_browser_is_refused(sealed: Seal) -> None:
+    import webbrowser
+
+    with pytest.raises(AssertionError, match=BROWSER_REFUSED):
+        webbrowser.open("http://127.0.0.1:1/")
+    with pytest.raises(AssertionError, match=BROWSER_REFUSED):
+        webbrowser.open_new_tab("http://127.0.0.1:1/")
     assert len(sealed.refused) == 2
     sealed.refused.clear()
 

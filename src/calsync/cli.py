@@ -74,7 +74,7 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--attendees", choices=("none", "notes"), help="attendees into the notes or dropped")
     add.add_argument("--conference", choices=("copy", "none"), help="the meeting link")
     add.add_argument(
-        "--preview", action="store_true", help="show what the rule would sync and stop (writes nothing)"
+        "--preview", action="store_true", help="show what the rule would sync and stop (writes no config)"
     )
     change = _writer(rule_sub, "set", "change one setting of a rule")
     change.add_argument("name")
@@ -396,6 +396,26 @@ def _describe(exc: BaseException, args: argparse.Namespace | None = None) -> str
     return f"error: {type(exc).__name__}: {exc}\n"
 
 
+def _report(exc: BaseException, args: argparse.Namespace, out: TextIO) -> None:
+    """Print an error that stopped a command: the JSON error object when the command answers
+    in JSON, else the message. The daemon's output is its log (under launchd, a file): there an
+    error that is not a configuration problem is named by its type only, since its text can
+    carry a request URL."""
+    from calsync.errors import ConfigError, public_name
+
+    if _wants_json(args):
+        _dump(_error_json(exc), out)
+    elif getattr(args, "command", None) == "daemon" and not isinstance(exc, ConfigError):
+        from calsync.lock import AlreadyRunning
+
+        if isinstance(exc, AlreadyRunning):  # calsync's own message: no URL in it
+            out.write(_describe(exc, args))
+        else:
+            out.write(f"error: {public_name(exc)}\n")
+    else:
+        out.write(_describe(exc, args))
+
+
 def cmd_config_check(args: argparse.Namespace, out: TextIO) -> int:
     config = _load(args)
     out.write(f"ok: {len(config.accounts)} accounts, {len(config.rules)} rules\n")
@@ -408,7 +428,7 @@ def _dump(body: object, out: TextIO) -> None:
 
 def _error_kind(exc: BaseException) -> str:
     from calsync.configfile import ConfigConflict
-    from calsync.errors import ConfigError
+    from calsync.errors import AuthError, ConfigError
     from calsync.lock import AlreadyRunning
     from calsync.opsclient import DaemonLost
 
@@ -416,11 +436,42 @@ def _error_kind(exc: BaseException) -> str:
         return "conflict"
     if isinstance(exc, ConfigError):
         return "config"
+    if isinstance(exc, AuthError):
+        return "auth"
     if isinstance(exc, AlreadyRunning):
         return "locked"
     if isinstance(exc, DaemonLost):
         return "daemon_lost"
+    from calsync.ops import TooSoon
+
+    if isinstance(exc, TooSoon):
+        return "too_soon"
     return "error"
+
+
+def _wants_json(args: argparse.Namespace | None) -> bool:
+    """Whether the command answers in JSON (``--json``; ``config get`` always does)."""
+    if args is None:
+        return False
+    if getattr(args, "command", None) == "config" and getattr(args, "config_command", None) == "get":
+        return True
+    return bool(getattr(args, "json", False))
+
+
+def _error_json(exc: BaseException) -> dict[str, object]:
+    """The ``{"error": {...}}`` object for an error that stopped a command: ``kind``,
+    ``message`` and, for a configuration error, every problem."""
+    from calsync.errors import CalsyncError, ConfigError
+
+    error: dict[str, object] = {"kind": _error_kind(exc)}
+    if isinstance(exc, ConfigError):
+        error["message"] = "; ".join(exc.problems)
+        error["problems"] = list(exc.problems)
+    elif isinstance(exc, CalsyncError):
+        error["message"] = str(exc)
+    else:
+        error["message"] = f"{type(exc).__name__}: {exc}"
+    return {"error": error}
 
 
 # Operations that report an account they could not reach in their result (``error_kind`` in
@@ -433,7 +484,7 @@ def _ops_command(args: argparse.Namespace, out: TextIO, name: str, op_args: dict
     """Run one operation (through the daemon if it runs, else here with the lock) and print it:
     the summary, the diff with ``--dry-run``, and the command a person runs next, if any."""
     from calsync import opsclient
-    from calsync.errors import CalsyncError, ConfigError
+    from calsync.errors import CalsyncError
 
     try:
         result = opsclient.call(
@@ -442,10 +493,7 @@ def _ops_command(args: argparse.Namespace, out: TextIO, name: str, op_args: dict
     except CalsyncError as exc:
         if not args.json:
             raise
-        error: dict[str, object] = {"kind": _error_kind(exc), "message": str(exc)}
-        if isinstance(exc, ConfigError):
-            error["problems"] = exc.problems
-        _dump({"error": error}, out)
+        _dump(_error_json(exc), out)
         return exit_code_for(exc)
     code = EXIT_OK
     if result.op in EXITS_BY_UNREACHED_ACCOUNT and (kind := result.data.get("error_kind")):
@@ -512,6 +560,7 @@ APPROVE_EXIT = {
     "stale": EXIT_FAILED,
     "failed": EXIT_FAILED,
     "not_blocked": EXIT_CONFIG,
+    "synced": EXIT_OK,
 }
 
 
@@ -525,7 +574,7 @@ def cmd_approve(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
     if not args.yes and not args.dry_run:
         if args.json or not stdin.isatty():  # no prompt in JSON mode or without a person
             if args.json:
-                _dump({"error": {"kind": "config", "message": YES_NEEDED, "problems": [YES_NEEDED]}}, out)
+                _dump(_error_json(ConfigError([YES_NEEDED])), out)
             else:
                 out.write(YES_NEEDED + "\n")
             return EXIT_CONFIG
@@ -553,10 +602,7 @@ def cmd_approve(args: argparse.Namespace, out: TextIO, stdin: TextIO) -> int:
     except CalsyncError as exc:
         if not args.json:
             raise
-        error: dict[str, object] = {"kind": _error_kind(exc), "message": str(exc)}
-        if isinstance(exc, ConfigError):
-            error["problems"] = exc.problems
-        _dump({"error": error}, out)
+        _dump(_error_json(exc), out)
         return exit_code_for(exc)
     return _approve_answer(result, args, out)
 
@@ -704,14 +750,14 @@ def cmd_calendars(args: argparse.Namespace, out: TextIO) -> int:
     ``--refresh`` or when nothing is cached (``calendars.refresh``: through the daemon if it
     runs, else here with the run lock)."""
     from calsync import opsclient
-    from calsync.errors import CalsyncError
+    from calsync.errors import CalsyncError, ConfigError
 
     config = _load(args)
     account = args.account
     if account not in config.accounts:
         message = f"unknown account {account!r}"
         if args.json:
-            _dump({"error": {"kind": "config", "message": message, "problems": [message]}}, out)
+            _dump(_error_json(ConfigError([message])), out)
         else:
             out.write(message + "\n")
         return EXIT_CONFIG
@@ -730,7 +776,7 @@ def cmd_calendars(args: argparse.Namespace, out: TextIO) -> int:
         except CalsyncError as exc:
             if not args.json:
                 raise
-            _dump({"error": {"kind": _error_kind(exc), "message": str(exc)}}, out)
+            _dump(_error_json(exc), out)
             return exit_code_for(exc)
         outcome = result.data.get("accounts", {}).get(account, {})
         if not outcome.get("refreshed"):
@@ -1036,10 +1082,7 @@ def cmd_trigger(args: argparse.Namespace, out: TextIO) -> int:
     except CalsyncError as exc:
         if not args.json:
             raise
-        error: dict[str, object] = {"kind": _error_kind(exc), "message": str(exc)}
-        if isinstance(exc, ConfigError):
-            error["problems"] = exc.problems
-        _dump({"error": error}, out)
+        _dump(_error_json(exc), out)
         return exit_code_for(exc)
     code = _trigger_exit(result.data)
     if args.json:
@@ -1233,19 +1276,17 @@ def _show(
     rule = getattr(args, "rule", None)
     # History outlives the config: `runs` and `changes` also show rules removed since.
     if check_rule and rule is not None and rule not in {r.name for r in config.rules}:
-        out.write(f"unknown rule(s): {rule}\n")
-        return EXIT_CONFIG
+        return _refuse(args, out, "unknown_rule", f"unknown rule(s): {rule}", EXIT_CONFIG)
     db_path, _ = state_paths(_state_dir(args))
     try:
         reader = StateReader(db_path)
         with reader:
             view = build(config, reader)
     except StateUnavailable:
-        out.write(NO_STATE_MESSAGE + "\n")
-        return EXIT_FAILED
+        return _refuse(args, out, "no_state", NO_STATE_MESSAGE, EXIT_FAILED)
     except sqlite3.DatabaseError as exc:  # not a database, corrupt, or locked
-        out.write(f"error: the state database could not be read: {type(exc).__name__}\n")
-        return EXIT_FAILED
+        message = f"the state database could not be read: {type(exc).__name__}"
+        return _refuse(args, out, "state_unreadable", message, EXIT_FAILED, prefix="error: ")
     if args.json:
         out.write(json.dumps({**view.to_json(), **(extra or {})}, ensure_ascii=False, indent=2) + "\n")
     else:
@@ -1380,12 +1421,14 @@ def cmd_status(args: argparse.Namespace, out: TextIO) -> int:
     return code
 
 
-def _refuse(args: argparse.Namespace, out: TextIO, kind: str, message: str, code: int) -> int:
-    """A refused read: the message, or ``{"error": ...}`` with ``--json``."""
-    if args.json:
+def _refuse(
+    args: argparse.Namespace, out: TextIO, kind: str, message: str, code: int, *, prefix: str = ""
+) -> int:
+    """A refused read: the message (after ``prefix``), or ``{"error": ...}`` with ``--json``."""
+    if _wants_json(args):
         _dump({"error": {"kind": kind, "message": message}}, out)
     else:
-        out.write(message + "\n")
+        out.write(prefix + message + "\n")
     return code
 
 
@@ -1512,7 +1555,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
         if args.command == "changes":
             return cmd_changes(args, out)
     except CalsyncError as exc:
-        out.write(_describe(exc, args))
+        _report(exc, args, out)
         return exit_code_for(exc)
     except Exception as exc:
         # The network, the state database or the filesystem failing outside an adapter:
@@ -1522,7 +1565,7 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
         import httpx
 
         if isinstance(exc, httpx.HTTPError | sqlite3.Error | OSError):
-            out.write(_describe(exc, args))
+            _report(exc, args, out)
             return exit_code_for(exc)
         from calsync import debug
 

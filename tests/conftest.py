@@ -35,6 +35,7 @@ def _no_calsync_debug(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: igno
 PROXY_VARIABLES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 KEYRING_REFUSED = "a test reached the real keyring"
 LAUNCHCTL_REFUSED = "a test reached the real launchctl"
+BROWSER_REFUSED = "a test opened a real browser"
 
 
 class Seal:
@@ -140,10 +141,17 @@ def sealed(
     - the keychain fails closed: ``credentials._keyring`` refuses every call, and
       ``PYTHON_KEYRING_BACKEND`` gives a child process keyring's ``fail`` backend;
     - ``launchctl`` is never run: ``service._run`` refuses (a test passes a fake launchctl);
+    - no browser opens: ``webbrowser.open`` (and ``open_new``, ``open_new_tab``) refuse, so a
+      test that reaches the Google sign-in passes its own ``open_browser``;
     - no connection leaves the machine: a connect or name lookup for anything but loopback or
       a unix socket is refused, and no proxy is used (the developer's proxy listens on
       loopback and would carry the request out). ``@pytest.mark.network`` lifts the network
       guard (nothing needs it).
+
+    A child process (``calsync`` run as a subprocess, Radicale) inherits only the environment
+    part of the seal: ``HOME``, ``CALSYNC_*``, the fail keyring and ``NO_PROXY``, not the
+    network, launchctl or browser guards. That is safe as long as a child's config sets no
+    real credential (env credentials left unset) and no ``[notify]`` channel; keep it so.
     """
     seal = Seal()
     home = tmp_path_factory.mktemp("no-home")
@@ -163,6 +171,14 @@ def sealed(
 
     # The developer's machine runs real launchd jobs: `calsync service` only ever gets a fake.
     monkeypatch.setattr(service, "_run", no_launchctl)
+
+    import webbrowser
+
+    def no_browser(*args: object, **kwargs: object) -> bool:
+        raise seal.refuse(BROWSER_REFUSED)
+
+    for name in ("open", "open_new", "open_new_tab"):
+        monkeypatch.setattr(webbrowser, name, no_browser)
 
     for name in PROXY_VARIABLES:
         monkeypatch.delenv(name, raising=False)

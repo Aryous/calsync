@@ -33,7 +33,7 @@ from calsync.errors import AuthError, CalsyncError, ConfigError, RulePaused, pla
 from calsync.store import CONFIG_CHANGE_RETENTION, AccountCalendar, Store
 
 if TYPE_CHECKING:
-    from calsync.engine import CycleResult, RuleResult
+    from calsync.engine import Approval, CycleResult, RuleResult
     from calsync.notify import Alert
     from calsync.wiring import Adapters
 
@@ -58,6 +58,10 @@ class DaemonHooks(Protocol):
     ) -> "asyncio.Future[CycleResult | None] | None":
         """Store the approval for the rule's next cycle and request that cycle; with ``wait``,
         a future of that cycle's result (None: the cycle failed)."""
+        ...
+
+    def push(self, alerts: list["Alert"]) -> None:
+        """Send ``alerts`` in the daemon's background outbox."""
         ...
 
     def borrow_adapters(
@@ -87,6 +91,19 @@ class DaemonHooks(Protocol):
 
 class OpsUnavailable(CalsyncError):
     """This daemon runs no operations (``--no-sync``: no lock, no store), ``notify.test`` aside."""
+
+
+class TooSoon(CalsyncError):
+    """``notify.test`` again within ``NOTIFY_TEST_COOLDOWN`` in the daemon (the API answers 429
+    ``too_soon``): a paired browser cannot push without limit."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            f"A test push was sent less than {NOTIFY_TEST_COOLDOWN:g} seconds ago; try again shortly."
+        )
+
+
+NOTIFY_TEST_COOLDOWN = 10.0  # seconds between the daemon's test pushes
 
 
 class DaemonStopping(OpsUnavailable):
@@ -328,12 +345,73 @@ def _config_op(
     changed = text != snapshot.text
     if changed:
         ctx.on_config_written(written)
+        _check_guards(ctx, snapshot.text, text)
     summary = change.summary
     if change.after_write is not None:
         summary += change.after_write()
     if not recorded:
         summary += "; history not recorded"
     return OpResult(op, changed, summary, shown, change.data, change.needs_human)
+
+
+GUARD_LOOSENED = "guard_loosened"  # change action: a blocked rule's delete guard was raised
+
+
+def _check_guards(ctx: OpContext, before: str, after: str) -> None:
+    """A write that raised a blocked rule's ``delete_guard.max_count`` or ``max_ratio`` lets
+    the held-back deletes through without an approval: recorded (a ``guard_loosened`` change
+    with its origin) and pushed like an approval. Contained: the config is written already."""
+    try:
+        old = configfile.validate_text(before, ctx.config_path.parent)
+    except ConfigError:
+        return  # nothing ran from an invalid text: no guard to compare with
+    try:
+        new = configfile.validate_text(after, ctx.config_path.parent)
+        guards = {r.name: r.delete_guard for r in old.rules}
+        loosened = [
+            r.name
+            for r in new.rules
+            if (was := guards.get(r.name)) is not None
+            and (r.delete_guard.max_count > was.max_count or r.delete_guard.max_ratio > was.max_ratio)
+            and next(iter(ctx.store.statuses(r.name)), ("",))[0] == "blocked"
+        ]
+        if not loosened:
+            return
+        from calsync import notify
+        from calsync.store import ChangeRecord
+
+        now = ctx.clock()
+        for name in loosened:
+            log.info("rule %s: delete guard loosened while blocked (%s)", name, ctx.source)
+            ctx.store.record_change(
+                ChangeRecord(name, "guard", GUARD_LOOSENED, now, f"delete guard loosened ({ctx.source})")
+            )
+        alerts = [notify.guard_loosened(name, ctx.source, new, now) for name in loosened]
+        if ctx.daemon is not None:
+            ctx.daemon.push(alerts)
+        else:
+            _send_now(new, alerts)
+    except Exception as exc:
+        log.warning("loosened delete guard not recorded (%s)", type(exc).__name__)
+        debug.details(log, "loosened delete guard not recorded", exc)
+
+
+def _send_now(config: Config, alerts: Sequence["Alert"]) -> None:
+    """Send ``alerts`` before returning, from synchronous code in this process (on a thread of
+    its own when an event loop already runs here)."""
+    import threading
+
+    def send() -> None:
+        asyncio.run(send_contained(config, alerts))
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        send()
+        return
+    worker = threading.Thread(target=send)
+    worker.start()
+    worker.join()
 
 
 def _shown_diff(ctx: OpContext, old: str, new: str, diff: str) -> str:
@@ -408,9 +486,22 @@ def _rule_add(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
     op = "rule.add"
     name, table, source, target = _rule_table(op, args)
 
+    from calsync.naming import rule_tag
+
+    # Copies carry their rule's name: those an earlier rule of this name left behind are this
+    # rule's now, and its cycles delete the ones its source does not have (guard permitting).
+    earlier = ctx.store.tagged_copies(rule_tag(name))
+
     def edit(doc: tomlkit.TOMLDocument) -> _Edit:
         _add_rule(doc, table, source, target)
-        return _Edit(f'rule "{name}" added: "{":".join(source)}" to "{":".join(target)}"')
+        summary = f'rule "{name}" added: "{":".join(source)}" to "{":".join(target)}"'
+        if not earlier:
+            return _Edit(summary)
+        warning = (
+            f'; warning: {_copies(earlier)} left by an earlier rule "{name}" are recorded — this rule '
+            "takes them over and deletes those its source does not have (through the delete guard)"
+        )
+        return _Edit(summary + warning, data={"earlier_copies": earlier})
 
     return _config_op(ctx, op, dry_run, edit)
 
@@ -525,11 +616,18 @@ def _credential(raw: Any) -> CredentialRef | None:
     return None
 
 
-def _account_remove(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
+async def _account_remove(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
+    """Remove an account no rule uses. With ``delete_credential``, its keychain entry goes too
+    (after the config is written, on a worker thread: a keychain prompt never stalls the
+    daemon's event loop), unless another account uses it. ``data.credential``: ``kept``
+    (not asked, or shared), ``deleted``, ``failed`` (reported in the summary), ``manual`` (an
+    ``env`` or ``file`` credential, which a person removes) or ``none``."""
     op = "account.remove"
     a = _Args(op, args, {"name", "delete_credential"})
     name = a.text("name")
     delete_credential = a.flag("delete_credential")
+    to_delete: list[CredentialRef | None] = []  # set by the edit: delete this one after the write
+    shared: list[str] = []
 
     def edit(doc: tomlkit.TOMLDocument) -> _Edit:
         raw = _raw(doc)
@@ -551,11 +649,13 @@ def _account_remove(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpRe
         if ref is not None and sharers:  # deleting it would sign those accounts out too
             shared[:] = sharers
             return _Edit(f'account "{name}" removed', after_write=lambda: _shared_tail(sharers, "was kept"))
-        return _Edit(f'account "{name}" removed', after_write=lambda: _delete_credential(ref))
+        to_delete[:] = [ref]
+        return _Edit(f'account "{name}" removed')
 
-    shared: list[str] = []
     result = _config_op(ctx, op, dry_run, edit)
-    if dry_run and result.summary.startswith(DRY_RUN):
+    if dry_run:
+        if not result.summary.startswith(DRY_RUN):
+            return result
         if shared:
             tail = _shared_tail(shared, "would be kept")
         elif delete_credential:
@@ -563,7 +663,19 @@ def _account_remove(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpRe
         else:
             tail = "; its credential would be kept"
         return OpResult(result.op, result.changed, result.summary + tail, result.diff, result.data)
-    return result
+    if not result.changed:
+        return result
+    if not to_delete:
+        return dataclasses.replace(result, data={**result.data, "credential": "kept"})
+    import anyio.to_thread
+
+    tail, state = await anyio.to_thread.run_sync(_delete_credential, to_delete[0])
+    summary, unrecorded = result.summary, "; history not recorded"
+    if summary.endswith(unrecorded):  # the credential's fate belongs to the account's sentence
+        summary = summary[: -len(unrecorded)] + tail + unrecorded
+    else:
+        summary += tail
+    return dataclasses.replace(result, summary=summary, data={**result.data, "credential": state})
 
 
 def _shared_tail(sharers: list[str], kept: str) -> str:
@@ -581,20 +693,20 @@ def _accounts_of(rule: Any) -> set[str]:
     return {str(side.get("account")) for side in sides if isinstance(side, Mapping)}
 
 
-def _delete_credential(ref: CredentialRef | None) -> str:
-    """The end of ``account.remove``'s summary. The config is already written: a failure here is
-    reported, not raised."""
+def _delete_credential(ref: CredentialRef | None) -> tuple[str, str]:
+    """The end of ``account.remove``'s summary and ``data.credential``. The config is already
+    written: a failure here is reported, not raised."""
     if ref is None:
-        return "; it had no credential"
+        return "; it had no credential", "none"
     try:
         deleted = credentials.delete_secret(ref)
     except CalsyncError as exc:
         cause = exc.__cause__
         kind = type(cause).__name__ if cause is not None else type(exc).__name__
-        return f'; its keychain entry "{ref.ref}" could not be deleted ({kind}): remove it by hand'
+        return f'; its keychain entry "{ref.ref}" could not be deleted ({kind}): remove it by hand', "failed"
     if not deleted:
-        return f"; its credential ({ref.backend}) must be removed by hand"
-    return "; its keychain entry was deleted"
+        return f"; its credential ({ref.backend}) must be removed by hand", "manual"
+    return "; its keychain entry was deleted", "deleted"
 
 
 # ----- settings and undo -------------------------------------------------------------------
@@ -657,7 +769,9 @@ def _approve(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
     In-process, one cycle for that rule runs here. ``data.status``: ``approved`` (the set was
     deleted), ``stale`` (the planned deletes are another set now: nothing deleted, the new
     fingerprint and count in ``data``), ``not_blocked`` (nothing to approve; nothing stored),
-    ``failed`` (the approval cycle failed), ``pending`` and, in a dry run, ``would_approve``."""
+    ``failed`` (the approval cycle failed), ``synced`` (the guard no longer held anything back:
+    the rule synced as usual, without the approval), ``pending`` and, in a dry run,
+    ``would_approve``."""
     from calsync import views
     from calsync.config import load_config
     from calsync.wiring import state_paths
@@ -712,7 +826,10 @@ def _approve(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
 
     notify.approving(ctx.store, name)  # the approval is this block's push: its key closes now
     approval = notify.approved(name, blocked.count, ctx.source, config, ctx.clock())
-    result, removed = asyncio.run(_cycle_here(ctx, config, [name], {name: fingerprint}, alerts=[approval]))
+    from calsync.engine import Approval
+
+    approvals = {name: Approval(fingerprint, ctx.source)}
+    result, removed = asyncio.run(_cycle_here(ctx, config, [name], approvals, alerts=[approval]))
     outcome = _outcome(op, name, fingerprint, blocked.count, result)
     if removed:
         return dataclasses.replace(outcome, summary=outcome.summary + "; " + "; ".join(removed))
@@ -792,14 +909,14 @@ def _outcome(op: str, rule: str, fingerprint: str, count: int, cycle: "CycleResu
     # The guard no longer held anything back (the set shrank, or the guard was raised): the
     # rule synced as usual and the approval was not needed.
     summary = f'rule "{rule}" was no longer blocked; it synced as usual ({_copies(r.deleted)} deleted)'
-    return OpResult(op, r.deleted > 0, summary, data={**_status(rule, "not_blocked"), "deleted": r.deleted})
+    return OpResult(op, r.deleted > 0, summary, data={**_status(rule, "synced"), "deleted": r.deleted})
 
 
 async def _cycle_here(
     ctx: OpContext,
     config: Config,
     rules: list[str],
-    approvals: Mapping[str, str] | None = None,
+    approvals: Mapping[str, "Approval"] | None = None,
     *,
     alerts: Sequence["Alert"] = (),
 ) -> tuple["CycleResult", list[str]]:
@@ -1299,6 +1416,7 @@ AsyncOp = Callable[[OpContext, dict[str, Any], bool], Coroutine[Any, Any, OpResu
 # Operations that talk to the accounts. The daemon awaits them under its lock (``run_op_async``);
 # in a process of their own (``run_op``) they get an event loop of their own.
 ASYNC_OPS: dict[str, AsyncOp] = {
+    "account.remove": _account_remove,  # a keychain delete runs on a worker thread
     "calendars.refresh": _calendars_refresh,
     "rule.preview": _rule_preview,
     "trigger": _trigger,
@@ -1325,7 +1443,6 @@ OPS: dict[str, Callable[[OpContext, dict[str, Any], bool], OpResult]] = {
     "rule.pause": _pause(True),
     "rule.resume": _pause(False),
     "account.add": _account_add,
-    "account.remove": _account_remove,
     "approve": _approve,
     **{name: _own_loop(op) for name, op in ASYNC_OPS.items()},
 }

@@ -49,8 +49,9 @@ def read_secret(ref: CredentialRef, *, environ: Mapping[str, str] = os.environ) 
 
 
 def secret_exists(ref: CredentialRef, *, environ: Mapping[str, str] = os.environ) -> bool | None:
-    """Whether the secret ``ref`` names is there (never its value, nothing logged); None when
-    the keychain cannot be asked."""
+    """Whether the secret ``ref`` names is there; None when the keychain cannot be asked. The
+    answer is a flag only: for the keychain the value is read (``get_password`` is the only
+    portable question) but never returned, kept or logged."""
     if ref.backend == "env":
         return bool(environ.get(ref.ref))
     if ref.backend == "file":

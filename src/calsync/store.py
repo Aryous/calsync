@@ -134,7 +134,7 @@ class ChangeRecord:
 
     rule: str
     object_id: str
-    action: str  # created, updated, reverted, deleted, protected, blocked
+    action: str  # created, updated, reverted, deleted, protected, blocked, approved, guard_loosened
     at: datetime
     title: str | None
     # JSON ``{"fields": {name: [old, new]}}`` (summary fields that differ) for an update or a
@@ -482,6 +482,26 @@ class Store:
                 now = max(r.finished_at for r in runs)
                 self._db.execute("DELETE FROM change WHERE at < ?", (_utc(now - CHANGE_RETENTION),))
 
+    def record_change(self, change: ChangeRecord) -> None:
+        """One change row outside a cycle (a loosened delete guard), attached to the rule's
+        newest run (``run_id`` 0 when it has none)."""
+        with self._tx():
+            row = self._db.execute("SELECT MAX(id) FROM run WHERE rule = ?", (change.rule,)).fetchone()
+            run_id = int(row[0]) if row and row[0] is not None else 0
+            self._db.execute(
+                "INSERT INTO change (run_id, rule, object_id, action, at, title, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    change.rule,
+                    change.object_id,
+                    change.action,
+                    _utc(change.at),
+                    change.title,
+                    change.detail,
+                ),
+            )
+
     def last_title(self, rule: str, object_id: str) -> str | None:
         """The newest known title of an object: the only one left once its source is gone."""
         row = self._db.execute(
@@ -551,6 +571,11 @@ class Store:
             "WHERE c.account = ? AND c.ref = ? AND o.rule_tag = ?",
             (account, ref, tag),
         ).fetchone()
+        return int(row[0])
+
+    def tagged_copies(self, tag: str) -> int:
+        """The copies of rule ``tag`` recorded in any target calendar."""
+        row = self._db.execute("SELECT COUNT(*) FROM target_object WHERE rule_tag = ?", (tag,)).fetchone()
         return int(row[0])
 
     def record_config_change(
