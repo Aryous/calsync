@@ -506,6 +506,42 @@ async def test_a_failing_config_in_the_host_check_is_a_plain_500(
 # ----- the daemon's TCP listener ----------------------------------------------------------
 
 
+KEY_WARNING = "the web UI's key file cannot be used (%s); replace it with `calsync web reset-key`"
+
+
+@pytest.mark.parametrize(
+    ("mode", "kind"), [(0o644, "InsecureKeyFile"), (0o200, "PermissionError"), (None, None), (0o600, None)]
+)
+async def test_the_daemon_warns_once_at_start_about_an_unusable_key(
+    state: Path, short_dir: Path, caplog: pytest.LogCaptureFixture, mode: int | None, kind: str | None
+) -> None:
+    import shutil
+
+    caplog.set_level(logging.INFO, logger="calsync.daemon")
+    shutil.copy(state / "state.db", short_dir / "state.db")
+    key = None
+    if mode is not None:
+        key = auth.load_or_create_key(short_dir)
+        auth.key_path(short_dir).chmod(mode)
+    stop = asyncio.Event()
+    daemon = Daemon(web_config(), short_dir, sync=False, listen=("127.0.0.1", 0), clock=lambda: NOW)
+    task = asyncio.create_task(daemon.run(stop))
+    try:
+        for _ in range(500):  # the start's lines are logged once the listener serves
+            if any(r.getMessage().startswith("web UI on") for r in caplog.records) or task.done():
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 5)
+        auth.key_path(short_dir).unlink(missing_ok=True)
+    warnings = [r for r in caplog.records if r.name == "calsync.daemon" and r.levelno == logging.WARNING]
+    expected = [KEY_WARNING % kind] if kind else []
+    assert [r.getMessage() for r in warnings] == expected
+    assert key is None or all(key not in r.getMessage() for r in caplog.records)
+
+
 async def test_a_no_sync_daemon_serves_tcp(state: Path, short_dir: Path) -> None:
     import shutil
 

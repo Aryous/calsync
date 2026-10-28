@@ -50,6 +50,9 @@ NO_GUI_HINT = "hint: run this from a logged-in desktop session (not over SSH)"
 # `launchctl print` / `bootout` of a job that is not loaded: ESRCH (3) or 113 ("Could not find
 # specified service").
 NOT_LOADED_CODES = (3, 113)
+# `bootout` while launchd is already stopping the job: EINPROGRESS ("Operation now in progress").
+# The job is on its way out: wait for it like after any bootout.
+IN_PROGRESS_CODE = 36
 
 
 class LaunchctlError(Exception):
@@ -117,7 +120,7 @@ class SystemLaunchctl:
         # launchd waits up to ExitTimeOut for the daemon to finish its cycle.
         args = ("bootout", domain_label)
         result = self._call(*args, timeout=STOP_TIMEOUT)
-        if result.returncode not in (0, *NOT_LOADED_CODES):
+        if result.returncode not in (0, IN_PROGRESS_CODE, *NOT_LOADED_CODES):
             raise self._failed(args, result)
 
     def print(self, domain_label: str) -> str | None:
@@ -495,14 +498,19 @@ def _stop(
     sleep: Callable[[float], None] | None = None,
 ) -> bool:
     """Boot ``target`` out and wait until ``print`` no longer finds it, within ``STOP_TIMEOUT``.
-    ``False``: launchd still had the job at the deadline (it may still be stopping it)."""
+    ``False``: launchd still had the job at the deadline (it may still be stopping it). A bootout
+    that did not answer in time is checked with ``print`` once more: the job may have gone just
+    then."""
     clock = _clock if clock is None else clock
     sleep = _sleep if sleep is None else sleep
     deadline = clock() + STOP_TIMEOUT
     try:
         launchctl.bootout(target)
     except LaunchctlTimeout:
-        return False
+        try:
+            return launchctl.print(target) is None
+        except LaunchctlError:
+            return False
     while launchctl.print(target) is not None:
         if clock() >= deadline:
             return False
@@ -563,6 +571,11 @@ def install(
     others, warnings = find_others(None if dry_run else launchctl, paths, domain)
     if warning := checkout_warning(executable):
         warnings.append(warning)
+    if config is not None and not config.exists():
+        warnings.append(
+            f"warning: the config file {config} does not exist: the daemon exits at start "
+            "(and launchd retries it) until it does"
+        )
     lines = [*_warn_others(others, domain), *warnings]
     flags = dict(ENV_FLAGS)
     lines += [
@@ -684,10 +697,17 @@ def uninstall(
         "dry_run": dry_run,
     }
     if dry_run:
+        # As install's dry run: without launchctl it cannot know whether the job is loaded.
         lines = ["would run:", f"  {bootout}  (if loaded)"]
         if exists:
             lines.append(f"would remove {paths.plist}")
-        return Outcome(OK, {**base, "action": "would_uninstall", "commands": [bootout]}, [*lines, kept])
+        data = {
+            **base,
+            "action": "would_uninstall",
+            "commands": [bootout],
+            "steps": [{"command": bootout, "when": "if loaded"}],
+        }
+        return Outcome(OK, data, [*lines, kept])
     commands: list[str] = []
     lines: list[str] = []
     try:

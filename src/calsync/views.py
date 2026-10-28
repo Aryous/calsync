@@ -1408,11 +1408,15 @@ def build_changes(
     run_id: int | None = None,
 ) -> ChangesView:
     """Recorded changes, newest first; ``since`` keeps those at or after that instant, ``run_id``
-    those of that run only."""
+    those of that run only.
+
+    Rows come newest first by id, and ids follow time (one writer stamps them with its clock as
+    it records), so the scan stops at the first row older than ``since``: the rest are older."""
     found: list[ChangeView] = []
     for change in reader.changes(rule, run_id):
         if len(found) >= limit:
             break
-        if since is None or change.at >= since:
-            found.append(change)
+        if since is not None and change.at < since:
+            break
+        found.append(change)
     return ChangesView(tuple(found))

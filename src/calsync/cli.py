@@ -155,9 +155,7 @@ def _parser() -> argparse.ArgumentParser:
         "--no-sync", action="store_true", help="run no sync cycles (no lock, no credentials): serve only"
     )
     web_listener = daemon.add_mutually_exclusive_group()
-    web_listener.add_argument(
-        "--listen", type=_listen, help="serve the web UI on HOST:PORT (default: [web] listen)"
-    )
+    web_listener.add_argument("--listen", type=_listen, metavar="HOST:PORT", help=LISTEN_HELP)
     web_listener.add_argument(
         "--no-web", action="store_true", help="no web UI (no TCP listener); the local API socket stays"
     )
@@ -169,7 +167,7 @@ def _parser() -> argparse.ArgumentParser:
         ("reset-key", "replace the key: every paired browser has to pair again"),
     ):
         command = web_sub.add_parser(name, help=text)
-        command.add_argument("--listen", type=_listen, help="the daemon's HOST:PORT (default: [web] listen)")
+        command.add_argument("--listen", type=_listen, metavar="HOST:PORT", help=LISTEN_HELP)
 
     service = sub.add_parser("service", help="run the daemon at login as a launchd agent (macOS)")
     service_sub = service.add_subparsers(dest="service_command", required=True)
@@ -191,7 +189,7 @@ def _parser() -> argparse.ArgumentParser:
         "--listen",
         type=_listen_text,
         metavar="HOST:PORT",
-        help="the daemon's --listen (default: [web] listen)",
+        help="the web UI's address for the agent's daemon: HOST:PORT, or off (default: [web] listen)",
     )
     install.add_argument(
         "--force", action="store_true", help="replace a different plist; install despite another calsync job"
@@ -272,9 +270,16 @@ def _writer(
     return command
 
 
-def _listen(text: str) -> tuple[str, int]:
+LISTEN_HELP = 'the web UI\'s address: HOST:PORT, or "off" for no web UI (default: [web] listen)'
+LISTEN_OFF = "off"
+
+
+def _listen(text: str) -> tuple[str, int] | str:
+    """``HOST:PORT`` as ``(host, port)``, or ``LISTEN_OFF``."""
     from calsync.config import parse_listen
 
+    if text == LISTEN_OFF:
+        return LISTEN_OFF
     try:
         return parse_listen(text)
     except ValueError as exc:
@@ -569,16 +574,19 @@ def _confirm_blocked(
 ) -> "str | Literal[False] | OpResult":
     """Show the rule's blocked set and ask for the rule name. Its fingerprint once confirmed,
     False if not. Nothing is sent for a set the person was not shown: ``not_blocked`` (an
-    ``OpResult``) when the rule is not blocked; ``ConfigError`` for an unknown rule or a blocked
-    set that is no longer recorded (the operation's own answers)."""
+    ``OpResult``) when the rule is not blocked; ``ConfigError`` for an unknown or paused rule or
+    a blocked set that is no longer recorded (the operation's own answers)."""
     from calsync import ops
     from calsync.errors import ConfigError
     from calsync.views import StateReader, StateUnavailable, build_blocked, flat
     from calsync.wiring import state_paths
 
     config = _load(args)
-    if all(r.name != args.rule for r in config.rules):
+    rule = next((r for r in config.rules if r.name == args.rule), None)
+    if rule is None:
         raise ConfigError([f'unknown rule "{args.rule}"'])
+    if rule.paused:  # the operation refuses it: no titles, no prompt for nothing
+        raise ConfigError([f'rule "{args.rule}" is paused; resume it first'])
     db_path, _ = state_paths(_state_dir(args))
     try:
         with StateReader(db_path) as reader:
@@ -942,6 +950,8 @@ def _web_listen(args: argparse.Namespace, config: "Config") -> tuple[str, int] |
     ``listen = "off"``."""
     if getattr(args, "no_web", False):
         return None
+    if args.listen == LISTEN_OFF:
+        return None
     if args.listen is not None:
         return args.listen
     return (config.web.host, config.web.port) if config.web.enabled else None
@@ -1120,7 +1130,7 @@ def _error_body(response: "httpx.Response") -> dict[str, object]:
     return error if isinstance(error, dict) else {}
 
 
-WEB_OFF = 'the web UI is off ([web] listen = "off"); set [web] listen to HOST:PORT to use it\n'
+WEB_OFF = 'the web UI is off (listen "off"); set [web] listen or --listen to HOST:PORT to use it\n'
 PAIR_WARNING = (
     "Anyone with this link can see your calendar sync status. Reset it with `calsync web reset-key`.\n"
 )

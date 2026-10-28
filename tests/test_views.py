@@ -716,6 +716,29 @@ def test_change_since_filters_by_instant(tmp_path: Path) -> None:
     assert [(c["object_id"], c["title"]) for c in changes] == [("b", None)]
 
 
+def test_change_since_stops_at_the_first_older_row(tmp_path: Path) -> None:
+    with Store(tmp_path / "state.db") as store:
+        for i in range(6):
+            at = NOW - timedelta(hours=5 - i)  # oldest first, as a writer records them
+            store.record_runs(
+                [RunRecord("family", at, at, "ok", 1, 0, 0, 0, 1, None)],
+                [ChangeRecord("family", f"o{i}", "created", at, "Standup")],
+            )
+    read: list[str] = []
+    with reader(tmp_path) as r:
+        rows = r.changes
+
+        def counting(rule: str | None = None, run_id: int | None = None) -> Any:
+            for change in rows(rule, run_id):
+                read.append(change.object_id)
+                yield change
+
+        r.changes = counting  # type: ignore[method-assign]
+        changes = build_changes(family(), r, since=NOW - timedelta(hours=2)).to_json()["changes"]
+    assert [c["object_id"] for c in changes] == ["o5", "o4", "o3"]  # the same as filtering all
+    assert read == ["o5", "o4", "o3", "o2"]  # nothing past the first older row
+
+
 def test_changes_of_one_run(tmp_path: Path) -> None:
     with Store(tmp_path / "state.db") as store:
         for i, oid in enumerate(("a", "b", "c")):

@@ -443,6 +443,34 @@ def test_the_real_launchctl_builds_these_commands() -> None:
     assert timeouts == [10, service.EXIT_TIMEOUT + 30, 10, 10, 10]
 
 
+def test_a_bootout_already_in_progress_is_not_a_failure() -> None:
+    def runner(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 36, "", "Boot-out failed: 36: Operation now in progress\n")
+
+    service.SystemLaunchctl(run=runner).bootout(TARGET)  # launchd is stopping it: wait as usual
+
+
+def test_a_bootout_in_progress_goes_on_to_wait_for_the_job(machine: Machine) -> None:
+    calls: list[list[str]] = []
+    gone_after = [2]
+
+    def runner(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[1] == "bootout":
+            return subprocess.CompletedProcess(
+                argv, 36, "", "Boot-out failed: 36: Operation now in progress\n"
+            )
+        gone_after[0] -= 1
+        if gone_after[0] < 0:
+            return subprocess.CompletedProcess(argv, 113, "", "Could not find service\n")
+        return subprocess.CompletedProcess(argv, 0, PRINT_RUNNING, "")
+
+    real = service.SystemLaunchctl(run=runner)
+    assert service._stop(real, TARGET, clock=machine.time.clock, sleep=machine.time.sleep)  # pyright: ignore[reportPrivateUsage]
+    assert [argv[1] for argv in calls] == ["bootout", "print", "print", "print"]
+    assert machine.time.sleeps == [0.5, 0.5]
+
+
 def test_the_real_launchctl_raises_on_other_failures() -> None:
     def runner(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(argv, 5, "", "Bootstrap failed: 5: Input/output error\n")
@@ -511,6 +539,24 @@ def test_install_embeds_absolute_config_state_and_listen(
         "PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
         "LANG": "en_US.UTF-8",
     }
+
+
+def test_install_warns_when_the_embedded_config_does_not_exist(machine: Machine) -> None:
+    missing = machine.home / "conf" / "missing.toml"
+    code, out = machine.run("--config", str(missing), "service", "install", "--dry-run", "--json")
+    assert code == EXIT_OK, out  # a warning, not a refusal
+    assert json.loads(out)["warnings"] == [
+        f"the config file {missing.resolve()} does not exist: the daemon exits at start "
+        "(and launchd retries it) until it does"
+    ]
+    code, out = machine.run("--config", str(missing), "service", "install")
+    assert code == EXIT_OK and f"warning: the config file {missing.resolve()} does not exist" in out
+    assert machine.paths.plist.exists()
+    present = machine.home / "c.toml"
+    present.write_text("")
+    machine.paths.plist.unlink()
+    code, out = machine.run("--config", str(present), "service", "install", "--json")
+    assert code == EXIT_OK and json.loads(out)["warnings"] == []
 
 
 def test_install_rejects_a_bad_listen(machine: Machine) -> None:
@@ -867,6 +913,20 @@ def test_a_bootout_that_does_not_answer_is_still_stopping(machine: Machine) -> N
     assert ("bootstrap", DOMAIN, str(machine.paths.plist)) not in machine.launchctl.calls
 
 
+def test_a_bootout_that_does_not_answer_but_let_the_job_go_is_done(machine: Machine) -> None:
+    replaceable(machine)
+
+    def hangs(target: str) -> None:
+        machine.launchctl.loaded.pop(target, None)  # gone by the time launchctl is asked again
+        raise service.LaunchctlTimeout("launchctl bootout did not answer within 150 s")
+
+    machine.launchctl.bootout = hangs  # type: ignore[method-assign]
+    code, out = machine.run("service", "install", "--force")
+    assert code == EXIT_OK, out
+    assert ("bootstrap", DOMAIN, str(machine.paths.plist)) in machine.launchctl.calls
+    assert machine.time.sleeps == []  # one more print, no polling
+
+
 def test_stop_uses_the_injected_clock_and_sleep() -> None:
     fake = FakeLaunchctl({TARGET: PRINT_RUNNING})
     fake.stopping_polls = 2
@@ -958,6 +1018,10 @@ def test_uninstall_dry_run_touches_nothing(machine: Machine) -> None:
     assert code == EXIT_OK
     assert f"  launchctl bootout {TARGET}  (if loaded)\n" in out
     assert machine.paths.plist.exists()
+    body = json.loads(machine.run("service", "uninstall", "--dry-run", "--json")[1])
+    assert body["action"] == "would_uninstall"
+    assert body["commands"] == [f"launchctl bootout {TARGET}"]
+    assert body["steps"] == [{"command": f"launchctl bootout {TARGET}", "when": "if loaded"}]
     assert machine.launchctl.calls == []
 
 

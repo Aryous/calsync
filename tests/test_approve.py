@@ -531,6 +531,16 @@ def test_on_a_tty_an_unknown_rule_is_refused_without_sending(files: Files, calls
     assert calls[1:] == []
 
 
+def test_on_a_tty_a_paused_rule_is_refused_before_any_title(files: Files, calls: list[Any]) -> None:
+    files.config.write_text(TEXT.replace('name = "family"', 'name = "family"\npaused = true', 1))
+    stdin = Tty("family\n")
+    code, out = files.cli("approve", "family", stdin=stdin)
+    assert code == EXIT_CONFIG and 'rule "family" is paused; resume it first' in out
+    assert "would be deleted" not in out and "Event" not in out and "Type the rule name" not in out
+    assert stdin.tell() == 0  # nothing was read: no prompt
+    assert calls[1:] == []
+
+
 def test_yes_skips_the_prompt(files: Files, calls: list[Any]) -> None:
     assert files.cli("approve", "family", "--yes", "--wait") == (EXIT_OK, "answer: approved\n")
     assert files.cli("approve", "family", "--yes", "--fingerprint", "abc") == (EXIT_OK, "answer: approved\n")

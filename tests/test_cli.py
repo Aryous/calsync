@@ -1298,7 +1298,7 @@ def test_daemon_listen_is_validated(tmp_path: Path) -> None:
     assert info.value.code == 2  # argparse: a usage error
 
 
-WEB_OFF = 'the web UI is off ([web] listen = "off"); set [web] listen to HOST:PORT to use it\n'
+WEB_OFF = 'the web UI is off (listen "off"); set [web] listen or --listen to HOST:PORT to use it\n'
 
 
 def test_web_pair_when_the_web_ui_is_off(tmp_path: Path) -> None:
@@ -1321,6 +1321,37 @@ def test_web_pair_when_the_web_ui_is_off(tmp_path: Path) -> None:
         "ok: the key was replaced; every paired browser has to pair again\n" + WEB_OFF,
     )
     assert (state / "web.key").read_text().strip() != key
+
+
+def test_listen_off_turns_the_web_ui_off(tmp_path: Path) -> None:
+    import argparse
+
+    from calsync.cli import _parser, _web_listen
+    from calsync.config import load_config
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)  # [web] listen: the default address
+    state = tmp_path / "s"
+    pair = ["--config", str(cfg), "--state-dir", str(state), "web", "pair", "--listen", "off"]
+    assert run(pair) == (EXIT_CONFIG, WEB_OFF)
+    assert not (state / "web.key").exists()
+    config = load_config(cfg)
+    daemon_args = _parser().parse_args(["daemon", "--listen", "off"])
+    assert _web_listen(daemon_args, config) is None  # as --no-web
+    assert _web_listen(argparse.Namespace(listen=None), config) == (config.web.host, config.web.port)
+    for command in (["daemon"], ["web", "pair"], ["web", "reset-key"]):
+        assert 'HOST:PORT, or "off" for no web UI' in _help(_parser(), command)
+
+
+def _help(parser: Any, command: list[str]) -> str:
+    """The --help text of a subcommand, joined on one line (argparse wraps it)."""
+    import contextlib
+    import io
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), pytest.raises(SystemExit):
+        parser.parse_args([*command, "--help"])
+    return " ".join(buffer.getvalue().split())
 
 
 # ----- events and event show ------------------------------------------------------------------

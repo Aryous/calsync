@@ -13,8 +13,10 @@ cycle), and runs a cycle at start, then after every wait of ``interval × (1 ± 
 - A rule that keeps failing is skipped for ``BACKOFF`` minutes after its latest failure (by
   the number of failures in a row; a blocked result neither adds to nor resets the count). A
   requested rule runs regardless; a skipped rule records no run.
-- A rule that failed for authentication gets its accounts' adapters rebuilt before its next
-  attempt, which picks up a credential stored meanwhile by ``calsync auth``.
+- A rule that failed for authentication, or because an account could not be set up for a
+  config reason (a credential file's mode, a missing client secret file), gets its accounts'
+  adapters rebuilt before its next attempt, which picks up a credential stored meanwhile by
+  ``calsync auth`` or a file fixed meanwhile.
 
 Beside the scheduler, the daemon serves the local API (``calsync.api``) on
 ``<state_dir>/calsync.sock`` and, given ``listen``, the web UI (``calsync.web.app``) over TCP,
@@ -89,6 +91,7 @@ from calsync.errors import CalsyncError, ConfigError, RulePaused
 from calsync.http import RequestLog
 from calsync.lock import RunLock
 from calsync.store import Store
+from calsync.web import auth as web_auth
 from calsync.web.app import create_web_app
 
 log = logging.getLogger(__name__)
@@ -282,6 +285,7 @@ class Daemon:
         host, port = self._listen[0], sock.getsockname()[1]
         shown = f"[{host}]" if ":" in host else host
         log.info("web UI on http://%s:%d/ (pair a browser: calsync web pair)", shown, port)  # no key
+        _check_web_key(self._state_dir)
         await api.serve(app, sock, stop)
 
     @overload
@@ -959,7 +963,7 @@ class Daemon:
                 self._failures[name] = (failures, now)
             elif r.status != "blocked":  # blocked is neither a failure nor a success
                 self._failures.pop(name, None)
-            if r.error_kind == "auth":
+            if _needs_rebuild(r, self._adapters):
                 self._reauth.add(name)
             parts.append(counts_line(name, r) + (f" error_kind={r.error_kind}" if r.error_kind else ""))
         parts.append(f"requests={result.requests}")
@@ -980,6 +984,28 @@ class _Waiter:
 
 
 _UNCHECKABLE = (-1, -1)
+
+
+def _needs_rebuild(result: RuleResult, adapters: wiring.Adapters) -> bool:
+    """Whether the rule's accounts are rebuilt before its next attempt: after an auth failure,
+    and after a config-kind failure to set an account up (the build reads local files that a
+    person may fix meanwhile). A config error raised in the cycle (a calendar not found) is
+    not about the build: a rebuild would not change it."""
+    if result.error_kind == "auth":
+        return True
+    return result.error_kind == "config" and result.error_account in adapters.errors
+
+
+def _check_web_key(state_dir: Path) -> None:
+    """One warning at start when ``web.key`` exists but cannot be used (unreadable, or open to
+    other users): no browser can pair until it is replaced. The type only, never the key."""
+    try:
+        web_auth.read_key(state_dir)
+    except (OSError, ValueError, CalsyncError) as exc:  # ValueError: not UTF-8 text
+        log.warning(
+            "the web UI's key file cannot be used (%s); replace it with `calsync web reset-key`",
+            type(exc).__name__,
+        )
 
 
 def _web_address(config: Config) -> tuple[str, int] | None:

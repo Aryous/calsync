@@ -347,6 +347,53 @@ async def test_unreadable_account_is_recorded_failed_every_cycle(tmp_path: Path)
     assert other_runs[0].error_account == "broken"
 
 
+async def test_a_config_setup_error_rebuilds_that_account_too(tmp_path: Path) -> None:
+    fixed = False  # the person fixes the credential file's mode meanwhile
+
+    async def factory(config: Config, names: set[str], *, log: RequestLog | None = None) -> Adapters:
+        adapters = await world.factory(config, names, log=log)
+        if "broken" in names and not fixed:
+            from calsync.errors import ConfigError
+
+            adapters.sources.pop("broken")
+            adapters.errors["broken"] = ConfigError("credential file /tmp/example must be mode 0600")
+        return adapters
+
+    other = {**rule("other", target="Other"), "source": {"account": "broken", "calendar": "Family"}}
+    config = replace(
+        config_for([rule("family"), other], extra_google=True),
+        runtime=RuntimeConfig(timedelta(seconds=30), 0.0),
+    )
+    world = World(stop_after=4)
+
+    def fix() -> None:
+        nonlocal fixed
+        fixed = True
+
+    world.before_sleep = fix
+    daemon = world.daemon(config, tmp_path, adapters_factory=factory)
+    await daemon.run(world.stop)
+    # Built at start (and once more, temporarily, for the start's calendar refresh); rebuilt
+    # before the rule's next attempt at 60 s, after its 1 minute backoff.
+    assert world.builds == [{"broken"}, {"dav"}, {"me"}, {"broken"}, {"broken"}, {"dav"}]
+    with StateReader(tmp_path / "state.db") as reader:
+        other_runs = sorted(reader.runs("other"), key=lambda r: r.started_at)
+    assert [(int((r.started_at - NOW).total_seconds()), r.status, r.error_kind) for r in other_runs] == [
+        (0, "failed", "config"),
+        (60, "ok", None),
+        (90, "ok", None),
+    ]
+
+
+async def test_a_config_error_in_the_cycle_rebuilds_nothing(tmp_path: Path) -> None:
+    world = World(stop_after=4)
+    daemon = world.daemon(two_rules(work_source="Missing"), tmp_path)
+    await daemon.run(world.stop)
+    with StateReader(tmp_path / "state.db") as reader:
+        assert {(r.status, r.error_kind) for r in reader.runs("work")} == {("failed", "config")}
+    assert world.builds == [{"dav"}, {"me"}]  # a calendar not found is not about the build
+
+
 # ----- request log, logging ---------------------------------------------------
 
 
