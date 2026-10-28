@@ -24,11 +24,11 @@ VIEWPORTS = [
 ]
 
 # A seeded single event (社区活动), by the id calsync gives it.
-DENTIST = events_view.event_id("personal", FAMILY, "dentist", None)
+DENTIST = events_view.event_id("main", FAMILY, "dentist", None)
 
 SCREENS = {
     "map": "/",
-    "rule": "/#/rule/family-home",
+    "rule": "/#/rule/life-shared",
     "settings": "/#/settings",
     "activity": "/#/activity",
     "event": f"/#/event/{DENTIST}",
@@ -108,7 +108,7 @@ def test_the_calendar_views_fit(open_page: OpenPage, viewport: dict[str, int], t
 def test_the_phone_sheet_is_at_most_88_percent_and_scrolls(
     open_page: OpenPage, viewport: dict[str, int], touch: bool
 ) -> None:
-    page = open_page(viewport=viewport, has_touch=touch, path="/#/rule/family-home")
+    page = open_page(viewport=viewport, has_touch=touch, path="/#/rule/life-shared")
     ready(page)
     page.wait_for_timeout(600)
     sheet = page.locator("aside.insp")
@@ -122,7 +122,7 @@ def test_the_phone_sheet_is_at_most_88_percent_and_scrolls(
 
 def test_focus_is_visible_on_every_kind_of_control(open_page: OpenPage) -> None:
     """Tab through the page: each focused control draws a focus ring (outline or box-shadow)."""
-    page = open_page(path="/#/rule/family-home")
+    page = open_page(path="/#/rule/life-shared")
     ready(page)
     page.wait_for_timeout(600)
     seen = 0
@@ -162,7 +162,7 @@ SMALL_TARGETS = """() => [...document.querySelectorAll(
     "screen",
     [
         "/",
-        "/#/rule/family-home",
+        "/#/rule/life-shared",
         "/#/settings",
         "/#/activity",
         "/#/new",

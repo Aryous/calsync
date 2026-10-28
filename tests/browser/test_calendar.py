@@ -67,7 +67,7 @@ def test_the_week_puts_each_event_on_its_local_day(open_page: OpenPage) -> None:
     # All-day events: in the all-day row, on their own local day (Thursday and Saturday).
     all_day = calendar(page).locator(".tg-all > div:not(.gut)")
     expect(all_day.nth(3)).to_contain_text("交物业费")
-    expect(all_day.nth(5)).to_contain_text("秋游")
+    expect(all_day.nth(5)).to_contain_text("团建")
     expect(all_day.nth(2)).not_to_contain_text("交物业费")
     expect(calendar(page).locator(".dh.today")).to_have_attribute("data-day", "2026-10-26")
     expect(calendar(page).locator(".nowl:not(.faint)")).to_have_count(1)
@@ -90,15 +90,15 @@ def test_every_view_shows_the_seeded_events(open_page: OpenPage) -> None:
     expect(calendar(page).locator('.wc[data-day="2026-11-03"]')).to_contain_text("钢琴课")
 
     show(page, "月")
-    expect(calendar(page).locator('.wc[data-day="2026-10-31"]')).to_contain_text("秋游")
+    expect(calendar(page).locator('.wc[data-day="2026-10-31"]')).to_contain_text("团建")
     expect(calendar(page).locator('.wc[data-day="2026-10-01"]')).not_to_have_class(re.compile(r"\bout\b"))
     expect(calendar(page).locator('.wc[data-day="2026-11-01"]')).to_have_class(re.compile(r"\bout\b"))
 
     show(page, "列表")
     expect(calendar(page).locator(".ls h3").first).to_contain_text("今天 · 10月26日")
     run = calendar(page).locator(".lr", has_text="晨跑").first
-    expect(run.locator("small")).to_contain_text("家庭日程 · personal")
-    expect(run.locator("small")).to_contain_text("家庭 · family-icloud")
+    expect(run.locator("small")).to_contain_text("生活 · alex@example.com")
+    expect(run.locator("small")).to_contain_text("共享日历 · shared@example.com")
     expect(run.locator('small svg.svc[aria-label="Google 日历"]')).to_have_count(1)
     expect(run.locator('small svg.svc[aria-label="iCloud 日历"]').first).to_be_visible()
 
@@ -143,13 +143,13 @@ def test_layers_hide_their_events(open_page: OpenPage) -> None:
     page = open_calendar(open_page)
     layers = calendar(page).locator(".layers")
     mine = layers.locator(".layer", has_text="我的日历")
-    home = layers.locator(".layer", has_text="家庭")
+    home = layers.locator(".layer", has_text="共享日历")
     expect(mine.locator("svg.svc")).to_have_attribute("aria-label", "iCloud 日历")
-    expect(mine).to_contain_text("我的日历 · my-icloud")
+    expect(mine).to_contain_text("我的日历 · me@example.com")
     mine.click()
     expect(mine).to_have_attribute("aria-pressed", "false")
     expect(block(page, "周会")).to_have_count(0)  # only 我的日历 has it
-    expect(block(page, "晨跑").first).to_be_visible()  # 家庭 has it too
+    expect(block(page, "晨跑").first).to_be_visible()  # 共享日历 has it too
     expect(calendar(page).locator('[data-role="legend"]')).not_to_contain_text("工作")
     home.click()
     expect(block(page, "晨跑")).to_have_count(0)
@@ -158,7 +158,7 @@ def test_layers_hide_their_events(open_page: OpenPage) -> None:
 
 
 def test_a_paused_line_hatches_its_events(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
-    fresh_live.pause("work-mine")
+    fresh_live.pause("work-me")
     page = open_calendar(open_page, fresh_live)
     refresh_status(page)
     meeting = block(page, "周会")
@@ -186,18 +186,18 @@ def test_the_event_detail_matches_the_api(open_page: OpenPage, live: LiveDaemon)
     expect(insp.locator("#insp-title")).to_have_text("晨跑")
     expect(insp.locator(".ih p")).to_contain_text("10月26日 07:00–07:45")
     source = insp.locator('[data-role="source"]')
-    expect(source).to_contain_text("家庭日程")
-    expect(source).to_contain_text("personal · Google 日历")
+    expect(source).to_contain_text("生活")
+    expect(source).to_contain_text("alex@example.com · Google 日历")
     expect(source.locator(".tag")).to_have_text("重复")
     rows = insp.locator('[data-key="deliveries"] .row')
     expect(rows).to_have_count(len(detail["deliveries"]))
     expect(rows.first).to_contain_text("已送达 iCloud")
-    expect(rows.first).to_contain_text("family-icloud · iCloud 日历")
+    expect(rows.first).to_contain_text("shared@example.com · iCloud 日历")
 
     table = insp.locator('[data-role="compare"]')
     expect(table.locator('tr[data-field="title"] td').nth(1)).to_have_text(detail["original"]["title"])
     expect(table.locator('[data-differs="true"]')).to_have_count(0)
-    expect(table.locator("thead")).to_contain_text("「家庭」里的副本")
+    expect(table.locator("thead")).to_contain_text("「共享日历」里的副本")
 
     insp.locator('[data-key="compare"] .seg').get_by_role("button", name="我的日历").click()
     expect(table.locator('tr[data-field="title"] td').nth(2)).to_have_text("忙碌")
@@ -249,7 +249,7 @@ def test_blocks_sit_on_their_hour_lines(open_page: OpenPage, viewport: dict[str,
     desktop), so the 19:30 call starts half way between the 19:00 and 20:00 lines."""
     page = open_calendar(open_page, viewport=viewport, has_touch=viewport is PHONE)
     show(page, "日")
-    call = calendar(page).locator(".ev", has_text="家庭视频通话")
+    call = calendar(page).locator(".ev", has_text="视频通话")
     hour = page.evaluate(
         "() => parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--hourH'))"
     )

@@ -1187,7 +1187,7 @@ async def refresh_calendars(
         adapters.adapter(name)  # its setup error, if any
         if name in adapters.sources:
             found = await asyncio.wait_for(adapters.sources[name].list_calendars(), REFRESH_TIMEOUT)
-            return [AccountCalendar(name, c.id, c.name, c.role, at) for c in found]
+            return [AccountCalendar(name, c.id, c.name, c.role, at, c.primary) for c in found]
         listed = await asyncio.wait_for(adapters.targets[name].list_calendars(), REFRESH_TIMEOUT)
         return [AccountCalendar(name, c.href, c.name, None, at) for c in listed]
 

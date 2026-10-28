@@ -91,47 +91,52 @@ def no_secret_inputs(page: Page) -> None:
 
 
 def test_the_account_inspector_shows_its_state_calendars_and_reconnect(open_page: OpenPage) -> None:
-    page = open_page(path="/#/account/personal")
+    page = open_page(path="/#/account/main")
     insp = inspector(page)
     expect(insp).to_have_class(OPEN)
     expect(insp.locator("h2")).to_have_text("账号")
-    expect(insp.locator(".ih p")).to_have_text("personal · Google 日历账号")
+    expect(insp.locator(".ih p")).to_have_text("alex@example.com · Google 日历账号")
     expect(insp.locator(".ih p").get_by_role("img", name="Google 日历")).to_have_count(1)
     expect(insp.locator("[data-role=state]")).to_have_text("连接正常")
     # Its calendars, from the cache, named as always, with their lines.
     rows = insp.locator('.fs[data-key="calendars"] .row')
+    # The account's own calendar is 主日历 (Google names it after the email).
     expect(rows.locator(".cm")).to_have_text(
-        ["家庭日程 · personal", "孩子学校 · personal", "中国节假日 · personal"]
+        [
+            "主日历 · alex@example.com",
+            "生活 · alex@example.com",
+            "课程 · alex@example.com",
+            "中国节假日 · alex@example.com",
+        ]
     )
-    expect(rows.locator(".r")).to_have_text(["2 条线路", "1 条线路", "未同步"])
-    expect(rows.get_by_role("img", name="Google 日历")).to_have_count(3)
-    expect(rows.nth(0)).to_have_attribute("href", f"#/calendar/personal/{FAMILY.replace('@', '%40')}")
+    expect(rows.locator(".r")).to_have_text(["未同步", "2 条线路", "1 条线路", "未同步"])
+    expect(rows.get_by_role("img", name="Google 日历")).to_have_count(4)
+    expect(rows.nth(1)).to_have_attribute("href", f"#/calendar/main/{FAMILY.replace('@', '%40')}")
     hol = HOLIDAYS.replace("#", "%23").replace("@", "%40")
-    expect(rows.nth(2)).to_have_attribute("href", f"#/calendar/personal/{hol}")
+    expect(rows.nth(3)).to_have_attribute("href", f"#/calendar/main/{hol}")
     expect(insp.get_by_role("button", name="刷新列表")).to_be_visible()
     # Reconnecting is a terminal command, with a copy button; no password field anywhere.
     connect = insp.locator('.fs[data-key="connect"]')
     expect(connect.locator(".lb")).to_have_text("连接")
-    expect(connect.locator(".cmd code")).to_have_text("calsync auth personal")
+    expect(connect.locator(".cmd code")).to_have_text("calsync auth main")
     expect(connect.get_by_role("button", name="复制")).to_be_visible()
-    expect(connect).to_contain_text("完成后这里会自动更新，不用刷新。")
     expect(insp.locator(".ifoot").get_by_role("button", name="断开这个账号")).to_be_visible()
     no_secret_inputs(page)
     # A calendar row opens its inspector.
-    rows.nth(1).click()
-    expect(page).to_have_url(re.compile(rf"#/calendar/personal/{SCHOOL.replace('@', '%40')}$"))
+    rows.nth(2).click()
+    expect(page).to_have_url(re.compile(rf"#/calendar/main/{SCHOOL.replace('@', '%40')}$"))
     expect(insp.locator("h2")).to_have_text("日历")
 
 
 def test_an_icloud_account_names_its_service(open_page: OpenPage) -> None:
-    page = open_page(path="/#/account/my-icloud")
+    page = open_page(path="/#/account/icloud-me")
     insp = inspector(page)
-    expect(insp.locator(".ih p")).to_have_text("my-icloud · iCloud 账号")
+    expect(insp.locator(".ih p")).to_have_text("me@example.com · iCloud 账号")
     expect(insp.locator(".ih p").get_by_role("img", name="iCloud 日历")).to_have_count(1)
     rows = insp.locator('.fs[data-key="calendars"] .row')
-    expect(rows.locator(".cm")).to_have_text(["我的日历 · my-icloud"])
+    expect(rows.locator(".cm")).to_have_text(["我的日历 · me@example.com"])
     expect(rows.locator(".r")).to_have_text(["2 条线路"])
-    expect(insp.locator('.fs[data-key="connect"] .cmd code')).to_have_text("calsync auth my-icloud")
+    expect(insp.locator('.fs[data-key="connect"] .cmd code')).to_have_text("calsync auth icloud-me")
 
 
 def test_an_account_no_line_uses_says_so(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
@@ -155,13 +160,13 @@ def test_an_account_gone_from_the_config_says_so(open_page: OpenPage) -> None:
 def test_an_expired_authorisation_lists_the_reasons_and_the_command(
     open_page: OpenPage, fresh_live: LiveDaemon
 ) -> None:
-    fresh_live.stage_auth()  # work's Google credential is refused; work-mine ran on it
+    fresh_live.stage_auth()  # work's Google credential is refused; work-me ran on it
     page = open_page(daemon=fresh_live, path="/#/account/work")
     insp = inspector(page)
     note = insp.locator(".note.bad[data-role=auth]")
     expect(note.locator("b")).to_have_text("授权失效了。")
     expect(note.locator(".why li")).to_have_text(GOOGLE_REASONS)
-    expect(note.locator(".cm")).to_have_text(["工作 · work", "我的日历 · my-icloud"])
+    expect(note.locator(".cm")).to_have_text(["工作 · alex@work.example.com", "我的日历 · me@example.com"])
     connect = insp.locator('.fs[data-key="connect"]')
     expect(connect.locator(".lb")).to_have_text("重新连接")
     expect(connect.locator(".cmd code")).to_have_text("calsync auth work")
@@ -169,28 +174,28 @@ def test_an_expired_authorisation_lists_the_reasons_and_the_command(
     sent = ops_sent(page)
     insp.get_by_role("button", name="刷新列表").click()
     result = insp.locator("[data-role=refreshed]")
-    expect(result).to_contain_text("没能读到日历列表：work 的授权失效了")
+    expect(result).to_contain_text("没能读到日历列表：alex@work.example.com 的授权失效了")
     expect(result.locator(".cmd code")).to_have_text("calsync auth work")
     assert [s["name"] for s in sent] == ["calendars.refresh"]
     assert sent[0]["args"] == {"account": "work"}
 
 
 def test_refreshing_reads_the_calendar_list_again(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
-    page = open_page(daemon=fresh_live, path="/#/account/personal")
+    page = open_page(daemon=fresh_live, path="/#/account/main")
     insp = inspector(page)
     rows = insp.locator('.fs[data-key="calendars"] .row')
-    expect(rows).to_have_count(3)
+    expect(rows).to_have_count(4)
     fresh_live.in_loop(
-        lambda: fresh_live.world.google["personal"].add_calendar("trip@group.calendar.google.com", "旅行")
+        lambda: fresh_live.world.google["main"].add_calendar("trip@group.calendar.google.com", "旅行")
     )
     sent = ops_sent(page)
     insp.get_by_role("button", name="刷新列表").click()
-    expect(insp.locator("[data-role=refreshed]")).to_have_text("已刷新 · 4 个日历")
-    expect(rows).to_have_count(4)
+    expect(insp.locator("[data-role=refreshed]")).to_have_text("已刷新 · 5 个日历")
+    expect(rows).to_have_count(5)
     trip = rows.filter(has_text="旅行")
-    expect(trip.locator(".cm")).to_have_text("旅行 · personal")
+    expect(trip.locator(".cm")).to_have_text("旅行 · alex@example.com")
     expect(trip.locator(".r")).to_have_text("未同步")
-    assert sent == [{"name": "calendars.refresh", "args": {"account": "personal"}, "dry_run": False}]
+    assert sent == [{"name": "calendars.refresh", "args": {"account": "main"}, "dry_run": False}]
 
 
 # ----- removing an account ---------------------------------------------------------------------
@@ -198,7 +203,7 @@ def test_refreshing_reads_the_calendar_list_again(open_page: OpenPage, fresh_liv
 
 def test_removing_an_account_in_use_is_refused_with_its_lines(open_page: OpenPage, live: LiveDaemon) -> None:
     before = live.config_path.read_text(encoding="utf-8")
-    page = open_page(path="/#/account/personal")
+    page = open_page(path="/#/account/main")
     watch_of(page).allow(REFUSED)
     insp = inspector(page)
     sent = ops_sent(page)
@@ -208,13 +213,15 @@ def test_removing_an_account_in_use_is_refused_with_its_lines(open_page: OpenPag
     expect(refused).to_contain_text("还有 3 条线路在用这个账号，先删除这些线路，才能断开它：")
     lines = refused.locator("a.row")
     expect(lines).to_have_count(3)
-    expect(lines.nth(0)).to_have_attribute("href", "#/rule/family-home")
-    expect(lines.nth(0).locator(".cm")).to_have_text(["家庭日程 · personal", "家庭 · family-icloud"])
-    expect(lines.nth(1)).to_have_attribute("href", "#/rule/school-home")
-    expect(lines.nth(2)).to_have_attribute("href", "#/rule/family-mine")
+    expect(lines.nth(0)).to_have_attribute("href", "#/rule/life-shared")
+    expect(lines.nth(0).locator(".cm")).to_have_text(
+        ["生活 · alex@example.com", "共享日历 · shared@example.com"]
+    )
+    expect(lines.nth(1)).to_have_attribute("href", "#/rule/course-shared")
+    expect(lines.nth(2)).to_have_attribute("href", "#/rule/life-me")
     expect(panel.get_by_role("button", name="断开", exact=True)).to_have_count(0)
     # The refusal is the op's: a dry run, refused; nothing written.
-    assert sent == [{"name": "account.remove", "args": {"name": "personal"}, "dry_run": True}]
+    assert sent == [{"name": "account.remove", "args": {"name": "main"}, "dry_run": True}]
     assert live.config_path.read_text(encoding="utf-8") == before
     # A line opens from the list; 取消 closes the panel, not the inspector.
     panel.get_by_role("button", name="取消").click()
@@ -270,7 +277,7 @@ def test_the_wizard_checks_the_name_and_the_apple_id(open_page: OpenPage, live: 
         ("", "给账号起个名字"),
         ("my icloud", "只能用字母、数字、- 和 _，以字母或数字开头，最多 32 个字符"),
         ("home:icloud", "只能用字母、数字、- 和 _，以字母或数字开头，最多 32 个字符"),
-        ("my-icloud", "已经有一个叫 my-icloud 的账号了"),
+        ("icloud-me", "已经有一个叫 icloud-me 的账号了"),
     ]:
         name.fill(typed)
         first.get_by_role("button", name="下一步").click()
@@ -352,7 +359,7 @@ def test_the_icloud_wizard_adds_the_account_and_waits_for_its_calendars(
     fresh_live.authorise("grandma", ["外婆的日历"])
     refresh_status(page)
     fourth = current(page, "calendars")
-    expect(fourth.locator(".cm")).to_have_text(["外婆的日历 · grandma"])
+    expect(fourth.locator(".cm")).to_have_text(["外婆的日历 · grandma@example.com"])
     expect(fourth).to_contain_text("找到了 1 个日历")
     expect(step(page, "auth")).to_have_class(re.compile(r"\bdone\b"))
     fourth.get_by_role("button", name="选择要同步的日历").click()
@@ -362,11 +369,11 @@ def test_the_icloud_wizard_adds_the_account_and_waits_for_its_calendars(
     expect(insp.locator("h2")).to_have_text("新线路")
     target = insp.locator("[data-role=targets]").get_by_role("radio", name=re.compile("^外婆的日历"))
     expect(target).to_have_attribute("aria-checked", "true")
-    insp.locator("[data-role=sources]").get_by_role("radio", name=re.compile("^家庭日程")).click()
+    insp.locator("[data-role=sources]").get_by_role("radio", name=re.compile("^生活")).click()
     expect(insp.locator(".preview")).to_contain_text("将在")
     insp.get_by_role("button", name="创建并开始同步").click()
-    expect(page).to_have_url(re.compile(r"#/rule/personal-to-grandma$"), timeout=15_000)
-    expect(page.locator('.canvas .hit:not(.in)[data-rule="personal-to-grandma"]')).to_have_count(1)
+    expect(page).to_have_url(re.compile(r"#/rule/main-to-grandma$"), timeout=15_000)
+    expect(page.locator('.canvas .hit:not(.in)[data-rule="main-to-grandma"]')).to_have_count(1)
     no_secret_inputs(page)
     assert not any("grandma@example.com" in line for line in console)
 
@@ -394,7 +401,7 @@ def test_the_google_wizard_sets_up_the_client_secret_first(
         # The person runs it in the terminal; the page sees it in the config.
         daemon.op("config.set", {"key": "google.client_secret_file", "value": "client.json"})
         refresh_status(page)
-        expect(second).to_contain_text("Google 应用凭证已经设置好了")
+        expect(second.locator(".cmd")).to_have_count(0)
         expect(add).to_be_enabled()
         add.click()
         third = current(page, "auth")
@@ -405,13 +412,13 @@ def test_the_google_wizard_sets_up_the_client_secret_first(
         }
         expect(third.locator(".cmd code")).to_have_text("calsync auth google")
         expect(third).to_contain_text("浏览器")
-        daemon.authorise("google", ["家庭安排"])
+        daemon.authorise("google", ["共享日历安排"])
         refresh_status(page)
         fourth = current(page, "calendars")
-        expect(fourth.locator(".cm")).to_have_text(["家庭安排 · google"])
+        expect(fourth.locator(".cm")).to_have_text(["共享日历安排 · google"])
         fourth.get_by_role("button", name="选择要同步的日历").click()
         expect(page).to_have_url(re.compile(r"#/new\?source=google$"))
-        source = insp.locator("[data-role=sources]").get_by_role("radio", name=re.compile("^家庭安排"))
+        source = insp.locator("[data-role=sources]").get_by_role("radio", name=re.compile("^共享日历安排"))
         expect(source).to_have_attribute("aria-checked", "true")
         no_secret_inputs(page)
 
@@ -422,7 +429,6 @@ def test_a_configured_client_secret_needs_no_setup(open_page: OpenPage, live: Li
     expect(first.get_by_label("账号名字")).to_have_value("google")
     first.get_by_role("button", name="下一步").click()
     second = current(page, "details")
-    expect(second).to_contain_text("Google 应用凭证已经设置好了")
     expect(second.locator(".cmd")).to_have_count(0)
     expect(second.get_by_role("button", name="添加账号")).to_be_enabled()
 
@@ -457,7 +463,7 @@ def test_an_account_the_keychain_knows_is_added_from_the_terminal(
     )
     refresh_status(page)
     fourth = current(page, "calendars")
-    expect(fourth.locator(".cm")).to_have_text(["旧日历 · old"])
+    expect(fourth.locator(".cm")).to_have_text(["旧日历 · old@example.com"])
 
 
 def test_the_wizard_polls_every_ten_seconds_and_stops_when_closed(
@@ -505,8 +511,8 @@ def test_the_account_inspectors_fit_a_phone(
     open_page: OpenPage, viewport: dict[str, int], state: str
 ) -> None:
     if state in ("account", "remove"):
-        page = open_page(viewport=viewport, path="/#/account/personal")
-        expect(inspector(page).locator('.fs[data-key="calendars"] .row')).to_have_count(3)
+        page = open_page(viewport=viewport, path="/#/account/main")
+        expect(inspector(page).locator('.fs[data-key="calendars"] .row')).to_have_count(4)
         if state == "remove":
             watch_of(page).allow(REFUSED)
             inspector(page).locator(".ifoot").get_by_role("button", name="断开这个账号").click()

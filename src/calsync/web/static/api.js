@@ -12,6 +12,7 @@
 // person ({needs_human: true, command, reason}), the shape of every operation's result.
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
+import { setAccounts } from "/static/format.js";
 
 export class ApiError extends Error {
   constructor(kind, { status = 0, message = "", problems = [], error = null } = {}) {
@@ -134,7 +135,10 @@ export function useStatusPoller() {
     const mine = ++seq.current;
     try {
       const status = await get("/api/status");
-      if (mine === seq.current) setState({ status, error: null });
+      if (mine === seq.current) {
+        setAccounts(status.accounts);
+        setState({ status, error: null });
+      }
     } catch (e) {
       if (e.kind !== "unpaired" && mine === seq.current) setState((s) => ({ ...s, error: e }));
     } finally {

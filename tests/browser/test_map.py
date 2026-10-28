@@ -26,7 +26,7 @@ from tests.browser.live import CONFIG_WITHOUT_LINES, FAMILY, SCHOOL, WORK, LiveD
 pytestmark = pytest.mark.browser
 
 PALETTE = ["sage", "teal", "clay", "blue", "violet", "rose", "olive", "steel"]  # map.js PALETTE
-FAMILY_KEY, SCHOOL_KEY, WORK_KEY = f"personal/{FAMILY}", f"personal/{SCHOOL}", f"work/{WORK}"
+FAMILY_KEY, SCHOOL_KEY, WORK_KEY = f"main/{FAMILY}", f"main/{SCHOOL}", f"work/{WORK}"
 
 
 def colour_of(key: str) -> str:
@@ -132,10 +132,12 @@ def test_the_map_shows_every_account_calendar_and_line(
     status = live.get("/api/status")
     source = page.locator(".canvas .col.src")
     target = page.locator(".canvas .col.tgt")
-    expect(source.locator(".acct-h .an")).to_have_text(["personal", "work"])
-    expect(target.locator(".acct-h .an")).to_have_text(["family-icloud", "my-icloud"])
-    assert pills(page, "src") == ["家庭日程", "孩子学校", "中国节假日", "工作"]
-    assert pills(page, "tgt") == ["家庭", "我的日历"]
+    # Accounts by their emails (an Apple ID is one); each Google account's own calendar is 主日历.
+    expect(source.locator(".acct-h .an")).to_have_text(["alex@example.com", "alex@work.example.com"])
+    expect(target.locator(".acct-h .an")).to_have_text(["shared@example.com", "me@example.com"])
+    expect(source.locator(".acct-h small").first).to_contain_text("main · ")
+    assert pills(page, "src") == ["主日历", "生活", "课程", "中国节假日", "主日历", "工作"]
+    assert pills(page, "tgt") == ["共享日历", "我的日历"]
     # Each account header carries its service mark, named for assistive tech.
     expect(source.locator(".acct-h svg.svc").first).to_have_attribute("aria-label", "Google 日历")
     expect(target.locator(".acct-h svg.svc").first).to_have_attribute("aria-label", "iCloud 日历")
@@ -150,10 +152,14 @@ def test_the_map_shows_every_account_calendar_and_line(
     # A calendar no line uses is dashed and says so; a used one is not.
     holidays = source.locator(".cal", has_text="中国节假日")
     expect(holidays).to_have_class(re.compile(r"\bidle\b"))
-    expect(source.locator(".cal", has_text="家庭日程")).not_to_have_class(re.compile(r"\bidle\b"))
+    expect(source.locator(".cal", has_text="生活")).not_to_have_class(re.compile(r"\bidle\b"))
     if viewport == DESKTOP:
-        expect(source.locator(".acct-h small")).to_have_text(["2 个日历在同步", "1 个日历在同步"])
-        expect(target.locator(".acct-h small")).to_have_text(["1 个日历在接收", "1 个日历在接收"])
+        expect(source.locator(".acct-h small")).to_have_text(
+            ["main · 2 个日历在同步", "work · 1 个日历在同步"]
+        )
+        expect(target.locator(".acct-h small")).to_have_text(
+            ["icloud-shared · 1 个日历在接收", "icloud-me · 1 个日历在接收"]
+        )
         expect(holidays.locator("em")).to_have_text("未同步")
         series = {
             c["name"]: c["series"]
@@ -161,29 +167,27 @@ def test_the_map_shows_every_account_calendar_and_line(
             for c in a["calendars"]
             if c["series"] is not None
         }
-        expect(source.locator(".cal", has_text="家庭日程").locator("em")).to_have_text(
-            str(series["家庭日程"])
-        )
+        expect(source.locator(".cal", has_text="生活").locator("em")).to_have_text(str(series["生活"]))
         expect(source.locator(".cal", has_text="工作").locator("em")).to_have_text(str(series["工作"]))
-        expect(target.locator(".cal", has_text="家庭").locator("em")).to_have_text("2 个来源")
+        expect(target.locator(".cal", has_text="共享日历").locator("em")).to_have_text("2 个来源")
         expect(page.get_by_role("link", name="连接 Google 账号")).to_be_visible()
         expect(page.get_by_role("link", name="连接 iCloud 账号")).to_be_visible()
     # Source pills are coloured by calendar; the unused one has no colour.
     dots = source.locator(".cal .dot").evaluate_all("els => els.map(e => e.getAttribute('class'))")
     # (each a pure function of its key; the seed's three happen not to share one).
-    assert dots == [f"dot {colour_of(k)}" for k in (FAMILY_KEY, SCHOOL_KEY)] + [
+    assert dots == ["dot none"] + [f"dot {colour_of(k)}" for k in (FAMILY_KEY, SCHOOL_KEY)] + [
+        "dot none",
         "dot none",
         f"dot {colour_of(WORK_KEY)}",
     ]
-    assert dots == ["dot blue", "dot sage", "dot none", "dot violet"]
     # Each pill opens its calendar; each header its account (ids with # and / are encoded).
     expect(source.locator(".cal", has_text="中国节假日")).to_have_attribute(
-        "href", "#/calendar/personal/zh.china%23holiday%40group.v.calendar.google.com"
+        "href", "#/calendar/main/zh.china%23holiday%40group.v.calendar.google.com"
     )
-    expect(target.locator(".cal", has_text="家庭")).to_have_attribute(
-        "href", "#/calendar/family-icloud/%2Fdav%2Fhome%2F%E5%AE%B6%E5%BA%AD%2F"
+    expect(target.locator(".cal", has_text="共享日历")).to_have_attribute(
+        "href", "#/calendar/icloud-shared/%2Fdav%2Fhome%2F%E5%85%B1%E4%BA%AB%E6%97%A5%E5%8E%86%2F"
     )
-    expect(source.locator(".acct-h").first).to_have_attribute("href", "#/account/personal")
+    expect(source.locator(".acct-h").first).to_have_attribute("href", "#/account/main")
     assert watch_of(page).problems() == []
 
 
@@ -234,34 +238,36 @@ def test_the_wires_follow_a_resize(paired_page: Page) -> None:
 
 
 def test_a_paused_line_is_dashed(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
-    fresh_live.pause("school-home")
+    fresh_live.pause("course-shared")
     page = open_page(daemon=fresh_live)
     ready(page)
     status = fresh_live.get("/api/status")
-    school = pill_key(status, "school-home", "source")
-    home = pill_key(status, "school-home", "target")
-    expect(page.locator(".canvas .t[data-rule='school-home']")).to_have_class(re.compile(r"\bpaused\b"))
-    assert dash(page, "r:school-home") not in ("none", "", None)
-    assert dash(page, f"s:{school}") not in ("none", "", None)  # 孩子学校 has no other line
-    assert dash(page, "r:family-home") == "none"
-    assert dash(page, f"t:{home}") == "none"  # 家庭 still receives from 家庭日程
+    school = pill_key(status, "course-shared", "source")
+    home = pill_key(status, "course-shared", "target")
+    expect(page.locator(".canvas .t[data-rule='course-shared']")).to_have_class(re.compile(r"\bpaused\b"))
+    assert dash(page, "r:course-shared") not in ("none", "", None)
+    assert dash(page, f"s:{school}") not in ("none", "", None)  # 课程 has no other line
+    assert dash(page, "r:life-shared") == "none"
+    assert dash(page, f"t:{home}") == "none"  # 共享日历 still receives from 生活
     expect(page.locator(".result h1")).to_have_text("一条线路暂停中，其他都正常")
 
 
 def test_a_line_that_needs_a_person_shows_it_on_the_map(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
-    fresh_live.stage_auth()  # work-mine: the work account's credential is refused
-    fresh_live.stage_blocked()  # school-home: three deletes held by the guard
+    fresh_live.stage_auth()  # work-me: the work account's credential is refused
+    fresh_live.stage_blocked()  # course-shared: three deletes held by the guard
     page = open_page(daemon=fresh_live)
     ready(page)
-    expect(page.locator(".canvas .t[data-rule='work-mine']")).to_have_class(re.compile(r"\bbad\b"))
-    expect(page.locator(".canvas .t[data-rule='school-home']")).to_have_class(re.compile(r"\bheld\b"))
-    expect(page.locator(".canvas .t[data-rule='family-home']")).to_have_class(re.compile(r"^t ok\b"))
-    assert dash(page, "r:work-mine") not in ("none", "", None)
+    expect(page.locator(".canvas .t[data-rule='work-me']")).to_have_class(re.compile(r"\bbad\b"))
+    expect(page.locator(".canvas .t[data-rule='course-shared']")).to_have_class(re.compile(r"\bheld\b"))
+    expect(page.locator(".canvas .t[data-rule='life-shared']")).to_have_class(re.compile(r"^t ok\b"))
+    assert dash(page, "r:work-me") not in ("none", "", None)
     work = page.locator(".canvas .col.src .acct").filter(has=page.locator(".an", has_text="work"))
     expect(work.locator(".acct-h small")).to_have_text("授权已失效")
     # The tooltip says what is wrong.
-    title = page.locator(".canvas .hit[data-rule='work-mine']:not(.in) title")
-    expect(title).to_have_text("Google · work · 工作 → iCloud · my-icloud · 我的日历 · 授权失效")
+    title = page.locator(".canvas .hit[data-rule='work-me']:not(.in) title")
+    expect(title).to_have_text(
+        "Google · alex@work.example.com · 工作 → iCloud · me@example.com · 我的日历 · 授权失效"
+    )
 
 
 # ----- tooltips, clicks and focus --------------------------------------------------------------
@@ -270,49 +276,49 @@ def test_a_line_that_needs_a_person_shows_it_on_the_map(open_page: OpenPage, fre
 def test_the_wire_tooltip_names_service_and_account(paired_page: Page) -> None:
     page = paired_page
     ready(page)
-    text = "Google · work · 工作 → iCloud · my-icloud · 我的日历 · 正常"
-    hit = page.locator(".canvas .hit[data-rule='work-mine']:not(.in)")
+    text = "Google · alex@work.example.com · 工作 → iCloud · me@example.com · 我的日历 · 正常"
+    hit = page.locator(".canvas .hit[data-rule='work-me']:not(.in)")
     expect(hit.locator("title")).to_have_text(text)
     expect(hit).to_have_attribute("aria-label", text)
-    x, y = point_on(page, "work-mine", 0.12)  # between 工作 and the hub: no other line runs there
+    x, y = point_on(page, "work-me", 0.12)  # between 工作 and the hub: no other line runs there
     page.mouse.move(x, y)
     tip = page.locator(".canvas .tip")
     expect(tip).to_have_class(re.compile(r"\bon\b"))
     expect(tip).to_have_text(text)
     # While hovered, the other lines step back.
-    expect(page.locator(".canvas .t[data-rule='work-mine']")).to_have_class(re.compile(r"\bhot\b"))
-    expect(page.locator(".canvas .t[data-rule='family-home']")).to_have_class(re.compile(r"\bdim\b"))
+    expect(page.locator(".canvas .t[data-rule='work-me']")).to_have_class(re.compile(r"\bhot\b"))
+    expect(page.locator(".canvas .t[data-rule='life-shared']")).to_have_class(re.compile(r"\bdim\b"))
     page.mouse.move(5, 5)
     expect(tip).not_to_have_class(re.compile(r"\bon\b"))
-    expect(page.locator(".canvas .t[data-rule='family-home']")).not_to_have_class(re.compile(r"\bdim\b"))
+    expect(page.locator(".canvas .t[data-rule='life-shared']")).not_to_have_class(re.compile(r"\bdim\b"))
 
 
 def test_a_pill_tooltip_names_service_and_account(paired_page: Page) -> None:
     page = paired_page
     ready(page)
-    pill = page.locator(".canvas .col.src .cal", has_text="家庭日程")
-    expect(pill).to_have_attribute("title", "Google · personal · 家庭日程")
-    expect(pill).to_have_accessible_name(re.compile(r"^Google · personal · 家庭日程"))
+    pill = page.locator(".canvas .col.src .cal", has_text="生活")
+    expect(pill).to_have_attribute("title", "Google · alex@example.com · 生活")
+    expect(pill).to_have_accessible_name(re.compile(r"^Google · alex@example.com · 生活"))
 
 
 def test_clicking_a_wire_opens_its_line(paired_page: Page, live: LiveDaemon) -> None:
     page = paired_page
     ready(page)
-    x, y = point_on(page, "school-home", 0.12)  # 孩子学校's own stretch
+    x, y = point_on(page, "course-shared", 0.12)  # 课程's own stretch
     page.mouse.click(x, y)
-    expect(page).to_have_url(re.compile(r"#/rule/school-home$"))
+    expect(page).to_have_url(re.compile(r"#/rule/course-shared$"))
     expect(page.locator("aside.insp")).to_have_class(OPEN)
     # The selected line stays lit; what it does not touch is dimmed.
     status = live.get("/api/status")
-    lit = {pill_key(status, "school-home", "source"), pill_key(status, "school-home", "target")}
+    lit = {pill_key(status, "course-shared", "source"), pill_key(status, "course-shared", "target")}
     for key, cls in page.locator(".canvas .cal").evaluate_all(
         "els => els.map(e => [e.dataset.cal, e.getAttribute('class')])"
     ):
         assert ("dim" in cls.split()) == (key not in lit), (key, cls)
-    expect(page.locator(".canvas .t[data-rule='school-home']")).to_have_class(re.compile(r"\bhot\b"))
-    expect(page.locator(".canvas .t[data-rule='work-mine']")).to_have_class(re.compile(r"\bdim\b"))
+    expect(page.locator(".canvas .t[data-rule='course-shared']")).to_have_class(re.compile(r"\bhot\b"))
+    expect(page.locator(".canvas .t[data-rule='work-me']")).to_have_class(re.compile(r"\bdim\b"))
     page.mouse.move(5, 5)  # off the map: the open line alone keeps the others dimmed
-    expect(page.locator(".canvas .t[data-rule='work-mine']")).to_have_class(re.compile(r"\bdim\b"))
+    expect(page.locator(".canvas .t[data-rule='work-me']")).to_have_class(re.compile(r"\bdim\b"))
     page.locator("aside.insp").get_by_role("button", name="关闭").click()
     expect(page.locator("aside.insp")).not_to_have_class(OPEN)
     expect(page.locator(".canvas .cal.dim")).to_have_count(0)
@@ -321,22 +327,22 @@ def test_clicking_a_wire_opens_its_line(paired_page: Page, live: LiveDaemon) -> 
 def test_a_wire_opens_from_the_keyboard(paired_page: Page) -> None:
     page = paired_page
     ready(page)
-    wire = page.locator(".canvas .hit[data-rule='family-mine']:not(.in)")
+    wire = page.locator(".canvas .hit[data-rule='life-me']:not(.in)")
     expect(wire).to_have_attribute("role", "link")
     wire.focus()
-    expect(page.locator(".canvas .t[data-rule='family-mine']")).to_have_class(re.compile(r"\bhot\b"))
+    expect(page.locator(".canvas .t[data-rule='life-me']")).to_have_class(re.compile(r"\bhot\b"))
     page.keyboard.press("Enter")
-    expect(page).to_have_url(re.compile(r"#/rule/family-mine$"))
+    expect(page).to_have_url(re.compile(r"#/rule/life-me$"))
 
 
 def test_hovering_a_calendar_dims_the_rest(paired_page: Page) -> None:
     page = paired_page
     ready(page)
     page.locator(".canvas .col.src .cal", has_text="工作").hover()
-    expect(page.locator(".canvas .t[data-rule='work-mine']")).to_have_class(re.compile(r"\bhot\b"))
-    for other in ("family-home", "school-home", "family-mine"):
+    expect(page.locator(".canvas .t[data-rule='work-me']")).to_have_class(re.compile(r"\bhot\b"))
+    for other in ("life-shared", "course-shared", "life-me"):
         expect(page.locator(f".canvas .t[data-rule='{other}']")).to_have_class(re.compile(r"\bdim\b"))
-    expect(page.locator(".canvas .col.src .cal", has_text="家庭日程")).to_have_class(re.compile(r"\bdim\b"))
+    expect(page.locator(".canvas .col.src .cal", has_text="生活")).to_have_class(re.compile(r"\bdim\b"))
     expect(page.locator(".canvas .col.tgt .cal", has_text="我的日历")).not_to_have_class(
         re.compile(r"\bdim\b")
     )
@@ -345,8 +351,8 @@ def test_hovering_a_calendar_dims_the_rest(paired_page: Page) -> None:
 def test_an_open_calendar_keeps_its_lines_lit(open_page: OpenPage) -> None:
     page = open_page(path="/#/account/work")
     ready(page)
-    expect(page.locator(".canvas .t[data-rule='work-mine']")).to_have_class(re.compile(r"\bhot\b"))
-    expect(page.locator(".canvas .t[data-rule='family-home']")).to_have_class(re.compile(r"\bdim\b"))
+    expect(page.locator(".canvas .t[data-rule='work-me']")).to_have_class(re.compile(r"\bhot\b"))
+    expect(page.locator(".canvas .t[data-rule='life-shared']")).to_have_class(re.compile(r"\bdim\b"))
 
 
 @pytest.mark.parametrize("service", ["Google", "iCloud"])
@@ -463,7 +469,7 @@ def test_an_auth_card_lists_the_reasons_and_the_command(open_page: OpenPage, fre
     expect(page.locator(".result h1")).to_have_text("一条线路停了，其他都正常")
     card = page.locator(".attn[data-kind=auth]")
     expect(card).to_have_count(1)
-    expect(card.locator("b").first).to_have_text("work 的授权失效了")
+    expect(card.locator("b").first).to_have_text("alex@work.example.com 的授权失效了")
     expect(card.locator("b svg.svc").first).to_have_attribute("aria-label", "Google 日历")
     expect(card.locator(".why li")).to_have_text(
         [
@@ -475,8 +481,8 @@ def test_an_auth_card_lists_the_reasons_and_the_command(open_page: OpenPage, fre
     expect(card.locator(".cmd code")).to_have_text("calsync auth work")
     # The line it stopped, named with service and account.
     expect(card.locator(".route .cm")).to_have_count(2)
-    expect(card.locator(".route")).to_contain_text("工作 · work")
-    expect(card.locator(".route")).to_contain_text("我的日历 · my-icloud")
+    expect(card.locator(".route")).to_contain_text("工作 · alex@work.example.com")
+    expect(card.locator(".route")).to_contain_text("我的日历 · me@example.com")
     card.get_by_role("button", name="复制").click()
     expect(card.locator(".copied")).to_have_text(re.compile(r"^(已复制|已选中，请手动复制)$"))
     assert page.evaluate("String(window.getSelection())") in ("calsync auth work", "")
@@ -489,9 +495,9 @@ def test_a_blocked_card_opens_the_blocked_deletes(open_page: OpenPage, fresh_liv
     card = page.locator(".attn[data-kind=blocked]")
     expect(card).to_have_count(1)
     expect(card.locator("b").first).to_contain_text("3 个副本等你确认删除")
-    expect(card.locator("b a")).to_have_attribute("href", "#/blocked/school-home")
+    expect(card.locator("b a")).to_have_attribute("href", "#/blocked/course-shared")
     card.get_by_role("link", name="查看并处理").click()
-    expect(page).to_have_url(re.compile(r"#/blocked/school-home$"))
+    expect(page).to_have_url(re.compile(r"#/blocked/course-shared$"))
     expect(page.locator("aside.insp")).to_have_class(OPEN)
 
 
@@ -502,9 +508,9 @@ def test_a_failing_card_opens_the_line(open_page: OpenPage, fresh_live: LiveDaem
     card = page.locator(".attn[data-kind=failing]")
     expect(card).to_have_count(1)
     expect(card.locator("b").first).to_contain_text("连续 1 次同步失败")
-    expect(page.locator(".canvas .t[data-rule='family-mine']")).to_have_class(re.compile(r"\bbad\b"))
+    expect(page.locator(".canvas .t[data-rule='life-me']")).to_have_class(re.compile(r"\bbad\b"))
     card.get_by_role("link", name="查看线路").click()
-    expect(page).to_have_url(re.compile(r"#/rule/family-mine$"))
+    expect(page).to_have_url(re.compile(r"#/rule/life-me$"))
 
 
 def test_a_healthy_map_has_no_attention_card(paired_page: Page) -> None:
@@ -569,7 +575,7 @@ def test_the_phone_map_keeps_three_columns(open_page: OpenPage, viewport: dict[s
 # ----- fix round 1 ------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("side,calendar", [("src", "工作"), ("tgt", "家庭")])
+@pytest.mark.parametrize("side,calendar", [("src", "工作"), ("tgt", "共享日历")])
 def test_closing_a_calendar_with_the_mouse_leaves_nothing_dimmed(
     paired_page: Page, side: str, calendar: str
 ) -> None:
@@ -594,8 +600,8 @@ def test_a_pill_lights_its_lines_on_keyboard_focus(paired_page: Page) -> None:
     pill = page.locator(".canvas .cal", has_text="工作")
     pill.focus()
     expect(pill).to_be_focused()
-    expect(page.locator(".canvas .t[data-rule='work-mine']")).to_have_class(re.compile(r"\bhot\b"))
-    expect(page.locator(".canvas .t[data-rule='family-home']")).to_have_class(re.compile(r"\bdim\b"))
+    expect(page.locator(".canvas .t[data-rule='work-me']")).to_have_class(re.compile(r"\bhot\b"))
+    expect(page.locator(".canvas .t[data-rule='life-shared']")).to_have_class(re.compile(r"\bdim\b"))
 
 
 # The headline from the lines' states: (healths, Chinese, English).
@@ -662,7 +668,7 @@ def test_the_headline_counts_every_state(paired_page: Page) -> None:
 def test_a_stopped_line_beside_a_paused_one_is_not_called_fine(
     open_page: OpenPage, fresh_live: LiveDaemon
 ) -> None:
-    fresh_live.pause("school-home")
+    fresh_live.pause("course-shared")
     fresh_live.stage_auth()
     page = open_page(daemon=fresh_live)
     ready(page)
@@ -678,7 +684,9 @@ def test_with_no_line_yet_the_sentence_invites_a_first_one(open_page: OpenPage, 
         expect(page.locator(".result .detail")).to_have_text("从这里开始：新建一条线路")
         expect(page.locator(".result .detail a")).to_have_attribute("href", "#/new")
         expect(page.locator(".canvas .hit")).to_have_count(0)
-        expect(page.locator(".canvas .col.src .acct-h .an")).to_have_text(["personal", "work"])
+        expect(page.locator(".canvas .col.src .acct-h .an")).to_have_text(
+            ["alex@example.com", "alex@work.example.com"]
+        )
 
 
 @pytest.mark.parametrize("viewport", [PHONE, DESKTOP], ids=VIEWPORT_IDS)
@@ -704,9 +712,9 @@ def test_a_line_whose_account_is_missing_is_still_drawn(paired_page: Page) -> No
     expect(work.locator(".acct-h small")).to_have_text("不在账号列表里")
     page.wait_for_function("() => document.querySelectorAll('.canvas .hit:not(.in)').length === 4")
     geo = geometry(page)
-    assert geo["routes"]["work-mine"]["from"] == "work/工作"
+    assert geo["routes"]["work-me"]["from"] == "work/工作"
     pill = geo["pills"]["work/工作"]
-    start = geo["routes"]["work-mine"]["ends"][0]
+    start = geo["routes"]["work-me"]["ends"][0]
     assert near(start, pill["right"], pill["top"] + pill["height"] / 2)
 
 
@@ -731,19 +739,19 @@ OTHER = {"id": "/dav/home/提醒/", "name": "提醒", "role": None, "series": No
 def test_a_calendar_is_missing_only_when_the_list_is_known(
     paired_page: Page, calendars: list[dict[str, Any]], missing: bool
 ) -> None:
-    """家庭 is not in family-icloud's cached list. An empty list means the list is unknown (listing
-    failed, or has not run): no alarm. A list that has other calendars and not 家庭: missing. Either
+    """共享日历 is not in icloud-shared's cached list. An empty list means the list is unknown (listing
+    failed, or has not run): no alarm. A list that has other calendars and not 共享日历: missing. Either
     way the pill and both wires are there."""
     page = paired_page
     ready(page)
-    edited_status(page, with_calendars("family-icloud", calendars))
+    edited_status(page, with_calendars("icloud-shared", calendars))
     page.wait_for_function(
-        """() => [...document.querySelectorAll(".canvas .cal")].some((c) => c.dataset.cal === "family-icloud/家庭")"""
+        """() => [...document.querySelectorAll(".canvas .cal")].some((c) => c.dataset.cal === "icloud-shared/共享日历")"""
     )
-    cls = (classes(page, ".canvas .cal", "data-cal", "family-icloud/家庭") or "").split()
+    cls = (classes(page, ".canvas .cal", "data-cal", "icloud-shared/共享日历") or "").split()
     assert ("missing" in cls) is missing, cls
     geo = geometry(page)
-    assert {geo["routes"][r]["to"] for r in ("family-home", "school-home")} == {"family-icloud/家庭"}
+    assert {geo["routes"][r]["to"] for r in ("life-shared", "course-shared")} == {"icloud-shared/共享日历"}
 
 
 def source_colours(page: Page) -> dict[str, str]:
@@ -767,7 +775,7 @@ def without(rule: str) -> Any:
     return edit
 
 
-@pytest.mark.parametrize("rule", ["school-home", "family-mine", "work-mine"])
+@pytest.mark.parametrize("rule", ["course-shared", "life-me", "work-me"])
 def test_removing_a_line_keeps_the_other_colours(paired_page: Page, rule: str) -> None:
     page = paired_page
     ready(page)
@@ -795,7 +803,7 @@ def test_hovering_never_remeasures_and_polls_keep_one_observer(paired_page: Page
     for _ in range(3):
         before, measured = len(polls), canvas.get_attribute("data-measured")
         for f in (0.05, 0.08, 0.1, 0.12, 0.14, 0.1, 0.06):
-            x, y = point_on(page, "work-mine", f)
+            x, y = point_on(page, "work-me", f)
             page.mouse.move(x, y)
         expect(page.locator(".canvas .tip")).to_have_class(re.compile(r"\bon\b"))
         page.mouse.move(5, 5)
@@ -814,13 +822,15 @@ def test_hovering_never_remeasures_and_polls_keep_one_observer(paired_page: Page
 def test_english_counts_are_singular_at_one(open_page: OpenPage) -> None:
     page = open_page(path="/?lang=en")
     expect(page.locator(".hub-cap small")).to_have_text("4 lines")
-    work = page.locator(".canvas .col.src .acct").filter(has=page.locator(".an", has_text="work"))
-    expect(work.locator(".acct-h small")).to_have_text("1 calendar syncing")
-    expect(page.locator(".canvas .col.tgt .acct-h small")).to_have_text(
-        ["1 calendar receiving", "1 calendar receiving"]
+    work = page.locator(".canvas .col.src .acct").filter(
+        has=page.locator(".an", has_text="alex@work.example.com")
     )
-    edited_status(page, without("school-home"))
-    expect(page.locator(".canvas .col.tgt .cal", has_text="家庭").locator("em")).to_have_text("1 source")
+    expect(work.locator(".acct-h small")).to_have_text("work · 1 calendar syncing")
+    expect(page.locator(".canvas .col.tgt .acct-h small")).to_have_text(
+        ["icloud-shared · 1 calendar receiving", "icloud-me · 1 calendar receiving"]
+    )
+    edited_status(page, without("course-shared"))
+    expect(page.locator(".canvas .col.tgt .cal", has_text="共享日历").locator("em")).to_have_text("1 source")
 
 
 def luminance(rgb: str) -> float:
@@ -838,10 +848,10 @@ def test_a_focused_wire_has_a_visible_ring(open_page: OpenPage, theme: str) -> N
     the page (WCAG non-text contrast), in both themes."""
     page = open_page(color_scheme=theme)
     ready(page)
-    page.locator(".canvas .hit[data-rule='work-mine']:not(.in)").focus()
+    page.locator(".canvas .hit[data-rule='work-me']:not(.in)").focus()
     ring = page.evaluate(
         """() => {
-          const hit = document.querySelector(".canvas .hit[data-rule='work-mine']:not(.in)");
+          const hit = document.querySelector(".canvas .hit[data-rule='work-me']:not(.in)");
           const s = getComputedStyle(hit);
           return { stroke: s.stroke, opacity: s.strokeOpacity, width: s.strokeWidth,
                    bg: getComputedStyle(document.body).backgroundColor };

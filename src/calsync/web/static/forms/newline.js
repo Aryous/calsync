@@ -16,7 +16,7 @@
 
 import { html, useEffect, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
 import { t } from "/static/i18n.js";
-import { accountLabel, serviceOf } from "/static/format.js";
+import { accountLabel, serviceOf, calendarTitle } from "/static/format.js";
 import { ApiError, get, op, useStatus } from "/static/api.js";
 import { CalendarName, Icon, Service } from "/static/icons.js";
 import { Command } from "/static/command.js";
@@ -80,7 +80,7 @@ function Picker({ groups, chosen, onPick, isTaken, source, extra, role }) {
         const coloured = source && (c.rules || []).length;
         return html`<${Radio} checked=${chosen === c.key} disabled=${taken} tabbable=${stop === c.key} onPick=${() => onPick(g, c)}>
           ${source ? html`<i class=${`dot ${coloured ? colourOf(c.key) : "none"}`} aria-hidden="true"></i>` : null}
-          <span class="nm">${c.name}</span>
+          <span class="nm">${calendarTitle(g.account, c.name)}</span>
           <small>${taken ? t("already syncing") : source && c.series != null ? t("{n} series", { n: c.series }) : ""}</small>
         <//>`;
       })}`)}
@@ -119,7 +119,7 @@ function Leftover({ leftover, target, choice, onChoice }) {
 }
 
 function previewBody(state, target) {
-  if (!state) return html`<p class="hp flush">${t("Once both ends are chosen, calsync works out here what would happen. Nothing is written until you confirm.")}</p>`;
+  if (!state) return null;
   if (state.loading) return html`<p class="hp flush" aria-busy="true">${t("Previewing…")}</p>`;
   if (state.error) {
     return html`<div class="note bad" data-role="preview-error">
@@ -134,7 +134,7 @@ function previewBody(state, target) {
     <p>${d.target_exists
       ? slots(t("The events already in {calendar} are left alone."), { calendar: target })
       : d.target_would_be_created
-        ? t("This calendar does not exist yet: creating the line creates it in iCloud.")
+        ? t("This calendar does not exist yet: creating the line creates it.")
         : t("This calendar was not found in the account.")}</p>
     ${(state.earlier || []).filter((e) => !(d.leftover || []).some((l) => l.name === e.name)).map((e) => html`<p class="earlier" data-role="earlier">${e.copies === 1
       ? t("An earlier line called {name} left 1 copy behind; it stays in its calendar, and this line does not touch it.", { name: e.name })
@@ -343,7 +343,7 @@ export function NewLineForm({ route, onClose, onCreated, onReplace, active = tru
   const pickSource = (g, c) => setSrc(c.key);
   const pickTarget = (g, c) => setTgt(c.key);
   const newCalendar = (tabbable) => html`<${Radio} cls="new" checked=${tgt === "new"} tabbable=${tabbable} onPick=${() => setTgt("new")}>
-      <${Icon} name="plus"/><span class="nm">${t("Create a new calendar in iCloud")}</span>
+      <${Icon} name="plus"/><span class="nm">${t("Create a new calendar")}</span>
     <//>`;
   // Beside the targets' radiogroup, not in it: a radiogroup of its own.
   const newCalendarDetails = tgt === "new" ? html`<div class="newcal">
@@ -373,7 +373,7 @@ export function NewLineForm({ route, onClose, onCreated, onReplace, active = tru
       ${stage ? html`<p class="inote" role="status" data-role="stage">${stage}</p>` : null}
     </div>
     <div class="ifoot">
-      <span class="hp flush">${t("The other settings can be changed afterwards")}</span>
+      <span></span>
       <button class=${creating ? "btn primary busy" : "btn primary"} type="button" disabled=${!ready}
           aria-busy=${creating ? "true" : "false"} onClick=${create}>${creating ? t("Creating and syncing…") : t("Create and start syncing")}</button>
     </div>`;

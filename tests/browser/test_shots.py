@@ -4,7 +4,7 @@ synthetic data. Skipped unless ``CALSYNC_SHOTS`` names a directory:
     CALSYNC_SHOTS=.superpowers/sdd/shots/task-1 uv run pytest -m browser tests/browser/test_shots.py
 
 Files: ``<browser>-<phone|desktop>-<light|dark>[-<state>].png``; ``-attention`` is a daemon of its
-own with a refused credential (work-mine) and blocked deletes (school-home).
+own with a refused credential (work-me) and blocked deletes (course-shared).
 """
 
 import os
@@ -68,8 +68,8 @@ def _google_setup(page: Page) -> None:
     page.locator("aside.insp [data-role=waiting]").wait_for()
 
 
-DENTIST = events_view.event_id("personal", FAMILY, "dentist", None)
-RUN = events_view.event_id("personal", FAMILY, "run", "2026-10-26T07:00:00+08:00")
+DENTIST = events_view.event_id("main", FAMILY, "dentist", None)
+RUN = events_view.event_id("main", FAMILY, "run", "2026-10-26T07:00:00+08:00")
 
 
 def _delete_event(page: Page) -> None:
@@ -104,15 +104,15 @@ def _move_scope(page: Page) -> None:
 STATES: dict[str, tuple[str, Callable[[Page], None] | None]] = {
     "": ("/", None),
     "settings": ("/#/settings", None),
-    "focus": ("/#/rule/school-home", None),
-    "rule": ("/#/rule/family-mine", None),
-    "calendar": ("/#/calendar/family-icloud/%2Fdav%2Fhome%2F%E5%AE%B6%E5%BA%AD%2F", None),
-    "newline": (f"/#/new?source=personal&calendar={SCHOOL.replace('@', '%40')}", _preview),
-    "delete": ("/#/rule/school-home", _delete),
+    "focus": ("/#/rule/course-shared", None),
+    "rule": ("/#/rule/life-me", None),
+    "calendar": ("/#/calendar/icloud-shared/%2Fdav%2Fhome%2F%E5%85%B1%E4%BA%AB%E6%97%A5%E5%8E%86%2F", None),
+    "newline": (f"/#/new?source=main&calendar={SCHOOL.replace('@', '%40')}", _preview),
+    "delete": ("/#/rule/course-shared", _delete),
     # Task 4: the account inspector, 断开 refused, the wizard's first two steps (read-only: the
     # refusal is a dry run, and nothing is added).
-    "account": ("/#/account/personal", None),
-    "remove-refused": ("/#/account/personal", _remove_refused),
+    "account": ("/#/account/main", None),
+    "remove-refused": ("/#/account/main", _remove_refused),
     "connect-icloud-name": ("/#/connect/icloud", None),
     "connect-icloud-details": ("/#/connect/icloud", _icloud_details),
     "connect-google-details": ("/#/connect/google", _wizard_details),
@@ -261,7 +261,7 @@ def test_screenshot_of_the_wizard_waiting_and_done(
     page.locator('aside.insp .step[data-step="auth"][aria-current="step"]').wait_for()
     _shoot(page, f"{browser_name}-{size}-{theme}-connect-{service}-auth")
     fresh_live.authorise(
-        name, ["外婆的日历", "外婆的生日"] if service == "icloud" else ["家庭安排", "孩子活动"]
+        name, ["外婆的日历", "外婆的生日"] if service == "icloud" else ["共享日历安排", "孩子活动"]
     )
     refresh_status(page)
     page.locator('aside.insp .step[data-step="calendars"][aria-current="step"] .row').first.wait_for()

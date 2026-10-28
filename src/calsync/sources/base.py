@@ -19,6 +19,7 @@ class CalendarInfo:
     id: str
     name: str
     role: str | None = None  # Google calendarList accessRole: owner, writer, reader, freeBusyReader
+    primary: bool = False  # the account's own calendar (Google names it after the account's email)
 
 
 @dataclass(frozen=True, slots=True)

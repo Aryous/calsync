@@ -215,6 +215,7 @@ class AccountCalendarView:
     name: str
     role: str | None
     fetched_at: datetime
+    primary: bool = False
 
 
 # Change actions that put the source version on the target (what the engine records for writes).
@@ -489,10 +490,12 @@ class StateReader:
         """The account's cached calendar list, by id (none cached: empty)."""
         if not {"account", "id", "name", "role", "fetched_at"} <= self.columns("account_calendar"):
             return []
+        # ``is_primary`` arrived with version 7: an older database reads every calendar as not.
+        primary = "is_primary" if "is_primary" in self.columns("account_calendar") else "0"
         return [
-            AccountCalendarView(account, cid, name, role, _parse_time(fetched_at))
-            for cid, name, role, fetched_at in self._db.execute(
-                "SELECT id, name, role, fetched_at FROM account_calendar WHERE account = ? ORDER BY id",
+            AccountCalendarView(account, cid, name, role, _parse_time(fetched_at), bool(is_primary))
+            for cid, name, role, fetched_at, is_primary in self._db.execute(
+                f"SELECT id, name, role, fetched_at, {primary} FROM account_calendar WHERE account = ? ORDER BY id",
                 (account,),
             )
         ]
@@ -928,12 +931,14 @@ class CalendarStatus:
     series: int | None  # mirrored source series (a source account's calendar); None: a target's
     rules: tuple[str, ...]  # the rules using it, in config order
     synced: bool  # some rule using it is active (neither paused nor retiring)
+    primary: bool = False  # the account's own calendar (Google's primary: named after the email)
 
     def to_json(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "name": self.name,
             "role": self.role,
+            "primary": self.primary,
             "series": self.series,
             "rules": list(self.rules),
             "synced": self.synced,
@@ -952,12 +957,16 @@ class AccountView:
     # Google: whether its grant may change events (the scopes a token refresh reported); None:
     # not seen yet, or not a Google account.
     can_write: bool | None = None
+    # Who the account is, as its service names it: a Google account's email (its primary
+    # calendar's id), a CalDAV account's user name (an Apple ID is an email). None: not known yet.
+    email: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "provider": self.provider,
             "host": self.host,
+            "email": self.email,
             "auth": self.auth,
             "calendars": [c.to_json() for c in self.calendars],
             "can_write": self.can_write,
@@ -1215,6 +1224,7 @@ def _account_view(
                 series=reader.series_count(account.name, cal.id) if account.provider == "google" else None,
                 rules=tuple(r.name for r in using),
                 synced=any(not r.paused and not r.retire for r in using),
+                primary=cal.primary,
             )
         )
     return AccountView(
@@ -1224,7 +1234,15 @@ def _account_view(
         auth=_account_auth(account.name, config.rules, last),
         calendars=tuple(calendars),
         can_write=can_write(reader, account.name) if account.provider == "google" else None,
+        email=_email_of(account, calendars),
     )
+
+
+def _email_of(account: Account, calendars: Sequence[CalendarStatus]) -> str | None:
+    """A Google account's email: its primary calendar's id. A CalDAV account: its user name."""
+    if account.provider == "google":
+        return next((c.id for c in calendars if c.primary and "@" in c.id), None)
+    return account.username or None
 
 
 def can_write(reader: StateReader, account: str) -> bool | None:

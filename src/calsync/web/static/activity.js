@@ -86,7 +86,7 @@ function revertText(fields) {
   if (!names.length) return "";
   const name = names.includes("start") ? "start" : names[0];
   const [edited, ours] = fields[name];
-  return t("{what} was changed to {edited} on the iPhone; Google has {ours}", { what: fieldName(name), edited: fieldValue(name, edited), ours: fieldValue(name, ours) });
+  return t("The copy's {what} was changed to {edited}; Google has {ours}", { what: fieldName(name), edited: fieldValue(name, edited), ours: fieldValue(name, ours) });
 }
 
 // ----- building the timeline ------------------------------------------------------------------------
@@ -128,7 +128,7 @@ function changeItem(c, lines, cycleOf) {
     case "deleted":
       return { ...base, head: t("Deleted “{title}”", { title }), sub: "", merge: `${cycle}|deleted|${title}` };
     case "reverted":
-      return { ...base, head: t("“{title}” was changed on the iPhone and changed back", { title }), sub: revertText(fields), cls: "rev" };
+      return { ...base, head: t("The copy of “{title}” was changed and changed back", { title }), sub: revertText(fields), cls: "rev" };
     case "approved": {
       const m = /^(\d+) deletes? approved \((\w+)\)$/.exec(c.title || "");
       const n = m ? Number(m[1]) : null;

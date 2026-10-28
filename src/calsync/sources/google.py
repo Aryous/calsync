@@ -73,7 +73,7 @@ CALENDAR_LIST_PARAMS: Mapping[str, str] = {
 # in CALENDAR_LIST_PARAMS: a stored calendarList sync token is valid only for its parameters.
 CALENDAR_LIST_ALL_PARAMS: Mapping[str, str] = {
     **CALENDAR_LIST_PARAMS,
-    "fields": "nextPageToken,nextSyncToken,items(id,summary,summaryOverride,accessRole,deleted)",
+    "fields": "nextPageToken,nextSyncToken,items(id,summary,summaryOverride,accessRole,primary,deleted)",
 }
 
 
@@ -231,6 +231,7 @@ class GoogleSource:
                 item["id"],
                 item.get("summaryOverride") or item.get("summary", item["id"]),
                 item.get("accessRole") or None,
+                bool(item.get("primary")),
             )
             for item in items
             if not item.get("deleted")

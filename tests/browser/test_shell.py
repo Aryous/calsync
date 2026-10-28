@@ -215,10 +215,10 @@ def test_the_inspector_opens_on_settings_and_closes(paired_page: Page, viewport:
 @pytest.mark.parametrize(
     ("hash_", "title"),
     [
-        ("#/rule/family-home", "线路"),
-        ("#/account/personal", "账号"),
+        ("#/rule/life-shared", "线路"),
+        ("#/account/main", "账号"),
         ("#/new", "新线路"),
-        ("#/blocked/work-mine", "被拦下的删除"),
+        ("#/blocked/work-me", "被拦下的删除"),
     ],
 )
 def test_every_inspector_route_opens_the_container(open_page: OpenPage, hash_: str, title: str) -> None:
@@ -391,7 +391,7 @@ def test_closing_leaves_no_inspector_behind_in_history(open_page: OpenPage) -> N
     expect(page.get_by_role("tab", name="活动")).to_have_attribute("aria-selected", "true")
     page.locator(".top-r").get_by_role("link", name="设置").click()
     expect(inspector.locator("h2")).to_have_text("设置")
-    page.evaluate("location.hash = '#/rule/family-home'")
+    page.evaluate("location.hash = '#/rule/life-shared'")
     expect(inspector.locator("h2")).to_have_text("线路")
     page.evaluate("window.scrollTo(0, 0)")
     page.keyboard.press("Escape")
@@ -412,7 +412,7 @@ def test_closing_a_linked_inspector_chain_turns_it_into_the_map(open_page: OpenP
     page.goto("/?lang=zh#/settings")  # a fresh document, loaded with an inspector hash
     inspector = page.locator("aside.insp")
     expect(inspector.locator("h2")).to_have_text("设置")
-    page.evaluate("location.hash = '#/account/personal'")
+    page.evaluate("location.hash = '#/account/main'")
     expect(inspector.locator("h2")).to_have_text("账号")
     page.keyboard.press("Escape")
     expect(inspector).not_to_have_class(re.compile(r"\bopen\b"))
@@ -433,7 +433,7 @@ def in_app(page: Page, live: LiveDaemon) -> None:
 
 
 def test_closing_a_linked_chain_back_to_the_same_inspector(open_page: OpenPage, live: LiveDaemon) -> None:
-    """Loaded at #/settings, then #/account/personal, then #/settings again: the first close
+    """Loaded at #/settings, then #/account/main, then #/settings again: the first close
     travels to the first entry (same fragment: only popstate fires) and closes there; further
     closes are harmless and the page never leaves the app."""
     page = open_page()
@@ -442,7 +442,7 @@ def test_closing_a_linked_chain_back_to_the_same_inspector(open_page: OpenPage, 
     inspector = page.locator("aside.insp")
     expect(inspector.locator("h2")).to_have_text("设置")
     frames(page)
-    page.evaluate("location.hash = '#/account/personal'")
+    page.evaluate("location.hash = '#/account/main'")
     expect(inspector.locator("h2")).to_have_text("账号")
     frames(page)
     page.evaluate("location.hash = '#/settings'")
@@ -460,10 +460,10 @@ def test_closing_a_linked_chain_back_to_the_same_inspector(open_page: OpenPage, 
     "steps",
     [
         ["#/settings"],
-        ["#/settings", "#/rule/family-home"],
-        ["#/settings", "#/account/personal", "#/settings"],
+        ["#/settings", "#/rule/life-shared"],
+        ["#/settings", "#/account/main", "#/settings"],
         ["#/activity", "#/settings", "#/settings"],
-        ["#/rule/family-home", "#/", "#/settings", "#/account/work", "#/settings", "#/account/work"],
+        ["#/rule/life-shared", "#/", "#/settings", "#/account/work", "#/settings", "#/account/work"],
     ],
     ids=lambda steps: "-".join(step.strip("#/").replace("/", ".") or "map" for step in steps),
 )

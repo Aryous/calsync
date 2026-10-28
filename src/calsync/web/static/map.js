@@ -17,7 +17,7 @@
 
 import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
 import { t } from "/static/i18n.js";
-import { accountLabel, calendarLabel, serviceOf } from "/static/format.js";
+import { accountKey, accountLabel, calendarLabel, calendarTitle, serviceOf } from "/static/format.js";
 import { Icon, Service } from "/static/icons.js";
 
 /** The source calendars' colours (classes ``dot <name>``, tokens ``--dot-<name>``): eight quiet
@@ -422,7 +422,7 @@ function Pill({ pill, focus, selected }) {
   const cls = ["cal", idle ? "idle" : "", pill.missing ? "missing" : "", lit === false ? "dim" : "", selected ? "sel" : ""].filter(Boolean).join(" ");
   return html`<a class=${cls} href=${calendarHref(pill)} data-cal=${pill.key} title=${label}
       aria-label=${metaText ? `${label} · ${metaText}` : label}>
-    <i class=${`dot ${pill.colour}`} aria-hidden="true"></i><span class="nm">${pill.name}</span>${meta ? html`<em class="num" aria-hidden="true">${meta}</em>` : null}
+    <i class=${`dot ${pill.colour}`} aria-hidden="true"></i><span class="nm">${calendarTitle(pill.account, pill.name)}</span>${meta ? html`<em class="num" aria-hidden="true">${meta}</em>` : null}
   </a>`;
 }
 
@@ -435,7 +435,8 @@ function AccountGroup({ group, focus, route }) {
     let text;
     if (group.side === "src") text = n === 1 ? t("1 calendar syncing") : t("{n} calendars syncing", { n });
     else text = n === 1 ? t("1 calendar receiving") : t("{n} calendars receiving", { n });
-    sub = html`<small>${text}</small>`;
+    const key = accountKey(group.name);
+    sub = html`<small>${key ? `${key} · ${text}` : text}</small>`;
   }
   const selected = (p) => route && route.name === "calendar" && route.account === p.account && route.calendar === p.id;
   return html`<div class="acct" data-acct=${group.name}>

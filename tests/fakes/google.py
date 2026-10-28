@@ -43,6 +43,7 @@ class FakeGoogle:
         self._calendars: dict[str, _Calendar] = {}
         self._removed: dict[str, int] = {}
         self._roles: dict[str, str] = {}  # calendarList accessRole
+        self._primary: str | None = None  # the account's own calendar (its id is the email)
         self.write_scope = True  # False: the grant has no calendar.events scope
         self.writes: list[tuple[str, str]] = []  # (method, path) of every write, batch parts too
         self.batches = 0  # batch requests received
@@ -63,10 +64,13 @@ class FakeGoogle:
         default_reminders: list[dict[str, Any]] | None = None,
         summary_override: str | None = None,
         access_role: str = "owner",
+        primary: bool = False,
     ) -> None:
         self._removed.pop(cid, None)
         self._calendars[cid] = _Calendar(summary, summary_override, tz, default_reminders or [], self._tick())
         self._roles[cid] = access_role
+        if primary:
+            self._primary = cid
 
     def remove_calendar(self, cid: str) -> None:
         del self._calendars[cid]
@@ -196,6 +200,7 @@ class FakeGoogle:
                     "timeZone": c.tz,
                     "defaultReminders": c.default_reminders,
                     "accessRole": self._roles.get(cid, "owner"),
+                    **({"primary": True} if cid == self._primary else {}),
                 }
                 for cid, c in self._calendars.items()
                 if since is None or c.changed_at > since

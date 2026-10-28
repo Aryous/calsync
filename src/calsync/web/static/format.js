@@ -81,12 +81,36 @@ export function serviceShort(service) {
   return "CalDAV";
 }
 
-/** How an account is named to a person. The config has no display label yet, so this is the
- * account's key ("personal") — the one place to change when a label field exists. Takes the key
- * or a status account ({name, …}). */
+// Who each account is (``GET /api/status``'s ``accounts[].email``: a Google account's email, an
+// Apple ID), kept here by setAccounts() at every status so every place names accounts alike.
+const emails = new Map();
+
+/** Remember the accounts' emails (the status poller calls it with each status). */
+export function setAccounts(accounts) {
+  emails.clear();
+  for (const a of accounts || []) if (a && a.email) emails.set(a.name, a.email);
+}
+
+/** How an account is named to a person: its email when calsync knows it, else its name in the
+ * config ("me-google"). Takes the name or a status account ({name, email, …}). */
 export function accountLabel(account) {
   if (account == null) return "";
-  return typeof account === "string" ? account : account.name;
+  if (typeof account !== "string") return account.email || emails.get(account.name) || account.name;
+  return emails.get(account) || account;
+}
+
+/** The config's name of an account when it is not what accountLabel shows (for the CLI). */
+export function accountKey(account) {
+  const name = typeof account === "string" ? account : account && account.name;
+  return name && accountLabel(account) !== name ? name : "";
+}
+
+/** A calendar's name as a person reads it: an account's own calendar (Google names it after the
+ * account's email) is 主日历. */
+export function calendarTitle(account, name) {
+  const name_ = name == null ? "" : String(name);
+  const email = emails.get(typeof account === "string" ? account : account && account.name);
+  return email && name_ === email ? t("Primary calendar") : name_;
 }
 
 /** A calendar's name with its account. Visible text (beside the service icon, which
@@ -94,8 +118,9 @@ export function accountLabel(account) {
  * go (an SVG <title>, a title attribute, an aria-label) — the service is spelled out first:
  * "Google · personal · 家庭日程". */
 export function calendarLabel({ service, account, name }, { plain = false } = {}) {
-  if (plain) return [service ? serviceShort(service) : "", accountLabel(account), name].filter(Boolean).join(" · ");
-  return [name, accountLabel(account)].filter(Boolean).join(" · ");
+  const title = calendarTitle(account, name);
+  if (plain) return [service ? serviceShort(service) : "", accountLabel(account), title].filter(Boolean).join(" · ");
+  return [title, accountLabel(account)].filter(Boolean).join(" · ");
 }
 
 /** A small count as a word, as the concept's sentence has it: "四条线路" (Chinese numerals 1–10,

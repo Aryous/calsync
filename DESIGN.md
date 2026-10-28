@@ -16,7 +16,8 @@ says who the UI is for and what it must do. The approved concept is
    no neon. The one signature movement is a slow comet along a healthy wire, and a wave along
    the wires when a sync runs.
 4. **A calendar is never named alone.** Wherever a calendar appears it carries its service mark
-   and its account: `[Google] 家庭日程 · personal`. The one helper that composes the words is
+   and its account, named by its email: `[Google] 生活 · alex@example.com`. An account's own
+   calendar (Google names it after the email) reads 主日历. The one helper that composes the words is
    `calendarLabel()` in `format.js`; `CalendarName` in `icons.js` adds the mark.
 5. **Every number is evidence.** A count links to what it counts where a place for it exists.
 6. **Configure, repair and write originals; never edit copies.** A change to an event goes to
@@ -127,9 +128,11 @@ it (transitions and animations at 0.01 ms).
 
 Chinese by default, English on request (`?lang=en` or the footer); the English text is the key in
 `i18n.js`, and every visible string goes through `t()`. Plain words over jargon: 线路 for a rule,
-副本 for a copy, 已送达 iCloud, "在 iPhone 上被改了，已改回" (never "有人"). An authorisation
-failure lists the usual reasons, including the Google app in "testing" status, which has to be
-renewed every 7 days.
+副本 for a copy, 已送达 + the target's own service name, "副本被改动，已改回" (never "有人", never a
+device or a person: calsync knows neither). No explanation of what is plain to see; a hint stays
+only where it prevents a mistake or names an empty or loading state. General flows never name a
+target service (calsync will sync to more than iCloud). An authorisation failure lists the usual
+reasons, including the Google app in "testing" status, which has to be renewed every 7 days.
 
 ## Accessibility
 
