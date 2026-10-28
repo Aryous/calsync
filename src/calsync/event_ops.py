@@ -133,6 +133,9 @@ def parse_fields(op: str, a: _Args, args: Mapping[str, Any], *, tz: str, insert:
     title = a.opt_text("title")
     if insert and title is None:
         raise ConfigError([f'{op}: "title" is required'])
+    repeat = args.get("repeat")
+    if repeat is not None and (not isinstance(repeat, list) or not all(isinstance(r, str) for r in repeat)):
+        raise ConfigError([f'{op}: "repeat" must be a list of lines such as "RRULE:FREQ=DAILY;COUNT=10"'])
     fields = EventFields(
         title=title,
         start=start,
@@ -141,6 +144,8 @@ def parse_fields(op: str, a: _Args, args: Mapping[str, Any], *, tz: str, insert:
         description=a.opt_text("description"),
         alarms=alarms,
         alarms_default=alarms_default,
+        key=a.opt_text("key"),
+        repeat=tuple(repeat) if repeat else None,
     )
     if problems := check_fields(fields):
         raise ConfigError([f"{op}: {p}" for p in problems])
@@ -427,7 +432,7 @@ def _calendar_for(
 async def event_create(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
     """A new event in a Google calendar. ``data.event_id``: calsync's id for it."""
     op = "event.create"
-    a = _Args(op, args, {"account", "calendar", "tz", "wait", *FIELD_ARGS})
+    a = _Args(op, args, {"account", "calendar", "tz", "wait", "repeat", "key", *FIELD_ARGS})
     config = _config_now(ctx)
     account = a.text("account")
     if account not in config.accounts or config.accounts[account].provider != "google":
@@ -676,3 +681,283 @@ async def event_delete(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> O
     record(ctx, "delete", loc.account, loc.cid, a.text("id"), target.title, {"changes": [], "scope": scope})
     result = OpResult(op, True, f"{what} in {where} was deleted in Google", data=data)
     return await follow(ctx, config, loc.rules, result, wait=a.flag("wait"))
+
+
+# ----- a batch ---------------------------------------------------------------------------------------
+
+MAX_ITEMS = 2000  # items in one events.apply call
+ITEM_ARGS = {"key", "id", "delete", "repeat", *FIELD_ARGS}
+
+
+@dataclass(slots=True)
+class _Item:
+    index: int
+    key: str | None
+    id: str | None  # calsync's event id
+    delete: bool
+    fields: EventFields
+    action: str = ""  # create | update | delete | unchanged | absent
+    source_id: str | None = None  # the Google event it writes
+    etag: str | None = None
+    status: str = "planned"  # planned | ok | failed
+    reason: str | None = None
+    changes: list[dict[str, Any]] | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"index": self.index, "action": self.action, "status": self.status}
+        if self.key is not None:
+            out["key"] = self.key
+        if self.id is not None:
+            out["id"] = self.id
+        if self.source_id is not None:
+            out["source_id"] = self.source_id
+        if self.reason is not None:
+            out["reason"] = self.reason
+        if self.changes:
+            out["changes"] = self.changes
+        return out
+
+
+def _items(op: str, raw: Any, tz: str) -> list[_Item]:
+    if not isinstance(raw, list):
+        raise ConfigError([f'{op}: "events" must be a list'])
+    if len(raw) > MAX_ITEMS:
+        raise ConfigError([f"{op}: at most {MAX_ITEMS} events in one call"])
+    items: list[_Item] = []
+    keys: set[str] = set()
+    ids: set[str] = set()
+    problems: list[str] = []
+    for index, entry in enumerate(raw):
+        where = f"{op}: events[{index}]"
+        try:
+            a = _Args(where, entry, ITEM_ARGS)
+            key, eid, delete = a.opt_text("key"), a.opt_text("id"), a.flag("delete")
+            if (key is None) == (eid is None):
+                raise ConfigError(
+                    [f'{where}: give "key" (calsync creates or updates it) or "id" (an existing event)']
+                )
+            if key is not None:
+                if key in keys:
+                    raise ConfigError([f'{where}: key "{key}" appears twice'])
+                keys.add(key)
+            if eid is not None:
+                if eid in ids:
+                    raise ConfigError([f"{where}: the same id appears twice"])
+                ids.add(eid)
+            if delete:
+                if set(entry) - {"key", "id", "delete"}:
+                    raise ConfigError([f"{where}: a delete takes only its key or id"])
+                fields = EventFields()
+            else:
+                insert = key is not None
+                fields = parse_fields(where, a, entry, tz=tz, insert=insert)
+                if key is not None:
+                    fields = EventFields(**{**_as_dict(fields), "key": key})
+            items.append(_Item(index, key, eid, delete, fields))
+        except ConfigError as exc:
+            problems.extend(exc.problems)
+    if problems:
+        raise ConfigError(problems[:20])
+    return items
+
+
+def _as_dict(fields: EventFields) -> dict[str, Any]:
+    return {name: getattr(fields, name) for name in EventFields.__dataclass_fields__}
+
+
+def _differs(want: EventFields, have: EventFields) -> list[dict[str, Any]]:
+    return [
+        c
+        for c in field_changes(have, want)
+        if c["field"] != "description" or want.description != have.description
+    ]
+
+
+async def _current(ctx: OpContext, writer: GoogleWriter, account: str, cid: str) -> dict[str, dict[str, Any]]:
+    """The calendar's live events (by Google id): the mirror plus what changed since the last
+    cycle (an incremental pull from the stored cursor; the store is left as it is)."""
+    from calsync.sources.google import GoogleSource
+
+    state, mirrors = ctx.store.load_source(account)
+    events = dict(mirrors.get(cid, {}))
+    source = GoogleSource(writer.client, writer.token, base_url=writer.base_url)
+    pulled = await source.pull([cid], state)
+    if cid in pulled.errors:
+        raise pulled.errors[cid]
+    pull = pulled.calendars[cid]
+    if pull.full:
+        events = {}
+    for raw in pull.upserts:
+        events[raw["id"]] = raw
+    for gone in pull.deletes:
+        events.pop(gone, None)
+    return {k: v for k, v in events.items() if v.get("status") != "cancelled"}
+
+
+def _plan(
+    items: list[_Item], live: Mapping[str, dict[str, Any]], prune: str | None, account: str, cid: str, tz: str
+) -> list[_Item]:
+    """Each item's action against ``live``; with ``prune``, deletes for the keyed events not named."""
+    from calsync.sources.google_write import event_key
+
+    by_key = {k: raw for raw in live.values() if (k := event_key(raw))}
+    for item in items:
+        if item.key is not None:
+            raw = by_key.get(item.key)
+        else:
+            raw = _by_calsync_id(item, live, account, cid)
+            if raw is None:
+                item.action, item.status, item.reason = (
+                    ("delete" if item.delete else "update"),
+                    "failed",
+                    "no such event",
+                )
+                continue
+        if item.delete:
+            if raw is None:
+                item.action = "absent"
+                item.status = "ok"
+                continue
+            item.action, item.source_id, item.etag = "delete", raw["id"], raw.get("etag")
+            continue
+        if raw is None:
+            item.action = "create"
+            continue
+        item.source_id, item.etag = raw["id"], raw.get("etag")
+        item.changes = _differs(item.fields, from_resource(raw, tz))
+        item.action = "update" if item.changes else "unchanged"
+        if not item.changes:
+            item.status = "ok"
+    if prune is not None:
+        named = {i.key for i in items if i.key is not None}
+        for key, raw in sorted(by_key.items()):
+            if key.startswith(prune) and key not in named:
+                extra = _Item(
+                    len(items), key, None, True, EventFields(), "delete", raw["id"], raw.get("etag")
+                )
+                items.append(extra)
+    return items
+
+
+def _by_calsync_id(
+    item: _Item, live: Mapping[str, dict[str, Any]], account: str, cid: str
+) -> dict[str, Any] | None:
+    """The live event (a single event or a whole series) a calsync id names in this calendar."""
+    import base64
+
+    assert item.id is not None
+    try:
+        text = base64.urlsafe_b64decode(item.id + "=" * (-len(item.id) % 4)).decode()
+    except (ValueError, UnicodeDecodeError):
+        return None
+    prefix = f"{account}/{cid}/"
+    if not text.startswith(prefix):
+        return None
+    rest = text[len(prefix) :]
+    if rest in live:
+        return live[rest]
+    series = rest.split("@", 1)[0]
+    raw = live.get(series)
+    return raw if raw is not None and raw.get("recurrence") else None
+
+
+async def events_apply(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
+    """Many writes to one calendar in batches: each item creates or updates the event with its
+    ``key``, or changes or deletes an existing event by ``id``; ``delete: true`` deletes;
+    ``prune_prefix`` deletes the keyed events whose key starts with it and that the list does not
+    name. Re-running the same list does only what is left. Never pre-approves copy deletes."""
+    from calsync.sources.google_write import BatchCall
+
+    op = "events.apply"
+    a = _Args(op, args, {"account", "calendar", "events", "prune_prefix", "tz", "wait"})
+    config = _config_now(ctx)
+    account = a.text("account")
+    if account not in config.accounts or config.accounts[account].provider != "google":
+        raise ConfigError([f'"{account}" is not a configured Google account'])
+    cid, role, zone = _calendar_for(ctx, config, account, a.text("calendar"))
+    if role in READ_ONLY_ROLES:
+        raise ConfigError(["this calendar is read-only for the account: calsync cannot change its events"])
+    tz = a.opt_text("tz") or zone or "UTC"
+    items = _items(op, a.raw("events"), tz)
+    prune = a.opt_text("prune_prefix")
+    if prune is not None and not prune:
+        raise ConfigError([f'{op}: "prune_prefix" must not be empty'])
+
+    async def work(writer: GoogleWriter) -> list[_Item]:
+        live = await _current(ctx, writer, account, cid)
+        planned = _plan(items, live, prune, account, cid, tz)
+        todo = [i for i in planned if i.status == "planned"]
+        if dry_run or not todo:
+            return planned
+        calls: list[BatchCall] = []
+        for item in todo:
+            if item.action == "create":
+                calls.append(BatchCall("POST", cid, body=to_resource(item.fields, patch=False)))
+            elif item.action == "update":
+                assert item.source_id is not None
+                calls.append(
+                    BatchCall(
+                        "PATCH", cid, item.source_id, to_resource(item.fields, patch=True), etag=item.etag
+                    )
+                )
+            else:
+                assert item.source_id is not None
+                calls.append(BatchCall("DELETE", cid, item.source_id, etag=item.etag))
+        replies = await writer.batch(calls)
+        if replies and all(
+            r.status == 403 and r.reason() in ("insufficientPermissions", "ACCESS_TOKEN_SCOPE_INSUFFICIENT")
+            for r in replies
+        ):
+            raise NoWriteAccess("no write access")
+        for item, reply in zip(todo, replies, strict=True):
+            if reply.ok or (item.action == "delete" and reply.gone):
+                item.status = "ok"
+                if item.action == "create":
+                    item.source_id = reply.body.get("id")
+            else:
+                item.status, item.reason = "failed", reply.reason()
+        return planned
+
+    batches = 1 + len(items) // 50
+    try:
+        done = await with_writer(ctx, config, account, work, limit=WRITE_TIMEOUT * (1 + batches))
+    except NoWriteAccess:
+        return no_write_access(op, account)
+    counts = {k: 0 for k in ("create", "update", "delete", "unchanged", "absent", "failed")}
+    for item in done:
+        counts["failed" if item.status == "failed" else item.action] += 1
+    data: dict[str, Any] = {
+        "account": account,
+        "calendar": cid,
+        "counts": counts,
+        "items": [i.to_json() for i in done],
+        "rules": syncing_rules(ctx, config, account, cid),
+    }
+    writes = counts["create"] + counts["update"] + counts["delete"]
+    where = f'a calendar of account "{account}"'
+    if dry_run:
+        summary = f"{DRY_RUN}{_counts_text(counts)} in {where}"
+        return OpResult(op, False, summary, data={**data, "would_change": writes > 0})
+    wrote = any(i.status == "ok" and i.action in ("create", "update", "delete") for i in done)
+    if wrote or counts["failed"]:
+        status = "failed" if not wrote else ("partial" if counts["failed"] else "ok")
+        record(ctx, "apply", account, cid, None, None, {"counts": counts}, status)
+    result = OpResult(op, wrote, f"{_counts_text(counts)} in {where}", data=data)
+    if not wrote:
+        return result
+    return await follow(ctx, config, data["rules"], result, wait=a.flag("wait"))
+
+
+def _counts_text(counts: Mapping[str, int]) -> str:
+    parts = [
+        f"{counts[k]} {word}"
+        for k, word in (
+            ("create", "created"),
+            ("update", "updated"),
+            ("delete", "deleted"),
+            ("unchanged", "unchanged"),
+            ("failed", "failed"),
+        )
+        if counts[k]
+    ]
+    return ", ".join(parts) or "nothing to do"

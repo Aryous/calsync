@@ -62,6 +62,7 @@ class EventFields:
     alarms: tuple[int, ...] | None = None
     alarms_default: bool = False
     key: str | None = None
+    repeat: tuple[str, ...] | None = None  # RRULE / EXDATE / RDATE lines (a new series)
 
 
 def _when_json(when: When) -> dict[str, Any]:
@@ -89,6 +90,12 @@ def check_fields(fields: EventFields) -> list[str]:
             problems.append("alarms: at most 5")
     if fields.title is not None and len(fields.title) > 1024:
         problems.append("title: at most 1024 characters")
+    if fields.repeat is not None:
+        bad_lines = [r for r in fields.repeat if not re.match(r"^(RRULE|EXRULE|RDATE|EXDATE)[:;]", r)]
+        if bad_lines:
+            problems.append("repeat: lines such as RRULE:FREQ=DAILY;COUNT=10")
+    if fields.key is not None and not 0 < len(fields.key) <= 200:
+        problems.append("key: 1 to 200 characters")
     return problems
 
 
@@ -115,6 +122,8 @@ def to_resource(fields: EventFields, *, patch: bool) -> dict[str, Any]:
         body["reminders"] = {"useDefault": False, "overrides": overrides}
     if fields.key is not None:
         body["extendedProperties"] = {"private": {KEY_PROPERTY: fields.key}}
+    if fields.repeat is not None:
+        body["recurrence"] = list(fields.repeat)
     return body
 
 
@@ -146,11 +155,19 @@ def from_resource(raw: Mapping[str, Any], default_tz: str) -> EventFields:
         alarms=alarms,
         alarms_default=use_default,
         key=event_key(raw),
+        repeat=tuple(raw.get("recurrence") or ()) or None,
     )
 
 
 def _when_text(when: When | None) -> str | None:
     return None if when is None else when.value.isoformat()
+
+
+def _same(a: When | None, b: When | None) -> bool:
+    """The same moment (a time in another zone is the same moment)."""
+    if a is None or b is None:
+        return a is b
+    return a.all_day == b.all_day and a.utc() == b.utc()
 
 
 def _alarms_text(fields: EventFields) -> str:
@@ -165,7 +182,7 @@ def field_changes(before: EventFields, after: EventFields) -> list[dict[str, Any
     changes: list[dict[str, Any]] = []
     if after.title is not None and after.title != before.title:
         changes.append({"field": "title", "before": before.title, "after": after.title})
-    if after.start is not None and (after.start != before.start or after.end != before.end):
+    if after.start is not None and not (_same(after.start, before.start) and _same(after.end, before.end)):
         changes.append(
             {
                 "field": "time",
@@ -177,6 +194,8 @@ def field_changes(before: EventFields, after: EventFields) -> list[dict[str, Any
         changes.append({"field": "location", "before": before.location, "after": after.location})
     if after.description is not None and after.description != before.description:
         changes.append({"field": "description", "before": None, "after": None})  # text not kept
+    if after.repeat is not None and tuple(after.repeat) != tuple(before.repeat or ()):
+        changes.append({"field": "repeat", "before": list(before.repeat or ()), "after": list(after.repeat)})
     alarms_set = after.alarms_default or after.alarms is not None
     if alarms_set and _alarms_text(after) != _alarms_text(before):
         changes.append({"field": "alarms", "before": _alarms_text(before), "after": _alarms_text(after)})
@@ -293,6 +312,18 @@ class GoogleWriter:
     @property
     def scopes(self) -> frozenset[str] | None:
         return getattr(self._token, "scopes", None)
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        return self._client
+
+    @property
+    def token(self) -> TokenProvider:
+        return self._token
+
+    @property
+    def base_url(self) -> str:
+        return self._base
 
     def _path(self, calendar_id: str, event_id: str | None = None, tail: str = "") -> str:
         path = f"/calendars/{quote(calendar_id, safe='')}/events"

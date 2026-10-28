@@ -556,7 +556,7 @@ async def test_state_from_different_params_forces_a_full_pull() -> None:
 
 def test_events_carry_what_writes_need() -> None:
     fields = google_mod.EVENTS_LIST_PARAMS["fields"]
-    for name in ("created", "organizer(self)", "extendedProperties(private)"):
+    for name in ("etag", "created", "organizer(self)", "extendedProperties(private)"):
         assert name in fields
 
 

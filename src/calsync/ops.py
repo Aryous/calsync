@@ -1470,6 +1470,7 @@ ASYNC_OPS: dict[str, AsyncOp] = {
     "event.create": _event_op("event_create"),
     "event.edit": _event_op("event_edit"),
     "event.delete": _event_op("event_delete"),
+    "events.apply": _event_op("events_apply"),
     "calendars.refresh": _calendars_refresh,
     "rule.preview": _rule_preview,
     "trigger": _trigger,

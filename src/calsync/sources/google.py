@@ -45,9 +45,9 @@ EVENT_FIELDS = (
     "id,status,updated,summary,description,location,start,end,"
     "originalStartTime,recurringEventId,recurrence,reminders,transparency,"
     "attendees(email,displayName,resource),hangoutLink,conferenceData(entryPoints(entryPointType,uri)),"
-    # For writes (phase C): who organises it (only the organiser may change it), when it was
-    # created (the oldest of duplicates), and an agent's key for the event.
-    "created,organizer(self),extendedProperties(private)"
+    # For writes (phase C): its etag (conditional writes), who organises it (only the organiser
+    # may change it), when it was created, and an agent's key for the event.
+    "etag,created,organizer(self),extendedProperties(private)"
 )
 # Identical for the initial full sync and every incremental call, as Google
 # requires. ``fields`` MUST keep nextSyncToken/nextPageToken or incremental
