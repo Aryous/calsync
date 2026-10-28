@@ -20,6 +20,9 @@
   --blue-bg: #E9EDF9; --blue-fg: #3D4E8E; --blue-dot: #8496D4;
   --sage-bg: #E5F1EA; --sage-fg: #2E6A4E; --sage-dot: #7DB297;
   --violet-bg: #EFEBF8; --violet-fg: #5A4A8A; --violet-dot: #A496D3;
+  /* source calendar dots (map.js PALETTE): ≥ 3:1 on the pill, light and dark */
+  --dot-sage: #589C78; --dot-teal: #5399A1; --dot-clay: #BB8168; --dot-blue: #7D8CC7;
+  --dot-violet: #9785C3; --dot-rose: #B97C9B; --dot-olive: #879550; --dot-steel: #7791A8;
   --shadow-1: 0 1px 2px rgba(31,41,55,.05);
   --shadow-2: 0 18px 48px -18px rgba(31,41,55,.22), 0 2px 6px rgba(31,41,55,.05);
   --hourH: 48px;
@@ -40,6 +43,8 @@
     --blue-bg: #1E2438; --blue-fg: #B6C1EC; --blue-dot: #8496D4;
     --sage-bg: #18291F; --sage-fg: #A6D5BC; --sage-dot: #6FA88B;
     --violet-bg: #251F36; --violet-fg: #CBC0EE; --violet-dot: #9C8ECB;
+    --dot-sage: #53A87A; --dot-teal: #4EA4AD; --dot-clay: #C7896E; --dot-blue: #8595D2;
+    --dot-violet: #A18DCE; --dot-rose: #C584A5; --dot-olive: #8E9F4B; --dot-steel: #7C9BB6;
     --shadow-1: 0 1px 2px rgba(0,0,0,.3);
     --shadow-2: 0 24px 60px -20px rgba(0,0,0,.6), 0 2px 6px rgba(0,0,0,.3);
     color-scheme: dark;
@@ -55,6 +60,8 @@
   --blue-bg: #1E2438; --blue-fg: #B6C1EC; --blue-dot: #8496D4;
   --sage-bg: #18291F; --sage-fg: #A6D5BC; --sage-dot: #6FA88B;
   --violet-bg: #251F36; --violet-fg: #CBC0EE; --violet-dot: #9C8ECB;
+  --dot-sage: #53A87A; --dot-teal: #4EA4AD; --dot-clay: #C7896E; --dot-blue: #8595D2;
+  --dot-violet: #A18DCE; --dot-rose: #C584A5; --dot-olive: #8E9F4B; --dot-steel: #7C9BB6;
   --shadow-1: 0 1px 2px rgba(0,0,0,.3);
   --shadow-2: 0 24px 60px -20px rgba(0,0,0,.6), 0 2px 6px rgba(0,0,0,.3);
   color-scheme: dark;
@@ -163,9 +170,14 @@ svg.svc.xs { width: 15px; height: 15px; }
 .cal.dim { opacity: .45; }
 .cal.missing { border-style: dashed; border-color: var(--wait); }
 .cal.missing em { color: var(--wait); }
-.dot.blue { background: var(--blue-dot); }
-.dot.sage { background: var(--sage-dot); }
-.dot.violet { background: var(--violet-dot); }
+.dot.sage { background: var(--dot-sage); }
+.dot.teal { background: var(--dot-teal); }
+.dot.clay { background: var(--dot-clay); }
+.dot.blue { background: var(--dot-blue); }
+.dot.violet { background: var(--dot-violet); }
+.dot.rose { background: var(--dot-rose); }
+.dot.olive { background: var(--dot-olive); }
+.dot.steel { background: var(--dot-steel); }
 .dot.none { background: transparent; border: 1px solid var(--slate); }
 .add-acct {
   display: inline-flex; align-items: center; gap: 6px; align-self: flex-start; min-height: 32px;

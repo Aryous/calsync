@@ -20,7 +20,9 @@ import { t } from "/static/i18n.js";
 import { accountLabel, calendarLabel, serviceOf } from "/static/format.js";
 import { Icon, Service } from "/static/icons.js";
 
-const COLOURS = ["blue", "sage", "violet"];
+/** The source calendars' colours (classes ``dot <name>``, tokens ``--dot-<name>``): eight quiet
+ * hues, each at least 3:1 against the pill in both themes. */
+export const PALETTE = ["sage", "teal", "clay", "blue", "violet", "rose", "olive", "steel"];
 
 // ----- the model: what the status says, arranged as the map draws it ----------------------------
 
@@ -107,13 +109,17 @@ export function mapModel(status) {
         if (!pill) {
           let group = groups[side].find((g) => g.name === spec.account);
           if (!group) {
-            // An account the status does not list: drawn anyway, marked, never dropped.
+            // An account the status does not list: drawn anyway, its header marked, never dropped.
             group = { name: spec.account, service: side === "src" ? "google" : "caldav", side, auth: "unknown", pills: [], missing: true };
             groups[side].push(group);
           }
+          // Marked missing only when the account's calendar list is known (non-empty) and lacks
+          // it: an empty list means unknown (listing failed or has not run), not gone.
+          const listed = (status.accounts || []).find((a) => a.name === spec.account);
+          const known = Boolean(listed && (listed.calendars || []).length);
           pill = {
             key, account: spec.account, id: spec.calendar, name: spec.calendar_name || spec.calendar, service: group.service,
-            side, series: null, rules: [], colour: "none", missing: true,
+            side, series: null, rules: [], colour: "none", missing: known,
           };
           pills.set(key, pill);
           group.pills.push(pill);
@@ -124,83 +130,30 @@ export function mapModel(status) {
     }
     return { name: rule.name, health: rule.health, state: wireState(rule.health), from: ends.source, to: ends.target };
   });
-  assignColours(groups.src.flatMap((g) => g.pills).filter((p) => p.rules.length));
+  for (const pill of pills.values()) {
+    if (pill.side === "src" && pill.rules.length) pill.colour = colourOf(pill.key);
+  }
   return { sources: groups.src, targets: groups.tgt, rules: lines, pills };
 }
 
-/** A key's preferred palette slot (FNV-1a), the same in every browser and on every load. */
-function slotOf(key) {
+/** A source calendar's colour: a pure function of its key (``<account>/<calendar id>``), the
+ * same on every device and whatever the other lines are. FNV-1a over the key's code points, then
+ * murmur3's finaliser (FNV's low bits mix poorly for a small modulus), mod the palette. Two
+ * calendars may share a colour: the name is always shown beside the dot. */
+export function colourOf(key) {
   let h = 0x811c9dc5;
   for (const ch of key) {
-    h ^= ch.codePointAt(0);
-    h = Math.imul(h, 0x01000193) >>> 0;
+    h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0;
   }
-  return h % COLOURS.length;
+  h = Math.imul(h ^ (h >>> 16), 0x85ebca6b) >>> 0;
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xc2b2ae35) >>> 0;
+  h = (h ^ (h >>> 16)) >>> 0; // unsigned: "^" alone gives a signed 32-bit number
+  return PALETTE[h % PALETTE.length];
 }
 
-/** Colours for the synced source calendars. A calendar's first colour is its key's preferred
- * slot, unless that colour is already used more than another (then the next least-used one),
- * taking calendars in sorted key order: the same in every browser for the same lines. Once given,
- * a colour is remembered (this browser's storage, "calsync.colours") and kept while the calendar
- * syncs, so adding or removing lines never recolours the calendars that stay: with three colours
- * a purely computed choice could not promise that. */
-const COLOUR_STORE = "calsync.colours";
-const COLOUR_MEMORY = 64; // calendars remembered
-
-function readColours() {
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(COLOUR_STORE) || "{}");
-    return stored && typeof stored === "object" && !Array.isArray(stored) ? stored : {};
-  } catch (e) {
-    return {};
-  }
-}
-
-function writeColours(memory) {
-  try {
-    const keys = Object.keys(memory);
-    for (const key of keys.slice(0, Math.max(0, keys.length - COLOUR_MEMORY))) delete memory[key];
-    window.localStorage.setItem(COLOUR_STORE, JSON.stringify(memory));
-  } catch (e) {
-    // no storage (a private window): the computed colours still apply
-  }
-}
-
-function assignColours(pills) {
-  const memory = readColours();
-  const used = COLOURS.map(() => 0);
-  const sorted = [...pills].sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-  const fresh = [];
-  for (const pill of sorted) {
-    const slot = COLOURS.indexOf(memory[pill.key]);
-    if (slot < 0) {
-      fresh.push(pill);
-      continue;
-    }
-    used[slot] += 1;
-    pill.colour = COLOURS[slot];
-  }
-  for (const pill of fresh) {
-    const want = slotOf(pill.key);
-    const least = Math.min(...used);
-    let slot = want;
-    for (let i = 0; i < COLOURS.length; i++) {
-      const s = (want + i) % COLOURS.length;
-      if (used[s] === least) {
-        slot = s;
-        break;
-      }
-    }
-    used[slot] += 1;
-    pill.colour = COLOURS[slot];
-    delete memory[pill.key]; // re-inserted last: the newest are kept
-    memory[pill.key] = pill.colour;
-  }
-  if (fresh.length) writeColours(memory);
-}
-
-/** The colour of each source calendar (by pill key), as the map paints its dot: the calendar
- * view colours its events the same way. */
+/** The colour of each synced source calendar (by pill key), as the map paints its dot: the
+ * calendar view colours its events the same way. Pure: reads ``status`` only. */
 export function sourceColours(status) {
   const colours = new Map();
   for (const pill of mapModel(status).pills.values()) {

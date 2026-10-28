@@ -20,9 +20,26 @@ from tests.browser.conftest import (
     sync_button,
     watch_of,
 )
-from tests.browser.live import CONFIG_WITHOUT_LINES, LiveDaemon, live_daemon
+from tests.browser.live import CONFIG_WITHOUT_LINES, FAMILY, SCHOOL, WORK, LiveDaemon, live_daemon
 
 pytestmark = pytest.mark.browser
+
+PALETTE = ["sage", "teal", "clay", "blue", "violet", "rose", "olive", "steel"]  # map.js PALETTE
+FAMILY_KEY, SCHOOL_KEY, WORK_KEY = f"personal/{FAMILY}", f"personal/{SCHOOL}", f"work/{WORK}"
+
+
+def colour_of(key: str) -> str:
+    """map.js colourOf, here: FNV-1a over the code points, murmur3's finaliser, mod the palette."""
+    h = 0x811C9DC5
+    for ch in key:
+        h = ((h ^ ord(ch)) * 0x01000193) & 0xFFFFFFFF
+    h ^= h >> 16
+    h = (h * 0x85EBCA6B) & 0xFFFFFFFF
+    h ^= h >> 13
+    h = (h * 0xC2B2AE35) & 0xFFFFFFFF
+    h ^= h >> 16
+    return PALETTE[h % len(PALETTE)]
+
 
 BOTH = pytest.mark.parametrize("viewport", [PHONE, DESKTOP], ids=VIEWPORT_IDS)
 OPEN = re.compile(r"\bopen\b")
@@ -152,9 +169,12 @@ def test_the_map_shows_every_account_calendar_and_line(
         expect(page.get_by_role("link", name="连接 iCloud 账号")).to_be_visible()
     # Source pills are coloured by calendar; the unused one has no colour.
     dots = source.locator(".cal .dot").evaluate_all("els => els.map(e => e.getAttribute('class'))")
-    # (the three synced ones distinct: three calendars, three colours).
-    assert dots[2] == "dot none"
-    assert sorted(dots[:2] + dots[3:]) == ["dot blue", "dot sage", "dot violet"]
+    # (each a pure function of its key; the seed's three happen not to share one).
+    assert dots == [f"dot {colour_of(k)}" for k in (FAMILY_KEY, SCHOOL_KEY)] + [
+        "dot none",
+        f"dot {colour_of(WORK_KEY)}",
+    ]
+    assert dots == ["dot blue", "dot sage", "dot none", "dot violet"]
     # Each pill opens its calendar; each header its account (ids with # and / are encoded).
     expect(source.locator(".cal", has_text="中国节假日")).to_have_attribute(
         "href", "#/calendar/personal/zh.china%23holiday%40group.v.calendar.google.com"
@@ -683,31 +703,57 @@ def edited_status(page: Page, edit: Any) -> None:
     refresh_status(page)
 
 
-def test_a_line_whose_account_or_calendar_is_missing_is_still_drawn(paired_page: Page) -> None:
-    """The status lacks the work account and 家庭 is not in family-icloud's calendar list: their
-    lines still have pills (marked) and wires."""
+def test_a_line_whose_account_is_missing_is_still_drawn(paired_page: Page) -> None:
+    """The status lacks the work account: its header says so, its line keeps a pill and a wire."""
     page = paired_page
     ready(page)
-
-    def edit(status: dict[str, Any]) -> dict[str, Any]:
-        status["accounts"] = [a for a in status["accounts"] if a["name"] != "work"]
-        for account in status["accounts"]:
-            if account["name"] == "family-icloud":
-                account["calendars"] = []
-        return status
-
-    edited_status(page, edit)
+    edited_status(
+        page, lambda status: {**status, "accounts": [a for a in status["accounts"] if a["name"] != "work"]}
+    )
     work = page.locator(".canvas .col.src .acct").filter(has=page.locator(".an", has_text="work"))
     expect(work.locator(".acct-h small")).to_have_text("不在账号列表里")
-    for key in ("work/工作", "family-icloud/家庭"):
-        assert "missing" in (classes(page, ".canvas .cal", "data-cal", key) or "").split(), key
     page.wait_for_function("() => document.querySelectorAll('.canvas .hit:not(.in)').length === 4")
     geo = geometry(page)
     assert geo["routes"]["work-mine"]["from"] == "work/工作"
-    assert {geo["routes"][r]["to"] for r in ("family-home", "school-home")} == {"family-icloud/家庭"}
     pill = geo["pills"]["work/工作"]
     start = geo["routes"]["work-mine"]["ends"][0]
     assert near(start, pill["right"], pill["top"] + pill["height"] / 2)
+
+
+def with_calendars(account: str, calendars: list[dict[str, Any]]) -> Any:
+    def edit(status: dict[str, Any]) -> dict[str, Any]:
+        for a in status["accounts"]:
+            if a["name"] == account:
+                a["calendars"] = calendars
+        return status
+
+    return edit
+
+
+OTHER = {"id": "/dav/home/提醒/", "name": "提醒", "role": None, "series": None, "rules": [], "synced": False}
+
+
+@pytest.mark.parametrize(
+    "calendars,missing",
+    [([], False), ([OTHER], True)],
+    ids=["list-unknown", "list-without-it"],
+)
+def test_a_calendar_is_missing_only_when_the_list_is_known(
+    paired_page: Page, calendars: list[dict[str, Any]], missing: bool
+) -> None:
+    """家庭 is not in family-icloud's cached list. An empty list means the list is unknown (listing
+    failed, or has not run): no alarm. A list that has other calendars and not 家庭: missing. Either
+    way the pill and both wires are there."""
+    page = paired_page
+    ready(page)
+    edited_status(page, with_calendars("family-icloud", calendars))
+    page.wait_for_function(
+        """() => [...document.querySelectorAll(".canvas .cal")].some((c) => c.dataset.cal === "family-icloud/家庭")"""
+    )
+    cls = (classes(page, ".canvas .cal", "data-cal", "family-icloud/家庭") or "").split()
+    assert ("missing" in cls) is missing, cls
+    geo = geometry(page)
+    assert {geo["routes"][r]["to"] for r in ("family-home", "school-home")} == {"family-icloud/家庭"}
 
 
 def source_colours(page: Page) -> dict[str, str]:
@@ -807,3 +853,91 @@ def test_a_focused_wire_has_a_visible_ring(open_page: OpenPage, theme: str) -> N
     )
     hi, lo = sorted((luminance(painted), luminance(ring["bg"])), reverse=True)
     assert (hi + 0.05) / (lo + 0.05) >= 3, (ring, painted)
+
+
+def test_colours_are_a_pure_function_of_the_calendar(open_page: OpenPage, live: LiveDaemon) -> None:
+    """sourceColours() reads the status only (no storage), and every page, fresh or not, computes
+    the colour colourOf(key) gives, which is the key's hash: nothing else."""
+    page = open_page()
+    ready(page)
+    got = page.evaluate(
+        """async () => {
+          const { sourceColours, colourOf, PALETTE } = await import("/static/map.js");
+          const writes = [];
+          const set = Storage.prototype.setItem;
+          Storage.prototype.setItem = function (key, value) { writes.push(key); return set.call(this, key, value); };
+          try {
+            const status = await (await fetch("/api/status")).json();
+            const colours = Object.fromEntries(sourceColours(status));
+            const again = Object.fromEntries(sourceColours(status));
+            return { colours, again, writes, palette: PALETTE, stored: Object.keys(localStorage),
+                     probe: ["a/b", "work/x", "家/庭"].map(colourOf) };
+          } finally {
+            Storage.prototype.setItem = set;
+          }
+        }"""
+    )
+    assert got["writes"] == [] and not any(k.startswith("calsync.colours") for k in got["stored"]), got
+    assert got["palette"] == PALETTE
+    assert got["colours"] == got["again"]
+    synced = {k: v for k, v in got["colours"].items() if v != "none"}
+    assert synced == {k: colour_of(k) for k in (FAMILY_KEY, SCHOOL_KEY, WORK_KEY)}
+    assert got["probe"] == [colour_of(k) for k in ("a/b", "work/x", "家/庭")]
+    fresh = open_page(path="/?theme=dark")  # another context: nothing shared
+    ready(fresh)
+    assert source_colours(fresh) == source_colours(page)
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_every_palette_dot_stands_out_from_its_pill(open_page: OpenPage, theme: str) -> None:
+    """Each of the eight dot colours has at least 3:1 against the pill (WCAG non-text contrast)."""
+    page = open_page(color_scheme=theme)
+    ready(page)
+    pairs = page.evaluate(
+        """(palette) => {
+          const pill = document.querySelector(".canvas .col.src .cal:not(.idle)");
+          const dot = pill.querySelector(".dot");
+          const before = dot.getAttribute("class");
+          const out = palette.map((name) => {
+            dot.setAttribute("class", `dot ${name}`);
+            return [name, getComputedStyle(dot).backgroundColor, getComputedStyle(pill).backgroundColor];
+          });
+          dot.setAttribute("class", before);
+          return out;
+        }""",
+        PALETTE,
+    )
+    for name, dot, pill in pairs:
+        hi, lo = sorted((luminance(dot), luminance(pill)), reverse=True)
+        assert (hi + 0.05) / (lo + 0.05) >= 3, (theme, name, dot, pill)
+    assert len({dot for _, dot, _ in pairs}) == len(PALETTE)  # eight distinct colours
+
+
+@pytest.mark.parametrize(
+    "keep,hint",
+    [
+        ("caldav", "从这里开始：连接 Google 账号 · 新建一条线路"),
+        ("google", "从这里开始：连接 iCloud 账号 · 新建一条线路"),
+        ("none", "从这里开始：连接 Google 账号 · 连接 iCloud 账号 · 新建一条线路"),
+    ],
+)
+def test_with_no_line_the_hint_starts_with_what_is_missing(
+    open_page: OpenPage, session_seal: None, keep: str, hint: str
+) -> None:
+    with live_daemon(config=CONFIG_WITHOUT_LINES, stage=False) as empty:
+        page = open_page(daemon=empty)
+        expect(page.locator(".result h1")).to_have_text("还没有线路")
+
+        def edit(status: dict[str, Any]) -> dict[str, Any]:
+            status["accounts"] = [a for a in status["accounts"] if keep != "none" and a["provider"] == keep]
+            return status
+
+        edited_status(page, edit)
+        expect(page.locator(".result .detail")).to_have_text(hint)
+        links = page.locator(".result .detail a").evaluate_all("els => els.map(e => e.getAttribute('href'))")
+        expected = {
+            "caldav": ["#/connect/google"],
+            "google": ["#/connect/icloud"],
+            "none": ["#/connect/google", "#/connect/icloud"],
+        }
+        assert links == [*expected[keep], "#/new"]
