@@ -250,7 +250,7 @@ function Alarms({ value, onChange }) {
   </div>`;
 }
 
-function Fields({ value, onChange, disabled }) {
+function Fields({ value, onChange, disabled, longBefore = false }) {
   const set = (key) => (e) => onChange({ ...value, [key]: e.currentTarget.value });
   // A new first day moves the last day with it: the event keeps its length.
   const setDate = (e) => {
@@ -259,7 +259,9 @@ function Fields({ value, onChange, disabled }) {
     onChange({ ...value, date, endDate });
   };
   const when = times(value);
-  const multiDay = Boolean(value.endDate && value.date && value.endDate > value.date);
+  // Shown while the event spans days, and for an event that did when it was read (so the field
+  // does not vanish while its last day is being typed).
+  const multiDay = longBefore || Boolean(value.endDate && value.date && value.endDate > value.date);
   return html`<fieldset class="ef-set" disabled=${disabled}>
     <div class="fs" data-key="title">
       <${Field} id="ev-title" label=${t("Title")}>
@@ -421,7 +423,8 @@ export function EditForm({ route, onClose, onReplace, active = true }) {
           onPick=${(key) => setCalendar(key)}/>` : null}
       ${recurring ? html`<div class="fs" data-key="scope"><span class="lb" id="scope-lb">${t("This is a repeating event")}</span>
           <${ScopeChoice} value=${scope} onPick=${setScope}/></div>` : null}
-      <${Fields} value=${value} onChange=${setValue} disabled=${busy}/>
+      <${Fields} value=${value} onChange=${setValue} disabled=${busy}
+          longBefore=${Boolean(before && !before.allDay && before.endDate > before.date)}/>
       ${writeAccess === false ? html`<div class="note warn" data-role="write-access">
           <p>${t("calsync may not change Google events for this account yet. Allow it once, in a terminal on the computer calsync runs on:")}</p>
           <${Command} command=${`calsync auth ${account} --write`}/></div>` : null}

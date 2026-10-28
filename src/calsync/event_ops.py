@@ -993,6 +993,8 @@ async def events_apply(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> O
                 item.status = "ok"
             else:
                 item.status, item.reason = "failed", reply.reason()
+                if item.action == "create":
+                    item.source_id = None  # nothing was made
         return planned
 
     batches = 1 + len(items) // 50

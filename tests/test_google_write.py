@@ -366,3 +366,26 @@ async def test_a_batch_insert_whose_id_exists_counts_as_made() -> None:
     first = await w.batch([BatchCall("POST", CAL, body=body)])
     again = await w.batch([BatchCall("POST", CAL, body=body)])
     assert first[0].ok and again[0].exists
+
+
+async def test_an_id_of_a_deleted_event_is_refused_not_reported_as_made() -> None:
+    fake = seeded()
+    w = writer(fake)
+    body = {
+        "id": "abcdef99999",
+        "summary": "x",
+        "start": {"date": "2026-11-01"},
+        "end": {"date": "2026-11-02"},
+    }
+    await w.insert(CAL, body)
+    await w.delete(CAL, "abcdef99999", etag=None)
+    fake_get = fake.handler
+
+    def handler(request: httpx.Request) -> httpx.Response:  # Google reads a deleted event back as cancelled
+        if request.method == "GET" and request.url.path.endswith("/abcdef99999"):
+            return httpx.Response(200, json=fake.event(CAL, "abcdef99999"))
+        return fake_get(request)
+
+    client = make_client(RequestLog(), transport=httpx.MockTransport(handler))
+    with pytest.raises(WriteConflict):
+        await GoogleWriter(client, StaticToken("t"), base_url=BASE_URL).insert(CAL, body)

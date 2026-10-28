@@ -401,7 +401,10 @@ class GoogleWriter:
             "POST", path, "google-event-insert", params={"sendUpdates": "none"}, json=body
         )
         if response.status_code == 409:  # made by an earlier attempt of this very insert
-            return await self.get(calendar_id, body["id"])
+            made = await self.get(calendar_id, body["id"])
+            if made.get("status") == "cancelled":  # Google keeps a deleted event's id reserved
+                raise WriteConflict(f"{path}: this event id was used by an event deleted since")
+            return made
         _check(response, path)
         return _json(response, path)
 
