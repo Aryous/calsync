@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from calsync import service
-from calsync.cli import EXIT_CONFIG, EXIT_FAILED, EXIT_OK, main
+from calsync.cli import EXIT_CONFIG, EXIT_FAILED, EXIT_OK, EXIT_RUNNING, main
 from calsync.service import LABEL, LaunchctlError, Paths
 
 UID = 7331
@@ -110,13 +110,18 @@ PRINT_OTHER = """gui/501/com.example.calsync = {
 
 
 class FakeLaunchctl:
-    """Records every call; ``loaded`` maps a ``domain/label`` to its ``print`` text."""
+    """Records every call; ``loaded`` maps a ``domain/label`` to its ``print`` text. After a
+    ``bootout`` the job stays listed for ``stopping_polls`` more ``print`` calls (``None``: it never
+    goes away), as launchd keeps it while the daemon finishes its cycle."""
 
     def __init__(self, loaded: dict[str, str] | None = None, listed: list[str] | None = None) -> None:
         self.loaded = dict(loaded or {})
         self.listed = list(listed or [])
         self.calls: list[tuple[str, ...]] = []
-        self.fail_bootstrap = False
+        self.fail_bootstrap: str | None = None
+        self.fail_list = False
+        self.stopping_polls: int | None = 0
+        self._stopping: dict[str, int | None] = {}
 
     # `list` comes last: below it, the name means the method, not the type.
     def writes(self) -> list[tuple[str, ...]]:
@@ -124,55 +129,94 @@ class FakeLaunchctl:
 
     def bootstrap(self, domain: str, plist: Path) -> None:
         self.calls.append(("bootstrap", domain, str(plist)))
-        if self.fail_bootstrap:
-            raise LaunchctlError(
-                "launchctl bootstrap failed (exit 5): Bootstrap failed: 5: Input/output error"
-            )
+        if self.fail_bootstrap is not None:
+            raise LaunchctlError(self.fail_bootstrap)
         self.loaded[f"{domain}/{LABEL}"] = PRINT_RUNNING
 
     def bootout(self, domain_label: str) -> None:
         self.calls.append(("bootout", domain_label))
-        self.loaded.pop(domain_label, None)
+        if self.stopping_polls == 0:
+            self.loaded.pop(domain_label, None)
+        elif domain_label in self.loaded:
+            self._stopping[domain_label] = self.stopping_polls
 
     def print(self, domain_label: str) -> str | None:
         self.calls.append(("print", domain_label))
+        if domain_label in self._stopping:
+            left = self._stopping[domain_label]
+            if left is not None:
+                if left == 0:
+                    del self._stopping[domain_label]
+                    self.loaded.pop(domain_label, None)
+                else:
+                    self._stopping[domain_label] = left - 1
         return self.loaded.get(domain_label)
 
     def list(self) -> str:
         self.calls.append(("list",))
+        if self.fail_list:
+            raise LaunchctlError("launchctl list failed (exit 1): Operation not permitted")
         labels = self.listed + [key.rsplit("/", 1)[1] for key in self.loaded]
         return LIST_HEADER + "".join(f"-\t0\t{label}\n" for label in dict.fromkeys(labels))
 
 
+class FakeClock:
+    """``service._clock`` and ``service._sleep``: sleeping advances the clock, nobody waits."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    path.chmod(0o755)
+    return path
+
+
 class Machine:
-    """The temporary home's LaunchAgents and Logs, a fake ``calsync`` executable on PATH, and the
-    fake launchctl the CLI gets."""
+    """The temporary home's LaunchAgents and Logs, a fake ``calsync`` executable on PATH (the
+    running program is pytest, and no calsync sits next to the running Python), the fake
+    launchctl the CLI gets, and a fake clock. ``$CALSYNC_CONFIG`` / ``$CALSYNC_STATE_DIR`` (set by
+    the seal) are unset: a test that wants them sets them."""
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
         self.home = home
         self.paths = Paths.default(home)
-        bin_dir = home / "bin"
-        bin_dir.mkdir()
-        self.exe = bin_dir / "calsync"
-        self.exe.write_text("#!/bin/sh\n")
-        self.exe.chmod(0o755)
+        self.exe = executable(home / "bin" / "calsync")
         self.launchctl = FakeLaunchctl()
+        self.time = FakeClock()
         monkeypatch.setattr(service, "system_launchctl", lambda: self.launchctl)
         monkeypatch.setattr(
             service.shutil, "which", lambda name: str(self.exe) if name == "calsync" else None
         )
+        monkeypatch.setattr(service.sys, "argv", [str(home / "venv" / "bin" / "pytest")])
+        monkeypatch.setattr(service.sys, "executable", str(home / "python" / "bin" / "python3"))
         monkeypatch.setattr(service.os, "getuid", lambda: UID)
+        monkeypatch.setattr(service, "_clock", self.time.clock)
+        monkeypatch.setattr(service, "_sleep", self.time.sleep)
         monkeypatch.delenv("LANG", raising=False)
+        monkeypatch.delenv("CALSYNC_CONFIG", raising=False)
+        monkeypatch.delenv("CALSYNC_STATE_DIR", raising=False)
 
     def run(self, *argv: str) -> tuple[int, str]:
         out = io.StringIO()
         code = main(list(argv), out=out, stdin=io.StringIO(""))
         return code, out.getvalue()
 
-    def other_plist(self, label: str, arguments: list[str]) -> Path:
+    def other_plist(self, label: str, arguments: list[str], **extra: object) -> Path:
         self.paths.agents_dir.mkdir(parents=True, exist_ok=True)
         path = self.paths.agents_dir / f"{label}.plist"
-        path.write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": arguments, "StartInterval": 60}))
+        body = {"Label": label, "ProgramArguments": arguments, "StartInterval": 60, **extra}
+        path.write_bytes(plistlib.dumps(body))
         return path
 
 
@@ -255,33 +299,91 @@ def test_the_program_arguments_parse_as_a_daemon_command(tmp_path: Path) -> None
 # --- the executable ---------------------------------------------------------------------
 
 
-def test_the_executable_is_found_on_path_resolved(tmp_path: Path) -> None:
-    real = tmp_path / "tools" / "calsync"
-    real.parent.mkdir()
-    real.write_text("#!/bin/sh\n")
-    real.chmod(0o755)
+NO_PYTHON = "/nowhere/bin/python3"
+
+
+def test_the_executable_is_the_running_calsync_first(tmp_path: Path) -> None:
+    running = executable(tmp_path / "tools" / "calsync")
+    beside = executable(tmp_path / "py" / "bin" / "calsync")
+    on_path = executable(tmp_path / "path" / "calsync")
+    found = service.find_executable(
+        which=lambda _: str(on_path), argv0=str(running), python=str(tmp_path / "py" / "bin" / "python3")
+    )
+    assert found == running.resolve()
+    assert beside.exists()
+
+
+def test_the_running_calsync_is_resolved(tmp_path: Path) -> None:
+    real = executable(tmp_path / "tools" / "calsync")
+    link = tmp_path / "bin" / "calsync"
+    link.parent.mkdir()
+    link.symlink_to(real)
+    assert service.find_executable(which=lambda _: None, argv0=str(link), python=NO_PYTHON) == real.resolve()
+
+
+def test_python_m_calsync_finds_the_calsync_next_to_its_python(tmp_path: Path) -> None:
+    # `python -m calsync`: argv[0] is .../calsync/__main__.py. The venv's python is a symlink
+    # to the base interpreter: the calsync beside the symlink counts, not beside its target.
+    base = executable(tmp_path / "base" / "bin" / "python3")
+    venv_bin = tmp_path / "env" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python3").symlink_to(base)
+    beside = executable(venv_bin / "calsync")
+    on_path = executable(tmp_path / "path" / "calsync")
+    found = service.find_executable(
+        which=lambda _: str(on_path),
+        argv0=str(tmp_path / "src" / "calsync" / "__main__.py"),
+        python=str(venv_bin / "python3"),
+    )
+    assert found == beside.resolve()
+
+
+def test_the_executable_falls_back_to_path_resolved(tmp_path: Path) -> None:
+    real = executable(tmp_path / "tools" / "calsync")
     link = tmp_path / "calsync"
     link.symlink_to(real)
-    assert service.find_executable(which=lambda _: str(link), argv0="python") == real.resolve()
+    other = executable(tmp_path / "pytest")
+    found = service.find_executable(which=lambda _: str(link), argv0=str(other), python=NO_PYTHON)
+    assert found == real.resolve()
 
 
-def test_the_executable_falls_back_to_argv0_when_it_is_calsync(tmp_path: Path) -> None:
-    exe = tmp_path / "calsync"
-    exe.write_text("#!/bin/sh\n")
-    exe.chmod(0o755)
-    assert service.find_executable(which=lambda _: None, argv0=str(exe)) == exe.resolve()
-    other = tmp_path / "pytest"
-    other.write_text("#!/bin/sh\n")
-    other.chmod(0o755)
-    assert service.find_executable(which=lambda _: None, argv0=str(other)) is None
+def test_a_missing_running_calsync_falls_through(tmp_path: Path) -> None:
+    on_path = executable(tmp_path / "path" / "calsync")
+    found = service.find_executable(
+        which=lambda _: str(on_path), argv0=str(tmp_path / "gone" / "calsync"), python=NO_PYTHON
+    )
+    assert found == on_path.resolve()
 
 
-def test_no_executable_when_neither_is_an_existing_file(tmp_path: Path) -> None:
+def test_no_executable_when_none_is_an_existing_file(tmp_path: Path) -> None:
     missing = tmp_path / "calsync"
-    assert service.find_executable(which=lambda _: str(missing), argv0=str(missing)) is None
+    assert service.find_executable(which=lambda _: str(missing), argv0=str(missing), python=NO_PYTHON) is None
     directory = tmp_path / "d" / "calsync"
     directory.mkdir(parents=True)
-    assert service.find_executable(which=lambda _: None, argv0=str(directory)) is None
+    assert service.find_executable(which=lambda _: None, argv0=str(directory), python=NO_PYTHON) is None
+    assert service.find_executable(which=lambda _: None, argv0="pytest", python=NO_PYTHON) is None
+
+
+def test_a_checkout_virtualenv_is_warned_about(tmp_path: Path) -> None:
+    project = tmp_path / "work" / "calsync"
+    (project / ".git").mkdir(parents=True)
+    exe = project / ".venv" / "bin" / "calsync"
+    warning = service.checkout_warning(exe)
+    assert warning is not None
+    assert str(project) in warning
+    assert "stop working if this checkout is removed" in warning
+    assert "uv tool install" in warning
+    # a git worktree: .git is a file
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: /elsewhere\n")
+    assert service.checkout_warning(worktree / ".venv" / "bin" / "calsync") is not None
+
+
+def test_a_tool_or_plain_virtualenv_is_not_warned_about(tmp_path: Path) -> None:
+    assert service.checkout_warning(tmp_path / "uv" / "tools" / "calsync" / "bin" / "calsync") is None
+    (tmp_path / "proj").mkdir()
+    assert service.checkout_warning(tmp_path / "proj" / ".venv" / "bin" / "calsync") is None
 
 
 # --- launchctl output -------------------------------------------------------------------
@@ -313,9 +415,11 @@ def test_list_labels() -> None:
 
 def test_the_real_launchctl_builds_these_commands() -> None:
     seen: list[list[str]] = []
+    timeouts: list[float] = []
 
-    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    def runner(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         seen.append(argv)
+        timeouts.append(timeout)
         if argv[1] == "print" and argv[2].endswith("/missing"):
             return subprocess.CompletedProcess(argv, 113, "", 'Could not find service "missing" in domain\n')
         if argv[1] == "bootout":
@@ -335,10 +439,12 @@ def test_the_real_launchctl_builds_these_commands() -> None:
         ["launchctl", "print", f"{DOMAIN}/missing"],
         ["launchctl", "list"],
     ]
+    # bootout waits for the daemon to finish its cycle (ExitTimeOut) and then some
+    assert timeouts == [10, service.EXIT_TIMEOUT + 30, 10, 10, 10]
 
 
 def test_the_real_launchctl_raises_on_other_failures() -> None:
-    def runner(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    def runner(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         return subprocess.CompletedProcess(argv, 5, "", "Bootstrap failed: 5: Input/output error\n")
 
     real = service.SystemLaunchctl(run=runner)
@@ -351,16 +457,18 @@ def test_the_real_launchctl_raises_on_other_failures() -> None:
 
 
 def test_the_real_launchctl_reports_a_missing_or_hanging_launchctl() -> None:
-    def missing(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    def missing(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         raise FileNotFoundError(argv[0])
 
-    def hangs(argv: list[str]) -> subprocess.CompletedProcess[str]:
-        raise subprocess.TimeoutExpired(argv, 10)
+    def hangs(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(argv, timeout)
 
     with pytest.raises(LaunchctlError, match="not found"):
         service.SystemLaunchctl(run=missing).list()
-    with pytest.raises(LaunchctlError, match="did not answer"):
+    with pytest.raises(service.LaunchctlTimeout, match="did not answer within 10 s"):
         service.SystemLaunchctl(run=hangs).list()
+    with pytest.raises(service.LaunchctlTimeout, match="did not answer within 150 s"):
+        service.SystemLaunchctl(run=hangs).bootout(TARGET)
 
 
 # --- install ----------------------------------------------------------------------------
@@ -473,7 +581,7 @@ def test_install_warns_about_another_loaded_calsync_job_and_refuses_without_forc
     machine.launchctl.loaded[f"{DOMAIN}/com.example.calsync"] = PRINT_OTHER
     machine.launchctl.listed = ["com.apple.unrelated"]
     code, out = machine.run("service", "install")
-    assert code == EXIT_CONFIG
+    assert code == EXIT_RUNNING
     assert "com.example.calsync" in out
     assert "/usr/local/bin/calsync run" in out
     assert "compete" in out
@@ -490,7 +598,7 @@ def test_install_finds_a_job_by_its_program_in_launch_agents(machine: Machine) -
     machine.other_plist("com.example.unrelated", ["/usr/bin/true"])
     machine.launchctl.loaded[f"{DOMAIN}/com.example.sync"] = PRINT_OTHER
     code, out = machine.run("service", "install", "--json")
-    assert code == EXIT_CONFIG
+    assert code == EXIT_RUNNING
     error = json.loads(out)["error"]
     assert error["kind"] == "other_jobs"
     assert error["others"] == [
@@ -501,7 +609,7 @@ def test_install_finds_a_job_by_its_program_in_launch_agents(machine: Machine) -
 def test_an_unloaded_agent_plist_still_counts_it_loads_at_login(machine: Machine) -> None:
     path = machine.other_plist("com.example.sync", ["/usr/local/bin/calsync", "run"])
     code, out = machine.run("service", "install")
-    assert code == EXIT_CONFIG
+    assert code == EXIT_RUNNING
     assert "next login" in out
     assert str(path) in out
 
@@ -517,7 +625,6 @@ def test_install_force_proceeds_with_another_job_and_leaves_it_alone(machine: Ma
 
 def test_install_refuses_without_an_executable(machine: Machine, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(service.shutil, "which", lambda name: None)
-    monkeypatch.setattr(service.sys, "argv", ["/nowhere/pytest"])
     code, out = machine.run("service", "install")
     assert code == EXIT_CONFIG
     assert "calsync executable" in out
@@ -558,13 +665,231 @@ def test_install_dry_run_still_refuses_a_differing_plist(machine: Machine) -> No
 
 
 def test_install_reports_a_failed_bootstrap(machine: Machine) -> None:
-    machine.launchctl.fail_bootstrap = True
+    machine.launchctl.fail_bootstrap = (
+        "launchctl bootstrap failed (exit 5): Bootstrap failed: 5: Input/output error"
+    )
     code, out = machine.run("service", "install")
     assert code == EXIT_FAILED
     assert "bootstrap failed" in out
+    assert "desktop session" not in out
     code, out = machine.run("service", "install", "--json")
     assert code == EXIT_FAILED
-    assert json.loads(out)["error"]["kind"] == "launchctl"
+    error = json.loads(out)["error"]
+    assert error["kind"] == "launchctl"
+    assert "hint" not in error
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "Bootstrap failed: 125: Domain does not support specified action",
+        "Domain does not support specified action",
+    ],
+)
+def test_a_bootstrap_without_a_gui_session_says_where_to_run_it(machine: Machine, stderr: str) -> None:
+    machine.launchctl.fail_bootstrap = f"launchctl bootstrap failed (exit 125): {stderr}"
+    code, out = machine.run("service", "install")
+    assert code == EXIT_FAILED
+    assert "run this from a logged-in desktop session (not over SSH)" in out
+    code, out = machine.run("service", "install", "--json")
+    assert code == EXIT_FAILED
+    assert "desktop session" in json.loads(out)["error"]["hint"]
+
+
+def test_install_prints_the_program_it_pins(machine: Machine) -> None:
+    code, out = machine.run("service", "install")
+    assert code == EXIT_OK, out
+    assert f"program: {machine.exe.resolve()}\n" in out
+    body = json.loads(machine.run("service", "install", "--json")[1])
+    assert body["program"] == [str(machine.exe.resolve()), "daemon"]
+    assert body["warnings"] == []
+
+
+def test_install_pins_the_running_calsync_over_the_one_on_path(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    running = executable(machine.home / "tools" / "calsync")
+    monkeypatch.setattr(service.sys, "argv", [str(running)])
+    code, out = machine.run("service", "install")
+    assert code == EXIT_OK, out
+    assert load(machine.paths.plist)["ProgramArguments"] == [str(running.resolve()), "daemon"]
+    assert f"program: {running.resolve()}" in out
+
+
+def test_install_from_a_checkout_virtualenv_warns(machine: Machine, monkeypatch: pytest.MonkeyPatch) -> None:
+    project = machine.home / "code" / "calsync"
+    (project / ".git").mkdir(parents=True)
+    exe = executable(project / ".venv" / "bin" / "calsync")
+    monkeypatch.setattr(service.sys, "argv", [str(exe)])
+    code, out = machine.run("service", "install")
+    assert code == EXIT_OK, out
+    assert "warning:" in out
+    assert "the daemon will stop working if this checkout is removed" in out
+    assert "uv tool install" in out
+    body = json.loads(machine.run("service", "install", "--json")[1])
+    assert len(body["warnings"]) == 1
+    assert "stop working if this checkout is removed" in body["warnings"][0]
+    dry = json.loads(machine.run("service", "install", "--dry-run", "--json")[1])
+    assert len(dry["warnings"]) == 1
+
+
+def test_install_embeds_calsync_config_and_state_dir_from_the_environment(
+    machine: Machine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(machine.home)
+    monkeypatch.setenv("CALSYNC_CONFIG", "conf/c.toml")
+    monkeypatch.setenv("CALSYNC_STATE_DIR", "~/st")
+    code, out = machine.run("service", "install")
+    assert code == EXIT_OK, out
+    config = str((machine.home / "conf" / "c.toml").resolve())
+    state = str((machine.home / "st").resolve())
+    assert load(machine.paths.plist)["ProgramArguments"] == [
+        str(machine.exe.resolve()),
+        "--config",
+        config,
+        "--state-dir",
+        state,
+        "daemon",
+    ]
+    assert f"--config {config}: from $CALSYNC_CONFIG" in out
+    assert f"--state-dir {state}: from $CALSYNC_STATE_DIR" in out
+    body = json.loads(machine.run("service", "install", "--json")[1])
+    assert body["from_env"] == {"CALSYNC_CONFIG": config, "CALSYNC_STATE_DIR": state}
+
+
+def test_a_flag_wins_over_the_environment(machine: Machine, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CALSYNC_CONFIG", str(machine.home / "env.toml"))
+    monkeypatch.setenv("CALSYNC_STATE_DIR", "")
+    code, out = machine.run("--config", str(machine.home / "flag.toml"), "service", "install", "--json")
+    assert code == EXIT_OK, out
+    body = json.loads(out)
+    assert body["from_env"] == {}
+    assert load(machine.paths.plist)["ProgramArguments"] == [
+        str(machine.exe.resolve()),
+        "--config",
+        str((machine.home / "flag.toml").resolve()),
+        "daemon",
+    ]
+
+
+def test_a_failed_launchctl_list_is_a_warning_not_silence(machine: Machine) -> None:
+    machine.launchctl.fail_list = True
+    code, out = machine.run("service", "install")
+    assert code == EXIT_OK, out
+    assert "warning: launchctl list failed" in out
+    assert f"only covered {machine.paths.agents_dir}" in out
+    body = json.loads(machine.run("service", "status", "--json")[1])
+    assert len(body["warnings"]) == 1
+    assert "only covered" in body["warnings"][0]
+    assert "only covered" in machine.run("service", "status")[1]
+
+
+def test_a_disabled_agent_plist_is_not_another_job(machine: Machine) -> None:
+    machine.other_plist("com.example.sync", ["/usr/local/bin/calsync", "run"], Disabled=True)
+    code, out = machine.run("service", "install", "--json")
+    assert code == EXIT_OK, out
+    assert json.loads(out)["others"] == []
+
+
+def test_install_dry_run_marks_the_bootout_as_conditional(machine: Machine) -> None:
+    # Without launchctl a dry run cannot know: the bootout is listed whenever the plist changes.
+    code, out = machine.run("service", "install", "--dry-run")
+    assert code == EXIT_OK, out
+    assert f"  launchctl bootout {TARGET}  (if loaded)\n" in out
+    assert f"  launchctl bootstrap {DOMAIN} {machine.paths.plist}\n" in out
+    body = json.loads(machine.run("service", "install", "--dry-run", "--json")[1])
+    assert body["steps"] == [
+        {"command": f"launchctl bootout {TARGET}", "when": "if loaded"},
+        {"command": f"launchctl bootstrap {DOMAIN} {machine.paths.plist}", "when": "always"},
+    ]
+    # unchanged: no bootout; the bootstrap only if not loaded
+    assert machine.run("service", "install")[0] == EXIT_OK
+    machine.launchctl.calls.clear()
+    code, out = machine.run("service", "install", "--dry-run", "--json")
+    assert json.loads(out)["steps"] == [
+        {"command": f"launchctl bootstrap {DOMAIN} {machine.paths.plist}", "when": "if not loaded"}
+    ]
+    assert machine.launchctl.calls == []
+
+
+def replaceable(machine: Machine) -> None:
+    """An installed, loaded agent whose plist differs from the one install would write now."""
+    machine.paths.agents_dir.mkdir(parents=True)
+    machine.paths.plist.write_bytes(plistlib.dumps({"Label": LABEL, "ProgramArguments": ["/old/calsync"]}))
+    machine.launchctl.loaded[TARGET] = PRINT_RUNNING
+
+
+def test_a_replace_waits_until_launchd_has_stopped_the_old_job(machine: Machine) -> None:
+    replaceable(machine)
+    machine.launchctl.stopping_polls = 3
+    code, out = machine.run("service", "install", "--force")
+    assert code == EXIT_OK, out
+    assert "can take up to about two minutes while a sync cycle finishes" in out
+    calls = machine.launchctl.calls
+    bootout = calls.index(("bootout", TARGET))
+    bootstrap = calls.index(("bootstrap", DOMAIN, str(machine.paths.plist)))
+    # three polls still find the job, the fourth does not; only then the bootstrap
+    assert calls[bootout + 1 : bootstrap] == [("print", TARGET)] * 4
+    assert machine.time.sleeps == [0.5, 0.5, 0.5]
+    assert load(machine.paths.plist)["ProgramArguments"] == [str(machine.exe.resolve()), "daemon"]
+
+
+def test_a_replace_gives_up_when_the_old_job_does_not_go(machine: Machine) -> None:
+    replaceable(machine)
+    old = machine.paths.plist.read_bytes()
+    machine.launchctl.stopping_polls = None
+    code, out = machine.run("service", "install", "--force")
+    assert code == EXIT_FAILED
+    assert "launchd may still be stopping" in out
+    assert "calsync service status" in out
+    assert ("bootstrap", DOMAIN, str(machine.paths.plist)) not in machine.launchctl.calls
+    assert machine.paths.plist.read_bytes() == old  # nothing written either
+    assert sum(machine.time.sleeps) == pytest.approx(service.EXIT_TIMEOUT + 30)
+
+    machine.time.sleeps.clear()
+    code, out = machine.run("service", "install", "--force", "--json")
+    assert code == EXIT_FAILED
+    error = json.loads(out)["error"]
+    assert error["kind"] == "still_stopping"
+    assert error["commands"] == [f"launchctl bootout {TARGET}"]
+
+
+def test_a_bootout_that_does_not_answer_is_still_stopping(machine: Machine) -> None:
+    replaceable(machine)
+
+    def hangs(target: str) -> None:
+        raise service.LaunchctlTimeout("launchctl bootout did not answer within 150 s")
+
+    machine.launchctl.bootout = hangs  # type: ignore[method-assign]
+    code, out = machine.run("service", "install", "--force")
+    assert code == EXIT_FAILED
+    assert "launchd may still be stopping" in out
+    assert ("bootstrap", DOMAIN, str(machine.paths.plist)) not in machine.launchctl.calls
+
+
+def test_stop_uses_the_injected_clock_and_sleep() -> None:
+    fake = FakeLaunchctl({TARGET: PRINT_RUNNING})
+    fake.stopping_polls = 2
+    clock = FakeClock()
+    assert service._stop(fake, TARGET, clock=clock.clock, sleep=clock.sleep)  # pyright: ignore[reportPrivateUsage]
+    assert clock.sleeps == [0.5, 0.5]
+    fake = FakeLaunchctl({TARGET: PRINT_RUNNING})
+    fake.stopping_polls = None
+    clock = FakeClock()
+    assert not service._stop(fake, TARGET, clock=clock.clock, sleep=clock.sleep)  # pyright: ignore[reportPrivateUsage]
+    assert clock.now - 1000.0 == pytest.approx(150)
+
+
+def test_the_install_help_tells_the_exit_codes_and_the_limits(
+    machine: Machine, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit):
+        machine.run("service", "install", "--help")
+    text = " ".join(capsys.readouterr().out.split())
+    assert "exit 4: another calsync job is set up" in text
+    assert "Exit 2: the plist differs" in text
+    assert "best effort" in text and "jobs defined elsewhere are not seen" in text
+    assert "$CALSYNC_CONFIG and $CALSYNC_STATE_DIR, when set, do" in text
 
 
 # --- uninstall --------------------------------------------------------------------------
@@ -580,6 +905,32 @@ def test_uninstall_boots_out_and_removes_only_the_plist(machine: Machine) -> Non
     assert not machine.paths.plist.exists()
     assert machine.paths.log.exists()
     assert "stay" in out
+
+
+def test_uninstall_waits_for_the_job_before_removing_the_plist(machine: Machine) -> None:
+    assert machine.run("service", "install")[0] == EXIT_OK
+    machine.launchctl.calls.clear()
+    machine.launchctl.stopping_polls = 2
+    code, out = machine.run("service", "uninstall")
+    assert code == EXIT_OK, out
+    assert "can take up to about two minutes" in out
+    assert machine.launchctl.calls == [("print", TARGET), ("bootout", TARGET)] + [("print", TARGET)] * 3
+    assert machine.time.sleeps == [0.5, 0.5]
+    assert not machine.paths.plist.exists()
+
+
+def test_uninstall_keeps_the_plist_while_the_job_is_still_stopping(machine: Machine) -> None:
+    assert machine.run("service", "install")[0] == EXIT_OK
+    machine.launchctl.stopping_polls = None
+    code, out = machine.run("service", "uninstall")
+    assert code == EXIT_FAILED
+    assert "launchd may still be stopping" in out
+    assert "calsync service status" in out
+    assert machine.paths.plist.exists()
+    code, out = machine.run("service", "uninstall", "--json")
+    assert code == EXIT_FAILED
+    assert json.loads(out)["error"]["kind"] == "still_stopping"
+    assert machine.paths.plist.exists()
 
 
 def test_uninstall_when_not_loaded_still_removes_the_plist(machine: Machine) -> None:
@@ -605,7 +956,7 @@ def test_uninstall_dry_run_touches_nothing(machine: Machine) -> None:
     machine.launchctl.calls.clear()
     code, out = machine.run("service", "uninstall", "--dry-run")
     assert code == EXIT_OK
-    assert f"launchctl bootout {TARGET}" in out
+    assert f"  launchctl bootout {TARGET}  (if loaded)\n" in out
     assert machine.paths.plist.exists()
     assert machine.launchctl.calls == []
 
@@ -636,6 +987,7 @@ def test_status_of_a_running_daemon(machine: Machine) -> None:
         "plist": str(machine.paths.plist),
         "log": str(machine.paths.log),
         "others": [],
+        "warnings": [],
     }
     code, out = machine.run("service", "status")
     assert "loaded: yes" in out and "4242" in out

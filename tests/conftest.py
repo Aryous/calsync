@@ -158,7 +158,7 @@ def sealed(
 
     from calsync import service
 
-    def no_launchctl(argv: list[str]) -> subprocess.CompletedProcess[str]:
+    def no_launchctl(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         raise seal.refuse(LAUNCHCTL_REFUSED)
 
     # The developer's machine runs real launchd jobs: `calsync service` only ever gets a fake.

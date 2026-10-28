@@ -176,9 +176,16 @@ def _parser() -> argparse.ArgumentParser:
     install = service_sub.add_parser(
         "install",
         help="write ~/Library/LaunchAgents/dev.calsync.daemon.plist and load it",
-        description="Install `calsync daemon` as the launchd agent dev.calsync.daemon. Global "
-        "--config and --state-dir, if given, go into the agent; $CALSYNC_CONFIG and "
-        "$CALSYNC_STATE_DIR do not (launchd does not see your shell's environment).",
+        description="Install `calsync daemon` as the launchd agent dev.calsync.daemon, running "
+        "this calsync (the running program, else the calsync next to this Python, else the one "
+        "on PATH). Global --config and --state-dir go into the agent as absolute paths; without "
+        "them, $CALSYNC_CONFIG and $CALSYNC_STATE_DIR, when set, do (launchd does not see your "
+        "shell's environment). Replacing a loaded agent waits for it to stop (up to about two "
+        "minutes while a sync cycle finishes). Other launchd jobs running calsync are found best "
+        "effort: labels in `launchctl list` and plists in ~/Library/LaunchAgents; jobs defined "
+        "elsewhere are not seen. Exit 2: the plist differs (use --force); exit 4: another "
+        "calsync job is set up (unload it, or use --force); exit 1: launchctl failed or the old "
+        "job is still stopping.",
     )
     install.add_argument(
         "--listen",
@@ -189,7 +196,13 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument(
         "--force", action="store_true", help="replace a different plist; install despite another calsync job"
     )
-    uninstall = service_sub.add_parser("uninstall", help="unload the agent and remove its plist (logs stay)")
+    uninstall = service_sub.add_parser(
+        "uninstall",
+        help="unload the agent and remove its plist (logs stay)",
+        description="Boot the agent out, wait until launchd has stopped it (up to about two "
+        "minutes while a sync cycle finishes), then remove its plist. Logs and the state "
+        "directory stay. Exit 1 if launchctl failed or the job is still stopping (the plist stays).",
+    )
     for command in (install, uninstall):
         command.add_argument("--dry-run", action="store_true", help="show the plist and commands; do nothing")
         command.add_argument("--json", action="store_true", help="print JSON")
@@ -1147,22 +1160,32 @@ def cmd_service(args: argparse.Namespace, out: TextIO) -> int:
     paths = service.Paths.default()
     launchctl = service.system_launchctl()
     uid = os.getuid()
+
+    def notice(line: str) -> None:
+        # Printed before a wait of up to two minutes, not after it.
+        out.write(line + "\n")
+        out.flush()
+
+    # JSON stays one document; the notice is for a person watching.
+    on_notice = None if args.json else notice
     if args.service_command == "install":
+        config, state_dir, from_env = service.locations(args.config, args.state_dir, os.environ)
         outcome = service.install(
             launchctl,
             paths,
             uid,
             executable=service.find_executable(),
-            # launchd starts the daemon in /: relative paths and ~ would not survive.
-            config=args.config.expanduser().resolve() if args.config is not None else None,
-            state_dir=args.state_dir.expanduser().resolve() if args.state_dir is not None else None,
+            config=config,
+            state_dir=state_dir,
             listen=args.listen,
             lang=os.environ.get("LANG"),
+            from_env=from_env,
             force=args.force,
             dry_run=args.dry_run,
+            notice=on_notice,
         )
     elif args.service_command == "uninstall":
-        outcome = service.uninstall(launchctl, paths, uid, dry_run=args.dry_run)
+        outcome = service.uninstall(launchctl, paths, uid, dry_run=args.dry_run, notice=on_notice)
     else:
         outcome = service.status(launchctl, paths, uid)
     if args.json:
