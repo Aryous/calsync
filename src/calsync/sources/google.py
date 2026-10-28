@@ -10,8 +10,8 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import timedelta
-from typing import Any
-from urllib.parse import quote
+from typing import TYPE_CHECKING, Any
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -35,6 +35,9 @@ from calsync.sources.base import (
 )
 from calsync.sources.google_auth import TokenProvider
 from calsync.sources.google_map import alarms_from_reminders, build_series, master_ids
+
+if TYPE_CHECKING:
+    from calsync.sources.google_write import GoogleWriter
 
 BASE_URL = "https://www.googleapis.com/calendar/v3"
 
@@ -148,6 +151,14 @@ class GoogleSource:
     def scopes(self) -> frozenset[str] | None:
         """The scopes Google reported at the last token refresh; None: not known (yet)."""
         return getattr(self._token, "scopes", None)
+
+    def writer(self) -> "GoogleWriter":
+        """A writer for the same account: the same client, token and API root."""
+        from calsync.sources.google_write import GoogleWriter
+
+        parts = urlsplit(self._base)
+        batch = f"{parts.scheme}://{parts.netloc}/batch{parts.path}"
+        return GoogleWriter(self._client, self._token, base_url=self._base, batch_url=batch)
 
     async def _get(self, path: str, params: Mapping[str, str], kind: str) -> dict[str, Any]:
         response = await self._send(path, params, kind)

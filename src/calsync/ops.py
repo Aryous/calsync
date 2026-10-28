@@ -65,6 +65,11 @@ class DaemonHooks(Protocol):
         their originals in the web UI. Only operations with origin ``ui`` call it."""
         ...
 
+    async def rebuild(self, names: set[str]) -> None:
+        """Build the adapters of ``names`` again from their stored credentials (a credential
+        stored by ``calsync auth`` since). The caller holds the daemon's lock."""
+        ...
+
     def push(self, alerts: list["Alert"]) -> None:
         """Send ``alerts`` in the daemon's background outbox."""
         ...
@@ -1445,10 +1450,26 @@ def _leftover(ctx: OpContext, config: Config, rule: Rule) -> list[dict[str, Any]
 
 AsyncOp = Callable[[OpContext, dict[str, Any], bool], Coroutine[Any, Any, OpResult]]
 
+
 # Operations that talk to the accounts. The daemon awaits them under its lock (``run_op_async``);
 # in a process of their own (``run_op``) they get an event loop of their own.
+def _event_op(name: str) -> AsyncOp:
+    """An operation of ``event_ops`` (imported when used: it builds on this module)."""
+
+    async def run(ctx: OpContext, args: dict[str, Any], dry_run: bool) -> OpResult:
+        from calsync import event_ops
+
+        op: AsyncOp = getattr(event_ops, name)
+        return await op(ctx, args, dry_run)
+
+    return run
+
+
 ASYNC_OPS: dict[str, AsyncOp] = {
     "account.remove": _account_remove,  # a keychain delete runs on a worker thread
+    "event.create": _event_op("event_create"),
+    "event.edit": _event_op("event_edit"),
+    "event.delete": _event_op("event_delete"),
     "calendars.refresh": _calendars_refresh,
     "rule.preview": _rule_preview,
     "trigger": _trigger,

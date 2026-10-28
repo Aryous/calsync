@@ -476,6 +476,10 @@ class Daemon:
         log.info("rule %s: %d deletes approved (%s)", rule, count, origin)
         return self._wait_for_cycle({rule}) if wait else None
 
+    async def rebuild(self, names: set[str]) -> None:
+        """``ops.DaemonHooks.rebuild``: the accounts' adapters again, from stored credentials."""
+        await self._build(sorted(n for n in names if n in self._parts))
+
     def preapprove(self, rule: str, object_ids: frozenset[str]) -> None:
         """``ops.DaemonHooks.preapprove``: the copies ``object_ids`` of ``rule`` may be deleted
         past the guard (a person deleted their originals in the web UI). The caller holds

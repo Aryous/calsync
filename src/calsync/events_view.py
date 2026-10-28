@@ -415,12 +415,24 @@ def _occurrence(item: Series, rest: str, now: datetime) -> Instance | None:
     return next((i for i in expand_instances(item, lo, hi) if _when(i.start) == text), None)
 
 
-def build_event(config: Config, reader: StateReader, eid: str, now: datetime) -> EventDetail:
-    """The event ``eid`` names, with the source series' own fields (``original``) and, per
-    delivery, the stored summary of the copy and the fields it differs in. ``NotFound``: a
-    malformed id, or no such occurrence now."""
-    from calsync.render import changed_fields, summary_of
+@dataclass(frozen=True, slots=True)
+class Located:
+    """Where an event id points in the mirror: what a write to Google needs."""
 
+    account: str
+    cid: str  # the source calendar id
+    calendar: str  # as the first rule syncing it names it
+    calendar_name: str
+    source_id: str  # the series (or single event) id
+    instance: Instance  # the occurrence the id names
+    instance_start: str | None  # its start as the id carries it (None: a single event)
+    timezone: str  # the calendar's zone (the mirror's meta)
+    rules: tuple[str, ...]  # the rules that sync the calendar, in config order
+
+
+def _find(
+    config: Config, reader: StateReader, eid: str, now: datetime
+) -> tuple[_Calendar, Series, Instance, str | None]:
     key = _decode(eid)
     for cal in _calendars(config, reader, now):
         prefix = f"{cal.account}/{cal.cid}/"
@@ -429,28 +441,53 @@ def build_event(config: Config, reader: StateReader, eid: str, now: datetime) ->
         rest = key[len(prefix) :]
         for item in source_series(reader, cal.account, cal.cid, cal.entry):
             inst = _occurrence(item, rest, now)
-            if inst is None:
-                continue
-            span = _span(cal, item)
-            deliveries: list[EventDelivery] = []
-            for copies in cal.rules:
-                state, shaped, oid = copies.state(item, span)
-                copy = reader.copy_summary(copies.reading.tag, oid)
-                differs: tuple[str, ...] = ()
-                if copy is not None and state != "delivered":
-                    differs = tuple(changed_fields(copy, summary_of(shaped)))
-                deliveries.append(
-                    EventDelivery(
-                        rule=copies.rule.name,
-                        target=_target_json(copies),
-                        state=state,
-                        delivered_at=copies.times.get(oid),
-                        content=copies.rule.fields.content,
-                        alarms_minutes_before=copies.alarms(inst),
-                        copy=copy,
-                        differs=differs,
-                    )
-                )
-            event = Event(eid, inst, _source_json(config, cal), tuple(deliveries))
-            return EventDetail(event, summary_of(item))
+            if inst is not None:
+                return cal, item, inst, (rest[len(item.source_id) + 1 :] if inst.recurring else None)
     raise NotFound(eid)
+
+
+def locate(config: Config, reader: StateReader, eid: str, now: datetime) -> Located:
+    """The event ``eid`` names, for a write. ``NotFound``: a malformed id, or no such occurrence."""
+    cal, item, inst, start = _find(config, reader, eid, now)
+    return Located(
+        account=cal.account,
+        cid=cal.cid,
+        calendar=cal.ref,
+        calendar_name=cal.name,
+        source_id=item.source_id,
+        instance=inst,
+        instance_start=start,
+        timezone=str(cal.entry.get("timezone") or "UTC"),
+        rules=tuple(c.rule.name for c in cal.rules),
+    )
+
+
+def build_event(config: Config, reader: StateReader, eid: str, now: datetime) -> EventDetail:
+    """The event ``eid`` names, with the source series' own fields (``original``) and, per
+    delivery, the stored summary of the copy and the fields it differs in. ``NotFound``: a
+    malformed id, or no such occurrence now."""
+    from calsync.render import changed_fields, summary_of
+
+    cal, item, inst, _ = _find(config, reader, eid, now)
+    span = _span(cal, item)
+    deliveries: list[EventDelivery] = []
+    for copies in cal.rules:
+        state, shaped, oid = copies.state(item, span)
+        copy = reader.copy_summary(copies.reading.tag, oid)
+        differs: tuple[str, ...] = ()
+        if copy is not None and state != "delivered":
+            differs = tuple(changed_fields(copy, summary_of(shaped)))
+        deliveries.append(
+            EventDelivery(
+                rule=copies.rule.name,
+                target=_target_json(copies),
+                state=state,
+                delivered_at=copies.times.get(oid),
+                content=copies.rule.fields.content,
+                alarms_minutes_before=copies.alarms(inst),
+                copy=copy,
+                differs=differs,
+            )
+        )
+    event = Event(eid, inst, _source_json(config, cal), tuple(deliveries))
+    return EventDetail(event, summary_of(item))
