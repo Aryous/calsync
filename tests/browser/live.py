@@ -221,6 +221,9 @@ class World:
     # While set and not open, every Google request waits for it (``LiveDaemon.hold_cycles``): a
     # cycle stays in progress, and the daemon's loop (its web UI too) keeps running meanwhile.
     gate: asyncio.Event | None = None
+    # Google accounts whose every request is answered 401 (``LiveDaemon.refuse``): their rules'
+    # next runs fail on the credential, as when a token was revoked.
+    refused: set[str] = field(default_factory=set)
 
     @classmethod
     def seeded(cls) -> World:
@@ -242,15 +245,19 @@ class World:
                 adapters.targets[name] = self.targets.setdefault(name, FakeTarget())
                 continue
             fake = self.google.setdefault(name, FakeGoogle())
-            client = make_client(adapters.log, transport=httpx.MockTransport(self._gated(fake)))
+            client = make_client(adapters.log, transport=httpx.MockTransport(self._gated(name, fake)))
             adapters.clients.append(client)
             adapters.sources[name] = GoogleSource(client, StaticToken("t"), base_url=BASE_URL)
         return adapters
 
-    def _gated(self, fake: FakeGoogle) -> Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]:
+    def _gated(
+        self, name: str, fake: FakeGoogle
+    ) -> Callable[[httpx.Request], Coroutine[Any, Any, httpx.Response]]:
         async def handler(request: httpx.Request) -> httpx.Response:
             if self.gate is not None:
                 await self.gate.wait()
+            if name in self.refused:
+                return httpx.Response(401, json={"error": {"code": 401, "message": "Invalid Credentials"}})
             return fake.handler(request)
 
         return handler
@@ -403,6 +410,47 @@ class LiveDaemon:
         self.in_loop(lambda: self.world.google["personal"].put_event(FAMILY, pending_event()))
         result = self.op("trigger", {"rule": "family-home", "wait": True, "timeout": 30})
         assert result.data.get("ran") is True, result.to_json()
+
+    # ----- staging what needs a person -------------------------------------------------
+    def trigger(self, rule: str) -> dict[str, Any]:
+        """One cycle of ``rule`` (waited for); the trigger's data."""
+        result = self.op("trigger", {"rule": rule, "wait": True, "timeout": 30})
+        assert result.data.get("ran") is True, result.to_json()
+        return result.data
+
+    def pause(self, rule: str) -> None:
+        result = self.op("rule.pause", {"name": rule})
+        assert result.changed, result.to_json()
+
+    def stage_auth(self, account: str = "work", rule: str = "work-mine") -> None:
+        """``account``'s Google credential stops working (every request 401) and ``rule`` runs on
+        it: the rule's health is ``auth``, an ``auth`` attention names the account."""
+        self.in_loop(lambda: self.world.refused.add(account))
+        self.trigger(rule)
+
+    def stage_blocked(self) -> None:
+        """Every 孩子学校 event is cancelled in Google and ``school-home`` runs: deleting all three
+        copies is over the delete guard (max_ratio 0.5), so the run is ``blocked``."""
+
+        def cancel() -> None:
+            google = self.world.google["personal"]
+            for event_id in ("piano", "meeting", "outing"):
+                google.cancel_event(SCHOOL, event_id)
+
+        self.in_loop(cancel)
+        assert self.trigger("school-home")["rules"]["school-home"]["status"] == "blocked"
+
+    def stage_failing(
+        self, rule: str = "family-mine", account: str = "my-icloud", calendar: str = "我的日历"
+    ) -> None:
+        """The target calendar fails once (a 503-like error) while ``rule`` runs: ``failing``."""
+        from calsync.errors import TransientError
+
+        def fail() -> None:
+            self.world.targets[account].fail_changes[calendar] = TransientError("CalDAV 503 (staged)")
+
+        self.in_loop(fail)
+        assert self.trigger(rule)["rules"][rule]["status"] == "failed"
 
     # ----- access -----------------------------------------------------------------------
     @property

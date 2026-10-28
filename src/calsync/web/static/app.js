@@ -4,9 +4,11 @@
 
 import { html, render, useCallback, useEffect, useLayoutEffect, useRef, useState } from "/static/vendor/htm-preact-standalone.mjs";
 import { t, getLang } from "/static/i18n.js";
-import { ago, clockTime } from "/static/format.js";
-import { op, StatusContext, useStatus, useStatusPoller } from "/static/api.js";
-import { Icon, Mark, Sprite } from "/static/icons.js";
+import { accountLabel, ago, clockTime, countWord, dayLabel, serviceOf, ymd } from "/static/format.js";
+import { get, op, StatusContext, useStatus, useStatusPoller } from "/static/api.js";
+import { CalendarName, Icon, Mark, Service, Sprite } from "/static/icons.js";
+import { Command } from "/static/command.js";
+import { SyncMap } from "/static/map.js";
 
 // ----- router ---------------------------------------------------------------------------------
 // #/                              the map (no inspector)
@@ -18,6 +20,7 @@ import { Icon, Mark, Sprite } from "/static/icons.js";
 // #/new                           a new line (query: prefill)
 // #/event/<id>                    an event's detail
 // #/blocked/<rule>                a rule's blocked deletes
+// #/connect/<google|icloud>       connect an account (the wizard)
 // Anything else is replaced by #/. Segments are URI-encoded; "?k=v" after the path is ``query``.
 
 const ROUTES = [
@@ -29,6 +32,7 @@ const ROUTES = [
   [/^\/new$/, () => ({ name: "new" })],
   [/^\/event\/([^/]+)$/, (m) => ({ name: "event", event: m[1] })],
   [/^\/blocked\/([^/]+)$/, (m) => ({ name: "blocked", rule: m[1] })],
+  [/^\/connect\/(google|icloud)$/, (m) => ({ name: "connect", service: m[1] })],
 ];
 
 const ROOT = { name: "root", query: {}, key: "/" };
@@ -172,9 +176,8 @@ function errorNote(error) {
   return { text: t("Something went wrong ({kind})", { kind: error.kind }), bad: true };
 }
 
-function SyncButton({ onResult }) {
+function SyncButton({ onResult, busy, setBusy }) {
   const { cycleRunning, refresh } = useStatus();
-  const [busy, setBusy] = useState(false);
   const pending = busy || cycleRunning;
   const label = pending ? t("Syncing…") : t("Sync now");
 
@@ -198,78 +201,234 @@ function SyncButton({ onResult }) {
   </button>`;
 }
 
-function Header({ onResult }) {
+function Header({ onResult, busy, setBusy }) {
   return html`<header class="top">
     <a class="brand" href="#/"><${Mark}/>calsync</a>
     <div class="top-r">
-      <${SyncButton} onResult=${onResult}/>
+      <${SyncButton} onResult=${onResult} busy=${busy} setBusy=${setBusy}/>
       <a class="btn icon" href="#/settings" aria-label=${t("Settings")}><${Icon} name="gear"/></a>
     </div>
   </header>`;
 }
 
-// ----- the map frame and the result sentence --------------------------------------------------
+// ----- the result sentence and the attention cards ----------------------------------------------
+// Under the map, one sentence says how it went: a headline (every line working, one stopped, some
+// paused…) and a detail line (when it last synced, how many changes reached iCloud today — a link
+// to the activity behind the number — and the next check). When the status can no longer be
+// refreshed the sentence says so, with the time calsync was last seen, until a poll succeeds.
+// Under it, one card per thing that needs a person (status.attention).
 
-function linesText(n) {
-  return n === 1 ? t("1 line") : t("{n} lines", { n });
-}
-
-/** The map (Task 2 draws the accounts, calendars and wires into the two columns). */
-function MapFrame() {
-  const { status } = useStatus();
-  const rules = status ? status.rules.length : null;
-  return html`<section class="canvas" aria-label=${t("Sync map")}>
-    <div class="col src"></div>
-    <a class="hubwrap" href="#/settings" aria-label=${t("calsync hub: open the settings")}>
-      <span class="hub"></span>
-      <span class="hub-cap"><b>calsync</b>${rules === null ? null : html`<small class="num">${linesText(rules)}</small>`}</span>
-    </a>
-    <div class="col tgt"></div>
-  </section>`;
-}
+const STOPPED = new Set(["auth", "failing", "blocked"]);
 
 function headline(status) {
-  const summary = status.summary;
-  if (summary.rules === 0) return t("No line yet");
-  switch (summary.health) {
-    case "ok":
-      return summary.rules === 1 ? t("The only line is working") : t("Every line is working");
-    case "never_run":
-      return t("Not synced yet");
-    case "paused":
-      return t("Some lines are paused");
-    default:
-      return t("A line needs you");
+  const rules = status.rules || [];
+  if (rules.length === 0) return t("No line yet");
+  const live = rules.filter((r) => r.health !== "paused" && r.health !== "retiring");
+  const stopped = live.filter((r) => STOPPED.has(r.health)).length;
+  const paused = rules.filter((r) => r.health === "paused").length;
+  if (stopped > 0) {
+    if (stopped === live.length) return live.length === 1 ? t("The line has stopped") : t("Every line has stopped");
+    if (stopped === 1) return t("One line has stopped; the others are fine");
+    return t("{n} lines have stopped; the others are fine", { n: countWord(stopped) });
   }
+  if (paused > 0) {
+    if (live.length === 0) return paused === 1 ? t("The line is paused") : t("Every line is paused");
+    if (paused === 1) return t("One line is paused; the others are fine");
+    return t("{n} lines are paused; the others are fine", { n: countWord(paused) });
+  }
+  if (live.length > 0 && live.every((r) => r.health === "never_run")) return t("Not synced yet");
+  if (rules.length === 1) return t("The only line is working");
+  return t("All {n} lines are working", { n: countWord(rules.length) });
 }
 
-function detailLine(status) {
+/** "10:42" today, "10月25日 周日 10:42" another day. */
+function when(value) {
+  if (!value) return "";
+  return ymd(value) === ymd(Date.now()) ? clockTime(value) : `${dayLabel(value)} ${clockTime(value)}`;
+}
+
+/** ``template`` with ``{slot}`` replaced by ``node`` (a link inside a translated sentence). */
+function withSlot(template, slot, node) {
+  const [before, after = ""] = template.split(`{${slot}}`);
+  return html`${before}${node}${after}`;
+}
+
+function joined(parts) {
+  return parts.map((part, i) => html`${i ? " · " : ""}${part}`);
+}
+
+function detailParts(status, cycleRunning) {
   const parts = [];
-  const last = status.summary.last_sync_at;
-  if (last) parts.push(t("Synced {when}", { when: ago(last) }));
+  const summary = status.summary;
+  if (cycleRunning) parts.push(t("Syncing now"));
+  else if (summary.last_sync_at) parts.push(t("Synced {when}", { when: ago(summary.last_sync_at) }));
+  const n = summary.delivered_today || 0;
+  if (n > 0) {
+    // The count is evidence: it opens the activity behind it, and brings the tabs into view
+    // (here, on the click: coming back to #/activity from an inspector must not scroll).
+    const show = () => window.requestAnimationFrame(() => {
+      const lower = document.getElementById("lower");
+      if (lower) lower.scrollIntoView({ block: "start" });
+    });
+    const changes = html`<a class="num" href="#/activity" onClick=${show}>${n === 1 ? t("1 change") : t("{n} changes", { n })}</a>`;
+    parts.push(withSlot(t("Delivered {changes} today"), "changes", changes));
+  } else if (summary.last_sync_at) {
+    parts.push(t("Nothing new delivered today"));
+  }
   const next = status.daemon && status.daemon.next_cycle_at;
-  if (next) parts.push(t("next check {time}", { time: clockTime(next) }));
-  return parts.join(" · ");
+  if (next && !cycleRunning) parts.push(html`<span class="num">${t("next check {time}", { time: clockTime(next) })}</span>`);
+  return parts;
 }
 
 function Result({ note }) {
-  const { status, error } = useStatus();
+  const { status, error, cycleRunning } = useStatus();
   let title = t("Reading the sync state…");
-  let line = "";
+  let parts = [];
   let bad = false;
-  if (status) {
+  if (status && error) {
+    // Read before, out of reach now: never claim it is all fine with a frozen time.
+    const offline = error.kind === "offline";
+    title = offline ? t("Can't reach calsync") : t("Can't read the latest state");
+    parts = [t("Last seen at {time}", { time: when(status.generated_at) }), offline ? t("retrying") : errorNote(error).text];
+    bad = true;
+  } else if (status) {
     title = headline(status);
-    line = detailLine(status);
+    parts = detailParts(status, cycleRunning);
   } else if (error) {
-    line = errorNote(error).text;
+    title = error.kind === "offline" ? t("Can't reach calsync") : t("Can't read the sync state");
+    parts = [error.kind === "offline" ? t("Is it running? Retrying") : errorNote(error).text];
     bad = true;
   }
   // Only the result of 立即同步 is announced (role=status); the ticking "N 分钟前" line is not.
   return html`<section class="result">
     <h1>${title}</h1>
-    ${line && !note ? html`<p class=${bad ? "bad" : ""}>${line}</p>` : null}
+    ${parts.length ? html`<p class=${bad ? "detail bad" : "detail"}>${joined(parts)}</p>` : null}
     <p class=${note && note.bad ? "note bad" : "note"} role="status" aria-live="polite" data-role="result-note">${note ? note.text : ""}</p>
+    ${status && !error ? html`<${Attention} status=${status}/>` : null}
   </section>`;
+}
+
+// ----- attention cards ---------------------------------------------------------------------------
+
+function serviceOfAccount(status, name) {
+  const account = (status.accounts || []).find((a) => a.name === name);
+  return account ? serviceOf(account) : "caldav";
+}
+
+/** A line as it is always named: [icon] 工作 · work → [icon] 我的日历 · my-icloud. */
+function LineName({ status, rule }) {
+  const end = (spec) => html`<${CalendarName} service=${serviceOfAccount(status, spec.account)}
+      account=${spec.account} name=${spec.calendar_name || spec.calendar}/>`;
+  return html`<span class="route">${end(rule.source)}<span class="arrow" aria-label=${t("to")}>→</span>${end(rule.target)}</span>`;
+}
+
+function LineNames({ status, rules }) {
+  return html`<span class="routes">${rules.map((rule) => html`<${LineName} status=${status} rule=${rule}/>`)}</span>`;
+}
+
+const REASONS = {
+  google: () => [
+    t("The Google account's password changed"),
+    t("calsync's access was revoked in the Google account"),
+    t("The Google app is still in “testing”: its authorisation has to be renewed every 7 days"),
+  ],
+  caldav: () => [
+    t("The Apple ID password changed"),
+    t("The app-specific password was revoked or replaced"),
+  ],
+};
+
+function Card({ kind, tone, children, action }) {
+  return html`<div class=${`attn ${tone}`} data-kind=${kind}>
+    <span class="mk"><${Icon} name="alert"/></span>
+    <div class="body">${children}</div>
+    ${action}
+  </div>`;
+}
+
+function AuthCard({ status, account, rules, command }) {
+  const service = serviceOfAccount(status, account);
+  const since = rules.map((r) => r.last_ok_at).filter(Boolean).sort().pop();
+  const reasons = (service === "google" ? REASONS.google : REASONS.caldav)();
+  return html`<${Card} kind="auth" tone="bad"
+      action=${html`<a class="btn" href=${`#/account/${encodeURIComponent(account)}`}>${t("The account")}</a>`}>
+    <b><${Service} service=${service} small=${true}/> ${t("{account}'s authorisation has expired", { account: accountLabel(account) })}</b>
+    <small><${LineNames} status=${status} rules=${rules}/>${since ? t("Not updated since {time}; the other lines carry on", { time: when(since) }) : t("Stopped; the other lines carry on")}</small>
+    <p class="why-h">${t("Usually one of these:")}</p>
+    <ul class="why">${reasons.map((r) => html`<li>${r}</li>`)}</ul>
+    <p class="why-h">${t("Connect it again from a terminal on this computer:")}</p>
+    <${Command} command=${command || `calsync auth ${account}`}/>
+  <//>`;
+}
+
+function BlockedCard({ status, rule, count }) {
+  const href = `#/blocked/${encodeURIComponent(rule.name)}`;
+  const copies = html`<a class="num" href=${href}>${count === 1 ? t("1 copy") : t("{n} copies", { n: count })}</a>`;
+  return html`<${Card} kind="blocked" tone="held"
+      action=${html`<a class="btn primary" href=${href}>${t("Review")}</a>`}>
+    <b>${count ? withSlot(t("{copies} waiting for you to confirm deleting"), "copies", copies) : t("Copies are waiting for you to confirm deleting")}</b>
+    <small><${LineNames} status=${status} rules=${[rule]}/>${t("calsync held these deletes back: nothing is deleted until you confirm")}</small>
+  <//>`;
+}
+
+function FailingCard({ status, rule }) {
+  const href = `#/rule/${encodeURIComponent(rule.name)}`;
+  const n = rule.consecutive_failures || 1;
+  const times = html`<a class="num" href=${href}>${n === 1 ? t("1 time") : t("{n} times", { n })}</a>`;
+  return html`<${Card} kind="failing" tone="bad"
+      action=${html`<a class="btn" href=${href}>${t("Open the line")}</a>`}>
+    <b>${withSlot(t("Failed to sync {times} in a row"), "times", times)}</b>
+    <small><${LineNames} status=${status} rules=${[rule]}/>${rule.last_ok_at ? t("Last synced at {time}; the other lines carry on", { time: when(rule.last_ok_at) }) : t("Not synced yet; the other lines carry on")}</small>
+  <//>`;
+}
+
+/** The blocked count per rule (GET /api/blocked), refetched when the blocked set changes. */
+function useBlockedCounts(names, stamp) {
+  const [counts, setCounts] = useState({});
+  const key = names.join("\n");
+  useEffect(() => {
+    if (!names.length) return undefined;
+    let live = true;
+    get("/api/blocked")
+      .then((body) => {
+        if (live) setCounts(Object.fromEntries((body.blocked || []).map((b) => [b.rule, b.count])));
+      })
+      .catch(() => null); // the card still shows, without the number
+    return () => {
+      live = false;
+    };
+  }, [key, stamp]);
+  return counts;
+}
+
+function Attention({ status }) {
+  const items = status.attention || [];
+  const rule = (name) => (status.rules || []).find((r) => r.name === name);
+  const blocked = items.filter((a) => a.kind === "blocked" && rule(a.rule)).map((a) => a.rule);
+  const counts = useBlockedCounts(blocked, status.summary.last_sync_at);
+  if (!items.length) return null;
+  const cards = [];
+  const accounts = new Map(); // one auth card per account, naming every line it stopped
+  for (const a of items) {
+    const r = rule(a.rule);
+    if (!r) continue;
+    if (a.kind === "auth") {
+      const account = a.account || r.source.account;
+      if (!accounts.has(account)) {
+        const entry = { account, rules: [], command: a.command };
+        accounts.set(account, entry);
+        cards.push(entry);
+      }
+      accounts.get(account).rules.push(r);
+    } else cards.push({ kind: a.kind, rule: r });
+  }
+  return html`<div class="attns" role="group" aria-label=${t("Needs you")}>
+    ${cards.map((c) => {
+      if (c.account) return html`<${AuthCard} key=${`auth:${c.account}`} status=${status} ...${c}/>`;
+      if (c.kind === "blocked") return html`<${BlockedCard} key=${`blocked:${c.rule.name}`} status=${status} rule=${c.rule} count=${counts[c.rule.name] || 0}/>`;
+      return html`<${FailingCard} key=${`failing:${c.rule.name}`} status=${status} rule=${c.rule}/>`;
+    })}
+  </div>`;
 }
 
 // ----- lower: 日历 | 活动 --------------------------------------------------------------------
@@ -295,7 +454,7 @@ function Lower({ route }) {
     if (button) button.focus();
   };
 
-  return html`<section class="lower">
+  return html`<section class="lower" id="lower">
     <div class="tabs" role="tablist" onKeyDown=${onKeyDown}>
       ${TABS.map((id) => html`<button class="tab" type="button" role="tab" id=${`tab-${id}`}
           aria-selected=${tab === id ? "true" : "false"} aria-controls=${`pane-${id}`}
@@ -325,6 +484,8 @@ function inspectorHead(route) {
       return [t("Event"), ""];
     case "blocked":
       return [t("Blocked deletes"), route.rule];
+    case "connect":
+      return [route.service === "google" ? t("Connect a Google account") : t("Connect an iCloud account"), t("Step by step; passwords stay in the terminal")];
     default:
       return ["", ""];
   }
@@ -390,6 +551,7 @@ function App() {
   const status = useStatusPoller();
   const [route, closeInspector] = useRoute();
   const [note, setNote] = useState(null);
+  const [busy, setBusy] = useState(false); // our 立即同步 is running
   const noteTimer = useRef(0);
 
   const onResult = useCallback((next) => {
@@ -401,9 +563,10 @@ function App() {
   return html`<${StatusContext.Provider} value=${status}>
     <${Sprite}/>
     <div class="wrap">
-      <${Header} onResult=${onResult}/>
+      <${Header} onResult=${onResult} busy=${busy} setBusy=${setBusy}/>
       <main>
-        <${MapFrame}/>
+        <${SyncMap} status=${status.status} route=${opensInspector(route) ? route : null}
+            waving=${busy || status.cycleRunning} stale=${Boolean(status.status && status.error)}/>
         <${Result} note=${note}/>
         <${Lower} route=${route}/>
       </main>

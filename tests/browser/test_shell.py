@@ -3,14 +3,23 @@ concept's tokens and font, themes before first paint, fits a 360 px phone, opens
 inspector, runs a cycle from 立即同步, and sends an unpaired browser to the pair page."""
 
 import re
-import time
-from collections.abc import Callable
-from typing import Any
 
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.browser.conftest import DESKTOP, NARROW, PHONE, VIEWPORT_IDS, OpenPage, watch_of
+from tests.browser.conftest import (
+    DESKTOP,
+    NARROW,
+    PHONE,
+    VIEWPORT_IDS,
+    OpenPage,
+    ready,
+    refresh_status,
+    settled,
+    sync_button,
+    until,
+    watch_of,
+)
 from tests.browser.live import LiveDaemon
 
 pytestmark = pytest.mark.browser
@@ -42,23 +51,6 @@ document.addEventListener("DOMContentLoaded", () => {
 """
 
 
-def ready(page: Page) -> None:
-    """The app rendered and read /api/status."""
-    expect(page.locator(".result h1")).not_to_have_text("正在读取同步状态…")
-    expect(page.locator(".hub-cap small")).to_have_text("4 条线路")
-
-
-def sync_button(page: Page) -> Any:
-    return page.get_by_role("button", name=re.compile("立即同步|同步中"))
-
-
-def settled(page: Page) -> None:
-    """The inspector's slide (and the page's shift beside it) has finished."""
-    page.wait_for_function(
-        """() => document.getAnimations().filter((a) => a.playState === "running").length === 0"""
-    )
-
-
 def background(page: Page) -> str:
     return page.evaluate("getComputedStyle(document.body).backgroundColor")
 
@@ -78,7 +70,7 @@ def test_the_shell_loads_without_errors(
     expect(page.get_by_role("tab", name="日历")).to_have_attribute("aria-selected", "true")
     expect(page.get_by_role("tab", name="活动")).to_have_attribute("aria-selected", "false")
     assert live.get("/api/status")["summary"]["health"] == "ok"
-    expect(page.locator(".result h1")).to_have_text("每条线路都在正常工作")
+    expect(page.locator(".result h1")).to_have_text("四条线路都在正常工作")
     # Only the result of 立即同步 is announced; the ticking "N 分钟前" line is not a live region.
     assert page.locator("[aria-live]").count() == 1
     expect(page.locator("[data-role=result-note]")).to_have_attribute("role", "status")
@@ -206,7 +198,9 @@ def test_the_inspector_opens_on_settings_and_closes(paired_page: Page, viewport:
     expect(page).to_have_url(re.compile(r"/(#/?)?$"))
     expect(page.locator("body")).not_to_have_class(re.compile(r"\binsp-open\b"))
 
-    page.locator(".hubwrap").click()  # the hub opens the settings too; the close button closes
+    # The hub opens the settings too (its caption: the tile carries the lines' traces); the close
+    # button closes.
+    page.locator(".hubwrap .hub-cap").click()
     expect(inspector).to_have_class(re.compile(r"\bopen\b"))
     inspector.get_by_role("button", name="关闭").click()
     expect(inspector).not_to_have_class(re.compile(r"\bopen\b"))
@@ -336,19 +330,6 @@ def test_the_tabs_are_reached_with_tab_alone(open_page: OpenPage) -> None:
     expect(activity).to_have_attribute("aria-selected", "true")
 
 
-def refresh_status(page: Page) -> None:
-    """Fetch /api/status now, as the page does when it becomes visible again (not in 10 s)."""
-    page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
-
-
-def until(condition: Callable[[], bool], timeout: float = 10) -> None:
-    """Wait, Python-side, for something in the daemon."""
-    deadline = time.monotonic() + timeout
-    while not condition():
-        assert time.monotonic() < deadline, "the condition never became true"
-        time.sleep(0.02)
-
-
 def test_sync_now_waits_while_a_cycle_runs(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
     """A cycle the daemon is running (the poll's cycle_started_at) shows 同步中… and makes the
     button aria-disabled: a second trigger cannot fire."""
@@ -412,9 +393,12 @@ def test_closing_leaves_no_inspector_behind_in_history(open_page: OpenPage) -> N
     expect(inspector.locator("h2")).to_have_text("设置")
     page.evaluate("location.hash = '#/rule/family-home'")
     expect(inspector.locator("h2")).to_have_text("线路")
+    page.evaluate("window.scrollTo(0, 0)")
     page.keyboard.press("Escape")
     expect(inspector).not_to_have_class(re.compile(r"\bopen\b"))
     expect(page).to_have_url(re.compile(r"#/activity$"))
+    page.wait_for_timeout(200)
+    assert page.evaluate("window.scrollY") == 0  # coming back to #/activity does not scroll
     page.go_back()
     expect(page).to_have_url(re.compile(r"/(#/?)?$"))
     expect(inspector).not_to_have_class(re.compile(r"\bopen\b"))

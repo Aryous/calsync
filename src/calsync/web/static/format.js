@@ -1,6 +1,7 @@
 // Dates, times and names as a person reads them. Times are shown in the browser's local zone
 // (the API sends ISO 8601 instants with offsets). A calendar is never named without its service
-// and account: calendarLabel() is the one place that composes that text.
+// and account: calendarLabel() is the one place that composes that text, accountLabel() the one
+// place that names an account.
 
 import { t, getLang } from "/static/i18n.js";
 
@@ -73,11 +74,34 @@ export function serviceName(service) {
   return t("CalDAV calendar");
 }
 
-/** "家庭日程 · personal": a calendar's name with its account, to render next to the service icon
- * (icons.js CalendarName does both). With ``plain`` (text where no icon can go: a title, an
- * aria-label) the service is named too: "家庭日程 · personal · Google 日历". */
+/** The service's short name, where no icon can say it (a tooltip, an aria-label). */
+export function serviceShort(service) {
+  if (service === "google") return "Google";
+  if (service === "icloud") return "iCloud";
+  return "CalDAV";
+}
+
+/** How an account is named to a person. The config has no display label yet, so this is the
+ * account's key ("personal") — the one place to change when a label field exists. Takes the key
+ * or a status account ({name, …}). */
+export function accountLabel(account) {
+  if (account == null) return "";
+  return typeof account === "string" ? account : account.name;
+}
+
+/** A calendar's name with its account. Visible text (beside the service icon, which
+ * icons.js CalendarName draws): "家庭日程 · personal". With ``plain`` — text where no icon can
+ * go (an SVG <title>, a title attribute, an aria-label) — the service is spelled out first:
+ * "Google · personal · 家庭日程". */
 export function calendarLabel({ service, account, name }, { plain = false } = {}) {
-  const parts = [name, account];
-  if (plain && service) parts.push(serviceName(service));
-  return parts.filter(Boolean).join(" · ");
+  if (plain) return [service ? serviceShort(service) : "", accountLabel(account), name].filter(Boolean).join(" · ");
+  return [name, accountLabel(account)].filter(Boolean).join(" · ");
+}
+
+/** A small count as a word, as the concept's sentence has it: "四条线路" (Chinese numerals 1–10,
+ * 两 for 2), digits above ten and in English. */
+export function countWord(n) {
+  if (getLang() !== "zh") return String(n);
+  if (n < 1 || n > 10) return `${n} `; // "12 条线路": digits keep their space
+  return ["一", "两", "三", "四", "五", "六", "七", "八", "九", "十"][n - 1];
 }

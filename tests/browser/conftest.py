@@ -22,13 +22,23 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
-from playwright.sync_api import Browser, BrowserContext, ConsoleMessage, Page, Playwright, sync_playwright
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    ConsoleMessage,
+    Locator,
+    Page,
+    Playwright,
+    expect,
+    sync_playwright,
+)
 
 from tests.browser.live import LiveDaemon, live_daemon, seal_session
 
@@ -212,3 +222,38 @@ def open_page(browser: Browser, live: LiveDaemon) -> Iterator[OpenPage]:
 @pytest.fixture
 def paired_page(open_page: OpenPage, viewport: dict[str, int]) -> Page:
     return open_page(viewport=viewport)
+
+
+# ----- helpers for the tests ------------------------------------------------------------------
+
+
+def ready(page: Page) -> None:
+    """The app rendered and read /api/status."""
+    expect(page.locator(".result h1")).not_to_have_text("正在读取同步状态…")
+    expect(page.locator(".hub-cap small")).to_have_text("4 条线路")
+
+
+def sync_button(page: Page) -> Locator:
+    return page.get_by_role("button", name=re.compile("立即同步|同步中"))
+
+
+def settled(page: Page) -> None:
+    """The inspector's slide (and the page's shift beside it) has finished. The map's comets
+    (animations with the id ``comet``) are ambient and never "finish" as a page does: ignored."""
+    page.wait_for_function(
+        """() => document.getAnimations()
+          .filter((a) => a.playState === "running" && a.id !== "comet").length === 0"""
+    )
+
+
+def refresh_status(page: Page) -> None:
+    """Fetch /api/status now, as the page does when it becomes visible again (not in 10 s)."""
+    page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+
+
+def until(condition: Callable[[], bool], timeout: float = 10) -> None:
+    """Wait, Python-side, for something in the daemon."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "the condition never became true"
+        time.sleep(0.02)

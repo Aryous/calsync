@@ -131,13 +131,45 @@ svg.svc.xs { width: 15px; height: 15px; }
 .btn.busy svg { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ----- the map frame (Task 2 fills the columns and draws the wires) ----------------------- */
+/* ----- the sync map ------------------------------------------------------------------------ */
 .canvas {
   position: relative; display: grid;
   grid-template-columns: minmax(210px, 264px) 1fr minmax(210px, 264px);
   align-items: center; padding: 36px 0 30px; min-height: 380px;
 }
 .col { display: flex; flex-direction: column; gap: 26px; position: relative; z-index: 2; min-width: 0; }
+.acct { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.acct-h {
+  display: flex; align-items: center; gap: 10px; padding: 4px 6px; margin: 0 -6px;
+  border-radius: 10px; text-decoration: none; min-width: 0; transition: background-color .2s;
+}
+.acct-h:hover { background: var(--sunk); }
+.acct-h .svc { width: 26px; height: 26px; }
+.acct-h > span { min-width: 0; }
+.acct-h b { display: block; font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acct-h small { display: block; color: var(--ink-3); font-size: 12px; line-height: 1.3; }
+.acct-h small.bad { color: var(--bad); }
+.cal {
+  position: relative; display: flex; align-items: center; gap: 10px; width: 100%; height: 42px; padding: 0 14px;
+  border-radius: 12px; border: 1px solid var(--line); background: var(--surface); box-shadow: var(--shadow-1);
+  font-size: 13.5px; text-decoration: none; transition: border-color .2s, opacity .3s;
+}
+.cal:hover { border-color: var(--slate); }
+.cal.sel { border-color: var(--accent); }
+.cal .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.cal .nm { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cal em { font-style: normal; color: var(--ink-3); font-size: 12.5px; flex: none; }
+.cal.idle { background: transparent; box-shadow: none; border-style: dashed; color: var(--ink-3); }
+.cal.dim { opacity: .45; }
+.dot.blue { background: var(--blue-dot); }
+.dot.sage { background: var(--sage-dot); }
+.dot.violet { background: var(--violet-dot); }
+.dot.none { background: transparent; border: 1px solid var(--slate); }
+.add-acct {
+  display: inline-flex; align-items: center; gap: 6px; align-self: flex-start; min-height: 32px;
+  color: var(--ink-3); font-size: 12.5px; text-decoration: none; transition: color .2s;
+}
+.add-acct:hover { color: var(--ink); }
 .hubwrap { position: relative; z-index: 0; display: flex; flex-direction: column; align-items: center; gap: 14px; text-decoration: none; }
 .hub {
   display: block; width: 116px; height: 116px; border-radius: 32px; border: 0; background: var(--hub);
@@ -149,12 +181,70 @@ svg.svc.xs { width: 15px; height: 15px; }
 .hub-cap b { font-weight: 600; font-size: 13.5px; letter-spacing: -.01em; }
 .hub-cap small { display: block; color: var(--ink-3); font-size: 12px; }
 
+/* The wires: an overlay over the grid (below the pills, above the hub tile). */
+.canvas svg.wires { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; z-index: 1; }
+.wires .w { fill: none; stroke: var(--wire); stroke-width: 1.4; transition: stroke .3s, opacity .3s, stroke-width .3s; }
+.wires .t { fill: none; stroke: var(--hub-trace); stroke-width: 1.6; transition: stroke .3s, opacity .3s; }
+.wires .w.paused { stroke: var(--ink-3); stroke-dasharray: 3 5; opacity: .6; }
+.wires .t.paused { stroke: var(--ink-3); stroke-dasharray: 2.5 4; }
+.wires .w.bad { stroke: var(--bad); stroke-dasharray: 3 5; opacity: .75; }
+.wires .t.bad { stroke: var(--bad); stroke-dasharray: 2.5 4; }
+.wires .w.held, .wires .t.held { stroke: var(--wait); }
+.wires .w.retiring { stroke: var(--slate); stroke-width: 1; stroke-dasharray: 2 4; }
+.wires .t.retiring { stroke-width: 1; stroke-dasharray: 2 4; opacity: .7; }
+.wires .w.hot { stroke-width: 1.8; opacity: 1; }
+.wires .w.ok.hot { stroke: var(--accent); }
+.wires .t.ok.hot { stroke: #fff; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .wires .t.ok.hot { stroke: #1F2937; } }
+:root[data-theme="dark"] .wires .t.ok.hot { stroke: #1F2937; }
+.wires .w.dim { opacity: .28; }
+.wires .t.dim { opacity: .25; }
+.wires .port { fill: var(--hub-port); stroke: var(--hub); stroke-width: 1.5; }
+.wires .end { fill: var(--surface); stroke: var(--wire); stroke-width: 1.4; }
+.wires .comet { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linecap: round; }
+.wires .hit { fill: none; stroke: transparent; stroke-width: 16; pointer-events: stroke; cursor: pointer; outline: none; }
+.wires .hit.in { stroke-width: 8; }
+.wires .hit:focus-visible { stroke: var(--accent); stroke-opacity: .18; }
+.canvas.stale .wires .w, .canvas.stale .wires .t { opacity: .4; }
+.tip {
+  position: absolute; z-index: 5; pointer-events: none; max-width: 300px; padding: 6px 10px; border-radius: 9px;
+  background: var(--ink); color: var(--bg); font-size: 12px; line-height: 1.4; white-space: nowrap;
+  opacity: 0; transform: translate(-50%, -130%); transition: opacity .15s;
+}
+.tip.on { opacity: 1; }
+
 /* ----- the result sentence ---------------------------------------------------------------- */
 .result { text-align: center; padding: 22px 0 6px; min-height: 92px; }
 .result h1 { font-size: 22px; line-height: 1.3; font-weight: 600; letter-spacing: -.02em; }
 .result p { margin-top: 6px; color: var(--ink-3); font-size: 13.5px; }
 .result p.bad { color: var(--bad); }
+.result .detail a { color: var(--ink-2); text-decoration-color: var(--line-2); }
+.result .detail a:hover { color: var(--ink); text-decoration-color: currentColor; }
 .result .note:empty { margin: 0; }
+
+/* attention cards: one per thing that needs a person */
+.attns { display: flex; flex-direction: column; gap: 10px; max-width: 640px; margin: 18px auto 0; text-align: left; }
+.attn { display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: start; column-gap: 14px; padding: 14px 16px; border-radius: 14px; background: var(--bad-wash); }
+.attn.held { background: var(--wait-wash); }
+.attn .mk { width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center; color: var(--bad); background: var(--surface); }
+.attn.held .mk { color: var(--wait); }
+.attn .body { min-width: 0; padding-top: 4px; }
+.attn b { display: block; font-weight: 600; font-size: 14px; line-height: 1.4; }
+.attn b .svc { vertical-align: -2px; }
+.attn b a { color: inherit; }
+.attn small { display: block; margin-top: 2px; color: var(--ink-2); font-size: 13px; }
+.attn .routes { display: flex; flex-direction: column; gap: 2px; margin: 4px 0 2px; }
+.attn .route { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; }
+.attn .route .cm { vertical-align: 0; }
+.attn .route .arrow { color: var(--ink-3); }
+.attn .why-h { margin: 10px 0 0; color: var(--ink-2); font-size: 13px; }
+.attn .why { margin: 4px 0 0; padding-left: 18px; color: var(--ink-2); font-size: 13px; }
+.attn .why li + li { margin-top: 2px; }
+.attn > .btn { margin-top: 0; }
+.cmd { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 4px 4px 4px 12px; border-radius: 10px; background: var(--surface); border: 1px solid var(--line); flex-wrap: wrap; }
+.cmd code { flex: 1; min-width: 0; font: 12.5px/1.4 var(--mono); overflow-x: auto; white-space: nowrap; padding: 6px 0; }
+.cmd .copied { flex-basis: 100%; color: var(--ink-3); font-size: 12px; padding: 0 0 4px; }
+.cmd .copied:empty { display: none; }
 
 /* ----- lower: tabs ------------------------------------------------------------------------ */
 .lower { margin-top: 48px; padding-bottom: 72px; }
@@ -207,8 +297,18 @@ svg.svc.xs { width: 15px; height: 15px; }
   .top .btn { width: 44px; height: 44px; padding: 0; }
   .canvas { grid-template-columns: minmax(0,1fr) 64px minmax(0,1fr); column-gap: 22px; padding: 22px 0 34px; min-height: 0; }
   .col { gap: 18px; }
+  .acct-h { min-height: 44px; }
+  .acct-h .svc { width: 20px; height: 20px; }
+  .acct-h small { display: none; }
+  .acct-h b { font-size: 12.5px; }
+  .cal { height: 44px; padding: 0 10px; gap: 8px; font-size: 13px; }
+  .cal em { display: none; }
+  .add-acct { min-height: 44px; font-size: 12px; line-height: 1.3; }
   .hub { width: 64px; height: 64px; border-radius: 19px; }
   .hub-cap small { display: none; }
+  .tip { white-space: normal; width: max-content; max-width: min(300px, calc(100vw - 32px)); }
+  .attn { grid-template-columns: 30px minmax(0, 1fr); row-gap: 10px; }
+  .attn > .btn { grid-column: 2; justify-self: start; height: 44px; }
   .result h1 { font-size: 19px; }
   .lower { margin-top: 36px; }
   .insp {

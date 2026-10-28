@@ -3,7 +3,8 @@ synthetic data. Skipped unless ``CALSYNC_SHOTS`` names a directory:
 
     CALSYNC_SHOTS=.superpowers/sdd/shots/task-1 uv run pytest -m browser tests/browser/test_shots.py
 
-Files: ``<browser>-<phone|desktop>-<light|dark>[-<state>].png``.
+Files: ``<browser>-<phone|desktop>-<light|dark>[-<state>].png``; ``-attention`` is a daemon of its
+own with a refused credential (work-mine) and blocked deletes (school-home).
 """
 
 import os
@@ -13,12 +14,14 @@ import pytest
 from playwright.sync_api import Page
 
 from tests.browser.conftest import DESKTOP, PHONE, OpenPage, watch_of
+from tests.browser.live import LiveDaemon
 
 pytestmark = pytest.mark.browser
 
 SHOTS = os.environ.get("CALSYNC_SHOTS")
 SIZES = {"phone": PHONE, "desktop": DESKTOP}
-STATES = {"": "/", "settings": "/#/settings"}
+# ``focus``: a line's inspector open, the map dimmed around that line.
+STATES = {"": "/", "settings": "/#/settings", "focus": "/#/rule/school-home"}
 
 
 def settle(page: Page) -> None:
@@ -65,3 +68,27 @@ def test_screenshot_of_the_pair_page(open_page: OpenPage, browser_name: str, the
     page = open_page(viewport=PHONE, color_scheme=theme, paired=False)
     settle(page)
     page.screenshot(path=str(Path(SHOTS) / f"{browser_name}-phone-{theme}-pair.png"), caret="initial")
+
+
+@pytest.mark.skipif(not SHOTS, reason="set CALSYNC_SHOTS to a directory to take screenshots")
+@pytest.mark.parametrize("theme", ["light", "dark"])
+@pytest.mark.parametrize("size", list(SIZES))
+def test_screenshot_with_attention(
+    open_page: OpenPage, fresh_live: LiveDaemon, browser_name: str, size: str, theme: str
+) -> None:
+    assert SHOTS
+    fresh_live.stage_auth()
+    fresh_live.stage_blocked()
+    page = open_page(daemon=fresh_live, viewport=SIZES[size], color_scheme=theme, reduced_motion="reduce")
+    page.locator(".attn[data-kind=blocked] b a").wait_for(state="attached")  # the count is read
+    settle(page)
+    page.wait_for_timeout(300)
+    watch = watch_of(page)
+    assert watch.problems() == []
+    page.screenshot(
+        path=str(Path(SHOTS) / f"{browser_name}-{size}-{theme}-attention.png"),
+        full_page=True,
+        caret="initial",
+    )
+    watch.console.clear()
+    watch.csp.clear()
