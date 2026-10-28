@@ -19,8 +19,11 @@ says who the UI is for and what it must do. The approved concept is
    and its account: `[Google] 家庭日程 · personal`. The one helper that composes the words is
    `calendarLabel()` in `format.js`; `CalendarName` in `icons.js` adds the mark.
 5. **Every number is evidence.** A count links to what it counts where a place for it exists.
-6. **Configure and repair, never edit events** (until phase C). No secret is ever typed into the
-   browser: a step that needs a person shows the command to run, with a copy button.
+6. **Configure, repair and write originals; never edit copies.** A change to an event goes to
+   Google (a form, a drag, a delete) and the copy follows at the sync the write requests; the
+   iCloud copy itself is never offered for editing. No secret is ever typed into the browser: a
+   step that needs a person (write access: `calsync auth <account> --write`) shows the command
+   to run, with a copy button.
 
 ## Colour
 
@@ -88,6 +91,18 @@ every device; two calendars may share a hue because the name is always beside th
   what to do.
 - **Rows** (`.row`, `.ar`): lists in inspectors and the activity timeline (time, an icon tile,
   a headline, a secondary line with the route).
+- **Event form** (`forms/edit.js`, `#/event-edit/<id>`, `#/event-new`): labelled fields
+  (`.ef`), the date across and the two times under it (`.ef-row`), a segmented 有具体时间 / 全天,
+  reminders as a segmented 日历默认 / 不提醒 / 自己选 plus toggle chips (`.pick`, at most five). A
+  repeating event first asks 只改这一次 / 改整个系列 (radio rows). Saving waits for the sync and
+  returns to the detail; a conflict offers 重新读取. Only changed fields are sent.
+- **Delete confirmation** (`.del` in the detail): a wash of `--bad-wash`, the scope for a
+  repeating event, 取消 and a solid 删除.
+- **Dragging** (`drag.js`): `.ev.drag` blocks move in 15-minute steps (sideways: another day;
+  the bottom edge `.rs`: the end); the target is a `.ghost` outlined in `--accent` with the new
+  time first, dashed and breathing while it saves; month and all-day chips light their target
+  cell (`.drop`). Touch holds 0.4 s first. A repeating event asks in `.move-sheet`, fixed at the
+  bottom. Invitations and read-only calendars have no `.drag`.
 
 ## Delivery state, everywhere the same
 

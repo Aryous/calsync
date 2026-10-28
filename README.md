@@ -14,8 +14,10 @@ Google Calendar ──► calsync (your machine) ──► iCloud / any CalDAV �
 > `--json` for scripts and [AI agents](docs/agent-cli.md)), the
 > `calsync daemon` background process with push notifications, and the
 > launchd service installer are complete and tested, and so is the web UI (the
-> sync map, the calendar, activity and settings). Editing events from the web UI
-> is next (see [Roadmap](docs/ROADMAP.md)).
+> sync map, the calendar, activity and settings). With write access, calsync
+> also creates, changes (by form or by dragging) and deletes the Google
+> originals, from the web UI or the command line, and agents can write many
+> events in one idempotent batch (see [Roadmap](docs/ROADMAP.md)).
 
 ---
 
@@ -190,8 +192,13 @@ calsync reads your calendars with your own Google Cloud OAuth client:
    ```
 
 Personal use needs no Google verification; you will see an "unverified app"
-warning when you sign in (choose *Advanced → continue*). calsync only asks for
-read-only calendar access.
+warning when you sign in (choose *Advanced → continue*). `calsync auth
+<account>` asks for read-only calendar access. To create, change and delete
+events from calsync (the web UI's 修改 and 新建日程, `calsync event …`), give it
+write access once: `calsync auth <account> --write` (Google's page then asks
+for both; keep the box for changing events ticked). calsync never revokes a
+grant: revoking a token of the shared OAuth client would also cut off every
+other token of that client and account.
 
 ### 3. Create an iCloud app-specific password
 
