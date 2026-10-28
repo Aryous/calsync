@@ -4,17 +4,19 @@
 > order, commits per task, and one Opus subagent reviews the whole branch at the end. Steps use
 > checkbox (`- [ ]`) syntax. Ledger: `.superpowers/sdd/progress.md`.
 
-**Goal:** calsync can write to Google Calendar, with a person (web UI) or an agent (CLI) in
-charge: create an event, change it (this occurrence or the whole series), delete it, write
-many events in one idempotent batch, and find and remove duplicates. Every write is followed by
-a sync, so the iCloud copy follows within one cycle. calsync itself stays one-way.
+**Goal:** calsync can write to Google Calendar. A person uses the web UI: create an event,
+change it in a form or by dragging it in the calendar (this occurrence or the whole series),
+delete it. An agent uses atomic CLI commands, including one idempotent batch command, and
+composes them itself for custom needs (removing duplicates is one such need: a recipe in
+`docs/agent-cli.md`, no special code). Every write is followed by a sync, so the iCloud copy
+follows within one cycle. calsync itself stays one-way.
 
 **Architecture:** a thin Google write client (`sources/google_write.py`) beside the existing
 read-only source; one new operations module (`event_ops.py`) whose operations are registered in
 `ops.ASYNC_OPS`, so the CLI and the daemon API share them; schema 6 adds the write history and
-each account's granted scopes; the engine learns a *pre-approval* so deletes a person asked for
-do not trip the mass-delete guard; the web UI gets an edit form, a new-event form, a delete
-action and a duplicates inspector.
+each account's granted scopes; the engine learns a *pre-approval* so the copy deletes that
+follow a delete made in the web UI do not trip the mass-delete guard; the web UI gets an edit
+form, a new-event form, a delete action and drag to move or resize.
 
 **Tech stack:** as before: Python 3.12+/asyncio, httpx, Starlette, SQLite, tomlkit; Preact + htm
 without a build step; pytest, Playwright (Chromium, WebKit).
@@ -23,17 +25,30 @@ without a build step; pytest, Playwright (Chromium, WebKit).
 
 The feasibility review (§3.7, §8) put in C: write access per account, changing the original,
 "only this one / the whole series", sync right after saving, CLI `event edit`. It left creating,
-deleting and dragging to "after C". The ROADMAP puts creating in C. On 2026-10-28 the user added
-two features as required: **removing duplicates** and **batch writes** (the recurring reminder
-schedule: 330 events written by a script, and duplicates an assistant had created).
+deleting and dragging to "after C". The ROADMAP puts creating in C. The user's decisions on
+2026-10-28:
+
+1. Creating, deleting, **dragging** and **batch writes** are in C.
+2. Batch writes are for agents only (CLI / API); the web UI gets no import form, it shows the
+   result in the activity timeline. GUI use is too rare to justify a form.
+3. **No duplicates feature.** calsync provides atomic commands (list events with the fields an
+   agent needs, delete, batch apply); an agent finds and removes duplicates itself. The
+   definition of a duplicate goes into the agent recipe: same calendar, same title (ignoring
+   case and spaces), same start, same end, same repetition; keep the one already delivered to
+   iCloud, else the oldest created; show the list to the person before deleting.
+4. **Mass-delete guard:** only a delete a person makes in the web UI releases its own iCloud copy
+   deletes. Deletes made through the CLI or the API by anyone else (an agent, a script) meet the
+   guard as today: past 10 copies (or half of a calendar) the line stops and waits for
+   `calsync approve` or the 放行 button.
 
 - **In C:** write access (`calsync auth <account> --write`); create; edit (this occurrence /
-  whole series); delete (this occurrence / whole series); batch apply (CLI and API, for agents);
-  find duplicates (read-only view, attention card) and remove them (web UI and CLI); write
-  history in the activity timeline; read-only calendars and invitations greyed out.
-- **Not in C:** "this and following" (splitting a series); drag to move; editing attendees or
-  sending invitations (calsync always writes with `sendUpdates=none`); editing iCloud copies
-  (one-way, D5); a batch-import form in the web UI (agents use the CLI; the UI shows the result).
+  whole series) by form and by drag; delete (this occurrence / whole series); batch apply (CLI
+  and API); the write history in the activity timeline; read-only calendars and invitations
+  greyed out.
+- **Not in C:** "this and following" (cutting a series in two: the old one ends, a new one
+  starts); editing attendees or sending invitations (calsync always writes with
+  `sendUpdates=none`); editing iCloud copies (one-way, D5); a batch-import form in the web UI;
+  any duplicates-specific code.
 
 ## Facts checked against Google's documentation (2026-10-28)
 
@@ -59,19 +74,19 @@ schedule: 330 events written by a script, and duplicates an assistant had create
 - Every write operation supports `--dry-run` / `dry_run` and `--json`; a dry run makes no
   write request (it may read).
 - Edits and deletes are conditional: GET the live event, compare with what the caller saw
-  (`expect`: the `etag`, or the mirror's `updated`), then PATCH/DELETE with `If-Match`. A
-  mismatch or a 412 is `conflict` (HTTP 409 in the API) and writes nothing.
+  (`expect`: the `etag`, or `expect_updated`: the mirror's `updated`), then PATCH/DELETE with
+  `If-Match`. A mismatch or a 412 is `conflict` (HTTP 409 in the API) and writes nothing.
 - Writes use `sendUpdates=none`. Events the account does not organise (`organizer.self` false)
   and calendars whose role is `reader` / `freeBusyReader` are not writable; the UI greys them
-  out and the operations refuse them before any request.
+  out (and does not let them be dragged) and the operations refuse them before any request.
 - A write operation builds its own Google adapter from the **stored** credential (never the
   daemon's cached one), so a credential stored by `calsync auth --write` works at once.
 - Missing write access is `needs_human`: `{"command": "calsync auth <account> --write",
   "reason": …}`. No secret is typed into the browser.
 - After a successful write, the operation requests a cycle for every rule whose source is the
   written calendar (it does not wait unless `wait` is given).
-- Copy deletes that follow from deletes a person or agent asked for in calsync are
-  pre-approved (see Task 2) and never shown as "held back".
+- Pre-approval only for origin `ui` (a person in the web UI). Origin `cli` (an agent, a script,
+  a person in a terminal) never pre-approves; its copy deletes meet the guard.
 - Plain words in the UI, as in DESIGN.md: 原件 / 副本 / 线路 / 已送达 iCloud. Chinese by default,
   every string through `t()`. Phone tap targets at least 44 px.
 - Summaries (`OpResult.summary`) name accounts, calendars and counts, never an event title (titles
@@ -81,25 +96,24 @@ schedule: 330 events written by a script, and duplicates an assistant had create
 
 | File | Responsibility |
 | --- | --- |
-| `src/calsync/sources/google_write.py` (new) | `EventFields` (the editable fields) ↔ Google resource; `GoogleWriter`: get, get_instance, insert, patch, delete, batch |
+| `src/calsync/sources/google_write.py` (new) | `EventFields` (the editable fields) ↔ Google resource; `GoogleWriter`: get, instance, insert, patch, delete, batch |
 | `src/calsync/sources/google.py` | `EVENT_FIELDS` += `created,organizer(self),extendedProperties(private)` (one full re-pull per calendar, by design) |
 | `src/calsync/sources/google_auth.py` | `RefreshTokenProvider.scopes`: the scopes the last refresh reported |
 | `src/calsync/sources/google_oauth.py`, `cli.py` (`auth`) | `--write`: ask for `calendar.readonly calendar.events` |
 | `src/calsync/store.py` | schema 6: `event_write` (history), `account_access` (scopes seen); `_upgrade_5` |
 | `src/calsync/engine.py`, `planner.py` | pre-approval: deletes in `Approval.covers` do not count for the guard |
-| `src/calsync/event_ops.py` (new) | `event.create`, `event.edit`, `event.delete`, `events.apply`, `duplicates.remove` |
-| `src/calsync/duplicates.py` (new) | pure: find duplicate groups in a calendar's mirror, choose the one to keep |
+| `src/calsync/event_ops.py` (new) | `event.create`, `event.edit`, `event.delete`, `events.apply` |
 | `src/calsync/ops.py` | register the new ops; `DaemonHooks.preapprove` |
 | `src/calsync/daemon.py` | store pre-approvals per rule, hand them to the next cycle; record scopes after a pull |
-| `src/calsync/events_view.py`, `views.py` | `editable` in the event detail; `can_write` per account in status; duplicates view; write history |
-| `src/calsync/api.py` | `GET /api/duplicates`, `GET /api/writes`; ops through `/api/ops/*` as today |
-| `src/calsync/cli.py` | `event new|edit|delete|apply`, `duplicates [--remove]`, `writes`, `auth --write` |
+| `src/calsync/events_view.py`, `views.py` | `editable` and the agent fields in events; `can_write` per account in status; the write history |
+| `src/calsync/api.py` | `GET /api/writes`; ops through `/api/ops/*` as today |
+| `src/calsync/cli.py` | `event new|edit|delete|apply`, `writes`, `auth --write` |
 | `src/calsync/web/static/forms/edit.js` (new) | the event form (new and edit), the delete confirmation |
 | `src/calsync/web/static/forms/event.js` | 修改 / 删除 in the detail; greyed reasons |
-| `src/calsync/web/static/forms/duplicates.js` (new) | the duplicates inspector |
-| `src/calsync/web/static/calendar.js`, `app.js`, `activity.js`, `i18n.js`, `styles.css` | 新建日程 button, routes `#/event-new`, `#/event-edit/<id>`, `#/duplicates`, attention card, write rows |
+| `src/calsync/web/static/drag.js` (new) | drag to move and resize in the time grid and the month grid |
+| `src/calsync/web/static/calendar.js`, `app.js`, `activity.js`, `i18n.js`, `styles.css` | 新建日程 button, routes `#/event-new`, `#/event-edit/<id>`, drag wiring, write rows |
 | `tests/…` | unit, ops, API, CLI and browser tests per task |
-| `docs/agent-cli.md`, `DESIGN.md`, `README.md`, `docs/ROADMAP.md` | the new commands and principle 6 |
+| `docs/agent-cli.md`, `DESIGN.md`, `README.md`, `docs/ROADMAP.md` | the new commands, the duplicates recipe, principle 6 |
 
 ---
 
@@ -136,7 +150,6 @@ class GoogleWriter:
     def __init__(self, client, token: TokenProvider, *, base_url=BASE_URL, batch_url=BATCH_URL)
     async def get(self, calendar_id, event_id) -> dict
     async def instance(self, calendar_id, series_id, original_start: str) -> dict   # events.instances?originalStart
-    async def find_key(self, calendar_id, key) -> dict | None  # privateExtendedProperty=calsync_key=<key>
     async def insert(self, calendar_id, body) -> dict
     async def patch(self, calendar_id, event_id, body, *, etag: str) -> dict
     async def delete(self, calendar_id, event_id, *, etag: str | None) -> None   # 404/410: already gone, fine
@@ -149,12 +162,11 @@ class GoogleWriter:
   `sendUpdates=none` on every write; 412 → `WriteConflict`; 403 with
   `insufficientPermissions` → `NoWriteAccess`; 403 rate limit → `TransientError`; 401 refreshes
   once (as `GoogleSource._get`); delete 404/410 is success; batch of 120 calls → 3 requests of
-  50/50/20, parts parsed in order, a part's 4xx is that call's error, not the batch's;
-  `find_key` sends `privateExtendedProperty`.
+  50/50/20, parts parsed in order, a part's 4xx is that call's error, not the batch's.
 - [ ] Implement. Reuse `request_with_retry`, `_error_reasons`, `_is_rate_limited` from
-  `google.py` (move the two helpers to a shared place only if a cycle of imports forces it).
-- [ ] `EVENT_FIELDS` += `created,organizer(self),extendedProperties(private)`; a test that `EVENTS_PARAMS_ID` changed (so
-  every calendar re-pulls fully once: intended).
+  `google.py`.
+- [ ] `EVENT_FIELDS` += `created,organizer(self),extendedProperties(private)`; a test that
+  `EVENTS_PARAMS_ID` changed (so every calendar re-pulls fully once: intended).
 - [ ] `RefreshTokenProvider.scopes: frozenset[str] | None` from the refresh response's `scope`.
 - [ ] `calsync auth <account> --write`: `authorization_url(..., scope=READ+WRITE)`; stored
   credential format unchanged; output "ok: credentials stored (read and write), N calendars
@@ -171,9 +183,9 @@ tests `tests/test_store.py`, `tests/test_engine_guard.py`, `tests/test_daemon.py
 ```sql
 CREATE TABLE event_write (
     id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, origin TEXT NOT NULL,  -- cli | ui
-    op TEXT NOT NULL,            -- create | edit | delete | apply | dedupe
+    op TEXT NOT NULL,            -- create | edit | move | delete | apply
     account TEXT NOT NULL, calendar TEXT NOT NULL, event_id TEXT, title TEXT,
-    detail TEXT,                 -- JSON: {"changes": [...], "count": n, "scope": "this|series", "failed": n}
+    detail TEXT,                 -- JSON: {"changes": [...], "counts": {...}, "scope": "this|series"}
     status TEXT NOT NULL         -- ok | partial | failed
 );
 CREATE TABLE account_access (account TEXT PRIMARY KEY, scopes TEXT NOT NULL, seen_at TEXT NOT NULL);
@@ -183,15 +195,15 @@ CREATE TABLE account_access (account TEXT PRIMARY KEY, scopes TEXT NOT NULL, see
 Store.record_write(row: WriteRecord) -> int ; Store.writes(limit, since=None) -> list[WriteRecord]
 Store.save_scopes(account, scopes: frozenset[str], at) ; Store.scopes(account) -> (frozenset, at) | None
 @dataclass(frozen=True) class Approval: fingerprint: str | None; origin: str; covers: frozenset[str] = frozenset()
-DaemonHooks.preapprove(rule: str, object_ids: frozenset[str], origin: Source) -> None
+DaemonHooks.preapprove(rule: str, object_ids: frozenset[str]) -> None   # origin is always "ui"
 ```
 
 - [ ] Store tests: fresh schema 6 equals an upgraded 5 (`test_upgraded_schema_equals_a_fresh_one`);
   the upgrade keeps `run`, `change`, `config_change`; `event_write` retention (newest 500).
-- [ ] Guard tests: planned deletes ⊆ covers → no block, an `approved` change row with origin;
-  covers ∪ 12 other deletes → the guard judges the 12 alone (blocks: max_count 10); covers that
-  name objects not planned are ignored; a pre-approval is consumed by the cycle that performs
-  its deletes and expires after 24 h.
+- [ ] Guard tests: planned deletes ⊆ covers → no block, an `approved` change row with origin
+  `ui`; covers plus 12 other deletes → the guard judges the 12 alone (blocks: max_count 10);
+  covers that name objects not planned are ignored; a pre-approval is consumed by the cycle
+  that performs its deletes and expires after 24 h.
 - [ ] Engine: `check_delete_guard` gets the plan minus covered deletes; the rest as today.
 - [ ] Daemon: `preapprove` merges object ids per rule; the next cycle of that rule gets them;
   after a cycle, `account_access` is updated from each Google adapter's `scopes`.
@@ -208,7 +220,8 @@ DaemonHooks.preapprove(rule: str, object_ids: frozenset[str], origin: Source) ->
   `location`, `description`, `alarms` (`"default"`, `""`, `"-10m,0m"` like rules, or a list of
   minutes), `wait`.
 - `event.edit`: `id` (calsync's event id), `scope` (`this` | `series`, required for an instance),
-  `expect` (an etag) or `expect_updated` (the `updated` the caller saw), the fields to change, `wait`.
+  `expect` (an etag) or `expect_updated` (the `updated` the caller saw), the fields to change,
+  `move` (true when the change came from a drag: recorded as op `move`), `wait`.
 - `event.delete`: `id`, `scope`, `expect` / `expect_updated`, `wait`.
 
 **Behaviour:**
@@ -220,88 +233,72 @@ DaemonHooks.preapprove(rule: str, object_ids: frozenset[str], origin: Source) ->
 - Build a Google writer for the account from the stored credential (`wiring`), under the
   daemon's cycle lock, each request bounded by `WRITE_TIMEOUT = 60.0`.
 - GET live (`instance()` for scope `this`, else the master); `expect` ≠ live `etag`, or
-  `expect_updated` ≠ live `updated` → `WriteConflict`. Dry run: return `{"before": …, "after": …, "changes": [...]}` and stop.
+  `expect_updated` ≠ live `updated` → `WriteConflict`. Dry run: return `{"before": …,
+  "after": …, "changes": [...]}` and stop.
+- A series moved by a drag (scope `series`): the master keeps its own date and moves by the
+  same offset (the dragged instance's new start minus its old start), so every occurrence
+  moves alike.
 - Write; on `NoWriteAccess` → `needs_human` (and save the scopes seen); on 412 → conflict.
-- Delete: pre-approve the copies: `object_id(rule, calendar_id, source_id)` for every rule whose
-  source is this calendar (a series delete: the series' object; an instance delete changes the
-  series object, nothing to pre-approve).
+- Delete with origin `ui`: pre-approve the copies: `object_id(rule, calendar_id, source_id)`
+  for every rule whose source is this calendar (a series delete: the series' object; an
+  instance delete changes the series object, nothing to pre-approve). Origin `cli`: nothing.
 - Record an `event_write` row; request cycles for the affected rules (`wait`: wait and return
   each rule's result).
 - Result `data`: `{"event": {...live after...}, "event_id": <calsync id>, "rules": [...], "changes": [...]}`.
 
-- [ ] Tests with a fake writer: each refusal makes no request; conflict on etag; dry run makes
-  no write; scope `this` uses `instance()` with the instance's original start; scope `series`
-  patches the master; a timed edit keeps the event's time zone; delete pre-approves exactly the
-  copy ids; the history row and the cycle request; `needs_human` on missing scope.
+- [ ] Tests with a fake writer: each refusal makes no request; conflict on etag and on
+  `updated`; dry run makes no write; scope `this` uses `instance()` with the instance's original
+  start; scope `series` patches the master; a series move shifts the master by the offset; a
+  timed edit keeps the event's time zone; a `ui` delete pre-approves exactly the copy ids, a
+  `cli` delete none; the history row and the cycle request; `needs_human` on missing scope.
 - [ ] Commit `feat(ops): create, edit and delete events in Google`.
 
-### Task 4: batch apply and duplicates
+### Task 4: batch apply
 
-**Files:** create `src/calsync/duplicates.py`; extend `event_ops.py`; tests
-`tests/test_duplicates.py`, `tests/test_event_apply.py`.
+**Files:** extend `event_ops.py`; tests `tests/test_event_apply.py`.
 
-**`events.apply`** — `account`, `calendar`, `events`: a list of items, each
-`{"key": "...", "delete": false, …EventFields…}`; `prune_prefix` (optional): delete events
-whose key starts with it and are not in the list.
+**`events.apply`** — `account`, `calendar`, `events`: a list of items. An item names its event
+either by `key` (calsync's identity in `extendedProperties.private.calsync_key`: create it if
+absent, update it if it differs) or by `id` (an existing event from `calsync events --json`:
+update or delete only). `{"delete": true}` deletes. `prune_prefix` (optional): delete keyed
+events whose key starts with it and are not in the list.
 
-- Find the keyed events in the mirror (`extendedProperties.private.calsync_key`, fetched since
-  Task 1); before writing, pull the calendar once so the mirror is current.
-- Plan per item: create (no event with the key), update (fields differ), unchanged, delete
-  (`delete: true`, or pruned). Dry run returns the plan with counts.
+- Pull the calendar once (the mirror is then current), find keyed events in the mirror.
+- Plan per item: create, update (fields differ), unchanged, delete. Dry run returns the plan
+  with counts and each item's outcome.
 - Write in batches of 50; per-item result `ok | failed (reason)`; a re-run after a partial
-  failure only does what is left (the key is the identity).
-- Pre-approve the copies of every delete; one `event_write` row (`op = apply`, counts in detail);
-  request the cycle once.
+  failure does only what is left (the key, or the id, is the identity).
+- Never pre-approves (origin `cli` or an API caller): its copy deletes meet the guard.
+- One `event_write` row (`op = apply`, counts in detail); request the cycle once.
 
-**Duplicates** (`duplicates.py`, pure):
+- [ ] Tests: the plan (create / update / unchanged / delete / prune); idempotent re-run; items by
+  `id`; an `id` that does not exist fails that item only; batch partial failure; dry run makes no
+  write; a bad item (end before start, both `key` and `id` missing) refuses the whole call before
+  any write.
+- [ ] Commit `feat(ops): batch apply with idempotent keys`.
 
-```python
-@dataclass(frozen=True) class DuplicateGroup:
-    account: str; calendar: str; title: str; start: str; end: str
-    keep: str               # source id kept by default
-    remove: tuple[str, ...]
-def find_duplicates(raw_events: Iterable[RawEvent], tz: str) -> list[DuplicateGroup]
-```
-
-- Duplicates: same calendar, not cancelled, same normalised title (trimmed, inner whitespace
-  collapsed, case-folded), same start and end (all-day: same dates; timed: same instant), and
-  the same recurrence (both single, or the same `RRULE`/`EXDATE` lines). Instances of a series
-  are never compared one by one.
-- Keep: the one whose copy is already delivered (fewest changes in iCloud); otherwise the oldest
-  `created`; otherwise the smallest id. Description, location and alarms of the others are not
-  merged (a person picks another to keep if needed).
-- `GET /api/duplicates` / `calsync duplicates`: groups for every source calendar a rule syncs.
-- `duplicates.remove`: `groups` as `[{"keep": id, "remove": [ids]}]` (from the view; the op
-  re-checks each against the mirror and refuses ids that are not duplicates of `keep`), or
-  `all: true`. Pulls the calendar first, re-checks every id against the fresh mirror, then
-  deletes in batches without `If-Match` (the mirror keeps no etag, and a GET per event would
-  double the requests; the fresh re-check stands in for it). Pre-approves copies, records
-  one `event_write` row (`op = dedupe`), requests the cycle.
-
-- [ ] Tests: titles differing in case/whitespace group; different end or recurrence does not;
-  keep rule order; apply plan (create/update/unchanged/delete/prune) and idempotent re-run;
-  batch partial failure; remove refuses a non-duplicate id.
-- [ ] Commit `feat(ops): batch apply with idempotent keys, duplicates and their removal`.
-
-### Task 5: API, CLI, views
+### Task 5: API, CLI, views, agent docs
 
 **Files:** `api.py`, `cli.py`, `views.py`, `events_view.py`, `docs/agent-cli.md`; tests
 `tests/test_api_events_write.py`, `tests/test_cli_events.py`.
 
-- [ ] Event detail gains `editable: {"ok": bool, "reason": null | "read_only_calendar" |
-  "invitation" | "no_write_access" | "no_source_rule", "command": null | "calsync auth X --write"}`
-  and `etag: null` (the mirror has no etag; `updated` is sent as `expect_updated` instead and
-  the op compares it with the live `updated`). Status: each Google account gains `can_write:
+- [ ] Events (list and detail) gain what an agent needs to reason: `source_id`, `updated`,
+  `created`, `repeats` (the recurrence lines, or null), `key` (or null), and `editable: {"ok":
+  bool, "reason": null | "read_only_calendar" | "invitation" | "no_write_access",
+  "command": null | "calsync auth X --write"}`. Status: each Google account gains `can_write:
   true | false | null` (null: not seen yet).
-- [ ] `GET /api/duplicates`, `GET /api/writes?limit` (the history, newest first).
+- [ ] `GET /api/writes?limit` (the history, newest first).
 - [ ] CLI: `calsync event new --account A --calendar C --title … --start … --end … [--all-day]
   [--location] [--alarms]`, `calsync event edit <id> [--this|--series] [fields]`, `calsync event
-  delete <id> [--this|--series]`, `calsync event apply <file.json|->`, `calsync duplicates
-  [--remove [--all]]`, `calsync writes`; all with `--dry-run`, `--json`, `--wait`. Exit codes as
-  today; conflict → exit 1 with `"kind": "conflict"`.
-- [ ] `docs/agent-cli.md`: the write loop for agents: write → `trigger --wait` (automatic) →
-  `events --json` to check delivery; batch file format; duplicates.
-- [ ] Commit `feat(cli,api): event writes, duplicates and the write history`.
+  delete <id> [--this|--series]`, `calsync event apply <file.json|->`, `calsync writes`; all
+  with `--dry-run`, `--json`, `--wait`. Exit codes as today; conflict → exit 1 with
+  `"kind": "conflict"`.
+- [ ] `docs/agent-cli.md`: the write loop (write → the cycle runs → `events --json` to check
+  delivery); the batch file format; **recipe: removing duplicates** (list with `events --json
+  --from --to`, group by the definition in Scope §3, show the groups to the person, then one
+  `event apply` with `{"id": …, "delete": true}` items; past the guard, the person or the agent
+  releases with `calsync approve` after checking `calsync blocked --json`).
+- [ ] Commit `feat(cli,api): event writes and the write history`.
 
 ### Task 6: web UI — edit and delete in the event detail
 
@@ -313,15 +310,15 @@ def find_duplicates(raw_events: Iterable[RawEvent], tz: str) -> list[DuplicateGr
   command to copy).
 - [ ] `#/event-edit/<id>`: title, all-day switch, date + start/end time (native inputs, 16 px),
   location, reminder (日历默认 / 不提醒 / list of minutes), description. A recurring instance asks
-  first: **只改这一次 / 改整个系列** (radio rows). Save → dry run is not needed (the form shows the
-  change list itself); the op runs with `expect_updated`; then the inspector returns to the
-  detail, which shows 等待送达 → 已送达 as the cycle runs.
+  first: **只改这一次 / 改整个系列** (radio rows). Save runs the op with `expect_updated`; the
+  inspector returns to the detail, which shows 等待送达 → 已送达 as the cycle runs.
 - [ ] Conflict: "这条日程刚在 Google 里被改过" with **重新载入**. `needs_human`: the command.
 - [ ] Delete: a confirmation sheet naming the calendar and, for a series, the scope choice; then
   the detail closes and the calendar reloads.
 - [ ] Browser tests (Chromium, WebKit): edit title and time of a single event; edit one
-  instance vs the series; conflict path; read-only calendar shows no buttons; delete; phone
-  viewport tap targets and overflow (`test_layout.py` gains the new routes).
+  instance vs the series; conflict path; read-only calendar shows no buttons; delete (the copy
+  delete is not held back even past the guard); phone viewport tap targets and overflow
+  (`test_layout.py` gains the new routes).
 - [ ] Commit `feat(web): change and delete events from the detail`.
 
 ### Task 7: web UI — new event
@@ -337,37 +334,37 @@ def find_duplicates(raw_events: Iterable[RawEvent], tz: str) -> list[DuplicateGr
   等待送达, then 已送达.
 - [ ] Commit `feat(web): create events`.
 
-### Task 8: web UI — duplicates and the write history
+### Task 8: web UI — drag to move and resize; the write history
 
-**Files:** create `forms/duplicates.js`; modify `sentence.js`/`app.js` (attention card),
-`activity.js`; tests `tests/browser/test_duplicates.py`, `tests/browser/test_activity.py`.
+**Files:** create `web/static/drag.js`; modify `calendar.js`, `activity.js`, `styles.css`,
+`i18n.js`; tests `tests/browser/test_drag.py`, `tests/browser/test_activity.py`.
 
-- [ ] Attention card when any synced calendar has duplicates: "家庭日程 里有 12 组重复日程（多了
-  31 个）" → `#/duplicates`.
-- [ ] Inspector: groups by calendar; each group: title, time, how many, which one stays (radio
-  rows; default the API's `keep`, marked 已送达 if its copy is delivered); **删除 31 个重复** →
-  confirm → progress → result ("已删除 31 个，iCloud 副本下次同步时一起删除").
-- [ ] Activity: write rows ("在 calsync 里修改了 · 时间 10:00 → 09:30", "批量写入 330 个",
-  "删除了 31 个重复") with origin 界面 / 命令行.
-- [ ] Commit `feat(web): duplicates and the write history`.
+- [ ] Day, two-day, week and two-week views: drag an event block up or down to change its time,
+  sideways to another day; drag its bottom edge to change its end. Steps of 15 minutes. While
+  dragging, the block shows the new time ("09:30–10:15").
+- [ ] Month view: drag an event chip to another day (the time of day stays).
+- [ ] Phone: hold an event about 0.4 s, then drag; a plain swipe still scrolls. Desktop: a press
+  that moves more than 4 px starts a drag; a click without movement still opens the detail.
+- [ ] Not draggable: events whose `editable.ok` is false, all-day events in the time grid's
+  hour area (they move in the all-day row and the month view only).
+- [ ] On release: a recurring event asks **只改这一次 / 改整个系列** (a small sheet; Escape or 取消
+  puts the block back). Then `event.edit` with `move: true`; the block stays at its new place,
+  marked 等待送达 until the cycle delivers it; a conflict or a failure puts it back with the
+  reason.
+- [ ] Keyboard: no drag; the detail's 修改 form is the keyboard path (named in the block's
+  accessible description).
+- [ ] Activity: write rows ("在 calsync 里修改了 · 时间 10:00 → 09:30", "拖动到 10月30日 09:30",
+  "批量写入 330 个") with origin 界面 / 命令行.
+- [ ] Browser tests: drag a single event an hour later; drag to the next day; resize; drag one
+  occurrence of a series (only this one) and the series; a click still opens the detail; a
+  read-only event does not move; a touch drag after the hold in WebKit; a swipe scrolls.
+- [ ] Commit `feat(web): drag events to move and resize; the write history`.
 
 ### Task 9: docs, full verification, review, merge
 
 - [ ] DESIGN.md principle 6 → "Configure, repair and write originals; never edit copies";
-  components for the form; README; ROADMAP (C done; "this and following", drag: later).
+  components for the form and the drag; README; ROADMAP (C done; "this and following": later).
 - [ ] Full suite: `uv run ruff check`, `ruff format --check`, `pyright`, `pytest` (unit), browser
   suite. Screenshots at phone and desktop width, light and dark.
 - [ ] One Opus subagent reviews the whole branch (`model: "opus"`), with the list of deferred
   minors from the ledger; fix its Critical/Important findings; merge to main locally (no push).
-
-## Decisions for the user
-
-1. Scope as above (create, edit, delete, batch, duplicates in; "this and following", drag,
-   attendees, batch form in the UI out).
-2. Duplicate = same calendar, title (ignoring case and spaces), start, end and repetition. Kept by
-   default: the one already delivered to iCloud, else the oldest. Nothing is removed without a
-   person or agent confirming the list.
-3. Batch writes are for agents (CLI/API, a JSON file with a key per event); the UI only shows the
-   result in the activity timeline.
-4. Deletes asked for in calsync release their own iCloud copy deletes (pre-approval); any other
-   deletes in the same cycle still meet the guard.
