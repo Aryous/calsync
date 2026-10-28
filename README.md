@@ -10,9 +10,11 @@ Google Calendar ──► calsync (your machine) ──► iCloud / any CalDAV �
    you write here       incremental, safe         people read here
 ```
 
-> **Status: early.** The sync engine, the `calsync` command line and the
-> `calsync daemon` background process are complete and tested; alerts, a
-> service installer and a web UI are next (see [Roadmap](docs/ROADMAP.md)).
+> **Status: early.** The sync engine, the `calsync` command line (with
+> `--json` for scripts and [AI agents](docs/agent-cli.md)), the
+> `calsync daemon` background process with push notifications, and the
+> launchd service installer are complete and tested. The web UI works but is
+> being rewritten (see [Roadmap](docs/ROADMAP.md)).
 
 ---
 
@@ -26,6 +28,7 @@ Google Calendar ──► calsync (your machine) ──► iCloud / any CalDAV �
 - [Upgrading](#upgrading)
 - [Configuration](#configuration)
 - [Running as a daemon](#running-as-a-daemon)
+- [Notifications](#notifications)
 - [Web UI](#web-ui)
 - [Command line](#command-line)
 - [Safety guarantees](#safety-guarantees)
@@ -64,6 +67,9 @@ directly in the other person's account.
 | **Safe by construction** | only touches events it created, mass-delete guard, keeps the last good copy when source data is malformed (see [Safety guarantees](#safety-guarantees)) |
 | **Credentials** | macOS Keychain, environment variables, or 0600 files; verified before they are stored |
 | **Proxies** | honours `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` |
+| **Runs in the background** | `calsync daemon` with hot reload of the config file; `calsync service install` sets it up as a launchd agent |
+| **Tells you when it needs you** | Bark and webhook pushes for expired sign-ins, blocked deletes, repeated failures and recovery |
+| **Agent friendly** | every command has `--json`; configuration changes are validated, backed up, recorded and undoable; see the [agent guide](docs/agent-cli.md) |
 
 ## How it works
 
@@ -217,6 +223,10 @@ target = { account = "me-icloud", calendar = "Family", create_if_missing = true 
 calsync config check
 ```
 
+You can also build the file from the command line: `calsync account add`
+and `calsync rule add` write the same tables (see
+[Changing the configuration](#changing-the-configuration)).
+
 ### 5. Sign in
 
 ```sh
@@ -230,11 +240,15 @@ one if verification fails.
 ### 6. Look, then sync
 
 ```sh
-calsync calendars me-google    # IDs and names of your Google calendars
-calsync calendars me-icloud    # your iCloud calendars
+calsync calendars me-google    # IDs, names and your role in each Google calendar
+calsync calendars me-icloud    # your iCloud calendars (their URLs and names)
 calsync run --dry-run          # print what would be created / updated / deleted
 calsync run                    # one sync cycle
 ```
+
+`calendars` prints when the list was fetched, then one line per calendar
+(ID or URL, name, and for Google your access role). The list is cached;
+`--refresh` fetches it again.
 
 ### 7. Keep it running
 
@@ -242,45 +256,53 @@ calsync run                    # one sync cycle
 calsync daemon                 # syncs now, then every minute, until Ctrl-C
 ```
 
-See [Running as a daemon](#running-as-a-daemon). `calsync service install`
-is not implemented yet; until it is, start the daemon at login with a launchd
-agent you write yourself. An example
-(`~/Library/LaunchAgents/dev.calsync.daemon.plist`):
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>dev.calsync.daemon</string>
-  <key>ProgramArguments</key>
-  <array><string>/Users/YOU/.local/bin/calsync</string><string>daemon</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/Users/YOU/Library/Logs/calsync.log</string>
-  <key>StandardErrorPath</key><string>/Users/YOU/Library/Logs/calsync.log</string>
-</dict></plist>
-```
+To start it at login and keep it running (macOS), install it as a launchd
+agent:
 
 ```sh
-launchctl load ~/Library/LaunchAgents/dev.calsync.daemon.plist
+calsync service install        # writes ~/Library/LaunchAgents/dev.calsync.daemon.plist and loads it
+calsync service status         # installed? loaded? its pid and last exit code
 ```
 
-`KeepAlive` restarts the daemon whenever it exits, so stop it with
-`launchctl unload ~/Library/LaunchAgents/dev.calsync.daemon.plist`, not with
-SIGTERM (launchd would start it again). A daemon that fails to start (a
-configuration error, a held lock) is retried about every 10 seconds; the log
-says why. If you used a `StartInterval` agent running `calsync run` before,
-unload it first: while the daemon runs, `calsync run` exits with code 4. The keychain backend needs a logged-in user
-session; on a machine that sits at the login screen use the `file` backend
-instead. There are no notifications yet: check `calsync status`.
+See [As a launchd service](#as-a-launchd-service-macos) and
+[Running as a daemon](#running-as-a-daemon). Set up
+[notifications](#notifications) so you hear when it needs you.
 
 ## Upgrading
 
 ```sh
 uv tool install --reinstall git+https://github.com/Aryous/calsync
 calsync config check
-calsync run --dry-run          # review before the first real cycle
+calsync run --dry-run          # review before the first real cycle (needs the daemon stopped)
 ```
+
+A running daemon keeps running the old version until it restarts. If it runs
+as a service, restart it with `calsync service uninstall` and
+`calsync service install` (the uninstall waits for a running cycle to
+finish).
+
+### Upgrading to the version with configuration commands, notifications and the service
+
+- **The state database is migrated in place** (schema 5). Run and change
+  history are kept and the first cycle costs no more than any other. What
+  calsync wrote for each copy is recorded from now on, so the change details
+  (`calsync changes --json`, `calsync event show`) start with the upgrade.
+- **Going back to an older calsync rebuilds its state database.** An older
+  version does not know the new schema, so it starts from an empty state:
+  one heavy cycle (no duplicates), and the run history, the change history
+  and the config history (`calsync config history`) are lost.
+- **`calsync service install` replaces a hand-written launchd plist.** If you
+  wrote `~/Library/LaunchAgents/dev.calsync.daemon.plist` yourself (as an
+  earlier version of this README said), `calsync service install` shows how
+  it differs and stops (exit 2); `calsync service install --force` boots the
+  old agent out (waiting for a running cycle to finish), writes its own plist
+  and loads it. Another launchd job that runs calsync (an old `StartInterval`
+  agent running `calsync run`, say) is reported and stops the install (exit
+  4): unload it first. The daemon's log is now
+  `~/Library/Logs/calsync/daemon.log`.
+- **Notifications are off until you configure a channel** (see
+  [Notifications](#notifications)). Their texts are Chinese by default; set
+  `notify.language` to `"en"` for English.
 
 ### Upgrading to the version with the daemon and the web UI
 
@@ -353,6 +375,8 @@ directory. Every problem in the file is reported at once.
 | `fields` | `{ attendees = "notes", conference = "copy", content = "full" }` | what of each event reaches the target; see below |
 | `on_target_edit` | `"revert"` | the only value: an edit made on the target is written back to the source version on the next cycle, and a copy deleted on the target is re-created |
 | `delete_guard` | `{ max_ratio = 0.5, max_count = 10 }` | block a cycle that would delete more than `max_count` events, or (from 3 deletions on) more than `max_ratio` of the rule's events |
+| `paused` | `false` | `true`: no cycle syncs the rule (`calsync pause` / `resume` set it) |
+| `retire` | `false` | `true`: the rule deletes its copies (through the delete guard), then calsync removes it from the file (`calsync rule remove --delete-copies` sets it) |
 
 `fields` — every key is optional:
 
@@ -377,9 +401,9 @@ next cycle.
 Durations are written as `30s`, `5m`, `2h`, `7d`, `1w`, with an optional sign.
 
 `[runtime]` sets the daemon's schedule: `interval` (default `60s`) and
-`jitter` (default `0.1`, so each wait is 54–66 s). `[notify]` (`bark_url`,
-`webhook_url`, `failure_threshold`) is validated today and will be used by
-alerts.
+`jitter` (default `0.1`, so each wait is 54–66 s). `[notify]` sets the push
+channels (`bark_url`, `webhook_url`, `public_url`, `failure_threshold`,
+`language`; see [Notifications](#notifications)).
 
 `[web]` sets where the daemon serves the [web UI](#web-ui):
 
@@ -389,16 +413,66 @@ listen = "127.0.0.1:8766"              # HOST:PORT (default); an IPv6 host in br
 allowed_hosts = ["mac-mini.local"]     # other names the browser may use for this machine
 ```
 
+### Changing the configuration
+
+You can edit the file by hand, or change it with commands that keep its
+comments and layout:
+
+```sh
+calsync config get                              # the parsed config as JSON (URLs and logins masked; --reveal)
+calsync config set runtime.interval 2m          # one setting; an empty value removes it
+calsync config set notify.bark_url https://api.day.app/YOUR_KEY
+calsync rule add work --source me-google:Work --target me-icloud:Work --create-target --preview
+calsync rule add work --source me-google:Work --target me-icloud:Work --create-target --content busy
+calsync rule set work window 30d:365d           # also alarms, fields.*, delete_guard.*, paused
+calsync rule remove work [--delete-copies]
+calsync pause family                            # no cycle syncs it until: calsync resume family
+calsync account add kid-icloud --provider caldav --server-url icloud --username kid@icloud.com
+calsync account remove kid-icloud
+calsync config history                          # who changed what, newest first
+calsync config undo                             # undo the newest change not yet undone
+```
+
+- Every command that changes the file takes `--dry-run` (validate and show
+  the diff, write nothing) and `--json`. The new text is validated as a whole
+  (the same checks as `config check`) before it is written; the previous file
+  is kept as `config.toml.bak`, and the new one replaces it atomically.
+- A change is refused if the file changed since calsync read it ("the file
+  was changed outside calsync; reload and try again"): run the command again.
+- With the daemon running, the command is carried out by the daemon between
+  two cycles and takes effect at once. Otherwise it runs in the command's own
+  process.
+- `rule add --preview` reads the source and target now and says how many
+  events the rule would copy, writing nothing. Offsets for `--alarms` that
+  start with `-` need an `=`: `--alarms=-10m,0m`.
+- `rule remove` leaves the rule's copies in the target calendar;
+  `--delete-copies` deletes them first (over the next cycles, through the
+  mass-delete guard) and then removes the rule.
+- `account add` stores no secret: `calsync auth NAME` does, afterwards.
+- `config history` records changes made with these commands (`cli`), from
+  the web UI (`ui`), by the daemon (removing a retired rule) and edits made
+  by hand that the daemon picked up (`external`); the newest 200 are kept.
+
+**Hot reload.** The daemon checks the file every 2 seconds between cycles
+(and right before each cycle) and applies a valid change without a restart;
+only the accounts whose definition changed are reconnected. An invalid
+edit is not applied: the daemon keeps running the previous configuration,
+logs the number of problems and sends a notification; `calsync config check`
+shows them. A changed `[web] listen` needs a restart; `allowed_hosts` apply
+at once.
+
 ### Files calsync creates
 
 | Path | Contents |
 | --- | --- |
-| `~/.config/calsync/` | your configuration and OAuth client file |
+| `~/.config/calsync/` | your configuration and OAuth client file; `config.toml.bak`, the file before calsync's last change |
 | macOS Keychain, service `calsync/<ref>` | refresh tokens and app-specific passwords (keychain backend) |
-| `~/.local/state/calsync/state.db` (or `$CALSYNC_STATE_DIR`, `--state-dir`) | rebuildable cache and run history, mode 0600 |
+| `~/.local/state/calsync/state.db` (or `$CALSYNC_STATE_DIR`, `--state-dir`) | rebuildable cache, run, change and config history, mode 0600 |
 | `~/.local/state/calsync/run.lock` | prevents two syncing processes (`calsync run`, `calsync daemon`) at once |
 | `~/.local/state/calsync/calsync.sock` | the daemon's local API socket, mode 0600, removed when it stops |
 | `~/.local/state/calsync/web.key` | the web UI's pairing key, mode 0600 (`calsync web pair` creates it) |
+| `~/Library/LaunchAgents/dev.calsync.daemon.plist` | the launchd agent (`calsync service install`) |
+| `~/Library/Logs/calsync/daemon.log` | the daemon's log under launchd (counts and config names only) |
 
 ## Running as a daemon
 
@@ -419,17 +493,30 @@ a `calsync run` meanwhile exits with code 4: use `calsync trigger` instead
   triggered rule runs regardless. A cycle blocked by the mass-delete guard
   neither adds to nor clears a rule's failure streak, so a backoff earned by
   earlier failures still applies. The rule stays blocked until someone acts:
-  check `calsync blocked --rule NAME`, then `calsync approve NAME` lets exactly
-  that set through in the daemon's next cycle (a different set blocks again).
-- **Authentication.** After `calsync auth <account>` the daemon picks up the
-  new credential at the rule's next attempt; `calsync trigger --rule NAME`
-  makes that now.
+  `calsync blocked --rule NAME` lists the copies it would delete (and the
+  set's fingerprint), then `calsync approve NAME` lets exactly that set
+  through in the daemon's next cycle (a different set blocks again). On a
+  terminal `approve` shows the titles and asks you to type the rule name;
+  without one it needs `--yes` (and should get `--fingerprint`, as an agent
+  does). Every approval is recorded and sent as a notification. Without a
+  daemon, `approve` runs that cycle itself.
+- **Authentication and setup.** After `calsync auth <account>`, or after you
+  fix what kept an account from being set up (a credential file's mode, a
+  missing OAuth client file), the daemon picks it up at the rule's next
+  attempt; `calsync trigger --rule NAME` makes that now.
+- **Configuration changes** apply without a restart (see
+  [Hot reload](#changing-the-configuration)). A paused rule is never run; a
+  retiring rule (`rule remove --delete-copies`) is removed from the file
+  once its copies are gone.
+- **The calendar list** of every account is fetched at start and every 6
+  hours, for `calsync calendars` and the web UI.
 - **Stopping.** SIGTERM or Ctrl-C lets the current cycle finish, then exits.
-  A second Ctrl-C does not force-quit; `kill -9` does. Under launchd with
-  `KeepAlive`, use `launchctl unload` instead: launchd restarts a daemon that
-  exits.
-- **Logs** go to stderr: one line per cycle with counts only (no titles, no
-  URLs).
+  A second Ctrl-C does not force-quit; `kill -9` does. Under launchd
+  (`KeepAlive`), use `calsync service uninstall` instead: launchd restarts a
+  daemon that exits.
+- **Logs** go to stderr (under the service, to
+  `~/Library/Logs/calsync/daemon.log`): one line per cycle with counts only
+  (no titles, no URLs).
 - **The socket.** The daemon serves a small JSON API on
   `<state-dir>/calsync.sock` (mode 0600, so only your user can reach it).
   `calsync trigger` uses it. With `--wait` it waits (at most `--timeout`
@@ -448,14 +535,98 @@ a `calsync run` meanwhile exits with code 4: use `calsync trigger` instead
   serving …`): point `--state-dir` at a copy of the state directory to show
   the data without touching the live one.
 
+### As a launchd service (macOS)
+
+```sh
+calsync service install [--listen HOST:PORT] [--force] [--dry-run]
+calsync service status
+calsync service uninstall [--dry-run]
+```
+
+`install` writes `~/Library/LaunchAgents/dev.calsync.daemon.plist` and loads
+it, so `calsync daemon` starts at login and is restarted whenever it exits
+(`KeepAlive`; launchd gives a stopping daemon 120 seconds to finish its
+cycle). The plist runs this calsync by its absolute path (the program you
+ran, else the `calsync` next to its Python, else the one on `PATH`); a
+`calsync` inside a repository checkout's virtualenv is warned about, since
+the service breaks when the checkout goes. The global `--config` and
+`--state-dir` go into the plist as absolute paths, and so do
+`$CALSYNC_CONFIG` / `$CALSYNC_STATE_DIR` when set (launchd does not see your
+shell's environment); a config file that does not exist is warned about.
+Run it from a logged-in desktop session, not over SSH.
+
+- Installing the same plist again does nothing (it loads it if it is not
+  loaded). A different plist at that path stops the install (exit 2, with
+  the diff); `--force` replaces it, booting the old agent out first and
+  waiting for it to stop (up to about two minutes while a cycle finishes).
+- Another launchd job that runs calsync (found in `launchctl list` and in
+  `~/Library/LaunchAgents`) stops the install (exit 4): two schedulers would
+  fight over the lock. Unload it, or pass `--force` to install anyway.
+- `uninstall` boots the agent out, waits for it to stop, then removes the
+  plist; the logs and the state directory stay.
+- `--dry-run` prints the plist and the `launchctl` commands and does
+  nothing. To manage the agent yourself, write that plist where you like and
+  load it with `launchctl bootstrap gui/$(id -u) PATH`.
+
+The keychain backend needs a logged-in user session; on a machine that sits
+at the login screen use the `file` backend instead.
+
+## Notifications
+
+calsync stays quiet while all is well and pushes one short message when
+something needs you:
+
+- an account's sign-in stopped working (run `calsync auth ACCOUNT`);
+- the mass-delete guard blocked a rule (the count and up to five titles);
+- a rule failed `failure_threshold` times in a row (default 3; blocked runs
+  and sign-in failures are not counted, they have their own push);
+- an edit you made by hand to the config file is invalid (the number of
+  problems; the daemon keeps running the previous configuration);
+- blocked deletes were approved (the rule, the count and where it came from);
+- and once more when a problem is over ("recovered").
+
+The same problem is pushed once until it is over. When a rule's blocked set
+changes (it grew, say), the new set is pushed no sooner than 30 minutes after
+the last push, unless it is at least twice as large; a series of invalid
+config edits is damped the same way. The daemon and `calsync run` both send
+pushes; a push that fails is logged (`notification failed (bark,
+ConnectTimeout)`, never the URL) and not retried, and never holds up a sync.
+
+```toml
+[notify]
+bark_url = "https://api.day.app/YOUR_DEVICE_KEY"   # Bark (iOS): the device URL the app shows
+webhook_url = "https://example.com/hooks/calsync"  # any endpoint that takes a JSON POST
+public_url = "http://mac-mini.local:8766/"         # optional: tapping a push opens the web UI here
+failure_threshold = 3
+language = "en"                                    # "zh" (the default) or "en"
+```
+
+- **Bark:** install the [Bark](https://github.com/Finb/bark) app on the
+  iPhone, copy the device URL it shows (`https://api.day.app/<key>`) into
+  `bark_url`, then run `calsync notify test`. The device key is a secret
+  (anyone with it can push to that phone): `calsync config get` masks it.
+  Sign-in and blocked-delete pushes use Bark's time-sensitive level.
+- **Webhook:** calsync POSTs `{"event", "rule", "account", "title", "body",
+  "url", "at"}`; `event` is `auth`, `blocked`, `failing`, `recovered`,
+  `reload_failed`, `approved` or `test`.
+- **`calsync notify test`** sends a test push to every configured channel and
+  prints how each went: exit 0 when all took it, 1 when one failed, 2 when
+  none is configured.
+- **Titles leave your machine.** A blocked-deletes push names events, and
+  pushes go through Bark's server and Apple's push service, or through your
+  webhook's server.
+
 ## Web UI
+
+The web UI is being rewritten; the page described here is the first
+version.
 
 The daemon also serves a web page with the sync status, the events due in the
 next 24 hours, recent changes and the run history, and a "sync now" button. By
 default it listens on `127.0.0.1:8766` (only this computer); set `[web]
 listen` or pass `calsync daemon --listen HOST:PORT` to change that. To turn
-the web UI off, set `listen = "off"` or pass `calsync daemon --no-web`; the
-local API socket (and `calsync trigger`) keeps working. If the daemon cannot
+the web UI off, set `listen = "off"` or pass `calsync daemon --no-web` (or
+`--listen off`); the local API socket (and `calsync trigger`) keeps working. If the daemon cannot
 listen on the address (the port is taken, say), it exits with code 2 before
 any sync and says why (`cannot listen on 127.0.0.1:8766: address already in
 use; …`): pick another port or turn the web UI off.
@@ -498,43 +669,80 @@ daemon runs:
 
 ```sh
 calsync status                 # health per rule, and what needs attention
+calsync events --from 2026-11-03 --to 2026-11-05   # events by local day, each with its delivery per rule
+calsync event show ID          # one event (an id from `events --json`): source, copies, differences
 calsync upcoming --hours 48    # events due soon and whether they reached the target
+calsync blocked                # deletes held back by the mass-delete guard
 calsync runs --limit 20        # recorded sync runs, newest first
-calsync changes --since 2026-10-24T08:00   # copies created, updated, deleted, …
+calsync changes --since 2026-10-24T08:00   # copies created, updated, deleted, … with what changed
+calsync calendars me-google    # an account's calendars, from the cache (--refresh: fetch now)
+calsync config history         # recorded configuration changes
 ```
 
-Each one takes `--json` for scripts and agents. **`--json` output (and the
+Each one takes `--json` for scripts and agents (see the
+[agent guide](docs/agent-cli.md) for the shapes). **`--json` output (and the
 API) contains event titles and locations**, so treat it like the calendar
-itself; the text output of `upcoming` and `changes` shows titles too.
+itself; the text output of `events`, `upcoming`, `blocked` and `changes`
+shows titles too.
 
 ## Command line
 
 ```
 calsync [--config PATH] [--state-dir DIR] <command>
 
+Setup
   config check                     validate the configuration
-  calendars <account>              list an account's calendars (ID/URL and name)
+  config get [--reveal]            the parsed configuration as JSON (masked unless --reveal)
+  config set KEY VALUE             one setting (runtime.*, notify.*, web.allowed_hosts, google.*)
+  config history [--limit N]       recorded configuration changes, newest first
+  config undo                      undo the newest change not yet undone
+  account add NAME --provider google|caldav [--server-url icloud|URL] [--username LOGIN]
+  account remove NAME [--delete-credential]
   auth <account>                   google: browser sign-in; caldav: read the password
        [--refresh-token-stdin]     google: store an existing refresh token instead
+  calendars <account> [--refresh]  an account's calendars: ID/URL, name, role (cached)
+  rule add NAME --source ACCOUNT:CALENDAR --target ACCOUNT:CALENDAR [--create-target]
+           [--window all|PAST:FUTURE] [--alarms copy|strip|-10m,0m] [--content full|busy]
+           [--attendees none|notes] [--conference copy|none] [--preview]
+  rule set NAME KEY VALUE          window, alarms, paused, retire, fields.*, delete_guard.*
+  rule remove NAME [--delete-copies]
+  pause RULE / resume RULE         stop and restart syncing a rule
+  notify test                      send a test push to every configured channel
+
+Syncing
   run [--rule NAME]…               one sync cycle (all rules, or the named ones)
       [--dry-run]                  show the plan, write nothing
       [--allow-deletes]            let this cycle through the mass-delete guard
   daemon [--no-sync]               sync on a schedule until stopped (SIGUSR1: sync now)
-         [--listen HOST:PORT]      serve the web UI there (default: [web] listen)
+         [--listen HOST:PORT|off]  the web UI's address (default: [web] listen)
          [--no-web]                no web UI (the local API socket stays)
   trigger [--rule NAME]            a cycle now: asked of the daemon, or run here without one
           [--wait] [--timeout S]   wait for that cycle (default 120 s, at most 600) and show it
+  blocked [--rule NAME]            deletes held back by the mass-delete guard
+  approve RULE [--fingerprint F] [--yes] [--wait]
+                                   let exactly that blocked set through
+  service install|uninstall|status the launchd agent (macOS)
   web pair [--listen HOST:PORT]    print the web UI's pair link(s)
   web reset-key [--listen …]       replace the pairing key (unpairs every browser)
-  status [--json]                  sync health per rule
-  upcoming [--hours N] [--rule NAME] [--json]
+
+Looking
+  status                           sync health per rule, and what needs attention
+  events [--from DATE] [--to DATE] [--rule NAME] [--target ACCOUNT:CALENDAR] [--query TEXT]
+                                   events by date, each with its delivery per rule
+  event show ID                    one event: the source and each copy
+  upcoming [--hours N] [--rule NAME]
                                    events due soon and their delivery state
-  runs [--rule NAME] [--limit N] [--json]
-                                   recorded sync runs, newest first
-  changes [--rule NAME] [--since TIME] [--limit N] [--json]
+  runs [--rule NAME] [--limit N]   recorded sync runs, newest first
+  changes [--rule NAME] [--since TIME] [--limit N]
                                    recorded changes to target copies, newest first
   --version
 ```
+
+Every command but `config check`, `auth`, `run`, `daemon` and `web` takes
+`--json`; every command that changes the configuration (and `run`,
+`approve`, `service install|uninstall`) takes `--dry-run`. Scripts and AI agents should
+read the [agent guide](docs/agent-cli.md): the JSON shapes, exit codes, how
+to relay what needs a person and how to approve blocked deletes safely.
 
 `calsync run` prints one line per rule (`status`, `created`, `updated`,
 `deleted`, `failed`, plus `protected` / `degraded` when relevant) and the
@@ -551,9 +759,9 @@ not zero:
 | --- | --- |
 | 0 | every rule succeeded |
 | 1 | a rule failed, partly failed or was blocked by the mass-delete guard; also network, database or filesystem errors and a server refusing a request (HTTP 403) |
-| 2 | configuration error, including one found while setting up an account |
+| 2 | configuration error, including one found while setting up an account; a configuration change refused by validation or because the file changed meanwhile; bad arguments |
 | 3 | authentication error — run `calsync auth <account>` |
-| 4 | another calsync process is running (for `run` while the daemon runs: use `calsync trigger`) |
+| 4 | another calsync process is running (for `run` while the daemon runs: use `calsync trigger`), or another daemon serves this state directory |
 
 With several rules the most actionable code wins: 3, then 2, then 1.
 
@@ -570,7 +778,11 @@ stale one.
   An unreadable resource holds the change cursor instead of being dropped.
 - **Mass-delete guard.** A cycle that would delete too much is blocked for that
   rule — no creates or updates either — and prints the titles it would have
-  deleted. `--allow-deletes` (scope it with `--rule`) lets one cycle through.
+  deleted. `calsync blocked` lists them, and `calsync approve RULE` lets
+  exactly that set through (by its fingerprint; a different set blocks
+  again); every approval is recorded and pushed. Without a daemon,
+  `calsync run --allow-deletes` (scope it with `--rule`) lets one cycle
+  through.
 - **Malformed source data keeps the last good copy.** A series Google returns
   but calsync cannot parse — or one with an unparseable instance — is never
   updated or deleted in the target; it is reported as `protected` /
@@ -594,10 +806,16 @@ stale one.
   the keychain or a 0600 file. They are never printed or logged.
 - Logs and error messages never contain event titles, descriptions,
   locations, attendees or links.
-- `--json` output, the text of `upcoming` and `changes`, and the daemon's
-  local API do contain titles and locations. The API listens on a 0600 unix
+- `--json` output, the text of `events`, `upcoming`, `blocked` and
+  `changes`, and the daemon's local API do contain titles and locations. If
+  you hand that output to a cloud-hosted AI agent, the titles leave your
+  machine with it. The API listens on a 0600 unix
   socket in the state directory and, for the web UI, on TCP behind a pairing
   cookie (see [Web UI](#web-ui)); by default only on `127.0.0.1`.
+- Notifications carry titles (a blocked-deletes push names up to five
+  events) and pass through Bark's server and Apple's push service, or your
+  webhook's server. The Bark URL contains your device key: `calsync config
+  get` and the web UI mask it.
 - The state database holds a copy of your calendar data and is created with
   mode 0600.
 - Redirects are followed manually (credentials are re-sent to the new host, as
@@ -621,10 +839,12 @@ stale one.
 - **Reverting phone edits has not been checked on iCloud yet.** It is tested
   against Radicale and a strict fake CalDAV server; a check with a real
   iPhone and iCloud is still pending.
-- **Renaming or removing a rule orphans its events.** Copies written under the
-  old rule name are never updated or deleted again; delete them by hand. Two
-  installs using the same rule name on the same target calendar would fight
-  over each other's events.
+- **Renaming a rule orphans its events.** Copies written under the old rule
+  name are never updated or deleted again; delete them by hand. Removing a
+  rule leaves its copies too, unless you remove it with
+  `calsync rule remove NAME --delete-copies`. Two installs using the same
+  rule name on the same target calendar would fight over each other's
+  events.
 - **Alerts on shared iCloud calendars.** Apple stores alerts per user, so
   alerts synced into your calendar do not reach the people you share it
   with. On their iPhone the shared events get only their own Default Alert
@@ -640,7 +860,14 @@ stale one.
 | `auth` for iCloud: rejected by every iCloud region | wrong Apple ID or app-specific password (often a pasted space); create a new password |
 | sync stops after about a week with exit code 3 | the Google OAuth consent screen is still in "Testing"; publish it, then `calsync auth` again |
 | Google sign-in says "access blocked" | your account is not a test user of a "Testing" consent screen; publish it or add yourself |
-| `status=blocked` | the mass-delete guard fired; check the printed titles, then `calsync run --rule NAME --allow-deletes` if intended |
+| `status=blocked` | the mass-delete guard fired; check `calsync blocked --rule NAME`, then `calsync approve NAME` if intended (without a daemon, `calsync run --rule NAME --allow-deletes` works too) |
+| `approve` says the blocked set changed (`stale`) | more or other copies would be deleted now than the set you approved; nothing was deleted. Look at `calsync blocked` again and approve the new set if it is intended |
+| a config command says "the file was changed outside calsync; reload and try again" | the file changed between calsync reading and writing it (an editor, or the daemon removing a retired rule); run the command again |
+| the daemon log says the config file is invalid and nothing changes | a hand edit has a problem; the daemon keeps the previous configuration. `calsync config check` lists the problems; `calsync config history` shows the last changes |
+| `service install` exits 2 ("exists and differs") or 4 ("another calsync job") | 2: a plist you wrote yourself is in the way; `--force` replaces it. 4: another launchd job runs calsync; unload it (`launchctl bootout gui/$(id -u)/LABEL`) or pass `--force` |
+| `service install` says to run it from a logged-in desktop session | launchd's per-user domain is not available over SSH; run it in Terminal on the machine itself |
+| the daemon warns "the web UI's key file cannot be used" | `web.key` is unreadable or open to other users; `calsync web reset-key` replaces it (browsers pair again) |
+| `notify test` reports `failed (…)` for a channel | wrong or expired Bark device URL, or the webhook refused the POST; fix `notify.bark_url` / `notify.webhook_url` and test again |
 | the daemon exits with code 2: `cannot listen on 127.0.0.1:8766: address already in use` | another program (or a second daemon) has the web UI's port. Set `[web] listen` to another port, or to `"off"` (or run `calsync daemon --no-web`) if you don't use the web UI |
 | exit code 4 | another `calsync run` or the daemon holds the lock; wait for it, or use `calsync trigger` while the daemon runs |
 | `trigger` ran the cycle itself ("no daemon runs, so the cycle ran here") | no daemon serves the socket in this state directory (check `--state-dir`); start it if one should be running |
@@ -665,14 +892,20 @@ uv run ruff check src tests && uv run ruff format --check src tests && uv run py
 ```
 src/calsync/
   cli.py  wiring.py  lock.py          command line, account wiring, run lock
-  config.py  credentials.py           TOML config, secret backends
+  ops.py  opsclient.py                the operations every command and the web UI share; where they run
+  config.py  configfile.py            TOML config; safe, validated, recorded edits
+  credentials.py                      secret backends
+  daemon.py  cycle.py  api.py         the daemon, one sync cycle, the JSON API
+  views.py  events_view.py            read-only views (status, events, …): the JSON contract
+  notify.py  service.py               Bark/webhook pushes, the launchd agent
+  web/                                pairing key and the web UI
   engine.py  planner.py  mirror.py    the sync cycle, pure planning, source mirror
   model.py  naming.py  render.py      unified event model, resource names, iCalendar
   store.py  http.py  errors.py        SQLite cache, HTTP/retry, error types
   sources/  google*.py                Google REST client, OAuth, event mapping
   targets/  dav.py  caldav.py         WebDAV protocol layer, CalDAV target
 tests/                                pytest; fakes/ has a strict Google fake and a CalDAV fake
-docs/                                 design spec, implementation plan, roadmap
+docs/                                 design specs, plans, roadmap, the agent guide
 ```
 
 Contributor and agent guide: [AGENTS.md](AGENTS.md). Test data is synthetic —
