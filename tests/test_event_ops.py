@@ -169,14 +169,14 @@ async def test_only_this_occurrence(live: Live) -> None:
 
 async def test_the_whole_series_title_and_a_move_by_offset(live: Live) -> None:
     eid = live.event_id("Reminder")
-    await live.op("event.edit", {"id": eid, "scope": "series", "title": "Eye drops"})
-    assert live.world.fake.event(GCAL, "drops")["summary"] == "Eye drops"
+    await live.op("event.edit", {"id": eid, "scope": "series", "title": "Daily vitamins"})
+    assert live.world.fake.event(GCAL, "drops")["summary"] == "Daily vitamins"
     await live.cycle()
     # Dragging the 25th's occurrence an hour later moves every occurrence, from the series' own start.
     moved = await live.op(
         "event.edit",
         {
-            "id": live.event_id("Eye drops"),
+            "id": live.event_id("Daily vitamins"),
             "scope": "series",
             "start": "2026-10-25T09:00",
             "end": "2026-10-25T09:10",

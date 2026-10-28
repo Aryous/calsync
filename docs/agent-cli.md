@@ -287,10 +287,10 @@ twice.
 that the list does not name: the way to replace a whole plan.
 
 ```json
-{"account": "me-google", "calendar": "Family", "prune_prefix": "eye-2026-11/",
+{"account": "me-google", "calendar": "Family", "prune_prefix": "vitamins-2026-12/",
  "events": [
-   {"key": "eye-2026-11/001", "title": "Eye drops (1/84)", "start": "2026-11-13T08:00", "end": "2026-11-13T08:05", "alarms": [0]},
-   {"key": "eye-2026-11/002", "title": "Eye drops (2/84)", "start": "2026-11-13T12:00", "end": "2026-11-13T12:05", "alarms": [0]}
+   {"key": "vitamins-2026-12/001", "title": "Vitamins (1/62)", "start": "2026-12-01T08:00", "end": "2026-12-01T08:05", "alarms": [0]},
+   {"key": "vitamins-2026-12/002", "title": "Vitamins (2/62)", "start": "2026-12-01T20:00", "end": "2026-12-01T20:05", "alarms": [0]}
  ]}
 ```
 

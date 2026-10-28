@@ -184,10 +184,10 @@ async def test_an_occurrence_id_needs_scope_series_and_no_new_times(live: Live) 
     )
     assert "event edit --series" in timed.data["items"][0]["reason"]
     assert live.world.fake.event(GCAL, "drops")["start"]["dateTime"] == "2026-10-24T08:00:00+08:00"
-    renamed = await apply(live, [{"id": drops, "scope": "series", "title": "Eye drops"}])
+    renamed = await apply(live, [{"id": drops, "scope": "series", "title": "Daily vitamins"}])
     assert (
         renamed.data["counts"]["update"] == 1
-        and live.world.fake.event(GCAL, "drops")["summary"] == "Eye drops"
+        and live.world.fake.event(GCAL, "drops")["summary"] == "Daily vitamins"
     )
 
 
