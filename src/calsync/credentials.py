@@ -48,6 +48,20 @@ def read_secret(ref: CredentialRef, *, environ: Mapping[str, str] = os.environ) 
     return value
 
 
+def secret_exists(ref: CredentialRef, *, environ: Mapping[str, str] = os.environ) -> bool | None:
+    """Whether the secret ``ref`` names is there; None when the keychain cannot be asked. The
+    answer is a flag only: for the keychain the value is read (``get_password`` is the only
+    portable question) but never returned, kept or logged."""
+    if ref.backend == "env":
+        return bool(environ.get(ref.ref))
+    if ref.backend == "file":
+        return Path(ref.ref).expanduser().exists()
+    try:
+        return _keyring().get_password(ref.ref, KEYRING_USER) is not None
+    except _keyring_error():
+        return None
+
+
 def write_secret(ref: CredentialRef, value: str) -> None:
     if ref.backend == "env":
         raise ConfigError([f"cannot store a secret in environment variable {ref.ref}"])
@@ -63,3 +77,29 @@ def write_secret(ref: CredentialRef, value: str) -> None:
         _keyring().set_password(ref.ref, KEYRING_USER, value)
     except _keyring_error() as exc:
         raise ConfigError([f"could not store keychain entry {ref.ref!r}: {exc}"]) from exc
+
+
+def delete_secret(ref: CredentialRef) -> bool:
+    """Delete a keychain entry (one that is already gone is fine; one still there after a failed
+    delete is a ``ConfigError``). True when calsync deleted it;
+    False for the ``env`` and ``file`` backends, which a person manages: calsync deletes neither
+    an environment variable nor a file it did not necessarily create."""
+    if ref.backend != "keychain":
+        return False
+    from keyring.errors import PasswordDeleteError  # lazy, like _keyring()
+
+    keyring = _keyring()
+    try:
+        keyring.delete_password(ref.ref, KEYRING_USER)
+    except PasswordDeleteError as exc:
+        # macOS's backend raises this for every keychain error (not found, access denied, a
+        # locked keychain): only an entry that is no longer there counts as deleted.
+        try:
+            gone = keyring.get_password(ref.ref, KEYRING_USER) is None
+        except _keyring_error():
+            gone = False
+        if not gone:
+            raise ConfigError([f"could not delete keychain entry {ref.ref!r}: {exc}"]) from exc
+    except _keyring_error() as exc:
+        raise ConfigError([f"could not delete keychain entry {ref.ref!r}: {exc}"]) from exc
+    return True

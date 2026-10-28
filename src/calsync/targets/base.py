@@ -47,6 +47,10 @@ class CachedObject:
     # written, and until when further target edits to it are adopted instead of reverted.
     revert_times: tuple[datetime, ...] = ()
     hold_until: datetime | None = None
+    # ``render.summary_of`` of what calsync last wrote (or adopted) here, as JSON text; None:
+    # unknown. Event content (titles): stored in the 0600 state DB, never logged. Carried
+    # wherever a ``CachedObject`` is rebuilt, or a cache save would forget it.
+    summary: str | None = None
 
 
 @dataclass(slots=True)
@@ -60,7 +64,12 @@ class Target(Protocol):
 
     async def list_calendars(self) -> list[TargetCalendar]: ...
 
-    async def ensure_calendar(self, ref: str, *, create: bool) -> TargetCalendar: ...
+    async def ensure_calendar(self, ref: str, *, create: bool) -> TargetCalendar:
+        """The calendar ``ref`` names (an href or a display name), created when missing and
+        ``create``. Raises ``CalendarNotListed`` only when the calendar listing was read and no
+        calendar in it matches ``ref`` (evidence that it does not exist); a failure to read the
+        listing (a 404 during discovery, the network) raises anything else."""
+        ...
 
     async def changes(self, cal: TargetCalendar, cursor: str | None) -> TargetDelta: ...
 

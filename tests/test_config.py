@@ -311,6 +311,50 @@ def test_bad_on_target_edit_reported_with_other_problems_of_the_rule(tmp_path: P
     assert "rules[family].on_target_edit" in text and "rules[family].fields.content" in text
 
 
+def test_paused_and_retire_default_false(tmp_path: Path) -> None:
+    rule = parse_config(copy.deepcopy(VALID), tmp_path).rules[0]
+    assert (rule.paused, rule.retire) == (False, False)
+
+
+def test_paused_and_retire_parsed(tmp_path: Path) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0]["paused"] = True
+    data["rules"][0]["retire"] = True
+    rule = parse_config(data, tmp_path).rules[0]
+    assert (rule.paused, rule.retire) == (True, True)
+
+
+@pytest.mark.parametrize("key", ["paused", "retire"])
+@pytest.mark.parametrize("value", ["true", 1, 0])
+def test_paused_and_retire_must_be_bool(tmp_path: Path, key: str, value: object) -> None:
+    data = copy.deepcopy(VALID)
+    data["rules"][0][key] = value
+    data["rules"][0]["delete_guard"] = {"max_count": -1}
+    with pytest.raises(ConfigError) as info:
+        parse_config(data, tmp_path)
+    assert f"rules[family].{key}: must be true or false" in info.value.problems
+    assert any("rules[family].delete_guard.max_count" in p for p in info.value.problems)
+
+
+def test_public_url(tmp_path: Path) -> None:
+    assert parse_config(copy.deepcopy(VALID), tmp_path).notify.public_url is None
+    for url in ("https://calsync.example.com", "http://192.0.2.1:8766/", "HTTPS://calsync.example.com/"):
+        data = copy.deepcopy(VALID)
+        data["notify"]["public_url"] = url
+        assert parse_config(data, tmp_path).notify.public_url == url
+
+
+@pytest.mark.parametrize(
+    "url", ["calsync.example.com", "ftp://example.com", 5, "", "https://", "http:///path", "https:calsync"]
+)
+def test_public_url_must_be_http(tmp_path: Path, url: object) -> None:
+    data = copy.deepcopy(VALID)
+    data["notify"]["public_url"] = url
+    with pytest.raises(ConfigError) as info:
+        parse_config(data, tmp_path)
+    assert info.value.problems == ["notify.public_url: must be an http(s) URL"]
+
+
 # ----- [web] ----------------------------------------------------------------------
 
 
@@ -374,3 +418,10 @@ def test_web_must_be_a_table() -> None:
     with pytest.raises(ConfigError) as info:
         parse_config({**VALID, "web": "127.0.0.1:8766"}, base_dir=Path("/cfg"))
     assert "web: must be a table" in info.value.problems
+
+
+def test_format_duration_round_trips() -> None:
+    from calsync.durations import format_duration
+
+    for text in ("7d", "180d", "36h", "90m", "-10m", "0s", "45s", "14d"):
+        assert format_duration(parse_duration(text)) == text

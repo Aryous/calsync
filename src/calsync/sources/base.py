@@ -18,6 +18,7 @@ RawEvent = Mapping[str, Any]
 class CalendarInfo:
     id: str
     name: str
+    role: str | None = None  # Google calendarList accessRole: owner, writer, reader, freeBusyReader
 
 
 @dataclass(frozen=True, slots=True)

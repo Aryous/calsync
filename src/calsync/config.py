@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal, overload
+from urllib.parse import urlsplit
 
 from calsync.durations import parse_duration
 from calsync.errors import ConfigError
@@ -71,6 +72,8 @@ class Rule:
     delete_guard: DeleteGuard
     fields: FieldPolicy = field(default_factory=FieldPolicy)
     on_target_edit: Literal["revert"] = "revert"  # a copy edited on the target is written back
+    paused: bool = False  # skipped by every cycle until resumed
+    retire: bool = False  # sync to nothing; the rule is removed once its copies are gone
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +81,8 @@ class NotifyConfig:
     bark_url: str | None = None
     webhook_url: str | None = None
     failure_threshold: int = 3
+    public_url: str | None = None  # links in notifications point here
+    language: str = "zh"  # of the push texts: "zh" or "en"
 
 
 @dataclass(frozen=True, slots=True)
@@ -289,6 +294,34 @@ def _optional_str(raw: Any, where: str, problems: list[str]) -> str | None:
     return None
 
 
+def _flag(raw: Any, where: str, problems: list[str]) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    problems.append(f"{where}: must be true or false")
+    return False
+
+
+def _public_url(raw: Any, problems: list[str]) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        parts = urlsplit(raw)
+        if parts.scheme.lower() in ("http", "https") and parts.netloc:
+            return raw
+    problems.append("notify.public_url: must be an http(s) URL")
+    return None
+
+
+LANGUAGES = ("zh", "en")
+
+
+def _language(raw: Any, problems: list[str]) -> str:
+    if raw in LANGUAGES:
+        return raw
+    problems.append('notify.language: must be "zh" or "en"')
+    return "zh"
+
+
 def _account(name: str, raw: Any, problems: list[str]) -> Account | None:
     where = f"accounts.{name}"
     if not isinstance(raw, Mapping):
@@ -451,9 +484,11 @@ def _rule(index: int, raw: Any, accounts: Mapping[str, Account], problems: list[
     fields = _fields(raw.get("fields"), f"{where}.fields", problems)
     if raw.get("on_target_edit", "revert") != "revert":
         problems.append(f'{where}.on_target_edit: only "revert" is supported')
+    paused = _flag(raw.get("paused", False), f"{where}.paused", problems)
+    retire = _flag(raw.get("retire", False), f"{where}.retire", problems)
     if source is None or target is None or not window_ok:
         return None
-    return Rule(name, source, target, window, alarms, guard, fields)
+    return Rule(name, source, target, window, alarms, guard, fields, paused=paused, retire=retire)
 
 
 def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:
@@ -476,6 +511,8 @@ def parse_config(data: Mapping[str, Any], base_dir: Path) -> Config:
             minimum=1,
             expect="an integer >= 1",
         ),
+        public_url=_public_url(notify_raw.get("public_url"), problems),
+        language=_language(notify_raw.get("language", "zh"), problems),
     )
 
     runtime_raw = _table(data.get("runtime"), "runtime", problems)

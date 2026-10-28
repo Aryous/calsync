@@ -1,7 +1,8 @@
 """The local JSON API under ``/api``: what ``calsync trigger`` and the web UI talk to.
 
 The daemon serves it on a unix socket, ``<state_dir>/calsync.sock`` (mode 0600), so only its
-user can reach it. Responses carry event titles (``upcoming`` and ``changes``), like ``--json``.
+user can reach it. Responses carry event titles (``upcoming``, ``events``, ``event`` and ``changes``),
+like ``--json``.
 
 Every view request opens its own read-only ``StateReader`` and closes it afterwards: a reader
 opened without a ``-wal`` file reads the database as immutable and would not see later writes.
@@ -18,9 +19,10 @@ import functools
 import json
 import logging
 import os
+import shlex
 import socket
 import sqlite3
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -35,9 +37,10 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from calsync import __version__, debug, views
+from calsync import __version__, credentials, debug, events_view, ops, views
 from calsync.config import Config
-from calsync.errors import ListenError
+from calsync.configfile import ConfigConflict
+from calsync.errors import ConfigError, ListenError, RulePaused
 from calsync.lock import DaemonServing
 from calsync.wiring import state_paths
 
@@ -51,6 +54,8 @@ log = logging.getLogger(__name__)
 MAX_HOURS = 168
 MAX_RUNS = 500
 MAX_CHANGES = 1000
+MAX_CONFIG_CHANGES = 200  # the store keeps no more
+MAX_BODY = 64 * 1024  # bytes: a request body (an operation's arguments) is never larger
 NO_STATE = "No sync has run yet."
 UNREADABLE = "The state database could not be read."
 
@@ -64,13 +69,36 @@ class DaemonControl(Protocol):
 
     def snapshot(self) -> "DaemonInfo": ...
 
+    async def run_op(
+        self, name: str, args: dict[str, Any], dry_run: bool, *, source: ops.Source
+    ) -> ops.OpResult: ...
+
+
+class _Json:
+    """A body that is JSON already, for ``_Endpoints._view``."""
+
+    def __init__(self, body: dict[str, Any]) -> None:
+        self._body = body
+
+    def to_json(self) -> dict[str, Any]:
+        return self._body
+
 
 class ApiError(Exception):
-    def __init__(self, status: int, kind: str, message: str) -> None:
+    def __init__(
+        self,
+        status: int,
+        kind: str,
+        message: str,
+        problems: Sequence[str] | None = None,
+        extra: Mapping[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
         self.kind = kind
         self.message = message
+        self.problems = problems
+        self.extra = extra  # more fields of the error object (``needs_human``: the command)
 
 
 def _now() -> datetime:
@@ -78,9 +106,18 @@ def _now() -> datetime:
 
 
 def error_response(
-    status: int, kind: str, message: str, headers: Mapping[str, str] | None = None
+    status: int,
+    kind: str,
+    message: str,
+    headers: Mapping[str, str] | None = None,
+    problems: Sequence[str] | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> Response:
-    return JSONResponse({"error": {"kind": kind, "message": message}}, status_code=status, headers=headers)
+    error: dict[str, Any] = {"kind": kind, "message": message}
+    if problems is not None:
+        error["problems"] = list(problems)
+    error.update(extra or {})
+    return JSONResponse({"error": error}, status_code=status, headers=headers)
 
 
 # ----- request parameters ---------------------------------------------------------------
@@ -108,14 +145,25 @@ def _instant(request: Request, name: str) -> datetime | None:
         return None
     try:
         value = datetime.fromisoformat(text)
-    except ValueError:
+        # A local time near the ends of the calendar may have no instant (ValueError, OverflowError).
+        return value if value.tzinfo is not None else value.astimezone()
+    except (ValueError, OverflowError):
         raise ApiError(400, "bad_request", f"{name}: expected an ISO 8601 time, got {text!r}") from None
-    return value if value.tzinfo is not None else value.astimezone()
+
+
+async def _body(request: Request) -> bytes:
+    """The request body, refused (413) beyond ``MAX_BODY`` bytes without reading the rest."""
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_BODY:
+            raise ApiError(413, "too_large", f"The request body is larger than {MAX_BODY // 1024} KiB.")
+    return body
 
 
 async def _trigger_rule(request: Request) -> str | None:
     """The optional ``{"rule": "R"}`` body; no body means every rule."""
-    raw = await request.body()
+    raw = await _body(request)
     if not raw.strip():
         return None
     try:
@@ -128,6 +176,29 @@ async def _trigger_rule(request: Request) -> str | None:
     if rule is not None and not isinstance(rule, str):
         raise ApiError(400, "bad_request", "rule: expected a string or null")
     return rule
+
+
+async def _op_body(request: Request) -> tuple[dict[str, Any], bool]:
+    """The ``{"args": {...}, "dry_run": bool}`` body; no body means no arguments."""
+    raw = await _body(request)
+    if not raw.strip():
+        return {}, False
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        raise ApiError(400, "bad_request", "body: expected JSON") from None
+    if not isinstance(body, dict):
+        raise ApiError(400, "bad_request", 'body: expected an object such as {"args": {}, "dry_run": false}')
+    unknown = sorted(set(body) - {"args", "dry_run"})
+    if unknown:
+        raise ApiError(400, "bad_request", f"{unknown[0]}: unknown field")
+    args: Any = body.get("args", {})
+    dry_run: Any = body.get("dry_run", False)
+    if not isinstance(args, dict):
+        raise ApiError(400, "bad_request", "args: expected an object")
+    if not isinstance(dry_run, bool):
+        raise ApiError(400, "bad_request", "dry_run: expected true or false")
+    return args, dry_run
 
 
 # ----- routes ---------------------------------------------------------------------------
@@ -146,8 +217,15 @@ class _Endpoints:
         self._daemon = daemon
         self._clock = clock
 
-    async def _view(self, build: Callable[[Config, views.StateReader], Any]) -> dict[str, Any]:
-        """``build(config, reader).to_json()`` in a worker thread, with a reader of its own."""
+    async def _view(
+        self,
+        build: Callable[[Config, views.StateReader], Any],
+        *,
+        no_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """``build(config, reader).to_json()`` in a worker thread, with a reader of its own.
+        Without a state database: ``no_state`` if given (a list that is simply empty then), else
+        503. ``events_view.NotFound`` is 404."""
         config = self._config()
         db_path = self._db_path
 
@@ -159,11 +237,22 @@ class _Endpoints:
         try:
             return await anyio.to_thread.run_sync(read)
         except views.StateUnavailable:
+            if no_state is not None:
+                return no_state
             raise ApiError(503, "no_state", NO_STATE) from None
+        except events_view.NotFound:
+            raise ApiError(404, "not_found", "No such event.") from None
         except sqlite3.DatabaseError:  # not a database, corrupt, or locked
             raise ApiError(500, "state_unreadable", UNREADABLE) from None
         except Exception as exc:
             raise _internal(exc) from None
+
+    def _rule(self, request: Request) -> str | None:
+        """The ``rule`` parameter, a configured rule (404 otherwise)."""
+        rule = request.query_params.get("rule")
+        if rule is not None and rule not in {r.name for r in self._config().rules}:
+            raise ApiError(404, "unknown_rule", f"Unknown rule {rule!r}.")
+        return rule
 
     async def status(self, request: Request) -> Response:
         now = self._clock()
@@ -174,13 +263,83 @@ class _Endpoints:
 
     async def upcoming(self, request: Request) -> Response:
         hours = _clamped(request, "hours", 24, MAX_HOURS)
-        rule = request.query_params.get("rule")
-        if rule is not None and rule not in {r.name for r in self._config().rules}:
-            raise ApiError(404, "unknown_rule", f"Unknown rule {rule!r}.")
+        rule = self._rule(request)
         now = self._clock()
         return JSONResponse(
             await self._view(
                 lambda config, reader: views.build_upcoming(config, reader, now, hours=hours, rule=rule)
+            )
+        )
+
+    async def blocked(self, request: Request) -> Response:
+        rule = self._rule(request)
+        return JSONResponse(
+            await self._view(lambda config, reader: views.build_blocked(config, reader, rule))
+        )
+
+    async def events(self, request: Request) -> Response:
+        """``GET /api/events?from&to&rule&target&q``: ``from`` / ``to`` ISO dates or times (local
+        without an offset; ``to`` exclusive; default: today and a week), at most
+        ``MAX_EVENT_DAYS`` apart."""
+        now = self._clock()
+        try:
+            start, end = events_view.event_range(_instant(request, "from"), _instant(request, "to"), now)
+        except (ValueError, OverflowError) as exc:
+            raise ApiError(400, "bad_request", str(exc)) from None
+        rule = self._rule(request)
+        target: tuple[str, str] | None = None
+        if (text := request.query_params.get("target")) is not None:
+            try:
+                target = events_view.parse_target(text)
+            except ValueError as exc:
+                raise ApiError(400, "bad_request", str(exc)) from None
+            if not events_view.known_target(self._config(), target):
+                raise ApiError(404, "unknown_target", f"No rule syncs into {text!r}.")
+        query = request.query_params.get("q") or None
+        return JSONResponse(
+            await self._view(
+                lambda config, reader: events_view.build_events(
+                    config, reader, start, end, rule=rule, target=target, query=query, now=now
+                )
+            )
+        )
+
+    async def event(self, request: Request) -> Response:
+        """``GET /api/event?id``: one event with its copies (404 ``not_found``: no such event)."""
+        eid = request.query_params.get("id")
+        if not eid:
+            raise ApiError(400, "bad_request", "id: required")
+        now = self._clock()
+        return JSONResponse(
+            await self._view(lambda config, reader: events_view.build_event(config, reader, eid, now))
+        )
+
+    async def config(self, request: Request) -> Response:
+        """``GET /api/config``: the running config, masked (revealing exists only on the CLI)."""
+        return JSONResponse(views.config_json(self._config()))
+
+    async def config_history(self, request: Request) -> Response:
+        limit = _clamped(request, "limit", 50, MAX_CONFIG_CHANGES)
+        return JSONResponse(
+            await self._view(
+                lambda config, reader: _Json(views.config_history_json(reader.config_changes(limit))),
+                no_state={"changes": []},
+            )
+        )
+
+    async def calendars(self, request: Request) -> Response:
+        """``GET /api/calendars?account``: the account's cached calendar list."""
+        account = request.query_params.get("account")
+        if not account:
+            raise ApiError(400, "bad_request", "account: required")
+        if account not in self._config().accounts:
+            raise ApiError(404, "unknown_account", f"Unknown account {account!r}.")
+        return JSONResponse(
+            await self._view(
+                lambda config, reader: _Json(
+                    views.calendars_json(account, reader.account_calendars(account))
+                ),
+                no_state=views.calendars_json(account, []),
             )
         )
 
@@ -211,11 +370,86 @@ class _Endpoints:
             raise ApiError(409, "read_only", "No daemon runs sync cycles here.")
         try:
             accepted = self._daemon.request_cycle(rule)
+        except RulePaused as exc:
+            raise ApiError(409, "paused", str(exc)) from None
         except ValueError:
             raise ApiError(404, "unknown_rule", f"Unknown rule {rule!r}.") from None
+        except ops.OpsUnavailable as exc:  # the scheduler has stopped: nothing would run it
+            raise ApiError(503, "unavailable", str(exc)) from None
         if not accepted:
             raise ApiError(409, "read_only", "The daemon runs with --no-sync: it runs no sync cycles.")
         return JSONResponse({"accepted": True, "rule": rule}, status_code=202)
+
+    def op(self, source: ops.Source) -> "Endpoint":
+        """``POST /api/ops/{name}``: one operation, run by the daemon between its cycles (except
+        ``trigger``, which only requests one and may wait for it)."""
+
+        async def endpoint(request: Request) -> Response:
+            name = request.path_params["name"]
+            args, dry_run = await _op_body(request)
+            if self._daemon is None:
+                raise ApiError(409, "read_only", "No daemon runs operations here.")
+            if name not in ops.OPS:
+                raise ApiError(404, "unknown_op", f"Unknown operation {name!r}.")
+            if (internal := ops.internal_arg(args)) is not None:
+                raise ApiError(400, "bad_request", f"{internal}: an internal argument")
+            if source == "ui":
+                human = _terminal_only(name, args) or await _repoints_credential(name, args)
+                if human is not None:
+                    raise ApiError(403, "needs_human", human["reason"], extra={"needs_human": True, **human})
+            try:
+                result = await self._daemon.run_op(name, args, dry_run, source=source)
+            except ConfigConflict as exc:
+                raise ApiError(422, "config_conflict", str(exc), exc.problems) from None
+            except ConfigError as exc:
+                raise ApiError(422, "config", str(exc), exc.problems) from None
+            except RulePaused as exc:
+                raise ApiError(409, "paused", str(exc), extra={"rule": exc.rule}) from None
+            except ops.DaemonStopping as exc:
+                raise ApiError(503, "unavailable", str(exc)) from None
+            except ops.OpsUnavailable as exc:
+                raise ApiError(409, "read_only", str(exc)) from None
+            except ops.TooSoon as exc:
+                raise ApiError(429, "too_soon", str(exc)) from None
+            return JSONResponse(result.to_json())
+
+        return endpoint
+
+
+def _terminal_only(name: str, args: Mapping[str, Any]) -> dict[str, str] | None:
+    """What the web UI may not do, as the command a person runs instead: deleting a credential
+    (credentials are managed from the terminal). None: allowed."""
+    if name == "account.remove" and args.get("delete_credential") is True:  # a mistyped value: the op says so
+        account = args.get("name")
+        shown = account if isinstance(account, str) and account else "NAME"
+        return {
+            "command": f"calsync account remove {shlex.quote(shown)} --delete-credential",
+            "reason": "credentials are managed from the terminal",
+        }
+    return None
+
+
+async def _repoints_credential(name: str, args: Mapping[str, Any]) -> dict[str, str] | None:
+    """``account.add`` from the web UI when the keychain already holds the new account's entry
+    (left by an account removed without ``--delete-credential``): the browser would re-point a
+    stored password at a server of its choosing. A person adds it from the terminal. A keychain
+    that cannot be asked refuses too. None: allowed (or arguments the op itself refuses)."""
+    account = args.get("name")
+    if name != "account.add" or not isinstance(account, str) or not account:
+        return None
+    exists = await anyio.to_thread.run_sync(credentials.secret_exists, ops.account_credential(account))
+    if exists is False:
+        return None
+    words = ["calsync", "account", "add", account]
+    for key in ("provider", "server_url", "username"):
+        if isinstance(value := args.get(key), str) and value:
+            words += ["--" + key.replace("_", "-"), value]
+    reason = (
+        "the keychain already holds a credential for this account; add it from the terminal"
+        if exists
+        else "the keychain could not be checked; add the account from the terminal"
+    )
+    return {"command": shlex.join(words), "reason": reason}
 
 
 def _internal(exc: Exception) -> ApiError:
@@ -279,21 +513,35 @@ def api_routes(
     state_dir: Path,
     daemon: DaemonControl | None,
     clock: Clock = _now,
+    ops_source: ops.Source | None = None,
 ) -> list[Route]:
-    """The ``/api`` routes. Their errors are ``ApiError``: install ``exception_handlers`` too."""
+    """The ``/api`` routes. Their errors are ``ApiError``: install ``exception_handlers`` too.
+
+    ``ops_source``: also ``POST /api/ops/{name}``, recording changes as made from there. The
+    unix-socket app passes ``"cli"``, the web UI ``"ui"`` (behind its pairing cookie and Origin
+    check; deleting a credential is refused there with the command to run instead)."""
     endpoints = _Endpoints(config_provider, state_dir, daemon, clock)
-    return [
+    routes = [
         Route("/api/status", guarded(endpoints.status), methods=["GET"]),
         Route("/api/upcoming", guarded(endpoints.upcoming), methods=["GET"]),
+        Route("/api/blocked", guarded(endpoints.blocked), methods=["GET"]),
+        Route("/api/events", guarded(endpoints.events), methods=["GET"]),
+        Route("/api/event", guarded(endpoints.event), methods=["GET"]),
+        Route("/api/config", guarded(endpoints.config), methods=["GET"]),
+        Route("/api/config/history", guarded(endpoints.config_history), methods=["GET"]),
+        Route("/api/calendars", guarded(endpoints.calendars), methods=["GET"]),
         Route("/api/runs", guarded(endpoints.runs), methods=["GET"]),
         Route("/api/changes", guarded(endpoints.changes), methods=["GET"]),
         Route("/api/trigger", guarded(endpoints.trigger), methods=["POST"]),
     ]
+    if ops_source is not None:
+        routes.append(Route("/api/ops/{name}", guarded(endpoints.op(ops_source)), methods=["POST"]))
+    return routes
 
 
 async def _api_error(request: Request, exc: Exception) -> Response:
     assert isinstance(exc, ApiError)
-    return error_response(exc.status, exc.kind, exc.message)
+    return error_response(exc.status, exc.kind, exc.message, problems=exc.problems, extra=exc.extra)
 
 
 async def _http_error(request: Request, exc: Exception) -> Response:
@@ -320,7 +568,10 @@ def create_app(
     daemon: DaemonControl | None,
     clock: Clock = _now,
 ) -> Starlette:
-    routes = api_routes(config_provider=config_provider, state_dir=state_dir, daemon=daemon, clock=clock)
+    # The socket's app: only this user reaches it (0600), so the CLI's operations run here.
+    routes = api_routes(
+        config_provider=config_provider, state_dir=state_dir, daemon=daemon, clock=clock, ops_source="cli"
+    )
     return Starlette(
         routes=routes, middleware=[Middleware(ContainErrors)], exception_handlers=exception_handlers
     )

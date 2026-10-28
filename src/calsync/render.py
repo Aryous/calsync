@@ -2,8 +2,9 @@
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from icalendar import Alarm as IcalAlarm
@@ -104,6 +105,61 @@ def render(series: Series, *, uid: str, rule_name: str, content_hash: str, now: 
     return cal.to_ical()
 
 
+# The fields of a copy's summary (``summary_of``), in display order; ``change.detail`` names them.
+SUMMARY_FIELDS = ("title", "start", "end", "all_day", "location", "alarms_minutes_before", "recurring")
+
+
+def _minutes_before(offsets: list[timedelta]) -> list[int]:
+    """Alarm offsets as minutes before the start, latest alarm first (``views.UpcomingEvent``)."""
+    return sorted((-int(offset.total_seconds() // 60) for offset in offsets), reverse=True)
+
+
+def summary_of(series: Series) -> dict[str, Any]:
+    """What calsync writes for a (shaped) series, as a person sees it: the master VEVENT's own
+    fields. For a recurring series that is the series as written (DTSTART is its first instance
+    by RFC 5545), not an expanded instance: an override or EXDATE on the first instance would
+    otherwise read as a change of the whole series. Times are ISO strings, as ``views`` shows them;
+    title and location are trimmed (as ``inspect`` and ``content_digest`` read them), empty: None.
+
+    Event content: stored in the 0600 state DB and shown by the API, never logged."""
+    return {
+        "title": (series.title or "").strip() or None,
+        "start": series.start.value.isoformat(),
+        "end": series.end.value.isoformat(),
+        "all_day": series.start.all_day,
+        "location": (series.location or "").strip() or None,
+        "alarms_minutes_before": _minutes_before([a.offset for a in series.alarms]),
+        "recurring": bool(series.recurrence),
+    }
+
+
+def _comparable(name: str, value: Any) -> Any:
+    """A summary value as it is compared: start and end as instants (a timed value in UTC, an
+    all-day date as a date), so a phone that rewrites DTSTART in another zone, or with a VTIMEZONE
+    of its own, changes nothing a person sees. Anything unreadable compares as it is."""
+    if name not in ("start", "end") or not isinstance(value, str):
+        return value
+    try:
+        if "T" not in value:
+            return ("date", date.fromisoformat(value))
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if moment.tzinfo is None:
+        return ("floating", moment)
+    return ("instant", moment.astimezone(UTC))
+
+
+def changed_fields(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str, list[Any]]:
+    """``{field: [old, new]}`` for each summary field present in both that differs (start and
+    end as instants: ``_comparable``). The values shown are the summaries' own."""
+    return {
+        name: [old[name], new[name]]
+        for name in SUMMARY_FIELDS
+        if name in old and name in new and _comparable(name, old[name]) != _comparable(name, new[name])
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class Inspected:
     uid: str
@@ -111,6 +167,8 @@ class Inspected:
     content_hash: str | None
     span: tuple[datetime, datetime] | None
     summary: str | None = None  # the master VEVENT's SUMMARY
+    # The master VEVENT in ``summary_of``'s shape, each field only if it could be read.
+    fields: Mapping[str, Any] | None = None
 
 
 def _rrule_lines(component: Component) -> list[str]:
@@ -163,7 +221,39 @@ def inspect(data: bytes) -> Inspected | None:
         content_hash=_optional(master, "x-calsync-hash"),
         span=span,
         summary=_optional(master, "summary"),
+        fields=_fields(master),
     )
+
+
+def _fields(master: Component) -> dict[str, Any]:
+    """The master in ``summary_of``'s shape; a field that cannot be read is left out (never raises)."""
+    readers: dict[str, Any] = {
+        "title": lambda: str(master.get("summary", "")).strip() or None,
+        "start": lambda: when_from_ical(master.decoded("dtstart")).value.isoformat(),
+        "end": lambda: _end(master).value.isoformat(),
+        "all_day": lambda: when_from_ical(master.decoded("dtstart")).all_day,
+        "location": lambda: str(master.get("location", "")).strip() or None,
+        "alarms_minutes_before": lambda: _minutes_before(
+            [timedelta(seconds=seconds) for seconds, related in _alarm_keys(master) if related == "START"]
+        ),
+        "recurring": lambda: bool(master.get("rrule")) or master.get("rdate") is not None,
+    }
+    fields: dict[str, Any] = {}
+    for name, read in readers.items():
+        try:
+            fields[name] = read()
+        except Exception:  # untrusted bytes: leave the field out
+            continue
+    return fields
+
+
+def _end(event: Component) -> When:
+    start = when_from_ical(event.decoded("dtstart"))
+    if "dtend" in event:
+        return when_from_ical(event.decoded("dtend"))
+    if "duration" in event:
+        return when_from_ical(start.value + event.decoded("duration"))
+    return start
 
 
 def _when_key(value: Any) -> list[Any]:

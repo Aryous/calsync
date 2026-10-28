@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import signal
 import stat
@@ -93,7 +94,9 @@ def test_auth_error_exit_code(tmp_path: Path) -> None:
     cfg = tmp_path / "c.toml"
     cfg.write_text(CONFIG.format(url="https://dav.example.com/", user="u", secret=tmp_path / "missing"))
     code, text = run(["--config", str(cfg), "calendars", "dav"])
-    assert code == EXIT_AUTH and "credential file not found" in text
+    # Nothing cached: the list is fetched first, and that fails at the account's setup.
+    assert code == EXIT_AUTH and 'AuthError: account "dav" has no usable credential' in text
+    assert "next: calsync auth dav" in text
 
 
 # ----- review fixes ---------------------------------------------------------
@@ -184,8 +187,8 @@ def test_lock_busy_mentions_trigger(tmp_path: Path) -> None:
     )
 
 
-def test_lock_busy_with_allow_deletes_says_to_stop_the_daemon(tmp_path: Path) -> None:
-    """`trigger` cannot let blocked deletes through: the advice must not loop back to it."""
+def test_lock_busy_with_allow_deletes_points_to_approve(tmp_path: Path) -> None:
+    """`trigger` cannot let blocked deletes through: the advice is `approve`, through the daemon."""
     cfg = tmp_path / "c.toml"
     cfg.write_text(CONFIG.format(url="https://dav.example.com/", user="u", secret=tmp_path / "pw"))
     state = tmp_path / "s"
@@ -193,11 +196,18 @@ def test_lock_busy_with_allow_deletes_says_to_stop_the_daemon(tmp_path: Path) ->
         code, text = run(["--config", str(cfg), "--state-dir", str(state), "run", "--allow-deletes"])
     assert code == EXIT_RUNNING
     assert text == (
-        f"another calsync process (pid {os.getpid()}) holds the lock. If it is the daemon: deletes "
-        "blocked by the mass-delete guard can only be allowed with the daemon stopped. Stop the "
-        "daemon, run this command again, then start the daemon again.\n"
+        f"another calsync process (pid {os.getpid()}) holds the lock. If it is the daemon, approve the "
+        "blocked deletes through it: check `calsync blocked --rule RULE`, then `calsync approve RULE`\n"
     )
-    assert "trigger" not in text
+    assert "trigger" not in text and "stop" not in text
+    from argparse import Namespace
+
+    from calsync.cli import _describe  # pyright: ignore[reportPrivateUsage]
+
+    one = Namespace(command="run", allow_deletes=True, rules=["family"])
+    assert _describe(AlreadyRunning(None), one).endswith(
+        "check `calsync blocked --rule family`, then `calsync approve family`\n"
+    )
 
 
 def test_lock_message_without_a_pid(tmp_path: Path) -> None:
@@ -697,7 +707,7 @@ def test_status_json_has_the_exact_top_level_keys(synced: list[str]) -> None:
     code, text = run([*synced, "status", "--json"])
     assert code == EXIT_OK
     view = json.loads(text)
-    assert list(view) == ["generated_at", "schema", "summary", "accounts", "rules", "attention"]
+    assert list(view) == ["generated_at", "schema", "summary", "accounts", "rules", "attention", "daemon"]
     assert view["summary"]["health"] == "ok" and view["rules"][0]["copies"] == 3
     assert text == json.dumps(view, ensure_ascii=False, indent=2) + "\n"
 
@@ -795,10 +805,48 @@ def test_changes_text_and_json(synced: list[str]) -> None:
 def test_view_commands_without_state_exit_1(tmp_path: Path) -> None:
     cfg = tmp_path / "config.toml"
     cfg.write_text(VIEWS_CONFIG)
-    for command in (["status"], ["upcoming", "--json"], ["runs"], ["changes"]):
+    for command in (["status"], ["upcoming"], ["runs"], ["changes"]):
         code, text = run(["--config", str(cfg), "--state-dir", str(tmp_path / "none"), *command])
         assert (code, text) == (EXIT_FAILED, "no state yet: run `calsync run` or start the daemon\n")
+    for command in (["status"], ["upcoming"], ["runs"], ["changes"], ["blocked"], ["events"]):
+        code, text = run(["--config", str(cfg), "--state-dir", str(tmp_path / "none"), *command, "--json"])
+        assert code == EXIT_FAILED, command
+        assert json.loads(text) == {
+            "error": {"kind": "no_state", "message": "no state yet: run `calsync run` or start the daemon"}
+        }
     assert not (tmp_path / "none").exists()
+
+
+READ_COMMANDS_JSON = [
+    ["status", "--json"],
+    ["blocked", "--json"],
+    ["events", "--json"],
+    ["event", "show", "abc", "--json"],
+    ["config", "get"],
+    ["config", "get", "--json"],
+    ["calendars", "me", "--json"],
+    ["runs", "--json"],
+    ["changes", "--json"],
+    ["upcoming", "--json"],
+]
+
+
+@pytest.mark.parametrize("command", READ_COMMANDS_JSON, ids=lambda c: " ".join(c))
+def test_read_commands_answer_a_config_error_as_json(tmp_path: Path, command: list[str]) -> None:
+    """An invalid hand edit is exactly when an agent's first call is ``status --json``."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG + '\n[runtime]\ninterval = "soon"\n')
+    code, text = run(["--config", str(cfg), "--state-dir", str(tmp_path / "s"), *command])
+    problem = "runtime.interval: invalid duration 'soon'; expected e.g. 30s, 5m, 2h, 7d, -15m"
+    assert code == EXIT_CONFIG
+    assert json.loads(text) == {"error": {"kind": "config", "message": problem, "problems": [problem]}}
+
+
+def test_read_commands_answer_an_unknown_rule_as_json(synced: list[str]) -> None:
+    for command in (["blocked"], ["upcoming"], ["events"]):
+        code, text = run([*synced, *command, "--rule", "nope", "--json"])
+        assert code == EXIT_CONFIG
+        assert json.loads(text) == {"error": {"kind": "unknown_rule", "message": "unknown rule(s): nope"}}
 
 
 def test_view_commands_reject_unknown_rules_and_bad_config(synced: list[str], tmp_path: Path) -> None:
@@ -834,9 +882,16 @@ def test_view_commands_report_an_unreadable_database(tmp_path: Path) -> None:
     state = tmp_path / "state"
     state.mkdir()
     (state / "state.db").write_bytes(b"not a database, just some text " * 64)
-    for command in (["status"], ["upcoming"], ["runs"], ["changes", "--json"]):
+    for command in (["status"], ["upcoming"], ["runs"], ["changes"]):
         code, text = run(["--config", str(cfg), "--state-dir", str(state), *command])
         assert (code, text) == (EXIT_FAILED, "error: the state database could not be read: DatabaseError\n")
+    code, text = run(["--config", str(cfg), "--state-dir", str(state), "changes", "--json"])
+    assert code == EXIT_FAILED and json.loads(text) == {
+        "error": {
+            "kind": "state_unreadable",
+            "message": "the state database could not be read: DatabaseError",
+        }
+    }
 
 
 def test_light_commands_import_no_heavy_modules(tmp_path: Path) -> None:
@@ -901,7 +956,9 @@ def _daemon_process(
     ``state``, which must be short: a unix socket path is limited to 104 bytes on macOS."""
     cfg = tmp_path / "config.toml"
     cfg.write_text(VIEWS_CONFIG)  # env credentials that are never set: no network, no secret read
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CALSYNC_")}
+    # The sealed environment (HOME, CALSYNC_CONFIG / CALSYNC_STATE_DIR, the fail keyring, no
+    # proxy) reaches the child too; only the developer's CALSYNC_DEBUG is dropped.
+    env = {k: v for k, v in os.environ.items() if k != "CALSYNC_DEBUG"}
     return subprocess.Popen(
         [
             sys.executable,
@@ -1040,7 +1097,7 @@ def test_daemon_with_its_port_in_use_exits_2_and_says_why(tmp_path: Path, short_
 class _RecordingDaemon:
     listens: ClassVar[list[tuple[str, int] | None]] = []
 
-    def __init__(self, config: Any, state_dir: Path, *, sync: bool, listen: Any) -> None:
+    def __init__(self, config: Any, state_dir: Path, *, sync: bool, listen: Any, config_path: Path) -> None:
         self.listens.append(listen)
 
     def snapshot(self) -> Any:
@@ -1113,37 +1170,39 @@ def test_daemon_no_web_and_listen_exclude_each_other(tmp_path: Path) -> None:
     assert info.value.code == 2
 
 
-def test_trigger_without_a_daemon(short_dir: Path) -> None:
+def test_trigger_without_a_daemon_runs_here(short_dir: Path) -> None:
+    """No socket, or one nobody listens on: nothing to hand the cycle to, so it runs here (and
+    needs the config; ``tests.test_trigger`` runs real cycles)."""
     import socket
 
-    not_running = (EXIT_FAILED, "the daemon is not running; use calsync run\n")
-    assert run(["--state-dir", str(short_dir / "none"), "trigger"]) == not_running  # no socket
+    missing = (EXIT_CONFIG, f"configuration error:\n  - config file not found: {short_dir / 'none.toml'}\n")
+    argv = ["--config", str(short_dir / "none.toml"), "--state-dir"]
+    assert run([*argv, str(short_dir / "none"), "trigger"]) == missing  # no socket
     dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     dead.bind(str(short_dir / "calsync.sock"))  # a socket file nobody listens on: refused
     dead.close()
-    assert run(["--state-dir", str(short_dir), "trigger"]) == not_running
+    assert run([*argv, str(short_dir), "trigger"]) == missing
     assert not (short_dir / "none").exists()
 
 
-def test_trigger_reports_a_socket_it_cannot_reach(tmp_path: Path, short_dir: Path) -> None:
+def test_trigger_reports_a_socket_it_cannot_reach(short_dir: Path) -> None:
     import socket
 
-    long_dir = tmp_path / ("d" * 110)  # longer than a unix socket path may be
-    long_dir.mkdir()
-    (long_dir / "calsync.sock").touch()
-    assert run(["--state-dir", str(long_dir), "trigger"]) == (
-        EXIT_FAILED,
-        "error: cannot connect to the daemon socket (OSError)\n",
-    )
     listening = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         listening.bind(str(short_dir / "calsync.sock"))
         listening.listen(1)
         (short_dir / "calsync.sock").chmod(0)  # connect needs write permission on the socket
-        assert run(["--state-dir", str(short_dir), "trigger"]) == (
-            EXIT_FAILED,
-            "error: cannot connect to the daemon socket (PermissionError)\n",
-        )
+        for wait in ([], ["--wait"]):
+            assert run(["--state-dir", str(short_dir), "trigger", *wait]) == (
+                EXIT_FAILED,
+                "error: cannot connect to the daemon socket (PermissionError)\n",
+            )
+            code, out = run(["--state-dir", str(short_dir), "trigger", *wait, "--json"])
+            assert code == EXIT_FAILED
+            assert json.loads(out) == {
+                "error": {"kind": "error", "message": "cannot connect to the daemon socket (PermissionError)"}
+            }
     finally:
         listening.close()
 
@@ -1284,7 +1343,7 @@ def test_daemon_listen_is_validated(tmp_path: Path) -> None:
     assert info.value.code == 2  # argparse: a usage error
 
 
-WEB_OFF = 'the web UI is off ([web] listen = "off"); set [web] listen to HOST:PORT to use it\n'
+WEB_OFF = 'the web UI is off (listen "off"); set [web] listen or --listen to HOST:PORT to use it\n'
 
 
 def test_web_pair_when_the_web_ui_is_off(tmp_path: Path) -> None:
@@ -1307,3 +1366,218 @@ def test_web_pair_when_the_web_ui_is_off(tmp_path: Path) -> None:
         "ok: the key was replaced; every paired browser has to pair again\n" + WEB_OFF,
     )
     assert (state / "web.key").read_text().strip() != key
+
+
+def test_listen_off_turns_the_web_ui_off(tmp_path: Path) -> None:
+    import argparse
+
+    from calsync.cli import _parser, _web_listen
+    from calsync.config import load_config
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(VIEWS_CONFIG)  # [web] listen: the default address
+    state = tmp_path / "s"
+    pair = ["--config", str(cfg), "--state-dir", str(state), "web", "pair", "--listen", "off"]
+    assert run(pair) == (EXIT_CONFIG, WEB_OFF)
+    assert not (state / "web.key").exists()
+    config = load_config(cfg)
+    daemon_args = _parser().parse_args(["daemon", "--listen", "off"])
+    assert _web_listen(daemon_args, config) is None  # as --no-web
+    assert _web_listen(argparse.Namespace(listen=None), config) == (config.web.host, config.web.port)
+    for command in (["daemon"], ["web", "pair"], ["web", "reset-key"]):
+        assert 'HOST:PORT, or "off" for no web UI' in _help(_parser(), command)
+
+
+def _help(parser: Any, command: list[str]) -> str:
+    """The --help text of a subcommand, joined on one line (argparse wraps it)."""
+    import contextlib
+    import io
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer), pytest.raises(SystemExit):
+        parser.parse_args([*command, "--help"])
+    return " ".join(buffer.getvalue().split())
+
+
+# ----- events and event show ------------------------------------------------------------------
+
+RANGE = ["--from", "2026-10-24T00:00+08:00", "--to", "2026-10-26T00:00+08:00"]
+
+
+def _local_day(iso: str) -> str:
+    from datetime import datetime
+
+    return datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d")
+
+
+def test_events_text(synced: list[str]) -> None:
+    code, text = run([*synced, "events", *RANGE])
+    assert code == EXIT_OK
+
+    def line(start: str, end: str, title: str) -> str:
+        return f"{_local_day(start)} {_local_hhmm(start)}–{_local_hhmm(end)}  {title}  [Family → Family: delivered]"
+
+    assert text.splitlines() == [
+        line("2026-10-24T18:00:00+08:00", "2026-10-24T18:15:00+08:00", "Standup"),
+        line("2026-10-25T12:00:00+08:00", "2026-10-25T13:00:00+08:00", "Lunch break"),
+        line("2026-10-25T18:00:00+08:00", "2026-10-25T18:15:00+08:00", "Standup"),
+        "(use --json for event ids)",
+    ]
+
+
+def test_events_text_all_day_and_empty(synced: list[str]) -> None:
+    code, text = run(
+        [*synced, "events", "--from", "2026-11-05T00:00+00:00", "--to", "2026-11-06T00:00+00:00"]
+    )
+    assert (code, text) == (
+        EXIT_OK,
+        "2026-11-05 all day  Holiday  [Family → Family: delivered]\n(use --json for event ids)\n",
+    )
+    code, text = run([*synced, "events", "--from", "2030-01-01", "--to", "2030-01-02"])
+    assert (code, text) == (EXIT_OK, "no events\n")
+
+
+def test_events_json_and_filters(synced: list[str]) -> None:
+    import json
+
+    code, text = run([*synced, "events", *RANGE, "--json"])
+    assert code == EXIT_OK
+    body = json.loads(text)
+    assert list(body) == ["from", "to", "schema", "truncated", "events"]
+    assert [e["title"] for e in body["events"]] == ["Standup", "Lunch\nbreak", "Standup"]
+    code, text = run([*synced, "events", *RANGE, "--json", "--query", "LUNCH", "--rule", "family"])
+    assert [e["title"] for e in json.loads(text)["events"]] == ["Lunch\nbreak"]
+    code, text = run([*synced, "events", *RANGE, "--json", "--target", "dav:Family"])
+    assert len(json.loads(text)["events"]) == 3
+
+
+def test_events_defaults_to_a_week_from_today(synced: list[str]) -> None:
+    import json
+    from datetime import datetime, timedelta
+
+    from tests.harness import NOW
+
+    body = json.loads(run([*synced, "events", "--json"])[1])
+    start, end = datetime.fromisoformat(body["from"]), datetime.fromisoformat(body["to"])
+    assert start == NOW.astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    assert end - start == timedelta(days=7)
+    body = json.loads(run([*synced, "events", "--json", "--from", "2026-10-30"])[1])
+    assert datetime.fromisoformat(body["to"]) - datetime.fromisoformat(body["from"]) == timedelta(days=7)
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--from", "2026-10-01", "--to", "2026-12-03"], "to: at most 62 days after from"),
+        (["--from", "2026-10-24", "--to", "2026-10-23"], "to: must not be before from"),
+        (["--rule", "nope"], "unknown rule(s): nope"),
+        (["--target", "dav:Nowhere"], "no rule syncs into dav:Nowhere"),
+        (["--target", "nocolon"], "target: expected ACCOUNT:CALENDAR, got 'nocolon'"),
+        (["--from", "2040-01-01"], "from: must be within 10 years of today"),
+        (["--from", "9999-12-30"], "from: must be within 10 years of today"),
+        (["--from", "2026-10-24", "--to", "9999-12-31T23:59+00:00"], "to: must be within 10 years of today"),
+    ],
+)
+def test_events_refuses_bad_arguments(synced: list[str], argv: list[str], message: str) -> None:
+    import json
+
+    assert run([*synced, "events", *argv]) == (EXIT_CONFIG, message + "\n")
+    code, text = run([*synced, "events", *argv, "--json"])
+    assert code == EXIT_CONFIG and json.loads(text)["error"]["message"] == message
+
+
+def test_events_refuses_an_unrepresentable_local_time(
+    synced: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as info:  # argparse: a usage error, exit 2 (not a traceback)
+        run([*synced, "events", "--from", "9999-12-31T23:00"])
+    assert info.value.code == EXIT_CONFIG and "expected an ISO 8601 time" in capsys.readouterr().err
+
+
+def test_upcoming_refuses_hours_beyond_the_calendar(synced: list[str]) -> None:
+    assert run([*synced, "upcoming", "--hours", "999999999999"]) == (EXIT_CONFIG, "hours: too far ahead\n")
+
+
+def test_upcoming_refuses_hours_whose_local_end_is_beyond_the_calendar(
+    synced: list[str], local_zone: Any
+) -> None:
+    from datetime import UTC, datetime
+
+    from tests.harness import NOW
+
+    local_zone("Asia/Shanghai")  # +08:00: the UTC end is representable, the local one is not
+    hours = int((datetime(9999, 12, 31, 20, tzinfo=UTC) - NOW).total_seconds() // 3600)
+    assert run([*synced, "upcoming", "--hours", str(hours)]) == (EXIT_CONFIG, "hours: too far ahead\n")
+
+
+def test_span_text_shows_the_end_date_of_a_multi_day_event(local_zone: Any) -> None:
+    from datetime import date, datetime, timedelta, timezone
+
+    from calsync.cli import _span_text  # pyright: ignore[reportPrivateUsage]
+    from calsync.model import When
+
+    local_zone("Asia/Shanghai")
+    plus8 = timezone(timedelta(hours=8))
+
+    def at(d: int, h: int) -> When:
+        return When(datetime(2026, 10, d, h, tzinfo=plus8), "Asia/Shanghai")
+
+    assert _span_text(at(28, 18), at(28, 19)) == "2026-10-28 18:00–19:00"
+    assert _span_text(at(28, 22), at(29, 1)) == "2026-10-28 22:00 – 2026-10-29 01:00"
+    assert _span_text(When(date(2026, 11, 5)), When(date(2026, 11, 6))) == "2026-11-05 all day"
+    assert _span_text(When(date(2026, 11, 5)), When(date(2026, 11, 8))) == "2026-11-05 – 2026-11-07 all day"
+
+
+def test_event_show(synced: list[str]) -> None:
+    import json
+
+    events = json.loads(run([*synced, "events", *RANGE, "--json"])[1])["events"]
+    lunch = events[1]["id"]
+    code, text = run([*synced, "event", "show", lunch, "--json"])
+    assert code == EXIT_OK
+    body = json.loads(text)
+    assert body["id"] == lunch and body["original"]["title"] == "Lunch\nbreak"
+    assert body["deliveries"][0]["copy"]["title"] == "Lunch\nbreak"
+    code, text = run([*synced, "event", "show", lunch])
+    assert code == EXIT_OK
+    start, end = "2026-10-25T12:00:00+08:00", "2026-10-25T13:00:00+08:00"
+    assert text == (
+        "Lunch break\n"
+        f"  when: {_local_day(start)} {_local_hhmm(start)}–{_local_hhmm(end)}\n"
+        "  source: me / Family\n"
+        "  family → dav / Family: delivered at 2026-10-24T08:00:00+00:00\n"
+    )
+
+
+def test_event_show_of_an_unknown_event(synced: list[str]) -> None:
+    import json
+
+    assert run([*synced, "event", "show", "bm9wZQ"]) == (EXIT_FAILED, "no such event\n")
+    code, text = run([*synced, "event", "show", "bm9wZQ", "--json"])
+    assert code == EXIT_FAILED and json.loads(text)["error"]["kind"] == "not_found"
+
+
+def test_status_json_daemon_is_null_without_a_daemon(synced: list[str]) -> None:
+    import json
+
+    assert json.loads(run([*synced, "status", "--json"])[1])["daemon"] is None
+
+
+def test_the_daemon_names_an_escaping_error_by_its_type_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon's output is its log: a ``TransientError`` text can carry a request URL."""
+    from calsync import cli
+    from calsync.errors import ConfigError, TransientError
+
+    async def failing(args: Any, out: Any) -> int:
+        raise TransientError("GET https://dav.example.com/private/calendar/ failed")
+
+    monkeypatch.setattr(cli, "_daemon", failing)
+    assert run(["daemon"]) == (1, "error: TransientError\n")
+
+    async def misconfigured(args: Any, out: Any) -> int:
+        raise ConfigError(["web.listen: not this computer's address"])
+
+    monkeypatch.setattr(cli, "_daemon", misconfigured)
+    assert run(["daemon"]) == (2, "configuration error:\n  - web.listen: not this computer's address\n")

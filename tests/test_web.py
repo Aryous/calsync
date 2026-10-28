@@ -8,6 +8,7 @@ import asyncio
 import errno
 import hashlib
 import hmac
+import json
 import logging
 import socket
 import stat
@@ -505,6 +506,42 @@ async def test_a_failing_config_in_the_host_check_is_a_plain_500(
 # ----- the daemon's TCP listener ----------------------------------------------------------
 
 
+KEY_WARNING = "the web UI's key file cannot be used (%s); replace it with `calsync web reset-key`"
+
+
+@pytest.mark.parametrize(
+    ("mode", "kind"), [(0o644, "InsecureKeyFile"), (0o200, "PermissionError"), (None, None), (0o600, None)]
+)
+async def test_the_daemon_warns_once_at_start_about_an_unusable_key(
+    state: Path, short_dir: Path, caplog: pytest.LogCaptureFixture, mode: int | None, kind: str | None
+) -> None:
+    import shutil
+
+    caplog.set_level(logging.INFO, logger="calsync.daemon")
+    shutil.copy(state / "state.db", short_dir / "state.db")
+    key = None
+    if mode is not None:
+        key = auth.load_or_create_key(short_dir)
+        auth.key_path(short_dir).chmod(mode)
+    stop = asyncio.Event()
+    daemon = Daemon(web_config(), short_dir, sync=False, listen=("127.0.0.1", 0), clock=lambda: NOW)
+    task = asyncio.create_task(daemon.run(stop))
+    try:
+        for _ in range(500):  # the start's lines are logged once the listener serves
+            if any(r.getMessage().startswith("web UI on") for r in caplog.records) or task.done():
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 5)
+        auth.key_path(short_dir).unlink(missing_ok=True)
+    warnings = [r for r in caplog.records if r.name == "calsync.daemon" and r.levelno == logging.WARNING]
+    expected = [KEY_WARNING % kind] if kind else []
+    assert [r.getMessage() for r in warnings] == expected
+    assert key is None or all(key not in r.getMessage() for r in caplog.records)
+
+
 async def test_a_no_sync_daemon_serves_tcp(state: Path, short_dir: Path) -> None:
     import shutil
 
@@ -601,3 +638,263 @@ async def test_a_daemon_whose_port_is_in_use_stops_before_any_cycle(
     with pytest.raises(ListenError):
         await asyncio.wait_for(daemon.run(asyncio.Event()), 5)
     assert not (short_dir / "calsync.sock").exists()  # the unix socket was closed and removed
+
+
+# ----- operations over TCP ------------------------------------------------------------------
+
+SAME_ORIGIN = {"origin": "http://127.0.0.1:8766"}
+
+
+class OpsDaemon(FakeDaemon):
+    """Records the operations it is asked to run, and their source."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ops: list[tuple[str, dict[str, Any], bool, str]] = []
+
+    async def run_op(self, name: str, args: dict[str, Any], dry_run: bool, *, source: str) -> Any:
+        from calsync.ops import OpResult
+
+        self.ops.append((name, args, dry_run, source))
+        return OpResult(name, True, "done")
+
+
+async def test_an_op_over_tcp_runs_with_source_ui(state: Path) -> None:
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    response = await c.post("/api/ops/rule.pause", json={"args": {"name": "family"}}, headers=SAME_ORIGIN)
+    assert response.status_code == 200 and response.json()["summary"] == "done"
+    assert daemon.ops == [("rule.pause", {"name": "family"}, False, "ui")]
+
+
+async def test_an_op_over_tcp_needs_the_cookie(state: Path) -> None:
+    auth.load_or_create_key(state)
+    daemon = OpsDaemon()
+    c = client(state, daemon=daemon)
+    response = await c.post("/api/ops/rule.pause", json={"args": {"name": "family"}}, headers=SAME_ORIGIN)
+    assert response.status_code == 401 and response.json() == UNPAIRED
+    assert daemon.ops == []
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{"origin": "http://evil.example"}, {"origin": "http://127.0.0.1:9999"}, {"origin": "null"}, {}],
+)
+async def test_an_op_over_tcp_needs_this_origin(state: Path, headers: dict[str, str]) -> None:
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    response = await c.post("/api/ops/rule.pause", json={"args": {"name": "family"}}, headers=headers)
+    assert response.status_code == 403 and response.json()["error"]["kind"] == "cross_origin"
+    assert daemon.ops == []
+
+
+async def test_deleting_a_credential_over_tcp_needs_the_terminal(state: Path) -> None:
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    args = {"name": "kid-dav", "delete_credential": True}
+    response = await c.post("/api/ops/account.remove", json={"args": args}, headers=SAME_ORIGIN)
+    assert response.status_code == 403
+    assert response.json() == {
+        "error": {
+            "kind": "needs_human",
+            "message": "credentials are managed from the terminal",
+            "needs_human": True,
+            "command": "calsync account remove kid-dav --delete-credential",
+            "reason": "credentials are managed from the terminal",
+        }
+    }
+    assert daemon.ops == []
+    kept = await c.post("/api/ops/account.remove", json={"args": {"name": "kid-dav"}}, headers=SAME_ORIGIN)
+    assert kept.status_code == 200 and daemon.ops == [("account.remove", {"name": "kid-dav"}, False, "ui")]
+
+
+async def test_a_large_op_body_is_413(state: Path) -> None:
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    body = json.dumps({"args": {"name": "x" * (64 * 1024)}})
+    response = await c.post(
+        "/api/ops/rule.pause",
+        content=body,
+        headers={**SAME_ORIGIN, "content-type": "application/json"},
+    )
+    assert response.status_code == 413 and response.json()["error"]["kind"] == "too_large"
+    assert daemon.ops == []
+    small = await c.post("/api/ops/rule.pause", json={"args": {"name": "x" * 1000}}, headers=SAME_ORIGIN)
+    assert small.status_code == 200
+
+
+async def test_ops_and_trigger_over_the_daemons_tcp_listener(short_dir: Path) -> None:
+    """A real daemon: an operation over TCP is recorded with source ``ui``; ``trigger`` waits."""
+    from calsync.views import StateReader
+    from tests.test_daemon import eventually
+    from tests.test_trigger import Running
+
+    d = Running(short_dir, serve=True, listen=("127.0.0.1", 0))
+    await d.start()
+    await eventually(lambda: d.daemon.web_address is not None)
+    assert d.daemon.web_address is not None
+    port = d.daemon.web_address[1]
+    key = auth.load_or_create_key(short_dir)
+    origin = {"origin": f"http://127.0.0.1:{port}"}
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=10) as c:
+        assert (await c.get("/", params={"k": key})).status_code == 303
+        paused = await c.post("/api/ops/rule.pause", json={"args": {"name": "work"}}, headers=origin)
+        waited = await c.post(
+            "/api/ops/trigger", json={"args": {"rule": "family", "wait": True, "timeout": 5}}, headers=origin
+        )
+    assert paused.status_code == 200 and paused.json()["summary"] == 'rule "work" paused'
+    with StateReader(short_dir / "state.db") as reader:
+        assert [(c.source, c.summary) for c in reader.config_changes()] == [("ui", 'rule "work" paused')]
+    assert waited.status_code == 200, waited.text
+    data = waited.json()["data"]
+    assert data["ran"] is True and list(data["rules"]) == ["family"]
+    await d.stop()
+
+
+# ----- what an operation's diff shows over TCP --------------------------------------------------
+
+MASKED_ACCOUNTS = """\
+[google]
+client_secret_file = "unused.json"
+
+[runtime]
+interval = "30s"
+jitter = 0.0
+
+[accounts.me]
+provider = "google"
+credential = { backend = "env", ref = "UNUSED" }
+
+[accounts.dav]
+provider = "caldav"
+server_url = "http://unused/"
+username = "someone@example.com"
+credential = { backend = "env", ref = "UNUSED" }
+
+[notify]
+bark_url = "https://api.day.app/DEVICEKEY"
+failure_threshold = 3
+"""
+
+
+async def test_an_op_diff_over_tcp_is_masked_and_the_socket_sees_the_file(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``GET /api/config`` masks the push URL's key and a username: a dry run's (or a write's)
+    diff over TCP masks them the same way, while the CLI's socket shows the file."""
+    from calsync import credentials
+    from tests.test_daemon import eventually
+    from tests.test_daemon_reload import FAMILY
+    from tests.test_ops import FakeKeyring
+    from tests.test_trigger import Running, uds
+
+    keychain = FakeKeyring()  # no entry for the new account: the web UI may add it
+    monkeypatch.setattr(credentials, "_keyring", lambda: keychain)
+    d = Running(short_dir, MASKED_ACCOUNTS + FAMILY, serve=True, listen=("127.0.0.1", 0))
+    await d.start()
+    await eventually(lambda: d.daemon.web_address is not None and (short_dir / "calsync.sock").is_socket())
+    assert d.daemon.web_address is not None
+    port = d.daemon.web_address[1]
+    key = auth.load_or_create_key(short_dir)
+    origin = {"origin": f"http://127.0.0.1:{port}"}
+    threshold = {"args": {"key": "notify.failure_threshold", "value": "5"}, "dry_run": True}
+    added = {
+        "args": {
+            "name": "new",
+            "provider": "caldav",
+            "server_url": "https://dav.example.com/principals/SECRETPATH/",
+            "username": "another@example.com",
+        },
+        "dry_run": True,
+    }
+    secrets = ("DEVICEKEY", "someone@example.com", "another@example.com", "SECRETPATH")
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=10) as c:
+        assert (await c.get("/", params={"k": key})).status_code == 303
+        tcp = [
+            await c.post("/api/ops/config.set", json=threshold, headers=origin),
+            await c.post("/api/ops/account.add", json=added, headers=origin),
+        ]
+        written = await c.post("/api/ops/account.add", json={"args": added["args"]}, headers=origin)
+    async with uds(short_dir) as s:
+        sock = [
+            await s.post("/api/ops/config.set", json=threshold),
+            await s.post("/api/ops/account.add", json={**added, "args": {**added["args"], "name": "newer"}}),
+        ]
+    await d.stop()
+    for response in [*tcp, written, *sock]:
+        assert response.status_code == 200, response.text
+    set_diff, add_diff = (r.json()["diff"] for r in tcp)
+    assert "-failure_threshold = 3\n+failure_threshold = 5\n" in set_diff
+    assert ' bark_url = "https://api.day.app"\n' in set_diff  # context, cut to scheme and host
+    assert '+username = "(hidden)"\n' in add_diff and '+server_url = "https://dav.example.com"\n' in add_diff
+    assert '+credential = {backend = "keychain", ref = "(hidden)"}\n' in add_diff
+    assert ' username = "(hidden)"\n' in add_diff  # the existing account, in the context
+    for text in (*(r.text for r in tcp), written.text):
+        for secret in secrets:
+            assert secret not in text
+    assert written.json()["changed"] is True
+    assert "another@example.com" in (short_dir / "config.toml").read_text()  # the file has it all
+    sock_set, sock_add = (r.json()["diff"] for r in sock)
+    assert "DEVICEKEY" in sock_set
+    assert "another@example.com" in sock_add and "SECRETPATH" in sock_add
+
+
+async def test_adding_an_account_over_tcp_never_re_points_a_stored_credential(
+    state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A keychain entry left by an account removed without ``--delete-credential``: a browser
+    adding an account of that name could point the stored password at a server it chose."""
+    from calsync import credentials
+    from tests.test_ops import FakeKeyring
+
+    keychain = FakeKeyring()
+    keychain.store[("calsync:old-dav", credentials.KEYRING_USER)] = "app-password"
+    monkeypatch.setattr(credentials, "_keyring", lambda: keychain)
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    args = {"name": "old-dav", "provider": "caldav", "server_url": "https://evil.example/", "username": "a b"}
+    response = await c.post("/api/ops/account.add", json={"args": args}, headers=SAME_ORIGIN)
+    assert response.status_code == 403
+    reason = "the keychain already holds a credential for this account; add it from the terminal"
+    assert response.json() == {
+        "error": {
+            "kind": "needs_human",
+            "message": reason,
+            "needs_human": True,
+            "command": "calsync account add old-dav --provider caldav --server-url https://evil.example/ "
+            "--username 'a b'",
+            "reason": reason,
+        }
+    }
+    dry = await c.post("/api/ops/account.add", json={"args": args, "dry_run": True}, headers=SAME_ORIGIN)
+    assert dry.status_code == 403
+    assert daemon.ops == []
+    assert "app-password" not in response.text
+    fresh = {"name": "new-dav", "provider": "caldav"}
+    allowed = await c.post("/api/ops/account.add", json={"args": fresh}, headers=SAME_ORIGIN)
+    assert allowed.status_code == 200 and daemon.ops == [("account.add", fresh, False, "ui")]
+
+
+async def test_adding_an_account_over_tcp_when_the_keychain_cannot_be_asked(
+    state: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import keyring.errors
+
+    from calsync import credentials
+
+    class Locked:
+        def get_password(self, service: str, user: str) -> str | None:
+            raise keyring.errors.KeyringLocked("locked")
+
+    monkeypatch.setattr(credentials, "_keyring", lambda: Locked())
+    daemon = OpsDaemon()
+    c = await paired(state, daemon=daemon)
+    args = {"name": "dav", "provider": "caldav"}
+    response = await c.post("/api/ops/account.add", json={"args": args}, headers=SAME_ORIGIN)
+    assert response.status_code == 403
+    assert (
+        response.json()["error"]["reason"]
+        == "the keychain could not be checked; add the account from the terminal"
+    )
+    assert response.json()["error"]["command"] == "calsync account add dav --provider caldav"
+    assert daemon.ops == []

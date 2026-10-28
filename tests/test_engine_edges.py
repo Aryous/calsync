@@ -15,7 +15,7 @@ import calsync.store as store_mod
 from calsync.errors import ConflictError, ForbiddenError, TransientError
 from calsync.http import RequestLog, make_client
 from calsync.model import Series
-from calsync.naming import object_id, resource_name
+from calsync.naming import object_id, resource_name, rule_tag
 from calsync.sources.base import CalendarInfo, CalendarMeta, RawEvent, SourcePull
 from calsync.sources.google import GoogleSource
 from calsync.sources.google_auth import StaticToken
@@ -47,7 +47,7 @@ async def test_detect_failure_fails_only_its_rule(tmp_path: Path) -> None:
     h.target.fail_changes["A"] = TransientError("sync-collection timed out")
     result = await h.engine.cycle()
     a, b = result.rules["a"], result.rules["b"]
-    assert a.status == "failed" and a.error == "TransientError: sync-collection timed out"
+    assert a.status == "failed" and a.error == 'TransientError: the target of rule "a" could not be reached'
     assert a.error_kind == "other"
     assert b.status == "ok" and b.created == 2
     assert {r.rule: r.status for r in h.store.latest_runs()} == {"a": "failed", "b": "ok"}
@@ -340,7 +340,7 @@ async def test_source_omitting_a_calendar_fails_the_rule_instead_of_reusing_data
     fake.cancel_event(GCAL, "stretch")
     source.forgetful = True  # neither in calendars nor in errors: a contract violation
     res = (await h.engine.cycle()).rules["family"]
-    assert res.status == "failed" and "contract" in (res.error or "")
+    assert res.status == "failed" and res.error == 'CalsyncError: the source of rule "family" failed'
     assert len(h.target.managed(h.target.calendars["Family"])) == 2
 
 
@@ -369,7 +369,8 @@ async def test_partial_failure_keeps_first_error_and_counts_the_rest(tmp_path: P
     h.target.before_write = flaky
     res = (await h.engine.cycle()).rules["family"]
     assert (res.status, res.created, res.failed) == ("partial", 1, 3)
-    assert res.error == "TransientError: PUT timed out (+2 more)" and res.error_kind == "other"
+    assert res.error == 'TransientError: the target of rule "family" could not be reached (+2 more)'
+    assert res.error_kind == "other"
     assert [r.status for r in h.store.latest_runs()] == ["partial"]
 
 
@@ -1507,3 +1508,137 @@ async def test_held_copy_that_shows_the_source_version_again_ends_its_hold(tmp_p
     res = await edit_and_cycle(h, clock, timedelta(hours=6))  # a new edit is reverted at once
     assert (res.updated, res.reverted) == (1, 1)
     assert MOVE_FROM in target.objects[href][1]
+
+
+# ----- 6. a config replaced in place (the daemon's hot reload) ----------------------------
+
+
+async def test_replace_config_keeps_a_blocked_rules_titles(tmp_path: Path) -> None:
+    """An unrelated config change must not make a blocked rule read its planned deletes again."""
+    from dataclasses import replace as dc_replace
+
+    from calsync.config import RuntimeConfig
+
+    fake = many(4)
+    config = config_for([rule()])
+    h = build_fake(tmp_path, fake, config)
+    await h.engine.cycle()
+    for i in range(4):
+        fake.cancel_event(GCAL, f"e{i}")
+    assert (await h.engine.cycle()).rules["family"].status == "blocked"
+    h.engine.replace_config(dc_replace(config, runtime=RuntimeConfig(timedelta(seconds=90), 0.0)))
+    h.target.calls.clear()
+    again = (await h.engine.cycle()).rules["family"]
+    assert again.status == "blocked" and sorted(again.blocked_titles) == ["E0", "E1", "E2", "E3"]
+    assert [op for op, _ in h.target.calls] == ["changes"]  # no fetch of the planned deletes
+    assert again.changes == []  # and no second set of "blocked" rows
+
+
+async def test_replace_config_forgets_a_rule_that_was_removed(tmp_path: Path) -> None:
+    fake = many(4)
+    config = config_for([rule()])
+    h = build_fake(tmp_path, fake, config)
+    await h.engine.cycle()
+    for i in range(4):
+        fake.cancel_event(GCAL, f"e{i}")
+    await h.engine.cycle()
+    h.engine.replace_config(config_for([rule("other", target="Other")]))
+    h.engine.replace_config(config)  # the same name again: a new rule as far as memory goes
+    h.target.calls.clear()
+    again = (await h.engine.cycle()).rules["family"]
+    assert again.status == "blocked" and [op for op, _ in h.target.calls] == ["changes", "fetch"]
+    assert len(again.changes) == 4  # recorded again
+
+
+async def test_replace_config_forgets_a_rule_whose_source_changed(tmp_path: Path) -> None:
+    fake = many(4)
+    fake.add_calendar("other@group.calendar.google.com", "Other")
+    config = config_for([rule()])
+    h = build_fake(tmp_path, fake, config)
+    await h.engine.cycle()
+    for i in range(4):
+        fake.cancel_event(GCAL, f"e{i}")
+    await h.engine.cycle()
+    h.engine.replace_config(config_for([rule(alarms="strip")]))  # same selection: kept
+    assert "family" in h.engine._last_blocked  # pyright: ignore[reportPrivateUsage]
+    h.engine.replace_config(config_for([rule(source="Other")]))
+    assert "family" not in h.engine._last_blocked  # pyright: ignore[reportPrivateUsage]
+    assert "family" not in h.engine._last_protected  # pyright: ignore[reportPrivateUsage]
+
+
+# ----- 7. paused and retiring rules ----------------------------------------------------------
+
+
+async def test_a_paused_rule_is_not_run(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, many(2), config_for([rule(paused=True)]))
+    result = await h.engine.cycle()
+    assert result.rules == {} and h.target.objects == {}
+    assert h.store.latest_runs() == []  # no run rows while paused
+
+
+async def test_a_retiring_rule_deletes_every_copy(tmp_path: Path) -> None:
+    fake = many(2)
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    assert len(h.target.objects) == 2
+    h.engine.replace_config(config_for([rule(retire=True)]))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.created, res.updated, res.deleted) == ("ok", 0, 0, 2)
+    assert h.target.objects == {}
+    assert sorted(c.action for c in res.changes) == ["deleted", "deleted"]
+    assert h.store.copies(rule_tag("family"), "dav", "Family") == 0
+    assert (await h.engine.cycle()).rules["family"].plan.empty
+
+
+async def test_a_retiring_rule_needs_no_source(tmp_path: Path) -> None:
+    """Retiring often follows the source calendar's removal: the copies still go."""
+    fake = many(2)
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    fake.remove_calendar(GCAL)
+    h.engine.replace_config(config_for([rule(retire=True)]))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.deleted) == ("ok", 2) and h.target.objects == {}
+
+
+async def test_a_retiring_rule_over_the_guard_blocks(tmp_path: Path) -> None:
+    h = build_fake(tmp_path, many(4), config_for([rule()]))
+    await h.engine.cycle()
+    h.engine.replace_config(config_for([rule(retire=True)]))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.error_kind, res.deleted) == ("blocked", "guard", 0)
+    assert sorted(res.blocked_titles) == ["E0", "E1", "E2", "E3"]
+    assert len(h.target.objects) == 4
+    assert h.store.copies(rule_tag("family"), "dav", "Family") == 4
+
+
+async def test_a_retiring_rule_with_a_window_deletes_copies_outside_it(tmp_path: Path) -> None:
+    """Past events stay on the target of a windowed rule; retiring it must still delete them."""
+    fake = many(1)
+    fake.put_event(GCAL, google_event("old", "Old", "2025-01-10T09:00:00+08:00", "2025-01-10T09:05:00+08:00"))
+    h = build_fake(tmp_path, fake, config_for([rule()]))  # full sync: both copies written
+    await h.engine.cycle()
+    assert len(h.target.objects) == 2
+    windowed = {"window": {"past": "7d", "future": "180d"}}
+    h.engine.replace_config(config_for([rule(**windowed)]))
+    kept = (await h.engine.cycle()).rules["family"]
+    assert (kept.deleted, kept.out_of_window) == (0, 1)  # an ordinary windowed cycle keeps it
+    h.engine.replace_config(config_for([rule(**windowed, retire=True)]))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.deleted) == ("ok", 2) and h.target.objects == {}
+    assert h.store.copies(rule_tag("family"), "dav", "Family") == 0
+
+
+async def test_a_retiring_rule_with_a_window_still_meets_the_guard(tmp_path: Path) -> None:
+    fake = many(2)
+    for i in range(2):
+        fake.put_event(
+            GCAL, google_event(f"old{i}", f"Old{i}", "2025-01-10T09:00:00+08:00", "2025-01-10T09:05:00+08:00")
+        )
+    h = build_fake(tmp_path, fake, config_for([rule()]))
+    await h.engine.cycle()
+    h.engine.replace_config(config_for([rule(window={"past": "7d", "future": "180d"}, retire=True)]))
+    res = (await h.engine.cycle()).rules["family"]
+    assert (res.status, res.error_kind, res.deleted) == ("blocked", "guard", 0)
+    assert sorted(res.blocked_titles) == ["E0", "E1", "Old0", "Old1"]
+    assert len(h.target.objects) == 4

@@ -64,7 +64,7 @@ class World:
         self.logs: list[RequestLog] = []
         self.clients: list[httpx.AsyncClient] = []
         self.deny: set[str] = set()  # google accounts built with a revoked credential, once
-        self.on_google: Callable[[], None] | None = None  # called on the next Google request, once
+        self.on_google: Callable[[], None] | None = None  # called on a cycle's next Google request, once
         self.before_sleep: Callable[[], None] | None = None  # called as each wait starts
         self.after_sleep: Callable[[], None] | None = None  # called as each timed-out wait ends
 
@@ -84,9 +84,11 @@ class World:
             self.after_sleep()
 
     def _google(self, request: httpx.Request) -> httpx.Response:
-        hook, self.on_google = self.on_google, None
-        if hook is not None:
-            hook()
+        # A cycle's request: the calendar-cache listing (at start, before the first cycle) is not.
+        if "accessRole" not in request.url.params.get("fields", ""):
+            hook, self.on_google = self.on_google, None
+            if hook is not None:
+                hook()
         return self.fake.handler(request)
 
     async def factory(self, config: Config, names: set[str], *, log: RequestLog | None = None) -> Adapters:
@@ -341,7 +343,55 @@ async def test_unreadable_account_is_recorded_failed_every_cycle(tmp_path: Path)
         other_runs = reader.runs("other")
     assert sorted(int((r.started_at - NOW).total_seconds()) for r in other_runs) == [0, 60]
     assert {(r.status, r.error_kind) for r in other_runs} == {("failed", "auth")}
-    assert other_runs[0].error is not None and "credential file not found" in other_runs[0].error
+    assert other_runs[0].error == 'AuthError: account "broken" has no usable credential'
+    assert other_runs[0].error_account == "broken"
+
+
+async def test_a_config_setup_error_rebuilds_that_account_too(tmp_path: Path) -> None:
+    fixed = False  # the person fixes the credential file's mode meanwhile
+
+    async def factory(config: Config, names: set[str], *, log: RequestLog | None = None) -> Adapters:
+        adapters = await world.factory(config, names, log=log)
+        if "broken" in names and not fixed:
+            from calsync.errors import ConfigError
+
+            adapters.sources.pop("broken")
+            adapters.errors["broken"] = ConfigError("credential file /tmp/example must be mode 0600")
+        return adapters
+
+    other = {**rule("other", target="Other"), "source": {"account": "broken", "calendar": "Family"}}
+    config = replace(
+        config_for([rule("family"), other], extra_google=True),
+        runtime=RuntimeConfig(timedelta(seconds=30), 0.0),
+    )
+    world = World(stop_after=4)
+
+    def fix() -> None:
+        nonlocal fixed
+        fixed = True
+
+    world.before_sleep = fix
+    daemon = world.daemon(config, tmp_path, adapters_factory=factory)
+    await daemon.run(world.stop)
+    # Built at start (and once more, temporarily, for the start's calendar refresh); rebuilt
+    # before the rule's next attempt at 60 s, after its 1 minute backoff.
+    assert world.builds == [{"broken"}, {"dav"}, {"me"}, {"broken"}, {"broken"}, {"dav"}]
+    with StateReader(tmp_path / "state.db") as reader:
+        other_runs = sorted(reader.runs("other"), key=lambda r: r.started_at)
+    assert [(int((r.started_at - NOW).total_seconds()), r.status, r.error_kind) for r in other_runs] == [
+        (0, "failed", "config"),
+        (60, "ok", None),
+        (90, "ok", None),
+    ]
+
+
+async def test_a_config_error_in_the_cycle_rebuilds_nothing(tmp_path: Path) -> None:
+    world = World(stop_after=4)
+    daemon = world.daemon(two_rules(work_source="Missing"), tmp_path)
+    await daemon.run(world.stop)
+    with StateReader(tmp_path / "state.db") as reader:
+        assert {(r.status, r.error_kind) for r in reader.runs("work")} == {("failed", "config")}
+    assert world.builds == [{"dav"}, {"me"}]  # a calendar not found is not about the build
 
 
 # ----- request log, logging ---------------------------------------------------
@@ -441,6 +491,7 @@ async def test_snapshot_json(tmp_path: Path) -> None:
         "last_cycle_at": NOW.isoformat(),
         "next_cycle_at": (NOW + timedelta(seconds=30)).isoformat(),
         "cycles": 1,
+        "cycle_started_at": None,
     }
     world.stop.set()
     await asyncio.wait_for(task, 5)
@@ -791,3 +842,124 @@ async def test_a_service_raising_system_exit_lets_the_running_cycle_finish(
     assert daemon.snapshot().cycles == 1
     with RunLock(short_dir / "run.lock"):
         pass
+
+
+# ----- operations over the socket ----------------------------------------------------------
+
+OPS_CONFIG = """\
+[google]
+client_secret_file = "unused.json"
+
+[accounts.me]
+provider = "google"
+credential = { backend = "env", ref = "UNUSED" }
+
+[accounts.dav]
+provider = "caldav"
+server_url = "http://unused/"
+username = "u"
+credential = { backend = "env", ref = "UNUSED" }
+
+[[rules]]
+name = "family"  # synced to the family calendar
+source = { account = "me", calendar = "Family" }
+target = { account = "dav", calendar = "Family", create_if_missing = true }
+"""
+
+
+async def test_an_op_over_the_socket_waits_for_the_running_cycle(
+    short_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import anyio.to_thread
+
+    from calsync import daemon as daemon_module
+    from calsync import opsclient
+
+    config_path = short_dir / "config.toml"
+    config_path.write_text(OPS_CONFIG)
+    world = World(block=True)
+    in_cycle = asyncio.Event()
+    release = asyncio.Event()
+    real = daemon_module.run_cycle
+
+    async def held_cycle(*args: Any, **kwargs: Any) -> Any:
+        in_cycle.set()
+        await release.wait()
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(daemon_module, "run_cycle", held_cycle)
+    caplog.set_level(logging.INFO, logger="calsync.daemon")
+    daemon = world.daemon(two_rules(), short_dir, serve=True, config_path=config_path)
+    task = asyncio.create_task(daemon.run(world.stop))
+    await in_cycle.wait()
+    await eventually(lambda: (short_dir / "calsync.sock").is_socket())
+    call = asyncio.ensure_future(
+        anyio.to_thread.run_sync(
+            lambda: opsclient.call(
+                "rule.pause", {"name": "family"}, dry_run=False, config_path=config_path, state_dir=short_dir
+            )
+        )
+    )
+    await asyncio.sleep(0.3)
+    assert not call.done() and config_path.read_text() == OPS_CONFIG  # waits for the cycle
+    release.set()
+    result = await asyncio.wait_for(call, 10)
+    assert (result.changed, result.summary) == (True, 'rule "family" paused')
+    assert "# synced to the family calendar" in config_path.read_text()
+    assert "paused = true" in config_path.read_text()
+    assert "config changed; applied" in caplog.messages
+    assert [r.name for r in daemon.config.rules if r.paused] == ["family"]  # applied at once
+    world.stop.set()
+    await asyncio.wait_for(task, 5)
+    with StateReader(short_dir / "state.db") as reader:
+        [change] = reader.config_changes()
+        assert len(reader.runs()) == 2  # the cycle finished and recorded before the op ran
+    assert (change.source, change.summary) == ("cli", 'rule "family" paused')
+
+
+async def test_ops_on_a_daemon_without_sync_are_refused(short_dir: Path) -> None:
+    import anyio.to_thread
+
+    from calsync import opsclient
+    from calsync.ops import OpsUnavailable
+
+    config_path = short_dir / "config.toml"
+    config_path.write_text(OPS_CONFIG)
+    _, stop, task = await run_viewer(short_dir)
+    with pytest.raises(OpsUnavailable, match="--no-sync"):
+        await anyio.to_thread.run_sync(
+            lambda: opsclient.call(
+                "rule.pause", {"name": "family"}, dry_run=False, config_path=config_path, state_dir=short_dir
+            )
+        )
+    assert config_path.read_text() == OPS_CONFIG
+    stop.set()
+    await asyncio.wait_for(task, 5)
+
+
+# ----- cycle_started_at -------------------------------------------------------------------------
+
+
+async def test_cycle_started_at_is_set_only_while_a_cycle_runs(tmp_path: Path) -> None:
+    world = World(stop_after=2)
+    daemon = world.daemon(two_rules(interval=30), tmp_path)
+    during: list[Any] = []
+    world.on_google = lambda: during.append(daemon.snapshot().cycle_started_at)
+    between: list[Any] = []
+    world.before_sleep = lambda: between.append(daemon.snapshot().cycle_started_at)
+    await daemon.run(world.stop)
+    assert during == [NOW]
+    assert between == [None, None]
+    assert daemon.snapshot().to_json()["cycle_started_at"] is None
+
+
+async def test_cycle_started_at_is_cleared_after_a_failing_cycle(tmp_path: Path) -> None:
+    world = World(stop_after=1)
+    daemon = world.daemon(two_rules(), tmp_path)
+
+    def boom() -> None:
+        raise RuntimeError("the store broke")
+
+    world.on_google = boom
+    await daemon.run(world.stop)
+    assert daemon.snapshot().cycle_started_at is None

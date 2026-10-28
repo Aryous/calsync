@@ -109,3 +109,14 @@ async def test_limiter_throttle_and_reset() -> None:
     assert limiter.limit == 3
     async with limiter:
         pass
+
+
+def test_same_href_matches_a_url_or_its_path() -> None:
+    """One matcher for ``CalDavTarget.ensure_calendar`` and the calendar cache (``ops``)."""
+    from calsync.naming import same_href
+
+    href = "https://dav.example.com/home/family/"
+    assert same_href(href, "https://dav.example.com/home/family")  # the URL, trailing slash ignored
+    assert same_href(href, "/home/family/")  # just the path
+    assert not same_href(href, "https://other.example.com/home/family/")
+    assert not same_href(href, "Family")  # a name is not a path

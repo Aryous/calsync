@@ -6,6 +6,8 @@ up exactly where the last one stopped.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 from collections import defaultdict
 from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence, Set
@@ -15,13 +17,21 @@ from typing import Any, Literal
 
 from calsync import debug
 from calsync.config import Config, Rule
-from calsync.errors import AuthError, CalsyncError, ConfigError, ConflictError, NotFoundError
+from calsync.errors import (
+    AuthError,
+    CalendarNotListed,
+    CalsyncError,
+    ConfigError,
+    ConflictError,
+    NotFoundError,
+    plain_error,
+)
 from calsync.http import RequestLog
 from calsync.mirror import Mirror, apply_pull
 from calsync.model import Window, apply_alarm_policy, apply_field_policy, series_hash, series_span
 from calsync.naming import object_id, parse_resource_name, resource_name, rule_tag, uid_for
 from calsync.planner import Actual, Desired, Plan, check_delete_guard, plan
-from calsync.render import Inspected, content_digest, inspect, render
+from calsync.render import Inspected, changed_fields, content_digest, inspect, render, summary_of
 from calsync.sources.base import CalendarMeta, Source
 from calsync.store import ChangeRecord, RunRecord, Store
 from calsync.targets.base import (
@@ -44,6 +54,30 @@ REVERT_HOLD = timedelta(hours=24)
 
 Status = Literal["ok", "partial", "failed", "blocked"]
 ErrorKind = Literal["auth", "config", "guard", "other"]
+# Where a rule failed, for its stored error: reading its source, its target (detection and
+# writes), or the rule's own work (planning, the store).
+Side = Literal["source", "target", "rule"]
+
+
+def delete_fingerprint(object_ids: Iterable[str]) -> str:
+    """The identity of a set of planned deletes: what an approval names. The engine and
+    ``views.build_blocked`` both use it, on the plan and on the recorded ``blocked`` rows."""
+    return hashlib.sha256("\n".join(sorted(object_ids)).encode()).hexdigest()[:16]
+
+
+@dataclass(frozen=True, slots=True)
+class Approval:
+    """Blocked deletes a person or an agent let through: the set's fingerprint and where the
+    approval came from (``cli``, ``ui``), recorded with the cycle that releases the set."""
+
+    fingerprint: str
+    origin: str
+
+
+# Change action: an approval (or ``--allow-deletes``) released a set the guard holds back (object
+# id: its fingerprint).
+APPROVED = "approved"
+ALLOW_DELETES = "run"  # the origin recorded for ``calsync run --allow-deletes``
 
 
 def error_kind_for(exc: BaseException) -> ErrorKind:
@@ -63,25 +97,58 @@ class RuleResult:
     reverted: int = 0  # copies edited on the target and written back (counted in updated)
     deleted: int = 0
     failed: int = 0
+    # Stored and shown (status, runs, the API): ``errors.plain_error``, never an exception's text.
     error: str | None = None
     error_kind: ErrorKind | None = None
+    error_account: str | None = None  # the account whose adapter (or its setup) failed
+    # A setup error's own text (a credential file's path or mode, a missing client secret file:
+    # what to fix), for ``calsync run``'s output only. Setup reads local files, no server, so
+    # no URL; still never stored, logged or served (run history keeps ``error``).
+    setup_detail: str | None = None
     plan: Plan | None = None
     protected: int = 0  # existing target copies held untouched this cycle (series unparsed or degraded)
     degraded: int = 0  # series in the source calendar that are unparsed or degraded, copy or not
     out_of_window: int = 0  # desired series skipped by the rule's time window
     blocked_titles: list[str] = field(default_factory=list)  # planned deletes, for the guard alert
     blocked_titles_complete: bool = True  # False: the lookup failed or some bodies were unreadable
+    blocked_fingerprint: str | None = None  # set when status == "blocked": the set's identity
+    approved: bool = False  # an approval named exactly this cycle's planned deletes
+    # Set when this cycle let its planned deletes through the guard (not in a dry run): the
+    # approval's origin (``cli``, ``ui``), or ``run`` for ``--allow-deletes`` past a set the guard
+    # would have blocked. The ``approved`` change row and push go with it.
+    approved_by: str | None = None
     changes: list[ChangeRecord] = field(default_factory=list)  # carries titles: never log
     # This cycle's protected / blocked object ids, for the engine's dedup memory: committed only
     # once ``changes`` is written. None: not reached (dry run, or the rule failed earlier).
     seen_protected: frozenset[str] | None = None
     seen_blocked: frozenset[str] | None = None
     seen_blocked_read: bool = False  # the title lookup for ``seen_blocked`` succeeded
+    # What a retirement is judged by (``cycle.retired``): the target this cycle ran against,
+    # whether its detection read every changed copy (no unread copy, no held cursor), and
+    # whether that calendar does not exist (a retiring rule never creates it: no copies).
+    target: tuple[str, str] | None = None  # (account, calendar ref from config)
+    detection_complete: bool = False
+    target_missing: bool = False
 
-    def fail(self, exc: BaseException) -> None:
+    def fail(
+        self, exc: BaseException, *, side: Side = "rule", account: str | None = None, setup: bool = False
+    ) -> None:
+        """Fail the rule with ``exc``, raised on ``side`` by ``account``'s adapter (``setup``:
+        building that adapter failed). The full text belongs in ``debug.details``, not here."""
         self.status = "failed"
-        self.error = f"{type(exc).__name__}: {exc}"
+        self.error = self.describe(exc, side=side, account=account, setup=setup)
         self.error_kind = error_kind_for(exc)
+        self.error_account = account
+        self.setup_detail = str(exc) if setup else None
+
+    def describe(
+        self, exc: BaseException, *, side: Side = "rule", account: str | None = None, setup: bool = False
+    ) -> str:
+        """The stored text for ``exc``: its type and a sentence of config names."""
+        subject = f'rule "{self.rule}"' if side == "rule" else f'the {side} of rule "{self.rule}"'
+        if isinstance(exc, _NotCreatedYet):
+            return f"NotFoundError: {subject} does not exist yet; a real run creates it"
+        return plain_error(exc, subject, account=account, setup=setup)
 
 
 @dataclass(slots=True)
@@ -115,6 +182,25 @@ def apply_target_delta(cache: TargetCache, delta: TargetDelta) -> list[str]:
     return need
 
 
+def _summary_json(want: Desired) -> str:
+    """The stored summary of what calsync writes for ``want`` (``target_object.summary``)."""
+    return json.dumps(summary_of(want.series), ensure_ascii=False, sort_keys=True)
+
+
+def _detail(before: str | None, after: Mapping[str, Any] | None) -> str | None:
+    """``change.detail``: the summary fields that differ between ``before`` (a stored summary)
+    and ``after``; None when either side is unknown. Event content: never logged."""
+    if before is None or after is None:
+        return None
+    try:
+        old = json.loads(before)
+    except ValueError:
+        return None
+    if not isinstance(old, dict):
+        return None
+    return json.dumps({"fields": changed_fields(old, after)}, ensure_ascii=False)
+
+
 def _title(text: str | None) -> str | None:
     """A title as the history stores it: an empty or missing one is None, never a placeholder."""
     return text if text and text.strip() else None
@@ -144,6 +230,15 @@ def _blocked_titles(deletes: Sequence[Actual], bodies: Bodies | None) -> tuple[l
 TargetKey = tuple[str, str]  # (account, calendar ref from config)
 
 
+class _CalendarMissing(NotFoundError):
+    """The calendar listing has no target calendar (``CalendarNotListed``) and no rule of it may
+    create it."""
+
+
+class _NotCreatedYet(NotFoundError):
+    """A dry run against a target calendar that a real run would create."""
+
+
 @dataclass(frozen=True, slots=True)
 class _Blocked:
     """The last recorded blocked set of a rule, with the titles its lookup found."""
@@ -152,6 +247,11 @@ class _Blocked:
     titles: tuple[str, ...] = ()
     complete: bool = True
     read: bool = False  # the lookup succeeded: the same set need not be read again
+
+
+def _selection(rule: Rule) -> tuple[str, str, str, str]:
+    """What a rule's per-rule memories depend on: its source and target calendars."""
+    return (rule.source.account, rule.source.calendar, rule.target.account, rule.target.calendar)
 
 
 def _rule_names(rules: Iterable[Rule]) -> str:
@@ -191,6 +291,35 @@ class Engine:
         # reading every planned delete each time would cost a multiget per cycle.
         self._last_protected: dict[str, frozenset[str]] = {}
         self._last_blocked: dict[str, _Blocked] = {}
+        # What detection read in copies edited on the target (``Inspected.fields``), by (rule tag,
+        # href), until the revert is written (its ``change.detail``: what the phone changed) or the
+        # copy turns out not to be an edit. In memory only: the body is read once (request budget),
+        # so a revert written by another process has no detail.
+        self._edited: dict[tuple[str, str], Mapping[str, Any]] = {}
+
+    def replace_config(self, config: Config) -> None:
+        """Run ``config`` from the next cycle on (the daemon's hot reload; never during a cycle).
+
+        Mirrors, calendar metadata, resolved ids, target calendars and caches are kept: they
+        belong to calendars, not rules. The per-rule memories (the last recorded blocked and
+        protected sets, the degraded warnings, the edited copies kept for a revert's detail) are
+        dropped for a rule that is gone or whose
+        source or target calendar changed, so its sets are recorded afresh; every other rule
+        keeps them, so a blocked rule is not read and recorded again because of an unrelated
+        edit."""
+        new = {r.name: r for r in config.rules}
+        stale = {
+            r.name
+            for r in self._config.rules
+            if (now := new.get(r.name)) is None or _selection(now) != _selection(r)
+        }
+        for name in stale:
+            self._last_blocked.pop(name, None)
+            self._last_protected.pop(name, None)
+        stale_tags = {rule_tag(name) for name in stale}
+        self._edited = {key: fields for key, fields in self._edited.items() if key[0] not in stale_tags}
+        self._warned_degraded = {key for key in self._warned_degraded if key[0] not in stale}
+        self._config = config
 
     # ----- phase 1: ingest ---------------------------------------------
     async def _ingest(self, account: str, rules: list[Rule]) -> dict[str, Exception]:
@@ -227,19 +356,26 @@ class Engine:
         return errors
 
     # ----- phase 2: detect ---------------------------------------------
-    async def _detect(self, key: TargetKey, rules: list[Rule], dry_run: bool) -> None:
+    async def _detect(self, key: TargetKey, rules: list[Rule], dry_run: bool) -> bool:
+        """Detect the target calendar's changes; True if every changed copy was read (the
+        cursor advanced). ``_CalendarMissing`` if the calendar listing does not have it and none
+        may create it; any other ``NotFoundError`` (a 404 during discovery) is no evidence that
+        the calendar is gone and fails its rules as any error does."""
         account, ref = key
         target = self._targets[account]
         cal = self._calendars.get(key) or self._store.load_target_calendar(account, ref)
         if cal is None:
-            wants_create = any(r.target.create_if_missing for r in rules)
+            # A retiring rule only deletes: it never creates the calendar it deletes from.
+            wants_create = any(r.target.create_if_missing and not r.retire for r in rules)
             try:
                 cal = await target.ensure_calendar(ref, create=wants_create and not dry_run)
-            except NotFoundError:
+            except CalendarNotListed as exc:
                 if dry_run and wants_create:
-                    raise NotFoundError(
+                    raise _NotCreatedYet(
                         f"target calendar {ref!r} does not exist yet; a real run creates it"
                     ) from None
+                if not wants_create:
+                    raise _CalendarMissing(str(exc)) from exc
                 raise
             self._store.save_target_calendar(account, ref, cal)
         self._calendars[key] = cal
@@ -285,6 +421,10 @@ class Engine:
                 content_hash = found.content_hash
             # Changed by someone else (or unknown to us): its rule compares it with the source
             # version when it next runs, which need not be this cycle (see _classify_reads).
+            if found is not None and found.fields is not None and known is not None and known.summary:
+                self._edited[(name[0], obj.href)] = found.fields
+            else:
+                self._edited.pop((name[0], obj.href), None)
             cache.objects[obj.href] = CachedObject(
                 etag=obj.etag,
                 rule_tag=name[0],
@@ -295,6 +435,7 @@ class Engine:
                 reverting=known.reverting if known else False,
                 revert_times=known.revert_times if known else (),
                 hold_until=known.hold_until if known else None,
+                summary=known.summary if known else None,
             )
         if marker_lost:
             # Counts only: tells whether the target keeps the marker (the real-device check).
@@ -317,6 +458,7 @@ class Engine:
         else:
             cache.cursor = delta.cursor
         self._store.save_target_cache(account, cal.href, cache)
+        return not unread
 
     # ----- phase 3-5: plan, guard, push --------------------------------
     def _desired(self, rule: Rule) -> tuple[dict[str, Desired], frozenset[str]]:
@@ -357,7 +499,9 @@ class Engine:
         cal = self._calendars[key]
         return cal, self._caches[(rule.target.account, cal.href)]
 
-    async def _run_rule(self, rule: Rule, result: RuleResult, *, dry_run: bool, allow_deletes: bool) -> None:
+    async def _run_rule(
+        self, rule: Rule, result: RuleResult, *, dry_run: bool, allow_deletes: bool, approval: Approval | None
+    ) -> None:
         cal, cache = self._cache_for(rule)
         tag = rule_tag(rule.name)
         actual = {
@@ -365,12 +509,14 @@ class Engine:
             for href, obj in cache.objects.items()
             if obj.rule_tag == tag
         }
+        # A retiring rule syncs to nothing over all of time: every copy is a delete, also one
+        # its window left behind (the guard still applies).
         window = (
             Window.everything()
-            if rule.window is None
+            if rule.retire or rule.window is None
             else Window.around(self._clock(), rule.window.past, rule.window.future)
         )
-        desired, unparsed = self._desired(rule)
+        desired, unparsed = ({}, frozenset[str]()) if rule.retire else self._desired(rule)
         incomplete = {oid for oid, want in desired.items() if not want.series.complete}
         result.degraded = len(unparsed) + len(incomplete)
         # Unparsed and degraded series keep an existing copy untouched (no update, no
@@ -409,11 +555,18 @@ class Engine:
             }
         result.plan = plan(desired, actual, window, frozenset(protected))
         result.out_of_window = result.plan.out_of_window
-        # The guard counts only non-protected actuals.
+        # The guard counts only non-protected actuals. An approval lets exactly the set it names
+        # through (by fingerprint); any other set is judged by the guard as always.
         deletable = len(actual.keys() - protected)
-        reason = None if allow_deletes else check_delete_guard(result.plan, deletable, rule.delete_guard)
+        fingerprint = delete_fingerprint(a.object_id for a in result.plan.delete)
+        result.approved = (
+            approval is not None and bool(result.plan.delete) and approval.fingerprint == fingerprint
+        )
+        guard = check_delete_guard(result.plan, deletable, rule.delete_guard)
+        reason = None if allow_deletes or result.approved else guard
         if reason:
             result.status, result.error, result.error_kind = "blocked", reason, "guard"
+            result.blocked_fingerprint = fingerprint
             blocked = frozenset(a.object_id for a in result.plan.delete)
             last = self._last_blocked.get(rule.name)
             bodies: Bodies | None = None
@@ -438,6 +591,26 @@ class Engine:
             return
         if not dry_run:
             result.seen_blocked = frozenset()  # a later block of the same set is new again
+        # Who let the set through: an approval, or ``--allow-deletes`` past a set the guard
+        # would have blocked (origin ``run``). Recorded in the activity record (before its
+        # deletes) whether or not a push channel is configured; ``approved_by`` raises its push.
+        released_by: str | None = None
+        if result.approved and approval is not None:
+            released_by = approval.origin
+        elif allow_deletes and guard:
+            released_by = ALLOW_DELETES
+        if released_by is not None and not dry_run:
+            result.approved_by = released_by
+            count = len(result.plan.delete)
+            result.changes.append(
+                ChangeRecord(
+                    rule.name,
+                    fingerprint,
+                    APPROVED,
+                    self._clock(),
+                    f"{count} delete{'' if count == 1 else 's'} approved ({released_by})",
+                )
+            )
         if not dry_run and not result.plan.empty:
             await self._push(rule, cal, cache, result.plan, result)
 
@@ -510,6 +683,7 @@ class Engine:
                     verify_digest=None,
                     reverting=False,
                     hold_until=None,
+                    summary=_summary_json(want),
                 )
             elif obj.reverting or obj.content_hash == want.content_hash:
                 # We wrote (or adopted) the source version and the copy shows something else:
@@ -547,6 +721,8 @@ class Engine:
                 # The source changed since we wrote it (or nothing tells what we wrote): an
                 # ordinary update.
                 cache.objects[have.href] = replace(obj, verify_digest=None)
+            if not cache.objects[have.href].reverting:  # not an edit to write back: no revert detail
+                self._edited.pop((rule_tag(rule.name), have.href), None)
         if unrenderable:
             log.warning(
                 "rule %s: %d copy(ies) could not be compared with the source version", rule.name, unrenderable
@@ -617,7 +793,9 @@ class Engine:
 
         def remember(href: str, etag: str | None, want: Desired, *, reverted: bool = False) -> None:
             """After a successful write: nothing pending, nothing left to revert. The loop
-            breaker's record is kept, plus this write if it was a revert."""
+            breaker's record is kept, plus this write if it was a revert; the summary is what
+            was written."""
+            self._edited.pop((tag, href), None)
             prior = cache.objects.get(href)
             times = prior.revert_times if prior else ()
             if reverted:
@@ -630,6 +808,7 @@ class Engine:
                 want.span,
                 revert_times=times,
                 hold_until=prior.hold_until if prior else None,
+                summary=_summary_json(want),
             )
 
         # Strict servers answer 412 to If-Match (even "*") for a missing resource, so
@@ -660,6 +839,11 @@ class Engine:
         async def update(want: Desired, have: Actual) -> None:
             prior = cache.objects.get(have.href)
             reverting = prior is not None and prior.reverting  # may be from an earlier cycle
+            before = prior.summary if prior is not None else None
+            # A revert: what the phone changed (the stored summary against the edited copy as
+            # detection read it). An update: what the source changed.
+            after = self._edited.get((tag, have.href)) if reverting else summary_of(want.series)
+            detail = _detail(before, after)
             data = body(want)
             try:
                 etag = await target.update(have.href, have.etag, data)
@@ -674,7 +858,7 @@ class Engine:
             result.reverted += reverting
             action = "reverted" if reverting else "updated"
             result.changes.append(
-                ChangeRecord(rule.name, want.object_id, action, now, _title(want.series.title))
+                ChangeRecord(rule.name, want.object_id, action, now, _title(want.series.title), detail)
             )
 
         async def delete(have: Actual) -> None:
@@ -687,6 +871,7 @@ class Engine:
                 if found is not None:
                     await target.delete(have.href, found.etag)
             cache.objects.pop(have.href, None)
+            self._edited.pop((tag, have.href), None)
             result.deleted += 1
             result.changes.append(ChangeRecord(rule.name, have.object_id, "deleted", now, title))
 
@@ -707,14 +892,16 @@ class Engine:
                     debug.details(log, f"rule {rule.name}: write failed", outcome)
         if errors:
             result.failed = len(errors)
-            first = errors[0]
-            more = f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""
-            result.error = f"{type(first).__name__}: {first}{more}"
             done = result.created + result.updated + result.deleted
             result.status = "partial" if done else "failed"
             # The most actionable kind wins: one revoked credential means "run calsync auth".
             kinds = {error_kind_for(e) for e in errors}
             result.error_kind = "auth" if "auth" in kinds else "config" if "config" in kinds else "other"
+            first = next(e for e in errors if error_kind_for(e) == result.error_kind)
+            more = f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""
+            account = rule.target.account
+            result.error = result.describe(first, side="target", account=account) + more
+            result.error_account = account
 
     # ----- the cycle ----------------------------------------------------
     async def cycle(
@@ -723,54 +910,91 @@ class Engine:
         rules: Sequence[str] | None = None,
         dry_run: bool = False,
         allow_deletes: bool = False,
+        approvals: Mapping[str, Approval] | None = None,
     ) -> CycleResult:
+        """One cycle of ``rules`` (None: every rule not paused). ``approvals``: rule -> the
+        approval (fingerprint of the planned deletes, origin) to let through the guard this
+        cycle; one that releases its set is recorded as an ``approved`` change (``approved_by``
+        on its result). ``allow_deletes`` skips the guard for every rule; a set it would have
+        blocked is recorded the same way, origin ``run``."""
+        approvals = approvals or {}
         started = self._clock()
         mark = self._log.mark() if self._log else 0
-        selected = [r for r in self._config.rules if rules is None or r.name in rules]
+        # A paused rule never runs (and records no run); a retiring one needs no source.
+        selected = [r for r in self._config.rules if (rules is None or r.name in rules) and not r.paused]
         results = {r.name: RuleResult(r.name) for r in selected}
         for target in self._targets.values():
             target.reset()
 
         by_source: dict[str, list[Rule]] = defaultdict(list)
         for rule in selected:
-            by_source[rule.source.account].append(rule)
+            if not rule.retire:
+                by_source[rule.source.account].append(rule)
         outcomes = await asyncio.gather(
             *(self._ingest(a, rs) for a, rs in by_source.items()), return_exceptions=True
         )
-        for (_, rs), outcome in zip(by_source.items(), outcomes, strict=True):
+        for (account, rs), outcome in zip(by_source.items(), outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 if not isinstance(outcome, Exception):
                     raise outcome
+                # The type only: the text can carry a request URL (CALSYNC_DEBUG=1 shows it).
+                log.warning("source %s failed (%s)", account, type(outcome).__name__)
+                debug.details(log, f"source {account} failed", outcome)
                 for rule in rs:
-                    results[rule.name].fail(outcome)
+                    results[rule.name].fail(outcome, side="source", account=account)
                 continue
             for rule in rs:
-                if rule.source.calendar in outcome:
-                    results[rule.name].fail(outcome[rule.source.calendar])
+                if rule.source.calendar in outcome:  # logged by _ingest
+                    results[rule.name].fail(outcome[rule.source.calendar], side="source", account=account)
 
         by_target: dict[TargetKey, list[Rule]] = defaultdict(list)
         for rule in selected:
+            results[rule.name].target = (rule.target.account, rule.target.calendar)
             if results[rule.name].status == "ok":
                 by_target[(rule.target.account, rule.target.calendar)].append(rule)
         outcomes = await asyncio.gather(
             *(self._detect(k, rs, dry_run) for k, rs in by_target.items()), return_exceptions=True
         )
-        for (_, rs), outcome in zip(by_target.items(), outcomes, strict=True):
+        for ((account, _), rs), outcome in zip(by_target.items(), outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 if not isinstance(outcome, Exception):
                     raise outcome
+                if not isinstance(outcome, _CalendarMissing):
+                    names = _rule_names(rs)
+                    log.warning("target %s (rule(s) %s) failed (%s)", account, names, type(outcome).__name__)
+                    debug.details(log, f"target {account} (rule(s) {names}) failed", outcome)
                 for rule in rs:
-                    results[rule.name].fail(outcome)
+                    if isinstance(outcome, _CalendarMissing) and rule.retire:
+                        # Nothing to delete where there is no calendar: the retirement is done.
+                        results[rule.name].target_missing = True
+                        results[rule.name].detection_complete = True
+                    else:
+                        results[rule.name].fail(outcome, side="target", account=account)
+                continue
+            for rule in rs:
+                results[rule.name].detection_complete = outcome
 
         async def guarded(rule: Rule) -> None:
             try:
-                await self._run_rule(rule, results[rule.name], dry_run=dry_run, allow_deletes=allow_deletes)
+                await self._run_rule(
+                    rule,
+                    results[rule.name],
+                    dry_run=dry_run,
+                    allow_deletes=allow_deletes,
+                    approval=approvals.get(rule.name),
+                )
             except Exception as exc:  # isolate rules from each other
                 log.error("rule %s failed (%s)", rule.name, type(exc).__name__)
                 debug.details(log, f"rule {rule.name} failed", exc)
                 results[rule.name].fail(exc)
 
-        await asyncio.gather(*(guarded(r) for r in selected if results[r.name].status == "ok"))
+        await asyncio.gather(
+            *(
+                guarded(r)
+                for r in selected
+                if results[r.name].status == "ok" and not results[r.name].target_missing
+            )
+        )
 
         if not dry_run:
             touched = {
@@ -803,6 +1027,7 @@ class Engine:
                         protected=r.protected,
                         out_of_window=r.out_of_window,
                         error_kind=r.error_kind,
+                        error_account=r.error_account,
                     )
                     for r in results.values()
                 ],

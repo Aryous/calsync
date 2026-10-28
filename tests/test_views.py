@@ -2,9 +2,9 @@
 
 import json
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import closing
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,10 +12,15 @@ import pytest
 
 from calsync.config import Config
 from calsync.naming import object_id, rule_tag
-from calsync.store import SCHEMA_VERSION, ChangeRecord, RunRecord, Store
+from calsync.sources.base import CalendarPull
+from calsync.store import SCHEMA_VERSION, AccountCalendar, ChangeRecord, RunRecord, Store
+from calsync.targets.base import CachedObject, TargetCache
 from calsync.views import (
+    AccountCalendarView,
+    ConfigChangeView,
     StateReader,
     StateUnavailable,
+    build_blocked,
     build_changes,
     build_runs,
     build_status,
@@ -112,6 +117,8 @@ def test_reader_opens_a_path_with_uri_characters(tmp_path: Path) -> None:
         ("https://caldav.icloud.com/", "iCloud"),
         ("https://p42-caldav.icloud.com.cn/123/", "iCloud"),
         ("https://dav.example.com/cal/", "dav.example.com"),
+        ("https://user:tok3n@dav.example.com/cal/", "dav.example.com"),
+        ("https://user:tok3n@/cal/", "(hidden)"),  # no host: never the raw text
     ],
 )
 def test_caldav_host(url: str, host: str) -> None:
@@ -141,10 +148,11 @@ async def test_status_after_a_cycle(tmp_path: Path) -> None:
         "attention": 0,
         "last_sync_at": NOW.isoformat(),
         "changes_24h": 3,
+        "delivered_today": 3,
     }
-    assert view["accounts"] == [
-        {"name": "me", "provider": "google", "host": "Google Calendar"},
-        {"name": "dav", "provider": "caldav", "host": "unused"},
+    assert view["accounts"] == [  # no calendar list cached yet
+        {"name": "me", "provider": "google", "host": "Google Calendar", "auth": "ok", "calendars": []},
+        {"name": "dav", "provider": "caldav", "host": "unused", "auth": "ok", "calendars": []},
     ]
     (fam,) = view["rules"]
     last_run = fam.pop("last_run")
@@ -179,6 +187,7 @@ async def test_status_after_a_cycle(tmp_path: Path) -> None:
         "requests",
         "error",
         "error_kind",
+        "error_account",
     ]
     assert last_run["status"] == "ok" and last_run["created"] == 3 and last_run["duration_ms"] == 0
     assert view["attention"] == []
@@ -281,7 +290,7 @@ async def test_runs_and_changes_newest_first(tmp_path: Path) -> None:
     assert [run["id"] for run in runs] == [2, 1]
     assert [run["deleted"] for run in runs] == [1, 0]
     assert one == runs[:1] and other == []
-    assert list(changes[0]) == ["id", "run_id", "rule", "object_id", "action", "at", "title"]
+    assert list(changes[0]) == ["id", "run_id", "rule", "object_id", "action", "at", "title", "detail"]
     assert changes[0] == {
         "id": 4,
         "run_id": 2,
@@ -290,6 +299,7 @@ async def test_runs_and_changes_newest_first(tmp_path: Path) -> None:
         "action": "deleted",
         "at": NOW.isoformat(),
         "title": "Weekly review",
+        "detail": None,
     }
     assert sorted(c["action"] for c in changes) == ["created", "created", "created", "deleted"]
     assert [c["id"] for c in changes] == [4, 3, 2, 1]
@@ -384,18 +394,91 @@ def test_blocked_attention_counts_the_blocked_deletions(tmp_path: Path) -> None:
             "kind": "blocked",
             "rule": "family",
             "account": None,
-            "message": "Sync paused: 4 deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again.",
-            "command": "calsync run --rule family --allow-deletes",
+            "message": "4 copies would be deleted — check `calsync blocked --rule family`, then approve if intended",
+            "command": "calsync approve family",
         }
     ]
+
+
+def test_blocked_attention_for_one_copy(tmp_path: Path) -> None:
+    blocked = [ChangeRecord("family", "o1", "blocked", NOW, None)]
+    view = _status(tmp_path, [_run("blocked", error="guard", kind="guard")], blocked)
+    assert view["attention"][0]["message"] == (
+        "1 copy would be deleted — check `calsync blocked --rule family`, then approve if intended"
+    )
 
 
 def test_blocked_attention_without_rows_has_no_count(tmp_path: Path) -> None:
     view = _status(tmp_path, [_run("blocked", error="guard", kind="guard")])
     assert (
         view["attention"][0]["message"]
-        == "Sync paused: deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again."
+        == "Copies would be deleted — check `calsync blocked --rule family`, then approve if intended"
     )
+
+
+# A blocked rule's history, run by run: (status, blocked object ids recorded with that run).
+T0, T1, T2 = NOW, NOW + timedelta(minutes=1), NOW + timedelta(minutes=2)
+SET_A = ["oa1", "oa2", "oa3", "oa4"]
+
+
+def _history(tmp_path: Path, runs: list[tuple[str, list[str]]]) -> None:
+    """Records ``runs`` one minute apart from ``T0``, each with its own blocked rows."""
+    with Store(tmp_path / "state.db") as store:
+        for i, (status, blocked) in enumerate(runs):
+            at = T0 + timedelta(minutes=i)
+            error, kind = (
+                ("guard", "guard")
+                if status == "blocked"
+                else ("boom", "other")
+                if status == "failed"
+                else (None, None)
+            )
+            store.record_runs(
+                [RunRecord("family", at, at, status, 0, 0, 0, 0, 1, error, error_kind=kind)],
+                [ChangeRecord("family", oid, "blocked", at, f"Event {oid}") for oid in blocked],
+            )
+
+
+def _blocked_and_attention(tmp_path: Path) -> tuple[Any, str]:
+    config = family()
+    with reader(tmp_path) as r:
+        view = build_blocked(config, r)
+        status = build_status(config, r, T2).to_json()
+    [entry] = view.rules
+    return entry, status["attention"][0]["message"]
+
+
+def test_rows_of_an_older_block_are_not_the_current_one(tmp_path: Path) -> None:
+    """Blocked again after an ok run, without rows of its own: the set is unknown, and the
+    attention count agrees with ``calsync blocked`` (no count from the older block's rows)."""
+    from calsync.engine import delete_fingerprint
+
+    _history(tmp_path, [("blocked", SET_A), ("ok", []), ("blocked", [])])
+    entry, message = _blocked_and_attention(tmp_path)
+    assert (entry.since, entry.count, entry.fingerprint, entry.items) == (T2, 0, None, ())
+    assert (
+        message == "Copies would be deleted — check `calsync blocked --rule family`, then approve if intended"
+    )
+    assert delete_fingerprint(SET_A) != entry.fingerprint
+
+
+def test_the_same_set_blocked_again_after_an_ok_run_is_a_new_block(tmp_path: Path) -> None:
+    from calsync.engine import delete_fingerprint
+
+    _history(tmp_path, [("blocked", SET_A), ("ok", []), ("blocked", SET_A)])
+    entry, message = _blocked_and_attention(tmp_path)
+    assert (entry.since, entry.count, entry.fingerprint) == (T2, 4, delete_fingerprint(SET_A))
+    assert message.startswith("4 copies would be deleted")
+
+
+def test_a_failed_run_in_the_middle_keeps_the_block(tmp_path: Path) -> None:
+    from calsync.engine import delete_fingerprint
+
+    _history(tmp_path, [("blocked", SET_A), ("failed", []), ("blocked", [])])
+    entry, message = _blocked_and_attention(tmp_path)
+    assert (entry.since, entry.count, entry.fingerprint) == (T0, 4, delete_fingerprint(SET_A))
+    assert [i.object_id for i in entry.items] == SET_A
+    assert message.startswith("4 copies would be deleted")
 
 
 def four() -> FakeGoogle:
@@ -425,7 +508,7 @@ async def test_blocked_count_survives_consecutive_blocked_runs(tmp_path: Path) -
     assert view["rules"][0]["consecutive_failures"] == 2
     assert (
         view["attention"][0]["message"]
-        == "Sync paused: 4 deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again."
+        == "4 copies would be deleted — check `calsync blocked --rule family`, then approve if intended"
     )
 
 
@@ -568,7 +651,7 @@ def test_v1_database_is_read_gracefully(tmp_path: Path) -> None:
     assert status["attention"][0]["account"] == "me"
     assert (
         status["attention"][1]["message"]
-        == "Sync paused: deletions are waiting for your confirmation. To allow them, stop the daemon, run the command, then start the daemon again."
+        == "Copies would be deleted — check `calsync blocked --rule other`, then approve if intended"
     )
     assert status["summary"]["health"] == "auth"
 
@@ -633,6 +716,31 @@ def test_change_since_filters_by_instant(tmp_path: Path) -> None:
     assert [(c["object_id"], c["title"]) for c in changes] == [("b", None)]
 
 
+def test_change_since_keeps_rows_whose_ids_do_not_follow_time(tmp_path: Path) -> None:
+    """Rules run concurrently and stamp their own clocks, but one cycle's rows are inserted in
+    config order: a rule earlier in the config may have lower ids and later times."""
+    config = config_for([rule("a"), rule("b", source="B", target="B")])
+    with Store(tmp_path / "state.db") as store:
+        store.record_runs(
+            [
+                RunRecord("a", NOW, NOW + timedelta(seconds=2), "ok", 1, 0, 0, 0, 1, None),
+                RunRecord("b", NOW, NOW + timedelta(seconds=1), "ok", 1, 0, 0, 0, 1, None),
+            ],
+            [
+                ChangeRecord("a", "late", "created", NOW + timedelta(seconds=2), "Standup"),
+                ChangeRecord("b", "early", "created", NOW + timedelta(seconds=1), "Standup"),
+                ChangeRecord("b", "old", "created", NOW - timedelta(hours=1), "Standup"),
+            ],
+        )
+    with reader(tmp_path) as r:
+        changes = build_changes(config, r, since=NOW + timedelta(milliseconds=1500)).to_json()["changes"]
+        both = build_changes(config, r, since=NOW + timedelta(seconds=1)).to_json()["changes"]
+        limited = build_changes(config, r, since=NOW, limit=1).to_json()["changes"]
+    assert [c["object_id"] for c in changes] == ["late"]
+    assert [c["object_id"] for c in both] == ["early", "late"]  # newest first by id, as before
+    assert [c["object_id"] for c in limited] == ["early"]
+
+
 def test_changes_of_one_run(tmp_path: Path) -> None:
     with Store(tmp_path / "state.db") as store:
         for i, oid in enumerate(("a", "b", "c")):
@@ -646,3 +754,453 @@ def test_changes_of_one_run(tmp_path: Path) -> None:
         assert build_changes(family(), r, rule="other", run_id=2).to_json()["changes"] == []
         assert build_changes(family(), r, run_id=99).to_json()["changes"] == []
     assert [(c["run_id"], c["object_id"]) for c in second] == [(2, "b")]
+
+
+# ----- schema v5 accessors ------------------------------------------------------
+
+SUMMARY = {
+    "title": "Lunch",
+    "start": "2026-10-25T12:00:00+08:00",
+    "end": "2026-10-25T13:00:00+08:00",
+    "all_day": False,
+    "location": "Cafe",
+    "alarms_minutes_before": [10, 0],
+    "recurring": False,
+}
+
+
+def test_v5_accessors_read_what_the_store_wrote(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    t = [NOW + timedelta(minutes=i) for i in range(6)]
+    with Store(db) as store:
+        first = store.record_config_change(
+            at=t[0], source="cli", summary='rule "family" paused', before="x = 1\n", after_fingerprint="f1"
+        )
+        store.record_config_change(
+            at=t[1], source="ui", summary="undo", before=None, after_fingerprint="f2", undoes=first
+        )
+        store.save_account_calendars(
+            "me",
+            [
+                AccountCalendar("me", GCAL, "Family", "owner", t[0]),
+                AccountCalendar("me", "c2", "Work", None, t[0]),
+            ],
+            t[0],
+        )
+        store.save_source(
+            "me",
+            {},
+            [
+                CalendarPull(GCAL, full=True, upserts=[{"id": "a"}, {"id": "b"}]),
+                CalendarPull("c2", full=True),
+            ],
+        )
+        cache = TargetCache(cursor=None)
+        cache.objects["/cal/family/x.ics"] = CachedObject(
+            '"e"', rule_tag("family"), "o1", "h", None, None, False
+        )
+        cache.objects["/cal/family/y.ics"] = CachedObject(
+            '"e"', rule_tag("family"), "o2", "h", None, None, False
+        )
+        store.save_target_cache("dav", "/cal/family/", cache)
+        for i, action in enumerate(("created", "updated", "reverted", "deleted", "blocked"), start=1):
+            store.record_runs(
+                [RunRecord("family", t[i], t[i], "ok", 0, 0, 0, 0, 1, None)],
+                [ChangeRecord("family", "o1", action, t[i], "Lunch")],
+            )
+    with closing(sqlite3.connect(db)) as conn:  # Task 6 writes summaries; here by hand
+        conn.execute("UPDATE target_object SET summary = ? WHERE object_id = 'o1'", (json.dumps(SUMMARY),))
+        conn.commit()
+
+    with reader(tmp_path) as r:
+        assert r.schema_current()
+        changes = r.config_changes()
+        assert changes == [
+            ConfigChangeView(first + 1, t[1], "ui", "undo", None, "f2", first),
+            ConfigChangeView(first, t[0], "cli", 'rule "family" paused', "x = 1\n", "f1", None),
+        ]
+        assert r.config_changes(limit=1) == changes[:1]
+        assert r.account_calendars("me") == [
+            AccountCalendarView("me", "c2", "Work", None, t[0]),
+            AccountCalendarView("me", GCAL, "Family", "owner", t[0]),
+        ]
+        assert r.account_calendars("other") == []
+        assert r.copy_summary(rule_tag("family"), "o1") == SUMMARY
+        assert r.copy_summary(rule_tag("family"), "o2") is None  # no summary written
+        assert r.copy_summary(rule_tag("other"), "o1") is None
+        # The newest create/update/revert: a later delete or block is not a delivery.
+        assert r.delivered_at("family", "o1") == t[3]
+        assert r.delivered_at("family", "o2") is None
+        assert r.series_count("me", GCAL) == 2
+        assert r.series_count("me", "c2") == 0
+        assert r.series_count("other", GCAL) == 0
+
+
+def test_copy_summary_ignores_unreadable_json(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    with Store(db) as store:
+        cache = TargetCache(cursor=None)
+        cache.objects["/cal/x.ics"] = CachedObject(None, "tag", "o1", None, None, None, False)
+        cache.objects["/cal/y.ics"] = CachedObject(None, "tag", "o2", None, None, None, False)
+        store.save_target_cache("dav", "/cal/", cache)
+    with closing(sqlite3.connect(db)) as conn:
+        conn.execute("UPDATE target_object SET summary = '{broken' WHERE object_id = 'o1'")
+        conn.execute("UPDATE target_object SET summary = '[1, 2]' WHERE object_id = 'o2'")
+        conn.commit()
+    with reader(tmp_path) as r:
+        assert r.copy_summary("tag", "o1") is None
+        assert r.copy_summary("tag", "o2") is None
+
+
+def test_v5_accessors_tolerate_an_older_database(tmp_path: Path) -> None:
+    """A v1 database: no config history, no calendar cache, no summaries, no change log."""
+    make_v1(tmp_path / "state.db")
+    before = snapshot(tmp_path)
+    with reader(tmp_path) as r:
+        assert not r.schema_current()
+        assert r.config_changes() == []
+        assert r.account_calendars("me") == []
+        assert r.copy_summary(rule_tag("family"), object_id("family", GCAL, "lunch")) is None
+        assert r.delivered_at("family", "o1") is None
+        assert r.series_count("me", GCAL) == 2
+    assert snapshot(tmp_path) == before
+
+
+def test_v5_accessors_on_a_database_without_tables(tmp_path: Path) -> None:
+    with closing(sqlite3.connect(tmp_path / "state.db")) as db:
+        db.execute("CREATE TABLE unrelated (x)")
+    with reader(tmp_path) as r:
+        assert r.config_changes() == []
+        assert r.account_calendars("me") == []
+        assert r.copy_summary("tag", "o1") is None
+        assert r.delivered_at("family", "o1") is None
+        assert r.series_count("me", GCAL) == 0
+
+
+# ----- paused and retiring rules ------------------------------------------------------------
+
+
+def _flagged(tmp_path: Path, runs: list[RunRecord], **flags: bool) -> dict[str, Any]:
+    with Store(tmp_path / "state.db") as store:
+        for run in runs:
+            store.record_runs([run])
+    with reader(tmp_path) as r:
+        return build_status(config_for([rule(**flags)]), r, NOW).to_json()
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [[], [_run("ok")], [_run("failed", error="boom", kind="other")], [_run("blocked", kind="guard")]],
+)
+def test_a_paused_rule_is_paused_whatever_its_runs_say(tmp_path: Path, runs: list[RunRecord]) -> None:
+    view = _flagged(tmp_path, runs, paused=True)
+    assert view["rules"][0]["health"] == "paused"
+    assert view["attention"] == [] and view["summary"]["health"] == "ok"
+
+
+def test_a_retiring_rule_is_retiring_and_counts_as_ok(tmp_path: Path) -> None:
+    view = _flagged(tmp_path, [_run("failed", error="boom", kind="other")], retire=True)
+    assert view["rules"][0]["health"] == "retiring" and view["summary"]["health"] == "ok"
+    assert [a["kind"] for a in view["attention"]] == ["failing"]  # a failure still needs a look
+
+
+def test_a_blocked_retiring_rule_keeps_the_blocked_attention(tmp_path: Path) -> None:
+    view = _flagged(tmp_path, [_run("blocked", error="would delete 4 of 4", kind="guard")], retire=True)
+    assert view["rules"][0]["health"] == "retiring"
+    assert [(a["kind"], a["rule"]) for a in view["attention"]] == [("blocked", "family")]
+
+
+def test_a_paused_rule_is_checked_before_retiring(tmp_path: Path) -> None:
+    view = _flagged(tmp_path, [], paused=True, retire=True)
+    assert view["rules"][0]["health"] == "paused" and view["attention"] == []
+
+
+# ----- status additions: the calendar map, account auth, deliveries today ---------------------------
+
+
+async def _cached_status(tmp_path: Path, config: Config, **kwargs: Any) -> dict[str, Any]:
+    """After one cycle (of ``family()``), with both accounts' calendar lists cached, as ``config``
+    sees it."""
+    h = build_fake(tmp_path, seeded(), family())
+    await h.engine.cycle()
+    with reader(tmp_path) as r:
+        href = r.target_calendar_href("dav", "Family")
+    assert href is not None
+    h.store.save_account_calendars(
+        "me",
+        [
+            AccountCalendar("me", GCAL, "Family", "owner", NOW),
+            AccountCalendar("me", "other@group.calendar.google.com", "Other", "reader", NOW),
+        ],
+        NOW,
+    )
+    h.store.save_account_calendars(
+        "dav",
+        [
+            AccountCalendar("dav", href, "Family", None, NOW),
+            AccountCalendar("dav", "/dav/x/", "Spare", None, NOW),
+        ],
+        NOW,
+    )
+    for run in kwargs.get("runs", ()):
+        h.store.record_runs([run])
+    with reader(tmp_path) as r:
+        return build_status(config, r, kwargs.get("now", NOW)).to_json()
+
+
+@pytest.mark.anyio
+async def test_status_accounts_carry_their_cached_calendars(tmp_path: Path) -> None:
+    view = await _cached_status(tmp_path, family())
+    me, dav = view["accounts"]
+    assert me["calendars"] == [
+        {"id": GCAL, "name": "Family", "role": "owner", "series": 3, "rules": ["family"], "synced": True},
+        {
+            "id": "other@group.calendar.google.com",
+            "name": "Other",
+            "role": "reader",
+            "series": 0,
+            "rules": [],
+            "synced": False,
+        },
+    ]
+    family_cal, spare = dav["calendars"]
+    assert family_cal["rules"] == ["family"] and family_cal["synced"] is True
+    assert family_cal["series"] is None and family_cal["name"] == "Family"
+    assert spare == {
+        "id": "/dav/x/",
+        "name": "Spare",
+        "role": None,
+        "series": None,
+        "rules": [],
+        "synced": False,
+    }
+
+
+@pytest.mark.anyio
+async def test_a_paused_rule_leaves_its_calendars_unsynced(tmp_path: Path) -> None:
+    view = await _cached_status(tmp_path, family(paused=True))
+    (cal, _) = view["accounts"][0]["calendars"]
+    assert cal["rules"] == ["family"] and cal["synced"] is False
+
+
+@pytest.mark.anyio
+async def test_account_auth(tmp_path: Path) -> None:
+    def failed(account: str | None, kind: str = "auth") -> RunRecord:
+        return RunRecord(
+            "family", NOW, NOW, "failed", 0, 0, 0, 0, 1, "AuthError", error_kind=kind, error_account=account
+        )
+
+    view = await _cached_status(tmp_path / "a", family(), runs=[failed("dav")])
+    assert [a["auth"] for a in view["accounts"]] == ["unknown", "failed"]
+    view = await _cached_status(tmp_path / "b", family(), runs=[failed("me")])
+    assert [a["auth"] for a in view["accounts"]] == ["failed", "unknown"]
+    view = await _cached_status(tmp_path / "c", family(), runs=[failed("me", kind="other")])
+    assert [a["auth"] for a in view["accounts"]] == ["unknown", "unknown"]
+
+
+def test_account_auth_without_runs_or_rules_is_unknown(tmp_path: Path) -> None:
+    view = _status(tmp_path, [])
+    assert [a["auth"] for a in view["accounts"]] == ["unknown", "unknown"]
+    with reader(tmp_path) as r:
+        view = build_status(config_for([]), r, NOW).to_json()
+    assert [a["auth"] for a in view["accounts"]] == ["unknown", "unknown"]
+
+
+def test_delivered_today_counts_writes_since_local_midnight(
+    tmp_path: Path, local_zone: Callable[[str], None]
+) -> None:
+    # 20:00Z on the 24th is 04:00 on the 25th in Shanghai: "today" there began at 16:00Z.
+    local_zone("Asia/Shanghai")
+    now = datetime(2026, 10, 24, 20, 0, tzinfo=UTC)
+    midnight = datetime(2026, 10, 24, 16, 0, tzinfo=UTC)
+
+    def change(action: str, at: datetime) -> ChangeRecord:
+        return ChangeRecord("family", "o1", action, at, "Lunch")
+
+    changes = [
+        change("created", midnight - timedelta(minutes=1)),  # yesterday there (but today in UTC)
+        change("created", midnight),
+        change("updated", midnight + timedelta(hours=1, microseconds=5)),
+        change("reverted", now),
+        change("deleted", now),  # not a delivery
+        change("blocked", now),
+    ]
+    with Store(tmp_path / "state.db") as store:
+        store.record_runs([_run("ok")], changes)
+    with reader(tmp_path) as r:
+        view = build_status(family(), r, now).to_json()
+        assert view["summary"]["delivered_today"] == 3
+        assert view["generated_at"] == now.isoformat()  # still the instant as given
+        local_zone("UTC")
+        assert build_status(family(), r, now).to_json()["summary"]["delivered_today"] == 4
+
+
+@pytest.mark.anyio
+async def test_upcoming_all_day_events_fall_on_local_days(
+    tmp_path: Path, local_zone: Callable[[str], None]
+) -> None:
+    local_zone("Asia/Shanghai")
+    fake = FakeGoogle()
+    fake.add_calendar(GCAL, "Family")
+    for eid, first, end in [("yesterday", "2026-10-24", "2026-10-25"), ("today", "2026-10-25", "2026-10-26")]:
+        fake.put_event(
+            GCAL,
+            {
+                "id": eid,
+                "status": "confirmed",
+                "summary": eid,
+                "start": {"date": first},
+                "end": {"date": end},
+            },
+        )
+    config = family()
+    h = build_fake(tmp_path, fake, config)
+    await h.engine.cycle()
+    now = datetime(2026, 10, 24, 23, 0, tzinfo=UTC)  # 07:00 on the 25th in Shanghai
+    with reader(tmp_path) as r:
+        view = build_upcoming(config, r, now, hours=12).to_json()
+    assert [e["title"] for e in view["events"]] == ["today"]
+    assert view["from"] == now.isoformat()  # the JSON keeps the instant as given
+
+
+def test_changes_carry_their_detail(tmp_path: Path) -> None:
+    detail = json.dumps({"fields": {"title": ["Lunch", "Team lunch"]}})
+    with Store(tmp_path / "state.db") as store:
+        store.record_runs(
+            [_run("ok")],
+            [
+                ChangeRecord("family", "o1", "updated", NOW, "Team lunch", detail),
+                ChangeRecord("family", "o2", "created", NOW, "Lunch"),
+            ],
+        )
+    with reader(tmp_path) as r:
+        changes = build_changes(family(), r).to_json()["changes"]
+        runs = build_runs(family(), r).to_json()["runs"]
+    assert [c["detail"] for c in changes] == [None, {"fields": {"title": ["Lunch", "Team lunch"]}}]
+    assert runs[0]["error_account"] is None
+
+
+# ----- the config text as the web UI sees it ---------------------------------------------------
+
+UNMASKED_TOML = """\
+accounts.top.token = "TOPTOKEN"
+
+[google]
+client_secret_file = "~/secret.json"
+
+[accounts.icloud]
+provider = "caldav"
+server_url = "icloud"
+username = "someone@example.com"  # the Apple ID
+credential = { backend = "keychain", ref = "calsync:icloud" }
+
+[accounts.other]
+provider = "caldav"
+server_url = "https://user:pw@dav.example.com:8443/path"
+username = 'lit@example.com'
+password = "PLAINPW"
+credential.backend = "file"
+credential.ref = "~/.pw-file"
+
+[accounts.third.credential]
+backend = "env"
+ref = "PW_VAR"
+
+[notify]
+bark_url = "https://api.day.app/DEVICEKEY"
+## bark_url = "https://api.day.app/HASHHASH"
+# webhook_url = "https://hooks.example.com/OLDPATH"
+webhook_url = \"\"\"https://hooks.example.com/
+MULTILINE\"\"\"
+failure_threshold = 3  # old bark_url = "https://api.day.app/TRAILING"
+public_url="http://nas.lan:8766/x"
+language = "en"
+
+[[rules]]
+name = "family"
+source = { account = "me", calendar = "family@example.com" }
+target = { account = "icloud", calendar = "Family", create_if_missing = true }
+note = "PRIVATENOTE"
+extra = { password = "INLINEPW" }
+
+[rules.window]
+past = "7d"
+
+[foo]
+password = "FOOPW"
+"""
+
+MASKED_TOML = """\
+accounts.top.token = "(hidden)"
+
+[google]
+client_secret_file = "(hidden)"
+
+[accounts.icloud]
+provider = "caldav"
+server_url = "icloud"
+username = "(hidden)"  # (comment hidden)
+credential = { backend = "keychain", ref = "(hidden)" }
+
+[accounts.other]
+provider = "caldav"
+server_url = "https://dav.example.com:8443"
+username = "(hidden)"
+password = "(hidden)"
+credential.backend = "file"
+credential.ref = "(hidden)"
+
+[accounts.third.credential]
+backend = "env"
+ref = "(hidden)"
+
+[notify]
+bark_url = "https://api.day.app"
+# (comment hidden)
+# (comment hidden)
+webhook_url = "(hidden)"
+failure_threshold = 3  # (comment hidden)
+public_url="http://nas.lan:8766"
+language = "en"
+
+[[rules]]
+name = "family"
+source = { account = "me", calendar = "family@example.com" }
+target = { account = "icloud", calendar = "Family", create_if_missing = true }
+note = "(hidden)"
+extra = { password = "(hidden)" }
+
+[rules.window]
+past = "7d"
+
+[foo]
+password = "(hidden)"
+"""
+
+
+def test_mask_config_text_masks_what_config_json_masks() -> None:
+    from calsync.views import mask_config_text
+
+    masked = mask_config_text(UNMASKED_TOML)
+    assert masked == MASKED_TOML
+    for secret in (
+        "DEVICEKEY",
+        "someone@",
+        "lit@",
+        "user:pw",
+        "/path",
+        "calsync:icloud",
+        "pw-file",
+        "PW_VAR",
+        "PLAINPW",
+        "TOPTOKEN",
+        "HASHHASH",
+        "TRAILING",
+        "PRIVATENOTE",
+        "INLINEPW",
+        "FOOPW",
+    ):
+        assert secret not in masked
+    for secret in ("secret.json", "OLDPATH", "MULTILINE", "nas.lan:8766/x"):
+        assert secret not in masked
+    assert mask_config_text(masked) == masked  # stable

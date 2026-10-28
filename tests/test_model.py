@@ -2,8 +2,10 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -507,8 +509,111 @@ def test_expand_respects_the_limit() -> None:
     assert len(got) == 7
 
 
+def test_expand_bounds_the_iterations_of_a_dense_old_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A secondly series started a year before the range: ~31.5 million occurrences before it.
+    # The cap, not the clock: the occurrences enumerated are counted.
+    pulled = 0
+    real = model._occurrence_set  # pyright: ignore[reportPrivateUsage]
+
+    def counting(*args: Any, **kwargs: Any) -> Iterator[datetime]:
+        nonlocal pulled
+        for dt in real(*args, **kwargs):
+            pulled += 1
+            yield dt
+
+    monkeypatch.setattr(model, "_occurrence_set", counting)
+    s = series(start=at(2025, 10, 23, 9, 30), recurrence=("RRULE:FREQ=SECONDLY",))
+    got = model.expand(s, _utc(2026, 10, 24), _utc(2026, 10, 25))
+    assert got.truncated and got.instances == []
+    assert pulled == model.EXPANSION_ITERATIONS + 1  # the one past the cap stops it
+
+
+def test_expand_finds_instances_within_the_iteration_bound() -> None:
+    s = series(start=at(2026, 10, 23, 9, 30), recurrence=("RRULE:FREQ=MINUTELY",))
+    got = model.expand(s, _utc(2026, 10, 24), _utc(2026, 10, 24, 0, 10))  # 1350 minutes later
+    assert not got.truncated and _utc(2026, 10, 24, 0, 9) in _starts(got.instances)
+
+
 def test_expand_non_recurring_yields_itself() -> None:
     s = series(start=at(2026, 10, 23, 9, 30))
     (only,) = model.expand_instances(s, _utc(2026, 10, 23), _utc(2026, 10, 24))
     assert only == model.Instance(s.start, s.end, "Standup", "", (Alarm(timedelta(0)),), False)
     assert model.expand_instances(s, _utc(2026, 10, 24), _utc(2026, 10, 25)) == []
+
+
+# ----- all-day instances on the range's own days; truncation ---------------------------
+
+PLUS8 = timezone(timedelta(hours=8))
+MINUS5 = timezone(timedelta(hours=-5))
+
+
+def _all_day(first: date, last: date, *, weekly: bool = False) -> Series:
+    """An all-day event from ``first`` to ``last`` (inclusive); ``weekly``: the second of three
+    weekly instances (the series starts a week earlier)."""
+    span = (last - first).days + 1
+    if weekly:
+        first -= timedelta(days=7)
+    s = series(start=When(first), recurrence=("RRULE:FREQ=WEEKLY;COUNT=3",) if weekly else ())
+    return replace(s, end=When(first + timedelta(days=span)))
+
+
+@pytest.mark.parametrize("weekly", [False, True], ids=["single", "recurring"])
+@pytest.mark.parametrize("zone", [PLUS8, MINUS5], ids=["utc+8", "utc-5"])
+def test_all_day_events_fall_on_the_ranges_own_days(zone: timezone, weekly: bool) -> None:
+    # A day view of 28 October in the viewer's zone: midnight to midnight there.
+    lo = datetime(2026, 10, 28, tzinfo=zone)
+    hi = lo + timedelta(days=1)
+    shown = {
+        d: [i.start.value for i in model.expand_instances(_all_day(d, d, weekly=weekly), lo, hi)]
+        for d in (date(2026, 10, 27), date(2026, 10, 28), date(2026, 10, 29))
+    }
+    assert shown == {date(2026, 10, 27): [], date(2026, 10, 28): [date(2026, 10, 28)], date(2026, 10, 29): []}
+
+
+@pytest.mark.parametrize("zone", [PLUS8, MINUS5], ids=["utc+8", "utc-5"])
+def test_a_multi_day_all_day_event_spanning_the_range(zone: timezone) -> None:
+    lo = datetime(2026, 10, 28, tzinfo=zone)
+    hi = lo + timedelta(days=1)
+
+    def shown(first: date, last: date) -> bool:
+        return bool(model.expand_instances(_all_day(first, last), lo, hi))
+
+    assert shown(date(2026, 10, 26), date(2026, 10, 30))  # covers the day
+    assert shown(date(2026, 10, 27), date(2026, 10, 28))  # ends on it
+    assert shown(date(2026, 10, 28), date(2026, 10, 29))  # starts on it
+    assert not shown(date(2026, 10, 25), date(2026, 10, 27))  # over the day before
+    assert not shown(date(2026, 10, 29), date(2026, 10, 31))  # from the day after
+
+
+def test_all_day_events_on_a_range_between_midnights() -> None:
+    # 07:00 on the 28th to 07:00 on the 29th (+08:00) touches both days there; in UTC it starts
+    # on the 27th.
+    lo = datetime(2026, 10, 28, 7, tzinfo=PLUS8)
+    hi = lo + timedelta(days=1)
+    days = [date(2026, 10, 27), date(2026, 10, 28), date(2026, 10, 29), date(2026, 10, 30)]
+    assert [bool(model.expand_instances(_all_day(d, d), lo, hi)) for d in days] == [False, True, True, False]
+
+
+def test_all_day_ranges_in_utc_are_unchanged() -> None:
+    lo, hi = _utc(2026, 10, 28), _utc(2026, 10, 29)
+    days = [date(2026, 10, 27), date(2026, 10, 28), date(2026, 10, 29)]
+    assert [bool(model.expand_instances(_all_day(d, d, weekly=True), lo, hi)) for d in days] == [
+        False,
+        True,
+        False,
+    ]
+
+
+def test_expansion_reports_hitting_the_limit() -> None:
+    hourly = series(start=at(2026, 10, 1, 9, 0), recurrence=("RRULE:FREQ=HOURLY",))
+    lo = _utc(2026, 10, 1)
+    cut = model.expand(hourly, lo, lo + timedelta(days=62))
+    assert len(cut.instances) == 1000 and cut.truncated
+    daily = series(start=at(2026, 10, 1, 9, 0), recurrence=("RRULE:FREQ=DAILY",))
+    whole = model.expand(daily, lo, lo + timedelta(days=62))
+    assert len(whole.instances) == 62 and not whole.truncated
+    # Exactly the limit inside the range is not a cut.
+    exact = model.expand(daily, lo, _utc(2026, 10, 8), limit=7)
+    assert len(exact.instances) == 7 and not exact.truncated
+    assert model.expand(daily, lo, _utc(2026, 10, 9), limit=7).truncated
+    assert model.expand_instances(hourly, lo, lo + timedelta(days=62)) == cut.instances

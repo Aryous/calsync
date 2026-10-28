@@ -2,23 +2,23 @@
 
 Most tables are caches that can be rebuilt from both ends (the source mirror and cursors, the
 target objects and cursors): losing them costs one heavy cycle, never data. History is not: the
-``run`` rows and the ``change`` audit log (the only place a deleted event's title survives)
-cannot be rebuilt, so a schema change keeps them.
+``run`` rows, the ``change`` audit log (the only place a deleted event's title survives) and the
+``config_change`` history cannot be rebuilt, so a schema change keeps them.
 
 Schema versions: an older database is upgraded in place, one ``_UPGRADES`` step per version,
 in one transaction. A version with no path to ``SCHEMA_VERSION`` (older than the first step,
 newer than this code, or unreadable) is dropped and rebuilt. To add version N+1: bump
 ``SCHEMA_VERSION``, change ``_SCHEMA`` (a fresh database), and add an ``N: _upgrade_N`` step
-that turns a version-N database into exactly that, keeping ``run`` and ``change``; a step may
-still empty a cache table if that is simpler. A step that creates a table drops it first: an
-older calsync that reopened a newer database rebuilt only the tables it knows and left the
-newer ones behind."""
+that turns a version-N database into exactly that, keeping ``run``, ``change`` and
+``config_change``; a step may still empty a cache table if that is simpler. A step that creates
+a table drops it first: an older calsync that reopened a newer database rebuilt only the tables
+it knows and left the newer ones behind."""
 
 import json
 import os
 import sqlite3
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -28,9 +28,10 @@ from calsync.mirror import Mirror
 from calsync.sources.base import CalendarPull
 from calsync.targets.base import CachedObject, TargetCache, TargetCalendar
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 RUN_RETENTION = 500  # newest runs kept per rule
 CHANGE_RETENTION = timedelta(days=90)  # change rows older than this (vs. the newest run) are pruned
+CONFIG_CHANGE_RETENTION = 200  # newest config_change rows kept
 
 _SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -48,7 +49,7 @@ CREATE TABLE target_object (
     account TEXT NOT NULL, calendar_href TEXT NOT NULL, href TEXT NOT NULL, etag TEXT,
     rule_tag TEXT NOT NULL, object_id TEXT NOT NULL, content_hash TEXT,
     span_start TEXT, span_end TEXT, verify_digest TEXT, reverting INTEGER NOT NULL,
-    revert_times TEXT NOT NULL, hold_until TEXT,
+    revert_times TEXT NOT NULL, hold_until TEXT, summary TEXT,
     PRIMARY KEY (account, calendar_href, href)
 );
 CREATE TABLE run (
@@ -57,19 +58,41 @@ CREATE TABLE run (
     updated INTEGER NOT NULL, deleted INTEGER NOT NULL, failed INTEGER NOT NULL,
     requests INTEGER NOT NULL, error TEXT, reverted INTEGER NOT NULL DEFAULT 0,
     protected INTEGER NOT NULL DEFAULT 0, out_of_window INTEGER NOT NULL DEFAULT 0,
-    error_kind TEXT
+    error_kind TEXT, error_account TEXT
 );
 CREATE INDEX run_rule ON run (rule, id);
 CREATE TABLE alert (key TEXT PRIMARY KEY, state TEXT NOT NULL, last_sent_at TEXT);
+CREATE TABLE change (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, rule TEXT NOT NULL,
+    object_id TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL, title TEXT, detail TEXT
+);
+CREATE INDEX change_rule ON change (rule, id);
+CREATE INDEX change_at ON change (at);
 """
-# Version 4: the change log. Shared by a fresh schema and the 3 -> 4 upgrade, so they cannot drift.
-_CHANGE_SCHEMA = (
+# The change log as version 4 created it: what the 3 -> 4 step builds (the 4 -> 5 step then adds
+# ``detail``). Frozen; ``test_upgraded_schema_equals_a_fresh_one`` keeps it in line with ``_SCHEMA``.
+_CHANGE_SCHEMA_V4 = (
     """CREATE TABLE change (
     id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, rule TEXT NOT NULL,
     object_id TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL, title TEXT
 )""",
     "CREATE INDEX change_rule ON change (rule, id)",
     "CREATE INDEX change_at ON change (at)",
+)
+# Version 5: the calendar cache and the config history. Shared by a fresh schema and the 4 -> 5
+# upgrade, so they cannot drift.
+_V5_SCHEMA = (
+    # role: Google accessRole / CalDAV "rw" | "ro"
+    """CREATE TABLE account_calendar (
+    account TEXT NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL, role TEXT, fetched_at TEXT NOT NULL,
+    PRIMARY KEY (account, id)
+)""",
+    # source: cli | ui | daemon | external
+    """CREATE TABLE config_change (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, source TEXT NOT NULL,
+    summary TEXT NOT NULL, before TEXT, after_fingerprint TEXT NOT NULL, undoes INTEGER
+)""",
+    "CREATE INDEX config_change_at ON config_change (at)",
 )
 _TABLES = (
     "meta",
@@ -80,6 +103,8 @@ _TABLES = (
     "run",
     "change",
     "alert",
+    "account_calendar",
+    "config_change",
 )
 
 
@@ -99,6 +124,7 @@ class RunRecord:
     protected: int = 0
     out_of_window: int = 0
     error_kind: str | None = None
+    error_account: str | None = None  # the account whose adapter or setup failed
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,13 +134,62 @@ class ChangeRecord:
 
     rule: str
     object_id: str
-    action: str  # created, updated, reverted, deleted, protected, blocked
+    action: str  # created, updated, reverted, deleted, protected, blocked, approved, guard_loosened
     at: datetime
     title: str | None
+    # JSON ``{"fields": {name: [old, new]}}`` (summary fields that differ) for an update or a
+    # revert whose previous summary is known; None otherwise. Event content, like ``title``.
+    detail: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigChangeRecord:
+    """One write of the config file. ``before`` is the whole previous text (``None``: none kept)."""
+
+    id: int
+    at: datetime
+    source: str  # cli, ui, daemon, external
+    summary: str
+    before: str | None
+    after_fingerprint: str
+    undoes: int | None  # the id of the change this one undid
+
+
+@dataclass(frozen=True, slots=True)
+class AccountCalendar:
+    """One calendar of an account's calendar list, as last fetched."""
+
+    account: str
+    id: str
+    name: str
+    role: str | None  # Google accessRole / CalDAV "rw" | "ro"
+    fetched_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAlert:
+    """An open ``alert`` key: when its push went out (None: unknown) and its detail."""
+
+    sent_at: datetime | None
+    detail: Mapping[str, Any] | None = None
+
+
+def _open_alert(state: str, sent: str | None) -> OpenAlert:
+    detail: Any = None
+    if state.startswith("open "):
+        try:
+            detail = json.loads(state[len("open ") :])
+        except ValueError:
+            detail = None
+    try:
+        sent_at = datetime.fromisoformat(sent) if sent else None
+    except ValueError:
+        sent_at = None
+    return OpenAlert(sent_at, detail if isinstance(detail, dict) else None)
 
 
 def _utc(t: datetime) -> str:
-    """Change times are stored in UTC so the retention cutoff compares as text."""
+    """Times in the history tables are stored in UTC so they compare (and prune) as text."""
     return t.astimezone(UTC).isoformat()
 
 
@@ -193,7 +268,7 @@ class Store:
             for table in _TABLES:
                 db.execute(f"DROP TABLE IF EXISTS {table}")
             # executescript() would commit our open transaction, so run statements one by one.
-            for statement in (*_SCHEMA.split(";"), *_CHANGE_SCHEMA):
+            for statement in (*_SCHEMA.split(";"), *_V5_SCHEMA):
                 if statement.strip():
                     db.execute(statement)
             db.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
@@ -297,9 +372,11 @@ class Store:
             reverting,
             times,
             hold,
+            summary,
         ) in self._db.execute(
             "SELECT href, etag, rule_tag, object_id, content_hash, span_start, span_end, verify_digest, "
-            "reverting, revert_times, hold_until FROM target_object WHERE account = ? AND calendar_href = ?",
+            "reverting, revert_times, hold_until, summary FROM target_object "
+            "WHERE account = ? AND calendar_href = ?",
             (account, calendar_href),
         ):
             span = (datetime.fromisoformat(lo), datetime.fromisoformat(hi)) if lo and hi else None
@@ -313,6 +390,7 @@ class Store:
                 bool(reverting),
                 revert_times=tuple(datetime.fromisoformat(t) for t in json.loads(times)),
                 hold_until=datetime.fromisoformat(hold) if hold else None,
+                summary=summary,
             )
         return cache
 
@@ -332,6 +410,7 @@ class Store:
                 int(obj.reverting),
                 json.dumps([t.isoformat() for t in obj.revert_times]),
                 obj.hold_until.isoformat() if obj.hold_until else None,
+                obj.summary,
             )
             for href, obj in cache.objects.items()
         ]
@@ -340,7 +419,10 @@ class Store:
                 "DELETE FROM target_object WHERE account = ? AND calendar_href = ?", (account, calendar_href)
             )
             self._db.executemany(
-                "INSERT INTO target_object VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
+                "INSERT INTO target_object (account, calendar_href, href, etag, rule_tag, object_id, "
+                "content_hash, span_start, span_end, verify_digest, reverting, revert_times, hold_until, "
+                "summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
             )
             self._db.execute(
                 "UPDATE target_calendar SET cursor = ? WHERE account = ? AND href = ?",
@@ -357,8 +439,8 @@ class Store:
             for r in runs:
                 cursor = self._db.execute(
                     "INSERT INTO run (rule, started_at, finished_at, status, created, updated, deleted, "
-                    "failed, requests, error, reverted, protected, out_of_window, error_kind) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "failed, requests, error, reverted, protected, out_of_window, error_kind, error_account) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         r.rule,
                         r.started_at.isoformat(),
@@ -374,13 +456,18 @@ class Store:
                         r.protected,
                         r.out_of_window,
                         r.error_kind,
+                        r.error_account,
                     ),
                 )
                 assert cursor.lastrowid is not None
                 run_ids[r.rule] = cursor.lastrowid
             self._db.executemany(
-                "INSERT INTO change (run_id, rule, object_id, action, at, title) VALUES (?, ?, ?, ?, ?, ?)",
-                [(run_ids[c.rule], c.rule, c.object_id, c.action, _utc(c.at), c.title) for c in changes],
+                "INSERT INTO change (run_id, rule, object_id, action, at, title, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (run_ids[c.rule], c.rule, c.object_id, c.action, _utc(c.at), c.title, c.detail)
+                    for c in changes
+                ],
             )
             for rule in run_ids:
                 self._db.execute(
@@ -395,6 +482,26 @@ class Store:
                 now = max(r.finished_at for r in runs)
                 self._db.execute("DELETE FROM change WHERE at < ?", (_utc(now - CHANGE_RETENTION),))
 
+    def record_change(self, change: ChangeRecord) -> None:
+        """One change row outside a cycle (a loosened delete guard), attached to the rule's
+        newest run (``run_id`` 0 when it has none)."""
+        with self._tx():
+            row = self._db.execute("SELECT MAX(id) FROM run WHERE rule = ?", (change.rule,)).fetchone()
+            run_id = int(row[0]) if row and row[0] is not None else 0
+            self._db.execute(
+                "INSERT INTO change (run_id, rule, object_id, action, at, title, detail) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    run_id,
+                    change.rule,
+                    change.object_id,
+                    change.action,
+                    _utc(change.at),
+                    change.title,
+                    change.detail,
+                ),
+            )
+
     def last_title(self, rule: str, object_id: str) -> str | None:
         """The newest known title of an object: the only one left once its source is gone."""
         row = self._db.execute(
@@ -404,10 +511,124 @@ class Store:
         ).fetchone()
         return row[0] if row else None
 
+    def statuses(self, rule: str) -> Iterator[tuple[str, int, str | None]]:
+        """The rule's runs as (status, failed, error_kind), newest first (as
+        ``StateReader.statuses``)."""
+        rows = self._db.execute(
+            "SELECT status, failed, error_kind FROM run WHERE rule = ? ORDER BY id DESC", (rule,)
+        )
+        return ((r[0], r[1], r[2]) for r in rows.fetchall())
+
+    # ----- alerts -------------------------------------------------------
+    # ``alert.state`` is ``closed``, ``open``, or ``open <JSON>``: an open key with its detail
+    # (the count a ``blocked`` push named, the config text a ``reload`` push was for), which
+    # ``notify`` reads to damp a replacement key. Kept in ``state`` so the schema stays as is.
+
+    def open_alerts(self) -> dict[str, OpenAlert]:
+        """The alerts sent and not yet closed, by key (``notify``)."""
+        rows = self._db.execute(
+            "SELECT key, state, last_sent_at FROM alert WHERE state = 'open' OR state LIKE 'open %'"
+        )
+        return {key: _open_alert(state, sent) for key, state, sent in rows.fetchall()}
+
+    def update_alerts(
+        self,
+        *,
+        opened: Mapping[str, OpenAlert] | None = None,
+        closed: Iterable[str] = (),
+        prune_before: datetime | None = None,
+    ) -> None:
+        """Open (or replace) ``opened``, close ``closed`` and, with ``prune_before``, delete the
+        closed rows last sent before it (or never), in one transaction."""
+        rows = [
+            (
+                key,
+                "open " + json.dumps(alert.detail, sort_keys=True) if alert.detail else "open",
+                _utc(alert.sent_at) if alert.sent_at is not None else None,
+            )
+            for key, alert in (opened or {}).items()
+        ]
+        with self._tx():
+            self._db.executemany(
+                "INSERT OR REPLACE INTO alert (key, state, last_sent_at) VALUES (?, ?, ?)", rows
+            )
+            self._db.executemany(
+                "UPDATE alert SET state = 'closed' WHERE key = ?", [(key,) for key in closed]
+            )
+            if prune_before is not None:
+                self._db.execute(
+                    "DELETE FROM alert WHERE state = 'closed' AND (last_sent_at IS NULL OR last_sent_at < ?)",
+                    (_utc(prune_before),),
+                )
+
+    # ----- config history ------------------------------------------------
+    def copies(self, tag: str, account: str, ref: str) -> int:
+        """The copies of rule ``tag`` recorded in the target calendar ``ref`` of ``account``
+        (copies left in a calendar the rule no longer targets are not counted)."""
+        row = self._db.execute(
+            "SELECT COUNT(*) FROM target_object o JOIN target_calendar c "
+            "ON o.account = c.account AND o.calendar_href = c.href "
+            "WHERE c.account = ? AND c.ref = ? AND o.rule_tag = ?",
+            (account, ref, tag),
+        ).fetchone()
+        return int(row[0])
+
+    def tagged_copies(self, tag: str) -> int:
+        """The copies of rule ``tag`` recorded in any target calendar."""
+        row = self._db.execute("SELECT COUNT(*) FROM target_object WHERE rule_tag = ?", (tag,)).fetchone()
+        return int(row[0])
+
+    def record_config_change(
+        self,
+        *,
+        at: datetime,
+        source: str,
+        summary: str,
+        before: str | None,
+        after_fingerprint: str,
+        undoes: int | None = None,
+    ) -> int:
+        """Record one config write and prune to the newest ``CONFIG_CHANGE_RETENTION``; the new id."""
+        with self._tx():
+            cursor = self._db.execute(
+                "INSERT INTO config_change (at, source, summary, before, after_fingerprint, undoes) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (_utc(at), source, summary, before, after_fingerprint, undoes),
+            )
+            assert cursor.lastrowid is not None
+            self._db.execute(
+                "DELETE FROM config_change WHERE id NOT IN "
+                "(SELECT id FROM config_change ORDER BY id DESC LIMIT ?)",
+                (CONFIG_CHANGE_RETENTION,),
+            )
+        return cursor.lastrowid
+
+    def config_changes(self, limit: int = 50) -> list[ConfigChangeRecord]:
+        """Config writes, newest first."""
+        rows = self._db.execute(
+            "SELECT id, at, source, summary, before, after_fingerprint, undoes FROM config_change "
+            "ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [ConfigChangeRecord(r[0], datetime.fromisoformat(r[1]), *r[2:]) for r in rows]
+
+    # ----- calendar cache ----------------------------------------------
+    def save_account_calendars(
+        self, account: str, calendars: Sequence[AccountCalendar], at: datetime
+    ) -> None:
+        """Replace the account's cached calendar list with ``calendars``, fetched at ``at``. The
+        arguments are authoritative: each row is stored under ``account`` with ``fetched_at = at``."""
+        with self._tx():
+            self._db.execute("DELETE FROM account_calendar WHERE account = ?", (account,))
+            self._db.executemany(
+                "INSERT INTO account_calendar (account, id, name, role, fetched_at) VALUES (?, ?, ?, ?, ?)",
+                [(account, c.id, c.name, c.role, _utc(at)) for c in calendars],
+            )
+
     def latest_runs(self) -> list[RunRecord]:
         rows = self._db.execute(
             "SELECT rule, started_at, finished_at, status, created, updated, deleted, failed, requests, error, "
-            "reverted, protected, out_of_window, error_kind "
+            "reverted, protected, out_of_window, error_kind, error_account "
             "FROM run WHERE id IN (SELECT MAX(id) FROM run GROUP BY rule) ORDER BY rule"
         ).fetchall()
         return [
@@ -423,12 +644,26 @@ def _upgrade_3(db: sqlite3.Connection) -> None:
     # An older calsync that reopened a v4 database rebuilt its own tables but left ``change``
     # behind; its rows point at run ids that rebuild reset, so they go.
     db.execute("DROP TABLE IF EXISTS change")
-    for statement in _CHANGE_SCHEMA:
+    for statement in _CHANGE_SCHEMA_V4:
+        db.execute(statement)
+
+
+def _upgrade_4(db: sqlite3.Connection) -> None:
+    """4 -> 5: copy summaries, change details, the failing account of a run, the calendar cache
+    and the config history; every row is kept."""
+    db.execute("ALTER TABLE target_object ADD COLUMN summary TEXT")
+    db.execute("ALTER TABLE change ADD COLUMN detail TEXT")
+    db.execute("ALTER TABLE run ADD COLUMN error_account TEXT")
+    # A v4 calsync that reopened a v5 database rebuilt its own tables (so the columns above are
+    # new again) but left these two behind.
+    for table in ("account_calendar", "config_change"):
+        db.execute(f"DROP TABLE IF EXISTS {table}")
+    for statement in _V5_SCHEMA:
         db.execute(statement)
 
 
 # version -> the step that turns a database of that version into the next one
-_UPGRADES: dict[int, Callable[[sqlite3.Connection], None]] = {3: _upgrade_3}
+_UPGRADES: dict[int, Callable[[sqlite3.Connection], None]] = {3: _upgrade_3, 4: _upgrade_4}
 
 
 def _upgradable(version: int) -> bool:

@@ -7,9 +7,16 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from calsync.errors import AuthError, CalsyncError, ConfigError, CursorExpired, NotFoundError
+from calsync.errors import (
+    AuthError,
+    CalendarNotListed,
+    CalsyncError,
+    ConfigError,
+    CursorExpired,
+    NotFoundError,
+)
 from calsync.http import Sleep
-from calsync.naming import parse_resource_name
+from calsync.naming import parse_resource_name, same_href
 from calsync.targets.base import DetectMode, FetchedObject, TargetCalendar, TargetDelta
 from calsync.targets.dav import (
     CALDAV,
@@ -74,13 +81,6 @@ class Limiter:
             self._cond.notify_all()
 
 
-def _same_href(href: str, ref: str) -> bool:
-    """``href`` is absolute; ``ref`` may be an absolute URL or just its path."""
-    if "://" not in ref:
-        href = urlsplit(href).path
-    return href.rstrip("/") == ref.rstrip("/")
-
-
 def _detect_mode(response: DavResponse) -> DetectMode:
     reports = response.props.get(q(DAV, "supported-report-set"))
     if reports is not None and reports.find(f".//{q(DAV, 'sync-collection')}") is not None:
@@ -131,7 +131,7 @@ class CalDavTarget:
             try:
                 items = await dav.propfind("", [q(DAV, "current-user-principal")], depth=0)
             except AuthError:
-                rejected.append(urlsplit(base).netloc)
+                rejected.append(urlsplit(base).hostname or "(hidden)")  # never a user:pass@ login
                 continue
             if len(items) != 1:
                 raise CalsyncError(f"unexpected PROPFIND response for {base}: {len(items)} entries")
@@ -183,23 +183,23 @@ class CalDavTarget:
 
     async def ensure_calendar(self, ref: str, *, create: bool) -> TargetCalendar:
         calendars = await self.list_calendars()
-        matches = [c for c in calendars if _same_href(c.href, ref)] or [c for c in calendars if c.name == ref]
+        matches = [c for c in calendars if same_href(c.href, ref)] or [c for c in calendars if c.name == ref]
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
             raise ConfigError([f"CalDAV calendar {ref!r} matches {len(matches)} calendars; use its href"])
         if not create:
-            raise NotFoundError(f"CalDAV calendar {ref!r} not found")
+            raise CalendarNotListed(f"CalDAV calendar {ref!r} not found")
         href = f"{(await self._calendar_home()).rstrip('/')}/{uuid.uuid4().hex}/"
         await self._dav.mkcalendar(href, ref)
         for cal in await self.list_calendars():
-            if _same_href(cal.href, href):
+            if same_href(cal.href, href):
                 return cal
         raise NotFoundError(f"created calendar {href} but it is not listed")
 
     @staticmethod
     def _managed(cal: TargetCalendar, responses: list[DavResponse]) -> list[DavResponse]:
-        return [r for r in responses if not _same_href(r.href, cal.href) and parse_resource_name(r.href)]
+        return [r for r in responses if not same_href(r.href, cal.href) and parse_resource_name(r.href)]
 
     async def _full_listing(self, cal: TargetCalendar, cursor: str | None) -> TargetDelta:
         responses, _ = await self._dav.report(cal.href, calendar_query_etags_body(), kind="calendar-query")
@@ -211,7 +211,7 @@ class CalDavTarget:
             cal.href, sync_collection_body(token), kind="sync-collection"
         )
         # RFC 6578 section 3.6: 507 on the collection itself means the listing was truncated.
-        truncated = any(_same_href(r.href, cal.href) and r.status == 507 for r in responses)
+        truncated = any(same_href(r.href, cal.href) and r.status == 507 for r in responses)
         changed: dict[str, str | None] = {}
         deleted: list[str] = []
         for r in self._managed(cal, responses):

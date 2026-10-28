@@ -9,19 +9,22 @@ The JSON shapes built here are a contract shared by every consumer: keep the key
 """
 
 import json
+import re
 import sqlite3
-from collections.abc import Iterator, Mapping, Sequence
+import tomllib
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import TracebackType
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from urllib.parse import quote, urlparse
 
 from calsync.config import Account, Config, Rule
 from calsync.errors import ConfigError
 from calsync.model import (
     Instance,
+    Series,
     When,
     Window,
     apply_alarm_policy,
@@ -33,9 +36,12 @@ from calsync.model import (
 from calsync.naming import object_id, rule_tag
 from calsync.store import SCHEMA_VERSION
 
-Health = Literal["ok", "failing", "blocked", "auth", "never_run"]
+# A rule's health: ``paused`` (the rule is paused) and ``retiring`` (``retire = true``: its
+# copies are being deleted) come from the config and win over the run-based ones.
+Health = Literal["ok", "failing", "blocked", "auth", "never_run", "paused", "retiring"]
 Delivery = Literal["delivered", "pending", "unknown"]
-# Worst first: the summary health is the first of these any rule has.
+# Worst first: the summary health is the first of these any rule has (paused and retiring
+# count as ok).
 _HEALTH_ORDER: tuple[Health, ...] = ("auth", "blocked", "failing", "never_run", "ok")
 NO_STATE_MESSAGE = "no state yet: run `calsync run` or start the daemon"
 
@@ -73,6 +79,7 @@ class RunView:
     requests: int
     error: str | None
     error_kind: str | None
+    error_account: str | None = None  # the account whose adapter or setup failed (schema 5)
 
     @property
     def duration_ms(self) -> int:
@@ -96,6 +103,7 @@ class RunView:
             "requests": self.requests,
             "error": self.error,
             "error_kind": self.error_kind,
+            "error_account": self.error_account,
         }
 
 
@@ -108,6 +116,17 @@ class ChangeView:
     action: str
     at: datetime
     title: str | None
+    detail: str | None = None  # the stored JSON (schema 5): ``{"fields": {name: [old, new]}}``
+
+    def detail_json(self) -> dict[str, Any] | None:
+        """The parsed detail; None when there is none or it cannot be read."""
+        if self.detail is None:
+            return None
+        try:
+            value = json.loads(self.detail)
+        except (TypeError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -118,8 +137,32 @@ class ChangeView:
             "action": self.action,
             "at": self.at.isoformat(),
             "title": self.title,
+            "detail": self.detail_json(),
         }
 
+
+@dataclass(frozen=True, slots=True)
+class ConfigChangeView:
+    id: int
+    at: datetime
+    source: str
+    summary: str
+    before: str | None
+    after_fingerprint: str
+    undoes: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class AccountCalendarView:
+    account: str
+    id: str
+    name: str
+    role: str | None
+    fetched_at: datetime
+
+
+# Change actions that put the source version on the target (what the engine records for writes).
+_DELIVERY_ACTIONS = ("created", "updated", "reverted")
 
 _RUN_COLUMNS: tuple[str, ...] = (
     "id",
@@ -137,6 +180,7 @@ _RUN_COLUMNS: tuple[str, ...] = (
     "requests",
     "error",
     "error_kind",
+    "error_account",
 )
 _RUN_DEFAULTS: Mapping[str, Any] = {"reverted": 0, "protected": 0, "out_of_window": 0, "error_kind": None}
 
@@ -234,21 +278,26 @@ class StateReader:
         rows = self._run_rows("WHERE rule = ? AND status = 'ok'", (rule,), 1)
         return rows[0] if rows else None
 
-    def statuses(self, rule: str) -> Iterator[tuple[str, int]]:
-        """The rule's run (status, failed) pairs, newest first."""
-        if not {"rule", "status", "failed", "id"} <= self.columns("run"):
+    def statuses(self, rule: str) -> Iterator[tuple[str, int, str | None]]:
+        """The rule's runs as (status, failed, error_kind), newest first."""
+        columns = self.columns("run")
+        if not {"rule", "status", "failed", "id"} <= columns:
             return iter(())
+        kind = "error_kind" if "error_kind" in columns else "NULL"
         return (
-            (r[0], r[1])
+            (r[0], r[1], r[2])
             for r in self._db.execute(
-                "SELECT status, failed FROM run WHERE rule = ? ORDER BY id DESC", (rule,)
+                f"SELECT status, failed, {kind} FROM run WHERE rule = ? ORDER BY id DESC", (rule,)
             )
         )
 
-    def changes(self, rule: str | None = None, run_id: int | None = None) -> Iterator[ChangeView]:
-        """Changes, newest first: of ``rule`` and of the run ``run_id`` when given (a missing
-        ``change`` table: none)."""
-        if not {"id", "run_id", "rule", "object_id", "action", "at", "title"} <= self.columns("change"):
+    def changes(
+        self, rule: str | None = None, run_id: int | None = None, since: datetime | None = None
+    ) -> Iterator[ChangeView]:
+        """Changes, newest first: of ``rule``, of the run ``run_id`` and at or after ``since``
+        when given (a missing ``change`` table: none)."""
+        present = self.columns("change")
+        if not {"id", "run_id", "rule", "object_id", "action", "at", "title"} <= present:
             return
         where: list[str] = []
         params: list[Any] = []
@@ -258,25 +307,102 @@ class StateReader:
         if run_id is not None:
             where.append("run_id = ?")
             params.append(run_id)
-        sql = "SELECT id, run_id, rule, object_id, action, at, title FROM change"
+        if since is not None:
+            # Stored in UTC ISO text; the prefilter on the text is a second early (a fraction of
+            # a second changes the width), the exact comparison is on the parsed times. Ids do
+            # not follow time within a cycle (rules stamp their own clocks, rows are inserted in
+            # config order), so nothing may stop at the first older row.
+            where.append("at >= ?")
+            params.append((since.astimezone(UTC) - timedelta(seconds=1)).isoformat())
+        detail = "detail" if "detail" in present else "NULL"
+        sql = f"SELECT id, run_id, rule, object_id, action, at, title, {detail} FROM change"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        for cid, rid, name, oid, action, at, title in self._db.execute(sql + " ORDER BY id DESC", params):
-            yield ChangeView(cid, rid, name, oid, action, _parse_time(at), title)
+        for cid, rid, name, oid, action, at, title, text in self._db.execute(
+            sql + " ORDER BY id DESC", params
+        ):
+            change = ChangeView(cid, rid, name, oid, action, _parse_time(at), title, text)
+            if since is None or change.at >= since:
+                yield change
 
-    def blocked_count(self, rule: str) -> int:
-        """Deletions in the most recently recorded blocked set (0: none recorded).
+    def latest_blocked(self, rule: str) -> tuple[int, list[tuple[str, str | None]]] | None:
+        """The most recently recorded blocked set: its run id and (object id, title) rows; None
+        if none is recorded.
 
         Blocked rows are written only when the blocked set changes, so the latest blocked run
         may have none: the newest set is the rows sharing the greatest ``run_id``."""
-        if not {"run_id", "rule", "action"} <= self.columns("change"):
-            return 0
-        row = self._db.execute(
-            "SELECT COUNT(*) FROM change WHERE rule = ? AND action = 'blocked' AND run_id = "
-            "(SELECT MAX(run_id) FROM change WHERE rule = ? AND action = 'blocked')",
+        if not {"run_id", "rule", "action", "object_id", "title"} <= self.columns("change"):
+            return None
+        rows = self._db.execute(
+            "SELECT run_id, object_id, title FROM change WHERE rule = ? AND action = 'blocked' AND run_id = "
+            "(SELECT MAX(run_id) FROM change WHERE rule = ? AND action = 'blocked') ORDER BY id",
             (rule, rule),
+        ).fetchall()
+        if not rows:
+            return None
+        return int(rows[0][0]), [(oid, title) for _, oid, title in rows]
+
+    def delivered_at(self, rule: str, object_id: str) -> datetime | None:
+        """When the rule last wrote the object to its target (the newest create, update or
+        revert); ``None``: never recorded."""
+        if not {"id", "rule", "object_id", "action", "at"} <= self.columns("change"):
+            return None
+        placeholders = ", ".join("?" * len(_DELIVERY_ACTIONS))
+        row = self._db.execute(
+            f"SELECT at FROM change WHERE rule = ? AND object_id = ? AND action IN ({placeholders}) "
+            "ORDER BY id DESC LIMIT 1",
+            (rule, object_id, *_DELIVERY_ACTIONS),
         ).fetchone()
-        return int(row[0])
+        return _parse_time(row[0]) if row else None
+
+    def delivered_times(self, rule: str) -> dict[str, datetime]:
+        """``delivered_at`` of every object of the rule, in one query (object id -> time)."""
+        if not {"id", "rule", "object_id", "action", "at"} <= self.columns("change"):
+            return {}
+        placeholders = ", ".join("?" * len(_DELIVERY_ACTIONS))
+        found: dict[str, datetime] = {}
+        for oid, at in self._db.execute(
+            f"SELECT object_id, at FROM change WHERE rule = ? AND action IN ({placeholders}) ORDER BY id",
+            (rule, *_DELIVERY_ACTIONS),
+        ):
+            found[oid] = _parse_time(at)  # ascending: the newest wins
+        return found
+
+    def deliveries_since(self, since: datetime) -> int:
+        """Change rows that wrote a copy (create, update, revert) at or after ``since``."""
+        if not {"action", "at"} <= self.columns("change"):
+            return 0
+        placeholders = ", ".join("?" * len(_DELIVERY_ACTIONS))
+        # Stored in UTC ISO text; the prefilter on the text is a day early (a fraction of a
+        # second changes the width), the exact comparison is on the parsed times.
+        rough = (since.astimezone(UTC) - timedelta(days=1)).isoformat()
+        rows = self._db.execute(
+            f"SELECT at FROM change WHERE action IN ({placeholders}) AND at >= ?", (*_DELIVERY_ACTIONS, rough)
+        )
+        return sum(1 for (at,) in rows if _parse_time(at) >= since)
+
+    # ----- config history and the calendar cache ----------------------------------
+    def config_changes(self, limit: int = 50) -> list[ConfigChangeView]:
+        """Config writes, newest first (no ``config_change`` table: none)."""
+        columns = ("id", "at", "source", "summary", "before", "after_fingerprint", "undoes")
+        if not set(columns) <= self.columns("config_change"):
+            return []
+        rows = self._db.execute(
+            f"SELECT {', '.join(columns)} FROM config_change ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [ConfigChangeView(r[0], _parse_time(r[1]), *r[2:]) for r in rows]
+
+    def account_calendars(self, account: str) -> list[AccountCalendarView]:
+        """The account's cached calendar list, by id (none cached: empty)."""
+        if not {"account", "id", "name", "role", "fetched_at"} <= self.columns("account_calendar"):
+            return []
+        return [
+            AccountCalendarView(account, cid, name, role, _parse_time(fetched_at))
+            for cid, name, role, fetched_at in self._db.execute(
+                "SELECT id, name, role, fetched_at FROM account_calendar WHERE account = ? ORDER BY id",
+                (account,),
+            )
+        ]
 
     # ----- source and target state ----------------------------------------------
     def source_state(self, account: str) -> dict[str, Any]:
@@ -304,6 +430,24 @@ class StateReader:
                 events.append(event)
         return events
 
+    def series_count(self, account: str, calendar: str) -> int:
+        """Mirrored source events of a calendar (``calendar``: the resolved Google calendar id)."""
+        if not {"account", "calendar"} <= self.columns("source_event"):
+            return 0
+        row = self._db.execute(
+            "SELECT COUNT(*) FROM source_event WHERE account = ? AND calendar = ?", (account, calendar)
+        ).fetchone()
+        return int(row[0])
+
+    def target_calendar_href(self, account: str, ref: str) -> str | None:
+        """The href the target calendar ``ref`` resolved to when it was last synced."""
+        if not {"account", "ref", "href"} <= self.columns("target_calendar"):
+            return None
+        row = self._db.execute(
+            "SELECT href FROM target_calendar WHERE account = ? AND ref = ?", (account, ref)
+        ).fetchone()
+        return row[0] if row else None
+
     def target_calendar_name(self, account: str, ref: str) -> str | None:
         if not {"account", "ref", "name"} <= self.columns("target_calendar"):
             return None
@@ -318,6 +462,24 @@ class StateReader:
         return int(
             self._db.execute("SELECT COUNT(*) FROM target_object WHERE rule_tag = ?", (tag,)).fetchone()[0]
         )
+
+    def copy_summary(self, tag: str, object_id: str) -> dict[str, Any] | None:
+        """What calsync last wrote for the object (the stored summary JSON); ``None``: none
+        stored or unreadable."""
+        if not {"rule_tag", "object_id", "summary"} <= self.columns("target_object"):
+            return None
+        row = self._db.execute(
+            "SELECT summary FROM target_object WHERE rule_tag = ? AND object_id = ? AND summary IS NOT NULL "
+            "LIMIT 1",
+            (tag, object_id),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            summary = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        return summary if isinstance(summary, dict) else None
 
     def delivered_hashes(self, tag: str) -> dict[str, str | None]:
         """Object id → recorded content hash of the rule's copies; ``None`` while a revert is pending."""
@@ -342,7 +504,300 @@ def host_for(provider: str, server_url: str | None) -> str:
     url = server_url or ""
     if url == "icloud" or "icloud.com" in url.lower():  # also icloud.com.cn
         return "iCloud"
-    return urlparse(url).hostname or url
+    return urlparse(url).hostname or HIDDEN  # never the raw text: it may carry a login
+
+
+HIDDEN = "(hidden)"
+
+
+def _scheme_host(url: str) -> str:
+    """``https://host[:port]`` of a URL: a push URL's path carries its device key, and a login
+    (``user:pass@``) never shows. ``"(hidden)"`` when the URL has no host or a bad port."""
+    parts = urlparse(url)
+    host = parts.hostname
+    try:
+        port = parts.port
+    except ValueError:
+        return HIDDEN
+    if not parts.scheme or not host:
+        return HIDDEN
+    if ":" in host:  # IPv6
+        host = f"[{host}]"
+    return f"{parts.scheme}://{host}" + (f":{port}" if port is not None else "")
+
+
+def config_json(config: Config, *, reveal: bool = False) -> dict[str, Any]:
+    """The parsed config as JSON (``calsync config get``, ``GET /api/config``). Unless
+    ``reveal``: push, webhook and public URLs are cut to scheme and host; each account shows
+    only its ``name``, ``provider``, ``host`` and whether a credential is configured (never the
+    username, an Apple ID, the credential ref or the server URL); the Google client secret file
+    shows only whether one is configured (its path names the home directory)."""
+    from calsync.durations import format_duration
+
+    def url(value: str | None) -> str | None:
+        return value if reveal or value is None or value == "icloud" else _scheme_host(value)
+
+    def alarms(rule: Rule) -> str | list[str]:
+        policy = rule.alarms
+        return policy if isinstance(policy, str) else [format_duration(o) for o in policy]
+
+    accounts: dict[str, dict[str, Any]] = {
+        a.name: {
+            "name": a.name,
+            "provider": a.provider,
+            "host": host_for(a.provider, a.server_url),
+            "credential_configured": bool(a.credential.ref),
+            "server_url": a.server_url,
+            "username": a.username,
+            "credential": {"backend": a.credential.backend, "ref": a.credential.ref},
+            "max_concurrency": a.max_concurrency,
+        }
+        if reveal
+        else {
+            "name": a.name,
+            "provider": a.provider,
+            "host": host_for(a.provider, a.server_url),
+            "credential_configured": bool(a.credential.ref),
+        }
+        for a in config.accounts.values()
+    }
+    secret_file = config.google_client_secret_file
+    rules = [
+        {
+            "name": r.name,
+            "source": {"account": r.source.account, "calendar": r.source.calendar},
+            "target": {
+                "account": r.target.account,
+                "calendar": r.target.calendar,
+                "create_if_missing": r.target.create_if_missing,
+            },
+            "window": None
+            if r.window is None
+            else {"past": format_duration(r.window.past), "future": format_duration(r.window.future)},
+            "alarms": alarms(r),
+            "fields": {
+                "content": r.fields.content,
+                "attendees": r.fields.attendees,
+                "conference": r.fields.conference,
+            },
+            "delete_guard": {"max_count": r.delete_guard.max_count, "max_ratio": r.delete_guard.max_ratio},
+            "paused": r.paused,
+            "retire": r.retire,
+        }
+        for r in config.rules
+    ]
+    web = config.web
+    host = f"[{web.host}]" if ":" in web.host else web.host
+    return {
+        "revealed": reveal,
+        "google": {
+            "client_secret_file": (None if secret_file is None else str(secret_file))
+            if reveal
+            else {"configured": secret_file is not None}
+        },
+        "accounts": accounts,
+        "rules": rules,
+        "notify": {
+            "bark_url": url(config.notify.bark_url),
+            "webhook_url": url(config.notify.webhook_url),
+            "public_url": url(config.notify.public_url),
+            "failure_threshold": config.notify.failure_threshold,
+            "language": config.notify.language,
+        },
+        "runtime": {
+            "interval": format_duration(config.runtime.interval),
+            "jitter": config.runtime.jitter,
+        },
+        "web": {
+            "listen": f"{host}:{web.port}" if web.enabled else "off",
+            "allowed_hosts": list(web.allowed_hosts),
+        },
+    }
+
+
+# What ``config_json`` masks, as the TOML keys (their last dotted part) that hold it: the URLs
+# are cut to scheme and host, the rest hidden. ``credential`` and ``ref`` cover an account's
+# credential however it is written (an inline table, a sub-table, a dotted key).
+_MASKED_URL_KEYS = frozenset({"bark_url", "webhook_url", "public_url", "server_url"})
+_MASKED_KEYS = _MASKED_URL_KEYS | {"username", "credential", "ref", "client_secret_file"}
+_TOML_KEY = r"""(?:[A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*"|'[^']*')"""
+# A key and its "=": at the start of a line (a commented-out one too), or inside an inline table.
+_KEY_EQUALS = re.compile(rf"(?:^\s*(?:#\s*)?|[{{,]\s*)(?P<key>{_TOML_KEY}(?:\s*\.\s*{_TOML_KEY})*)\s*=\s*")
+_BASIC_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
+_BARE_VALUE = re.compile(r"[^,}\s#]*")
+_MULTILINE_QUOTES = ('"""', "'''")
+
+
+def _last_key(dotted: str) -> str:
+    parts: list[str] = re.findall(_TOML_KEY, dotted)
+    return parts[-1].strip("\"'") if parts else ""
+
+
+def _value_end(line: str, start: int) -> tuple[int, str | None]:
+    """Where the TOML value starting at ``start`` ends on this line, and the delimiter of a
+    multi-line string it leaves open (None: closed on this line)."""
+    for delimiter in _MULTILINE_QUOTES:
+        if line.startswith(delimiter, start):
+            close = line.find(delimiter, start + 3)
+            return (close + 3, None) if close >= 0 else (len(line), delimiter)
+    if line.startswith('"', start):
+        match = _BASIC_STRING.match(line, start)
+        return (match.end() if match else len(line)), None
+    if line.startswith("'", start):
+        close = line.find("'", start + 1)
+        return (close + 1 if close >= 0 else len(line)), None
+    if line.startswith("[", start):  # an array: hidden to the end of the line
+        return len(line.rstrip("\n")), None
+    match = _BARE_VALUE.match(line, start)
+    return (match.end() if match else start), None
+
+
+def _masked_value(key: str, raw: str) -> str:
+    if key in _MASKED_URL_KEYS:
+        try:
+            value = tomllib.loads(f"v = {raw}").get("v")
+        except tomllib.TOMLDecodeError:
+            value = None
+        if isinstance(value, str):
+            return json.dumps(value if value == "icloud" else _scheme_host(value))
+    return json.dumps(HIDDEN)
+
+
+# The config's schema as the web UI may see it: for each top-level table, the keys shown as
+# they are (the last part of a dotted key or of a sub-table's name; an inline table's keys
+# count as its table's). Every other key is hidden, and so is every key of a table calsync
+# does not know: a key written by hand (``password = ...``) never reaches the web UI.
+_SHOWN_IN = {
+    "accounts": frozenset({"provider", "max_concurrency", "backend"}),
+    "notify": frozenset({"failure_threshold", "language"}),
+    "google": frozenset(),
+    "rules": frozenset(
+        {
+            "name",
+            "source",
+            "target",
+            "account",
+            "calendar",
+            "create_if_missing",
+            "window",
+            "past",
+            "future",
+            "alarms",
+            "fields",
+            "content",
+            "attendees",
+            "conference",
+            "delete_guard",
+            "max_count",
+            "max_ratio",
+            "on_target_edit",
+            "paused",
+            "retire",
+        }
+    ),
+    "runtime": frozenset({"interval", "jitter"}),
+    "web": frozenset({"listen", "allowed_hosts"}),
+}
+_TABLE_HEADER = re.compile(r"^\s*\[\[?\s*(?P<name>[^\]]+?)\s*\]\]?\s*$")
+COMMENT_HIDDEN = "# (comment hidden)"
+
+
+def _dotted(text: str) -> list[str]:
+    return [part.strip("\"'") for part in re.findall(_TOML_KEY, text)]
+
+
+def _hide_comment(line: str) -> str:
+    """The line with any comment's text replaced: a comment can quote anything (an old
+    device key, a password), so the web UI never sees comment text."""
+    quote: str | None = None
+    i = 0
+    while i < len(line):
+        char = line[i]
+        if quote is None:
+            if char == "#":
+                newline = "\n" if line.endswith("\n") else ""
+                return line[:i] + COMMENT_HIDDEN + newline
+            if char in "\"'":
+                quote = char
+        elif char == "\\" and quote == '"':
+            i += 1
+        elif char == quote:
+            quote = None
+        i += 1
+    return line
+
+
+def _is_hidden(path: list[str]) -> bool:
+    if not path:
+        return False
+    if path[-1] in _MASKED_KEYS:
+        return True
+    shown = _SHOWN_IN.get(path[0])
+    return shown is None or path[-1] not in shown
+
+
+def mask_config_text(text: str) -> str:
+    """The config file's text with what ``config_json`` masks masked, line by line by TOML key
+    (in an inline table or a dotted key too), every comment's text hidden, and every key
+    outside the known schema (``_SHOWN_IN``) hidden: what the web UI may see of a diff. A
+    masked multi-line string loses its continuation lines."""
+    out: list[str] = []
+    open_quote: str | None = None  # inside a masked multi-line string
+    section: list[str] = []
+    for raw_line in text.splitlines(keepends=True):
+        if open_quote is not None:
+            if open_quote in raw_line:
+                open_quote = None
+            continue
+        line = _hide_comment(raw_line)
+        header = _TABLE_HEADER.match(line.split("#", 1)[0])
+        if header is not None:
+            section = _dotted(header.group("name"))
+            out.append(line)
+            continue
+        pieces: list[str] = []
+        pos = 0
+        while (match := _KEY_EQUALS.search(line, pos)) is not None:
+            key = _last_key(match.group("key"))
+            if not _is_hidden(section + _dotted(match.group("key"))) or line.startswith("{", match.end()):
+                pieces.append(line[pos : match.end()])
+                pos = match.end()
+                continue
+            end, open_quote = _value_end(line, match.end())
+            pieces.append(line[pos : match.end()] + _masked_value(key, line[match.end() : end]))
+            pos = end
+            if open_quote is not None:
+                break
+        rest = "\n" if open_quote is not None else line[pos:]
+        out.append("".join(pieces) + rest)
+    return "".join(out)
+
+
+def config_history_json(changes: Sequence[ConfigChangeView]) -> dict[str, Any]:
+    """``calsync config history --json`` and ``GET /api/config/history``. Never the ``before``
+    text: a whole config, URLs included."""
+    return {
+        "changes": [
+            {
+                "id": c.id,
+                "at": c.at.isoformat(),
+                "source": c.source,
+                "summary": c.summary,
+                "after_fingerprint": c.after_fingerprint,
+                "undoes": c.undoes,
+            }
+            for c in changes
+        ]
+    }
+
+
+def calendars_json(account: str, calendars: Sequence[AccountCalendarView]) -> dict[str, Any]:
+    """``calsync calendars --json`` and ``GET /api/calendars``: an account's cached list."""
+    return {
+        "account": account,
+        "fetched_at": calendars[0].fetched_at.isoformat() if calendars else None,
+        "calendars": [{"id": c.id, "name": c.name, "role": c.role} for c in calendars],
+    }
 
 
 def _schema_json(reader: StateReader) -> dict[str, Any]:
@@ -367,14 +822,49 @@ def _source_calendar(reader: StateReader, rule: Rule) -> tuple[str | None, dict[
 # ----- status ------------------------------------------------------------------------
 
 
+AccountAuth = Literal["ok", "failed", "unknown"]
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarStatus:
+    """One calendar of an account's cached list, and the rules that sync it."""
+
+    id: str
+    name: str
+    role: str | None
+    series: int | None  # mirrored source series (a source account's calendar); None: a target's
+    rules: tuple[str, ...]  # the rules using it, in config order
+    synced: bool  # some rule using it is active (neither paused nor retiring)
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "role": self.role,
+            "series": self.series,
+            "rules": list(self.rules),
+            "synced": self.synced,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class AccountView:
     name: str
     provider: str
     host: str
+    # ``failed``: a rule using the account last failed on its credential; ``ok``: every rule
+    # using it last succeeded; else ``unknown`` (no rule, never run, or failing otherwise).
+    auth: AccountAuth = "unknown"
+    calendars: tuple[CalendarStatus, ...] = ()  # from the calendar cache; none cached: empty
 
     def to_json(self) -> dict[str, Any]:
-        return {"name": self.name, "provider": self.provider, "host": self.host}
+        return {
+            "name": self.name,
+            "provider": self.provider,
+            "host": self.host,
+            "auth": self.auth,
+            "calendars": [c.to_json() for c in self.calendars],
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -464,6 +954,7 @@ class StatusView:
     accounts: tuple[AccountView, ...]
     rules: tuple[RuleStatus, ...]
     attention: tuple[Attention, ...]
+    delivered_today: int = 0  # copies written (created, updated, reverted) since midnight
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -475,6 +966,7 @@ class StatusView:
                 "attention": len(self.attention),
                 "last_sync_at": _iso(self.last_sync_at),
                 "changes_24h": self.changes_24h,
+                "delivered_today": self.delivered_today,
             },
             "accounts": [a.to_json() for a in self.accounts],
             "rules": [r.to_json() for r in self.rules],
@@ -485,7 +977,7 @@ class StatusView:
 def _health(run: RunView | None) -> Health:
     if run is None:
         return "never_run"
-    if _is_ok(run.status, run.failed):
+    if is_ok(run.status, run.failed):
         return "ok"
     if run.error_kind == "auth" or (run.error_kind is None and (run.error or "").startswith("AuthError")):
         return "auth"
@@ -498,32 +990,72 @@ def _worst(present: set[Health]) -> Health:
     for health in _HEALTH_ORDER:
         if health in present:
             return health
-    return "ok"
+    return "ok"  # also: only paused or retiring rules
 
 
-def _is_ok(status: str, failed: int) -> bool:
+def _rule_health(rule: Rule, last: RunView | None) -> Health:
+    if rule.paused:
+        return "paused"
+    if rule.retire:
+        return "retiring"
+    return _health(last)
+
+
+def is_ok(status: str, failed: int) -> bool:
     """A run whose health is ``ok``: ok, or partial without failed items."""
     return status == "ok" or (status == "partial" and failed == 0)
 
 
-def _consecutive_failures(reader: StateReader, rule: str) -> int:
-    """The newest runs in a row whose health is not ``ok``."""
+class RunStatuses(Protocol):
+    """What ``consecutive_failures`` reads: a ``StateReader``, or the writer's ``Store``."""
+
+    def statuses(self, rule: str) -> Iterator[tuple[str, int, str | None]]: ...
+
+
+def _any_failure(status: str, failed: int, error_kind: str | None) -> bool:
+    return True
+
+
+def consecutive_failures(
+    reader: RunStatuses,
+    rule: str,
+    counts: Callable[[str, int, str | None], bool] = _any_failure,
+) -> int:
+    """The newest runs since the last ``ok`` one whose (status, failed, error_kind) ``counts``
+    (by default every one: the runs in a row whose health is not ``ok``)."""
     count = 0
-    for status, failed in reader.statuses(rule):
-        if _is_ok(status, failed):
+    for status, failed, error_kind in reader.statuses(rule):
+        if is_ok(status, failed):
             break
-        count += 1
+        if counts(status, failed, error_kind):
+            count += 1
     return count
 
 
-BLOCKED_ADVICE = "To allow them, stop the daemon, run the command, then start the daemon again."
+def flat(text: str) -> str:
+    """One line of user text: newlines and other whitespace runs become single spaces."""
+    return " ".join(text.split())
+
+
+def blocked_message(rule: str, count: int) -> str:
+    """What a blocked rule's attention says (``count`` 0: unknown)."""
+    what = f"{count} {'copy' if count == 1 else 'copies'}" if count else "Copies"
+    return f"{what} would be deleted — check `calsync blocked --rule {rule}`, then approve if intended"
 
 
 def _attention(reader: StateReader, status: RuleStatus) -> Attention | None:
+    """What needs a person for one rule. A paused rule needs nothing; a retiring one keeps the
+    attention its runs call for (a retirement over the delete guard waits for a decision)."""
     rule = status.rule
-    if status.health == "auth":
-        error = ((status.last_run and status.last_run.error) or "").lower()
-        account = rule.source.account if "google" in error or "oauth" in error else rule.target.account
+    if rule.paused:
+        return None
+    health = _health(status.last_run) if rule.retire else status.health
+    if health == "auth":
+        last = status.last_run
+        account = last.error_account if last is not None else None
+        if account is None:  # a run recorded before ``error_account`` existed: guess from its text
+            error = ((last and last.error) or "").lower()
+            account = rule.source.account if "google" in error or "oauth" in error else rule.target.account
         return Attention(
             "auth",
             rule.name,
@@ -531,45 +1063,97 @@ def _attention(reader: StateReader, status: RuleStatus) -> Attention | None:
             f"The {account} account needs to be connected again.",
             f"calsync auth {account}",
         )
-    if status.health == "blocked":
-        n = reader.blocked_count(rule.name)
-        waiting = f"{n} deletions are" if n else "deletions are"
-        # While the daemon runs it holds the lock, so the command can only run with it stopped
-        # (``approve`` will let the daemon do it).
-        return Attention(
-            "blocked",
-            rule.name,
-            None,
-            f"Sync paused: {waiting} waiting for your confirmation. {BLOCKED_ADVICE}",
-            f"calsync run --rule {rule.name} --allow-deletes",
-        )
-    if status.health == "failing":
+    if health == "blocked":
+        # The rows of this block, as ``calsync blocked`` reads them: one count per block.
+        entry = _blocked_rule(rule, reader)
+        message = blocked_message(rule.name, entry.count if entry is not None else 0)
+        return Attention("blocked", rule.name, None, message, f"calsync approve {rule.name}")
+    if health == "failing":
         k = status.consecutive_failures
         return Attention("failing", rule.name, None, f"Sync has failed {k} times in a row.", None)
     return None
 
 
-def _account_view(account: Account) -> AccountView:
-    return AccountView(account.name, account.provider, host_for(account.provider, account.server_url))
+def _uses_target(reader: StateReader, rule: Rule, calendar: AccountCalendarView) -> bool:
+    """The cached target calendar is the rule's: the href its ref resolved to when synced, else
+    the ref itself (an href, or a name), as ``ops._match_calendar`` matches."""
+    from calsync.naming import same_href
+
+    ref = rule.target.calendar
+    href = reader.target_calendar_href(rule.target.account, ref)
+    if href is not None:
+        return same_href(calendar.id, href)
+    return same_href(calendar.id, ref) or calendar.name == ref
+
+
+def _account_auth(account: str, rules: Sequence[Rule], last: Mapping[str, RunView | None]) -> AccountAuth:
+    using = [r for r in rules if account in (r.source.account, r.target.account)]
+    runs = [last[r.name] for r in using]
+    if any(run is not None and run.error_kind == "auth" and run.error_account == account for run in runs):
+        return "failed"
+    if using and all(run is not None and is_ok(run.status, run.failed) for run in runs):
+        return "ok"
+    return "unknown"
+
+
+def _account_view(
+    account: Account,
+    config: Config,
+    reader: StateReader,
+    last: Mapping[str, RunView | None],
+    cids: Mapping[str, str | None],
+) -> AccountView:
+    calendars: list[CalendarStatus] = []
+    for cal in reader.account_calendars(account.name):
+        sources = [r for r in config.rules if r.source.account == account.name and cids[r.name] == cal.id]
+        targets = [
+            r for r in config.rules if r.target.account == account.name and _uses_target(reader, r, cal)
+        ]
+        using = [r for r in config.rules if r in sources or r in targets]
+        calendars.append(
+            CalendarStatus(
+                id=cal.id,
+                name=cal.name,
+                role=cal.role,
+                series=reader.series_count(account.name, cal.id) if account.provider == "google" else None,
+                rules=tuple(r.name for r in using),
+                synced=any(not r.paused and not r.retire for r in using),
+            )
+        )
+    return AccountView(
+        account.name,
+        account.provider,
+        host_for(account.provider, account.server_url),
+        auth=_account_auth(account.name, config.rules, last),
+        calendars=tuple(calendars),
+    )
+
+
+def _midnight(now: datetime) -> datetime:
+    """The start of ``now``'s day, in ``now``'s own zone (pass ``now.astimezone()`` for the
+    local day)."""
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def build_status(config: Config, reader: StateReader, now: datetime) -> StatusView:
     rules: list[RuleStatus] = []
+    lasts: dict[str, RunView | None] = {}
+    cids: dict[str, str | None] = {}
     for rule in config.rules:
         runs = reader.runs(rule.name, limit=1)
-        last = runs[0] if runs else None
+        last = lasts[rule.name] = runs[0] if runs else None
         last_ok = reader.last_ok_run(rule.name)
-        _, entry = _source_calendar(reader, rule)
+        cids[rule.name], entry = _source_calendar(reader, rule)
         rules.append(
             RuleStatus(
                 rule=rule,
                 source_name=entry.get("summary_override") or entry.get("summary") or rule.source.calendar,
                 target_name=reader.target_calendar_name(rule.target.account, rule.target.calendar)
                 or rule.target.calendar,
-                health=_health(last),
+                health=_rule_health(rule, last),
                 last_run=last,
                 last_ok_at=last_ok.finished_at if last_ok else None,
-                consecutive_failures=_consecutive_failures(reader, rule.name),
+                consecutive_failures=consecutive_failures(reader, rule.name),
                 copies=reader.copies(rule_tag(rule.name)),
             )
         )
@@ -590,10 +1174,101 @@ def build_status(config: Config, reader: StateReader, now: datetime) -> StatusVi
         health=health,
         last_sync_at=max(ok_times) if ok_times else None,
         changes_24h=changes_24h,
-        accounts=tuple(_account_view(a) for a in config.accounts.values()),
+        accounts=tuple(_account_view(a, config, reader, lasts, cids) for a in config.accounts.values()),
         rules=tuple(rules),
         attention=attention,
+        delivered_today=reader.deliveries_since(_midnight(now.astimezone())),  # this machine's day
     )
+
+
+# ----- blocked deletes -------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedItem:
+    object_id: str
+    title: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedRule:
+    rule: str
+    since: datetime  # the first blocked run since the rule last synced ok
+    count: int
+    copies: int  # the rule's copies now (the guard's ratio is of these)
+    max_count: int
+    max_ratio: float
+    reason: str | None  # the guard's reason, as the run recorded it
+    fingerprint: str | None  # None: the blocked set is no longer recorded
+    items: tuple[BlockedItem, ...]
+
+    @property
+    def ratio(self) -> float | None:
+        return round(self.count / self.copies, 3) if self.copies else None
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "rule": self.rule,
+            "since": self.since.isoformat(),
+            "count": self.count,
+            "copies": self.copies,
+            "ratio": self.ratio,
+            "limit": {"max_count": self.max_count, "max_ratio": self.max_ratio},
+            "reason": self.reason,
+            "fingerprint": self.fingerprint,
+            "items": [{"object_id": i.object_id, "title": i.title} for i in self.items],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class BlockedView:
+    rules: tuple[BlockedRule, ...]
+
+    def to_json(self) -> dict[str, Any]:
+        return {"blocked": [r.to_json() for r in self.rules]}
+
+
+def _blocked_rule(rule: Rule, reader: StateReader) -> BlockedRule | None:
+    from calsync.engine import delete_fingerprint  # light here: views must not load the engine early
+
+    runs = reader.runs(rule.name)
+    if not runs or runs[0].status != "blocked":
+        return None
+    first = runs[0]
+    for run in runs:  # newest first: back to the last ok run (a failure does not end a block)
+        if is_ok(run.status, run.failed):
+            break
+        if run.status == "blocked":
+            first = run
+    found = reader.latest_blocked(rule.name)
+    # Rows from before this block (an older one) do not describe it: unknown, never guessed.
+    rows = found[1] if found is not None and found[0] >= first.id else []
+    items = sorted(
+        (BlockedItem(oid, title) for oid, title in rows),
+        key=lambda i: (i.title is None, (i.title or "").casefold(), i.object_id),
+    )
+    return BlockedRule(
+        rule=rule.name,
+        since=first.started_at,
+        count=len(items),
+        copies=reader.copies(rule_tag(rule.name)),
+        max_count=rule.delete_guard.max_count,
+        max_ratio=rule.delete_guard.max_ratio,
+        reason=runs[0].error,
+        fingerprint=delete_fingerprint(i.object_id for i in items) if items else None,
+        items=tuple(items),
+    )
+
+
+def build_blocked(config: Config, reader: StateReader, rule: str | None = None) -> BlockedView:
+    """The rules whose latest run is blocked by the mass-delete guard, in config order, each
+    with every planned delete (title order) and the fingerprint ``calsync approve`` names."""
+    found = [
+        entry
+        for r in config.rules
+        if (rule is None or r.name == rule) and (entry := _blocked_rule(r, reader)) is not None
+    ]
+    return BlockedView(tuple(found))
 
 
 # ----- upcoming -------------------------------------------------------------------------
@@ -649,35 +1324,69 @@ class UpcomingView:
         }
 
 
-def _rule_events(
-    rule: Rule, reader: StateReader, now: datetime, end: datetime, current: bool
-) -> list[UpcomingEvent]:
-    """The rule's instances in ``[now, end)``, shaped exactly as ``Engine._desired`` shapes them."""
+def source_series(reader: StateReader, account: str, cid: str, entry: Mapping[str, Any]) -> list[Series]:
+    """The mirrored source calendar's series, as the engine builds them."""
     from calsync.sources.google import meta_from_state
     from calsync.sources.google_map import build_series
 
-    cid, entry = _source_calendar(reader, rule)
-    if cid is None:
+    return build_series(reader.source_events(account, cid), meta_from_state(entry))
+
+
+class RuleReading:
+    """One rule's copies as the state records them, read once per request: the source calendar
+    its ref resolves to (``cid`` None: not resolvable), the recorded content hashes (only with a
+    ``current`` schema: hashes of another calsync version are not comparable), the target
+    calendar's name and the rule's window around ``now``. Shared by ``upcoming`` and ``events``."""
+
+    def __init__(self, rule: Rule, reader: StateReader, now: datetime, current: bool) -> None:
+        self.rule = rule
+        self.cid, self.entry = _source_calendar(reader, rule)
+        self.tag = rule_tag(rule.name)
+        self.current = current
+        self._hashes = reader.delivered_hashes(self.tag) if current else {}
+        self.target_name = (
+            reader.target_calendar_name(rule.target.account, rule.target.calendar) or rule.target.calendar
+        )
+        window = rule.window
+        self.window = None if window is None else Window.around(now, window.past, window.future)
+
+    def shape(self, item: Series) -> Series:
+        """The series as the rule writes it (exactly as ``Engine._desired`` shapes it)."""
+        return apply_field_policy(apply_alarm_policy(item, self.rule.alarms), self.rule.fields)
+
+    def object_id(self, item: Series) -> str:
+        assert self.cid is not None
+        return object_id(self.rule.name, self.cid, item.source_id)
+
+    def in_window(self, span: tuple[datetime, datetime]) -> bool:
+        return self.window is None or self.window.intersects(span)
+
+    def delivered(self, oid: str, shaped: Series) -> bool:
+        """The copy's recorded hash is the one calsync would write now."""
+        recorded = self._hashes.get(oid)
+        return recorded is not None and recorded == series_hash(shaped)
+
+
+def _rule_events(
+    rule: Rule, reader: StateReader, now: datetime, end: datetime, current: bool
+) -> list[UpcomingEvent]:
+    """The rule's instances in ``[now, end)``, shaped as the rule writes them; series outside
+    its window are left out."""
+    reading = RuleReading(rule, reader, now, current)
+    if reading.cid is None:
         return []
-    raw = reader.source_events(rule.source.account, cid)
-    tag = rule_tag(rule.name)
-    delivered = reader.delivered_hashes(tag) if current else {}
-    target_name = (
-        reader.target_calendar_name(rule.target.account, rule.target.calendar) or rule.target.calendar
-    )
-    window = None if rule.window is None else Window.around(now, rule.window.past, rule.window.future)
     events: list[UpcomingEvent] = []
-    for item in build_series(raw, meta_from_state(entry)):
-        shaped = apply_field_policy(apply_alarm_policy(item, rule.alarms), rule.fields)
-        if window is not None and not window.intersects(series_span(shaped)):
+    for item in source_series(reader, rule.source.account, reading.cid, reading.entry):
+        shaped = reading.shape(item)
+        if not reading.in_window(series_span(shaped)):
             continue
         delivery: Delivery = "unknown"
         if current:
-            recorded = delivered.get(object_id(rule.name, cid, item.source_id))
-            delivery = "delivered" if recorded is not None and recorded == series_hash(shaped) else "pending"
+            delivery = "delivered" if reading.delivered(reading.object_id(item), shaped) else "pending"
         events.extend(
-            UpcomingEvent(rule.name, inst, target_name, delivery)
-            for inst in expand_instances(shaped, now, end)
+            UpcomingEvent(rule.name, inst, reading.target_name, delivery)
+            # In local time: an all-day event counts on this machine's days (instants are the same).
+            for inst in expand_instances(shaped, now.astimezone(), end.astimezone())
         )
     return events
 
@@ -739,12 +1448,11 @@ def build_changes(
     limit: int = 100,
     run_id: int | None = None,
 ) -> ChangesView:
-    """Recorded changes, newest first; ``since`` keeps those at or after that instant, ``run_id``
-    those of that run only."""
+    """Recorded changes, newest first (by id); ``since`` keeps those at or after that instant
+    (filtered in SQL: ids do not follow time within a cycle), ``run_id`` those of that run only."""
     found: list[ChangeView] = []
-    for change in reader.changes(rule, run_id):
+    for change in reader.changes(rule, run_id, since):
         if len(found) >= limit:
             break
-        if since is None or change.at >= since:
-            found.append(change)
+        found.append(change)
     return ChangesView(tuple(found))

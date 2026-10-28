@@ -63,6 +63,13 @@ CALENDAR_LIST_PARAMS: Mapping[str, str] = {
     "fields": "nextPageToken,nextSyncToken,items(id,summary,summaryOverride,timeZone,defaultReminders,deleted)",
 }
 
+# The plain listing (``list_calendars``, the calendar cache) also asks for ``accessRole``. Never
+# in CALENDAR_LIST_PARAMS: a stored calendarList sync token is valid only for its parameters.
+CALENDAR_LIST_ALL_PARAMS: Mapping[str, str] = {
+    **CALENDAR_LIST_PARAMS,
+    "fields": "nextPageToken,nextSyncToken,items(id,summary,summaryOverride,accessRole,deleted)",
+}
+
 
 RATE_LIMIT_REASONS = frozenset(
     {
@@ -193,10 +200,14 @@ class GoogleSource:
 
     async def list_calendars(self) -> list[CalendarInfo]:
         items, _ = await self._list_all(
-            "/users/me/calendarList", CALENDAR_LIST_PARAMS, None, "google-calendarlist"
+            "/users/me/calendarList", CALENDAR_LIST_ALL_PARAMS, None, "google-calendarlist"
         )
         return [
-            CalendarInfo(item["id"], item.get("summaryOverride") or item.get("summary", item["id"]))
+            CalendarInfo(
+                item["id"],
+                item.get("summaryOverride") or item.get("summary", item["id"]),
+                item.get("accessRole") or None,
+            )
             for item in items
             if not item.get("deleted")
         ]

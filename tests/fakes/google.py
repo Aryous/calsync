@@ -33,6 +33,7 @@ class FakeGoogle:
         self._seq = 0
         self._calendars: dict[str, _Calendar] = {}
         self._removed: dict[str, int] = {}
+        self._roles: dict[str, str] = {}  # calendarList accessRole
 
     # ----- test helpers -------------------------------------------------
     def _tick(self) -> int:
@@ -47,9 +48,11 @@ class FakeGoogle:
         tz: str = "Asia/Shanghai",
         default_reminders: list[dict[str, Any]] | None = None,
         summary_override: str | None = None,
+        access_role: str = "owner",
     ) -> None:
         self._removed.pop(cid, None)
         self._calendars[cid] = _Calendar(summary, summary_override, tz, default_reminders or [], self._tick())
+        self._roles[cid] = access_role
 
     def remove_calendar(self, cid: str) -> None:
         del self._calendars[cid]
@@ -144,6 +147,7 @@ class FakeGoogle:
                     **({"summaryOverride": c.summary_override} if c.summary_override else {}),
                     "timeZone": c.tz,
                     "defaultReminders": c.default_reminders,
+                    "accessRole": self._roles.get(cid, "owner"),
                 }
                 for cid, c in self._calendars.items()
                 if since is None or c.changed_at > since

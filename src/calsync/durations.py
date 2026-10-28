@@ -14,3 +14,13 @@ def parse_duration(text: str) -> timedelta:
     sign, amount, unit = match.groups()
     seconds = int(amount) * _UNITS[unit]
     return timedelta(seconds=-seconds if sign == "-" else seconds)
+
+
+def format_duration(value: timedelta) -> str:
+    """The shortest text ``parse_duration`` reads back as ``value`` (whole seconds), e.g. ``7d``."""
+    seconds = int(value.total_seconds())
+    sign, seconds = ("-", -seconds) if seconds < 0 else ("", seconds)
+    for unit in ("d", "h", "m"):
+        if seconds and seconds % _UNITS[unit] == 0:
+            return f"{sign}{seconds // _UNITS[unit]}{unit}"
+    return f"{sign}{seconds}s"
