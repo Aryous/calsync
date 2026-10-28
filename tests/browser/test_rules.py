@@ -18,7 +18,7 @@ import pytest
 from playwright.sync_api import Locator, Page, expect
 
 from tests.browser.conftest import NARROW, PHONE, OpenPage, edited_status, refresh_status, until, watch_of
-from tests.browser.live import FAMILY, HOLIDAYS, SCHOOL, LiveDaemon
+from tests.browser.live import FAMILY, HOLIDAYS, SCHOOL, LiveDaemon, _all_day
 
 pytestmark = pytest.mark.browser
 
@@ -841,6 +841,36 @@ def test_old_copies_in_the_target_are_taken_over_by_default(
     inspector(page).get_by_role("button", name="创建并开始同步").click()
     expect(page).to_have_url(re.compile(r"#/rule/personal-to-my-icloud$"), timeout=15_000)
     assert copies_of(fresh_live, "personal-to-my-icloud") == 3
+
+
+def test_two_old_copies_are_deleted_and_then_the_line_is_created(
+    open_page: OpenPage, fresh_live: LiveDaemon
+) -> None:
+    """Two old copies are under the delete guard: they are deleted at once, the cleaning line
+    disappears and the new line is created."""
+    fresh_live.op(
+        "rule.add",
+        {"name": "personal-to-my-icloud", "source": "personal:孩子学校", "target": "my-icloud:我的日历"},
+    )
+    fresh_live.in_loop(lambda: fresh_live.world.google["personal"].cancel_event(SCHOOL, "outing"))
+    fresh_live.trigger("personal-to-my-icloud")
+    fresh_live.op("rule.remove", {"name": "personal-to-my-icloud"})
+    fresh_live.in_loop(
+        lambda: fresh_live.world.google["personal"].put_event(
+            SCHOOL, _all_day("outing", "秋游", "2026-10-31", "2026-11-01")
+        )
+    )
+    page = open_page(daemon=fresh_live, path=f"/#/new?source=personal&calendar={SCHOOL_Q}")
+    radio(page, "targets", "我的日历").click()
+    box = inspector(page).locator("[data-role=leftover]")
+    expect(box).to_contain_text("2 个旧副本")
+    box.get_by_role("radio", name=re.compile("^先删掉旧副本")).click()
+    inspector(page).get_by_role("button", name="创建并开始同步").click()
+    expect(page).to_have_url(re.compile(r"#/rule/personal-to-my-icloud(-2)?$"), timeout=20_000)
+    name = page.url.rsplit("/", 1)[1]
+    assert copies_of(fresh_live, name) == 3  # its own copies, once each
+    rules = [r["name"] for r in fresh_live.get("/api/config")["rules"]]
+    assert rules.count("personal-to-my-icloud") + rules.count("personal-to-my-icloud-2") == 1
 
 
 def test_old_copies_can_be_deleted_first(open_page: OpenPage, fresh_live: LiveDaemon) -> None:

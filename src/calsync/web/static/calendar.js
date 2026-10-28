@@ -15,7 +15,11 @@ import { CalendarName, Icon } from "/static/icons.js";
 import { mapModel } from "/static/map.js";
 
 const PHONE = "(max-width: 760px), (hover: none) and (pointer: coarse) and (max-width: 1024px)";
-const HOUR = 48; // px, the --hourH token
+/** An hour's height in px: the --hourH token as the stylesheet sets it now (44 on the phone). */
+function hourHeight() {
+  const value = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--hourH"));
+  return Number.isFinite(value) && value > 0 ? value : 48;
+}
 const VIEWS = ["day", "2day", "week", "2week", "month", "list"];
 const WIDE_ONLY = new Set(["week", "2week"]);
 const LIST_DAYS = 14;
@@ -186,12 +190,12 @@ function eventLabel(e, colourName) {
   return [e.title, time, colourName, stateWord(e.look)].filter(Boolean).join(", ");
 }
 
-function Block({ e, colour, day, now }) {
+function Block({ e, colour, day, now, hour }) {
   const start = startOfDay(day);
   const from = Math.max(e.s, start);
   const to = Math.min(e.e, addDays(start, 1));
-  const top = ((from - start) / 36e5) * HOUR;
-  const height = Math.max(22, ((to - from) / 36e5) * HOUR - 3);
+  const top = ((from - start) / 36e5) * hour;
+  const height = Math.max(22, ((to - from) / 36e5) * hour - 3);
   const width = 100 / e.lanes;
   const style = { top: `${top + 1}px`, height: `${height}px`, left: `calc(${width * e.lane}% + 3px)`, width: `calc(${width}% - 6px)` };
   const cls = ["ev", colour, e.e < now ? "past" : "", e.look !== "ok" ? `st-${e.look}` : ""].filter(Boolean).join(" ");
@@ -211,15 +215,16 @@ function Chip({ e, colour, flat }) {
   </button>`;
 }
 
-function TimeGrid({ dayList, events, colourOf, now, onDay }) {
+function TimeGrid({ dayList, events, colourOf, now, onDay, phone }) {
   const scroller = useRef(null);
+  const hour = useMemo(() => hourHeight(), [phone]);
   const showNow = dayList.some((d) => sameDay(d, now));
-  const nowTop = ((now - startOfDay(now)) / 36e5) * HOUR;
+  const nowTop = ((now - startOfDay(now)) / 36e5) * hour;
   const key = dayList.map(ymd).join(",");
   useLayoutEffect(() => {
     const el = scroller.current;
-    if (el) el.scrollTop = Math.max(0, (showNow ? now.getHours() - 3.2 : 7) * HOUR);
-  }, [key]);
+    if (el) el.scrollTop = Math.max(0, (showNow ? now.getHours() - 3.2 : 7) * hour);
+  }, [key, hour]);
   const cols = { "--n": String(dayList.length) };
   return html`<div class="tg" style=${cols}>
     <div class="tg-head"><div></div>
@@ -233,8 +238,8 @@ function TimeGrid({ dayList, events, colourOf, now, onDay }) {
     <div class="tg-scroll" ref=${scroller}>
       <div class="tg-body">
         <div class="hrs" aria-hidden="true">
-          ${Array.from({ length: 23 }, (_, i) => (showNow && Math.abs((i + 1) * HOUR - nowTop) < 16 ? null
-            : html`<span class="num" style=${{ top: `${(i + 1) * HOUR}px` }}>${String(i + 1).padStart(2, "0")}:00</span>`))}
+          ${Array.from({ length: 23 }, (_, i) => (showNow && Math.abs((i + 1) * hour - nowTop) < 16 ? null
+            : html`<span class="num" style=${{ top: `${(i + 1) * hour}px` }}>${String(i + 1).padStart(2, "0")}:00</span>`))}
           ${showNow ? html`<span class="nowt num" style=${{ top: `${nowTop}px` }}>${clockTime(now)}</span>` : null}
         </div>
         ${dayList.map((d) => {
@@ -245,7 +250,7 @@ function TimeGrid({ dayList, events, colourOf, now, onDay }) {
             bottom: Math.min(e.e, addDays(start, 1)) - start,
           }));
           return html`<div class=${[0, 6].includes(d.getDay()) ? "dcol wknd" : "dcol"} data-day=${ymd(d)}>
-            ${lanes(timed).map((e) => html`<${Block} e=${e} colour=${colourOf(e)} day=${d} now=${now}/>`)}
+            ${lanes(timed).map((e) => html`<${Block} e=${e} colour=${colourOf(e)} day=${d} now=${now} hour=${hour}/>`)}
             ${showNow ? html`<div class=${sameDay(d, now) ? "nowl" : "nowl faint"} style=${{ top: `${nowTop}px` }} aria-hidden="true"></div>` : null}
           </div>`;
         })}
@@ -420,7 +425,7 @@ export function CalendarPane() {
 
   let body;
   if (shownView === "day" || shownView === "2day" || shownView === "week") {
-    body = html`<${TimeGrid} dayList=${days(range.from, range.to)} events=${events} colourOf=${colourOf} now=${now} onDay=${goDay}/>`;
+    body = html`<${TimeGrid} dayList=${days(range.from, range.to)} events=${events} colourOf=${colourOf} now=${now} onDay=${goDay} phone=${phone}/>`;
   } else if (shownView === "2week") {
     body = html`<${WeekGrid} from=${range.from} weeks=${2} events=${events} colourOf=${colourOf} now=${now} onDay=${goDay}/>`;
   } else if (shownView === "month") {

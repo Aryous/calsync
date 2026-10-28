@@ -78,6 +78,36 @@ def test_a_config_change_has_its_own_row(open_page: OpenPage, fresh_live: LiveDa
 
 FAKE_CHANGES = [
     {
+        "id": 909,
+        "run_id": 1,
+        "rule": "school-home",
+        "object_id": "h1",
+        "action": "blocked",
+        "at": "2026-10-26T02:20:00+00:00",
+        "title": "钢琴课",
+        "detail": None,
+    },
+    {
+        "id": 908,
+        "run_id": 1,
+        "rule": "school-home",
+        "object_id": "h2",
+        "action": "blocked",
+        "at": "2026-10-26T02:20:00+00:00",
+        "title": "秋游",
+        "detail": None,
+    },
+    {
+        "id": 910,
+        "run_id": 1,
+        "rule": "family-home",
+        "object_id": "p1",
+        "action": "protected",
+        "at": "2026-10-26T02:20:00+00:00",
+        "title": "家庭聚餐",
+        "detail": None,
+    },
+    {
         "id": 906,
         "run_id": 1,
         "rule": "family-home",
@@ -164,6 +194,11 @@ def test_the_wording_of_updates_reverts_and_approvals(open_page: OpenPage) -> No
     expect(team.locator(".from")).to_contain_text("我的日历 · my-icloud")
     expect(rows(page).filter(has_text="在「我的日历」新增 2 条只显示“忙碌”的日程")).to_have_count(1)
     expect(rows(page).filter(has_text="Busy")).to_have_count(0)
+    held = rows(page).filter(has_text="2 个副本的删除被拦下了")
+    expect(held).to_have_count(1)
+    expect(held).to_have_attribute("href", "#/blocked/school-home")
+    expect(rows(page).filter(has_text="钢琴课")).to_have_count(0)  # not shown as an edit
+    expect(rows(page).filter(has_text="「家庭聚餐」暂时不动")).to_contain_text("没能完整读到")
     expect(rows(page).filter(has_text="更新「周会」")).to_contain_text("时间改为 09:30 · 原来是 10:00")
     reverted = rows(page).filter(has_text="「接孩子放学」在 iPhone 上被改了，已改回")
     expect(reverted).to_contain_text("iPhone 上把时间改成了 16:30；Google 里是 16:00")

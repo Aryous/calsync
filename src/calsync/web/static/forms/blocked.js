@@ -70,7 +70,7 @@ export function BlockedForm({ route, onClose, active = true }) {
   }, [load, cycles, active]);
 
   const approve = async () => {
-    if (busy || !entry) return;
+    if (busy || !entry || !entry.fingerprint) return; // no list known: nothing exact to approve
     setBusy(true);
     setNote(null);
     try {

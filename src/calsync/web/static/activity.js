@@ -134,6 +134,13 @@ function changeItem(c, lines, cycleOf) {
       const who = m ? origin(m[2]) : "";
       return { ...base, kind: "problem-ok", head: n === 1 ? t("Confirmed deleting 1 copy") : t("Confirmed deleting {n} copies", { n: n == null ? "?" : n }), sub: who ? t("From {who}", { who }) : "" };
     }
+    case "blocked":
+      // Each copy the guard held back is a row in the log: one row per line and sync here.
+      return { ...base, kind: "problem", icon: "alert", cls: "held", heldBack: true, merge: `${cycle}|blocked|${c.rule}`, count: 1,
+        link: `#/blocked/${encodeURIComponent(c.rule)}` };
+    case "protected":
+      return { ...base, kind: "problem", icon: "lock", head: t("Left “{title}” as it is", { title }),
+        sub: t("Google could not be read in full, so calsync did not touch its copy") };
     case "guard_loosened": {
       const m = /\((\w+)\)$/.exec(c.title || "");
       return { ...base, kind: "problem-ok", head: t("The delete guard was raised while deletes were held back"), sub: m ? t("From {who}", { who: origin(m[1]) }) : "" };
@@ -141,6 +148,11 @@ function changeItem(c, lines, cycleOf) {
     default:
       return { ...base, head: c.title || c.action, sub: "" };
   }
+}
+
+/** The guard's row, once its count is known. */
+function heldHead(item) {
+  return item.count === 1 ? t("Deleting 1 copy was held back") : t("Deleting {n} copies was held back", { n: item.count });
 }
 
 /** The words of a busy-only line's row, once its count is known. */
@@ -173,14 +185,15 @@ function cycleItems(runs, lines) {
     if (failed.length) {
       for (const r of failed) {
         items.push({ kind: "problem", at, icon: "alert", key: `r${r.id}`, rule: r.rule, line: lines.get(r.rule), targets: [r.rule], cls: "bad",
-          head: r.error_kind === "auth" ? t("{account}'s authorisation failed", { account: r.error_account || r.rule }) : t("The sync of “{rule}” failed", { rule: r.rule }),
-          sub: r.error || "" });
+          head: r.error_kind === "auth" ? t("{account}'s authorisation failed", { account: r.error_account || r.rule }) : t("This line's sync failed"),
+          sub: r.error_kind === "auth" ? t("Connect the account again; the other lines carry on") : r.error_kind === "config" ? t("calsync's settings for this line need a look") : t("calsync tries again at the next check"),
+          link: r.error_kind === "auth" && r.error_account ? `#/account/${encodeURIComponent(r.error_account)}` : `#/rule/${encodeURIComponent(r.rule)}` });
       }
     }
     if (blocked.length) {
       for (const r of blocked) {
         items.push({ kind: "problem", at, icon: "alert", key: `b${r.id}`, rule: r.rule, line: lines.get(r.rule), targets: [r.rule], cls: "held",
-          head: t("Deletes held back on “{rule}”", { rule: r.rule }), sub: t("Waiting for you to confirm"), link: `#/blocked/${encodeURIComponent(r.rule)}` });
+          head: t("Deletes were held back"), sub: t("Waiting for you to confirm"), link: `#/blocked/${encodeURIComponent(r.rule)}`, runBlocked: `${key}|${r.rule}` });
       }
     }
     if (failed.length || blocked.length || changed) {
@@ -207,7 +220,7 @@ function mergeTargets(items) {
   for (const item of items) {
     if (item.merge && seen.has(item.merge)) {
       const first = seen.get(item.merge);
-      if (item.busy) first.count += 1;
+      if (item.busy || item.heldBack) first.count += 1;
       else if (!first.targets.includes(item.rule)) first.targets.push(item.rule);
       continue;
     }
@@ -246,13 +259,14 @@ function fold(items) {
 export function timeline({ changes, runs, history, status }) {
   const lines = linesOf(status);
   const cycleOf = new Map(runs.map((r) => [r.id, r.started_at]));
-  const merged = fold(mergeTargets(changes.map((c) => changeItem(c, lines, cycleOf))).map((i) => (i.busy ? { ...i, head: busyHead(i), sub: "" } : i)));
+  const merged = fold(mergeTargets(changes.map((c) => changeItem(c, lines, cycleOf))).map((i) => (i.busy ? { ...i, head: busyHead(i), sub: "" } : i.heldBack ? { ...i, head: heldHead(i), sub: t("Waiting for you to confirm") } : i)));
   const items = [
     ...merged,
     ...cycleItems(runs, lines),
     ...history.map((h) => ({ kind: "config", at: new Date(h.at), icon: "gear", key: `h${h.id}`, head: changeText(h.summary), sub: t("Settings · from {who}", { who: sourceName(h.source) }) })),
   ];
-  return items.sort((a, b) => b.at - a.at);
+  const said = new Set(merged.filter((i) => i.heldBack).map((i) => `${i.cycle}|${i.rule}`));
+  return items.filter((i) => !(i.runBlocked && said.has(i.runBlocked))).sort((a, b) => b.at - a.at);
 }
 
 function matches(item, filter) {

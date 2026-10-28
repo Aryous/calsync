@@ -239,3 +239,19 @@ def test_nothing_overflows_at_360(open_page: OpenPage, name: str) -> None:
     assert page.evaluate("() => document.documentElement.scrollWidth") <= NARROW["width"]
     frame = calendar(page).locator(".cal-frame")
     assert frame.evaluate("(el) => el.scrollWidth <= el.clientWidth + 1")
+
+
+@pytest.mark.parametrize("viewport", [PHONE, {"width": 1440, "height": 900}], ids=["phone", "desktop"])
+def test_blocks_sit_on_their_hour_lines(open_page: OpenPage, viewport: dict[str, int]) -> None:
+    """A block's top is its start hour times the grid's hour height (44 px on the phone, 48 on the
+    desktop), so the 19:30 call starts half way between the 19:00 and 20:00 lines."""
+    page = open_calendar(open_page, viewport=viewport, has_touch=viewport is PHONE)
+    show(page, "日")
+    call = calendar(page).locator(".ev", has_text="家庭视频通话")
+    hour = page.evaluate(
+        "() => parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--hourH'))"
+    )
+    top = call.evaluate("(el) => el.offsetTop")
+    assert abs(top - (19.5 * hour + 1)) <= 1, (top, hour)
+    label = calendar(page).locator(".hrs span", has_text="19:00")
+    assert abs(label.evaluate("(el) => el.offsetTop") - 19 * hour) <= 1

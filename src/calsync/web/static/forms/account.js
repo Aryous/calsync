@@ -518,9 +518,9 @@ export function ConnectForm({ route, onClose, onReplace, active = true }) {
           <li>${t("In the Google Cloud console, create a project and enable the Google Calendar API.")}</li>
           <li>${t("Under Credentials, create an OAuth client of type “Desktop app”, download its JSON file and put it on the computer calsync runs on.")}</li>
           <li>${t("Publish the app (“In production”): while it is in “testing”, its authorisation has to be renewed every 7 days.")}</li>
-          <li>${t("In a terminal on that computer, run this; if the file is not in Downloads under that name, change the path to where it is:")}</li>
+          <li>${t("In a terminal on that computer, run this; if the file is not in Downloads, change the path to where it is:")}</li>
         </ol>
-        <${Command} command="calsync config set google.client_secret_file ~/Downloads/client_secret.json"/>
+        <${Command} command="calsync config set google.client_secret_file ~/Downloads/client_secret_*.json"/>
         <p class="hp after wait" data-role="waiting" role="status"><span class="wdot" aria-hidden="true"></span>${t("Once it is set, this page goes on by itself.")}</p>
         <div class="acts">${back}${addButton(true)}</div>`;
     }

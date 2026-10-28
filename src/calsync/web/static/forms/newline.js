@@ -263,20 +263,37 @@ export function NewLineForm({ route, onClose, onCreated, onReplace, active = tru
     : null;
 
   /** Delete the copies the removed line ``old`` left (a line of that name that only retires),
-   * then report whether they are gone (false: held back, or not finished). */
+   * then report whether they are gone (false: held back by the guard, or not finished yet). A
+   * scheduled sync may finish the job (and remove that line) before ours runs: then it is done. */
   const clearOld = async (old, chosen) => {
     setStage(t("Deleting the old copies…"));
     clearing.current = old;
-    const added = await op("rule.add", { name: old, source: chosen.source, target: chosen.target, retire: true });
-    if (added.needs_human) return false;
+    const has = async () => ((await get("/api/config")).rules || []).some((r) => r.name === old);
+    if (!(await has())) {
+      // A retry after a hold finds the line still there: no second one.
+      const added = await op("rule.add", { name: old, source: chosen.source, target: chosen.target, retire: true });
+      if (added.needs_human) return false;
+    }
     for (let i = 0; i < 50; i += 1) {
       const now = await get("/api/status");
       if ((now.rules || []).some((r) => r.name === old)) break;
+      if (!(await has())) return true; // already retired by a sync of its own
       await sleep(100);
     }
-    await op("trigger", { rule: old, wait: true, timeout: 120 });
-    const config = await get("/api/config");
-    return !(config.rules || []).some((r) => r.name === old);
+    let held = false;
+    try {
+      const run = await op("trigger", { rule: old, wait: true, timeout: 120 });
+      const r = ((run.data && run.data.rules) || {})[old];
+      held = Boolean(r && r.status === "blocked");
+    } catch (e) {
+      // gone before the trigger (an "unknown rule"): a sync of its own retired it
+    }
+    if (held) return false;
+    for (let i = 0; i < 20; i += 1) {
+      if (!(await has())) return true;
+      await sleep(150);
+    }
+    return false;
   };
 
   const create = async () => {

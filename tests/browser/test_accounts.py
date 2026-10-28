@@ -12,6 +12,7 @@ writes the config has a daemon of its own (``fresh_live``)."""
 
 import json
 import re
+import time
 import tomllib
 from typing import Any
 
@@ -53,9 +54,10 @@ def step(page: Page, name: str) -> Locator:
     return inspector(page).locator(f'.step[data-step="{name}"]')
 
 
-def current(page: Page, name: str) -> Locator:
-    """The wizard's step ``name``, once it is the current one."""
-    expect(step(page, name)).to_have_attribute("aria-current", "step")
+def current(page: Page, name: str, timeout: float = 15_000) -> Locator:
+    """The wizard's step ``name``, once it is the current one (a step behind a poll and a
+    refresh may take a few seconds under load)."""
+    expect(step(page, name)).to_have_attribute("aria-current", "step", timeout=timeout)
     return step(page, name)
 
 
@@ -384,7 +386,7 @@ def test_the_google_wizard_sets_up_the_client_secret_first(
         expect(second).to_contain_text("桌面应用")
         expect(second).to_contain_text("Google Calendar API")
         expect(second.locator(".cmd code")).to_have_text(
-            "calsync config set google.client_secret_file ~/Downloads/client_secret.json"
+            "calsync config set google.client_secret_file ~/Downloads/client_secret_*.json"
         )
         expect(second.locator("[data-role=waiting]")).to_contain_text("设置好后这里会自动继续")
         add = second.get_by_role("button", name="添加账号")
@@ -480,8 +482,14 @@ def test_the_wizard_polls_every_ten_seconds_and_stops_when_closed(
     second.get_by_role("button", name="添加账号").click()
     current(page, "auth")
     until(lambda: len(refreshes) == 1)
-    page.wait_for_timeout(10_800)
+    started = time.monotonic()
+    # Waited through the page: the requests are recorded only while Playwright runs.
+    while len(refreshes) < 2 and time.monotonic() - started < 15:
+        page.wait_for_timeout(200)
     assert len(refreshes) == 2  # every 10 s while the step is open
+    assert time.monotonic() - started >= 9  # not sooner
+    page.wait_for_timeout(2_000)
+    assert len(refreshes) == 2
     page.keyboard.press("Escape")
     expect(inspector(page)).not_to_have_class(OPEN)
     after_refreshes, after_configs = len(refreshes), len(configs)

@@ -157,3 +157,13 @@ def test_tap_targets_on_the_phone_are_44px(open_page: OpenPage, screen: str) -> 
     page.wait_for_timeout(600)
     small = page.evaluate(SMALL_TARGETS)
     assert not small, "too small to tap: " + " | ".join(small)
+
+
+@pytest.mark.parametrize("view", ["日", "双日", "月", "列表"])
+def test_tap_targets_in_each_phone_calendar_view(open_page: OpenPage, view: str) -> None:
+    page = open_page(viewport={"width": 390, "height": 844}, has_touch=True)
+    ready(page)
+    page.locator("#pane-calendar .seg.views").get_by_role("button", name=view, exact=True).click()
+    expect(page.locator("#pane-calendar .cal-frame")).to_have_attribute("aria-busy", "false")
+    small = page.evaluate(SMALL_TARGETS)
+    assert not small, "too small to tap: " + " | ".join(small)
