@@ -151,8 +151,22 @@ async def test_status_after_a_cycle(tmp_path: Path) -> None:
         "delivered_today": 3,
     }
     assert view["accounts"] == [  # no calendar list cached yet
-        {"name": "me", "provider": "google", "host": "Google Calendar", "auth": "ok", "calendars": []},
-        {"name": "dav", "provider": "caldav", "host": "unused", "auth": "ok", "calendars": []},
+        {
+            "name": "me",
+            "provider": "google",
+            "host": "Google Calendar",
+            "auth": "ok",
+            "calendars": [],
+            "can_write": None,
+        },
+        {
+            "name": "dav",
+            "provider": "caldav",
+            "host": "unused",
+            "auth": "ok",
+            "calendars": [],
+            "can_write": None,
+        },
     ]
     (fam,) = view["rules"]
     last_run = fam.pop("last_run")

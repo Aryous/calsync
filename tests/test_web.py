@@ -711,7 +711,9 @@ async def test_deleting_a_credential_over_tcp_needs_the_terminal(state: Path) ->
 async def test_a_large_op_body_is_413(state: Path) -> None:
     daemon = OpsDaemon()
     c = await paired(state, daemon=daemon)
-    body = json.dumps({"args": {"name": "x" * (64 * 1024)}})
+    from calsync.api import MAX_BODY
+
+    body = json.dumps({"args": {"name": "x" * MAX_BODY}})
     response = await c.post(
         "/api/ops/rule.pause",
         content=body,

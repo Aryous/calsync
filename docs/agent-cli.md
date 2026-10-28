@@ -24,6 +24,7 @@ added in later versions; existing keys keep their meaning.
 - [The loop](#the-loop)
 - [Exit codes and errors](#exit-codes-and-errors)
 - [When a person is needed (`needs_human`)](#when-a-person-is-needed-needs_human)
+- [Writing events through calsync](#writing-events-through-calsync)
 - [Approving blocked deletes](#approving-blocked-deletes)
 - [Changing the configuration](#changing-the-configuration)
 - [Pausing a rule](#pausing-a-rule)
@@ -65,9 +66,11 @@ added in later versions; existing keys keep their meaning.
 
 The everyday job: put something in the calendar and confirm that it arrived.
 
-1. **Write to Google** with your own Google Calendar tool, into the source
-   calendar of a rule (`calsync status --json` lists each rule's `source` and
-   `target`).
+1. **Write to Google** into the source calendar of a rule (`calsync status
+   --json` lists each rule's `source` and `target`): with calsync's own
+   commands ([Writing events through calsync](#writing-events-through-calsync):
+   one event, or many in one idempotent batch), or with your own Google
+   Calendar tool. calsync's commands request the sync themselves.
 2. **Sync now and wait for the result:**
 
    ```sh
@@ -127,7 +130,7 @@ rule does not read its source), then trigger once more.
 | Exit | Meaning | What to do |
 | --- | --- | --- |
 | 0 | ok | — |
-| 1 | failed: a rule failed or was blocked, a network or server error, a refused trigger (paused rule), `stale` approval, no such event, no state database yet, lost contact with the daemon, a test push too soon | read the JSON; retry later for transient errors |
+| 1 | failed: a rule failed or was blocked, a network or server error, a refused trigger (paused rule), `stale` approval, no such event, an event that changed in Google since you read it (`event_conflict`), no state database yet, lost contact with the daemon, a test push too soon | read the JSON; retry later for transient errors |
 | 2 | configuration error, a write refused by validation, a config conflict, bad arguments, `approve` without `--yes`, nothing to approve | fix the arguments; for a conflict, read again and redo the change |
 | 3 | authentication: an account's credential is missing, expired or revoked | relay the `calsync auth ACCOUNT` command to a person |
 | 4 | another calsync holds the lock (a `calsync run` in progress), or another daemon serves this state directory | wait and retry; never kill it |
@@ -216,6 +219,95 @@ yourself: it opens a browser or reads a password from the terminal.
 
 A `blocked` attention is the exception: an agent may approve it, carefully
 (next section).
+
+## Writing events through calsync
+
+calsync can write Google's originals itself, once the person has given it
+write access (`calsync auth <account> --write`, a consent page: a
+`needs_human` result names the command). It stays one way: the copies follow
+at the next cycle, which every write requests (`--wait` waits for it and
+answers with it in `data.cycle`, shaped like `trigger`'s `data`).
+
+| Command | What it does |
+| --- | --- |
+| `calsync event new --account A --calendar C --title T --start S --end E [--all-day] [--location L] [--description D] [--alarms X] [--repeat RRULE…] [--key K]` | one new event |
+| `calsync event edit ID [--this \| --series] [--expect ETAG \| --expect-updated TIME] [fields…]` | change one event, one occurrence or the whole series |
+| `calsync event delete ID [--this \| --series] [--expect… ]` | delete it |
+| `calsync event apply FILE\|- [--account A] [--calendar C] [--prune-prefix P]` | many writes in batches of 50, idempotent |
+| `calsync writes` | the history of writes made through calsync |
+
+All take `--json`, `--dry-run` (reads Google, writes nothing) and `--wait`.
+
+- **Times.** `2026-10-25` is a date (all day; an all-day event's `--end` is
+  the day after its last day), `2026-10-25T09:30` is in the calendar's zone,
+  or give an offset (`2026-10-25T09:30+08:00`).
+- **Reminders** (`--alarms`, `"alarms"`): `default` (the calendar's), `none`,
+  minutes before the start (`10,0` or `[10, 0]`), or offsets as rules write
+  them (`-10m,0m`). At most 5, at most four weeks before.
+- **Repeating events.** An `ID` from `events --json` names one occurrence.
+  `--this` changes or deletes only it; `--series` all of them (a new time for
+  the occurrence moves the whole series by the same offset). One of the two
+  is required for a repeating event. "This and following" is not offered.
+- **Conflicts.** Pass what you read: `--expect-updated` with the event's
+  `updated` (for `--series`, its `series_updated`) or `--expect` with an
+  etag. If the event changed in Google since, nothing is written: exit 1,
+  `"kind": "event_conflict"`. Read it again and decide.
+- **Refused before any request** (exit 2): a read-only calendar, an
+  invitation (only its organiser may change it: `editable.reason` in
+  `events --json` says so in advance), bad fields.
+- **Deletes and the guard.** Deletes made through the CLI meet the
+  mass-delete guard like any other: past 10 copies (or half a calendar) the
+  rule is blocked until someone [approves](#approving-blocked-deletes) the
+  set. Only a delete a person makes in the web UI releases its own copy.
+- Notifications to attendees are never sent (`sendUpdates=none`).
+
+### Batches: `event apply`
+
+The file is a list of items, or `{"account", "calendar", "events": [...],
+"prune_prefix", "tz"}` (flags override the file). Each item names its event:
+
+- by `"key"`: your own identity for it (stored in the event's private
+  extended properties). calsync creates it if no event has the key, updates
+  it if a field differs, else leaves it (`unchanged`);
+- or by `"id"`: an existing single event or whole series from `events
+  --json` (update or delete only).
+
+`"delete": true` deletes (an absent key is `absent`, not an error).
+`prune_prefix` also deletes the keyed events whose key starts with it and
+that the list does not name: the way to replace a whole plan.
+
+```json
+{"account": "me-google", "calendar": "Family", "prune_prefix": "eye-2026-11/",
+ "events": [
+   {"key": "eye-2026-11/001", "title": "Eye drops (1/84)", "start": "2026-11-13T08:00", "end": "2026-11-13T08:05", "alarms": [0]},
+   {"key": "eye-2026-11/002", "title": "Eye drops (2/84)", "start": "2026-11-13T12:00", "end": "2026-11-13T12:05", "alarms": [0]}
+ ]}
+```
+
+A bad item refuses the whole call before any write (`problems` names
+`events[i]`). The answer counts `create`, `update`, `delete`, `unchanged`,
+`absent`, `failed` and lists every item with its `action`, `status` (`ok`,
+`failed`) and `reason`. Running the same file again does only what is left:
+after a partial failure, just run it again. At most 2000 items per call.
+
+### Recipe: removing duplicates
+
+calsync has no duplicates command; compose one from the commands above.
+
+1. List the days concerned: `calsync events --from … --to … --json` (62 days
+   at most per call).
+2. Group the events of one calendar (`source.account`, `source.calendar`)
+   that have the same title (ignoring case and repeated spaces), `start`,
+   `end` and `repeats`. Count each repeating series once (by `source_id`).
+3. In each group keep one: the one whose `deliveries[].state` is
+   `delivered`, else the oldest `created`.
+4. **Show the groups to the person and get their yes.**
+5. Delete the rest in one call: `event apply` with `{"id": …, "delete":
+   true}` items (an occurrence's id with no `scope` deletes the whole series:
+   only do that for a duplicated series).
+6. If more than 10 copies go, the rule is blocked: `calsync blocked --json`
+   shows the set; it should be exactly the duplicates' copies. Then
+   `calsync approve <rule>` (or ask the person to press 放行 in the web UI).
 
 ## Approving blocked deletes
 
@@ -389,7 +481,7 @@ and the running daemon.
 ```json
 {
   "generated_at": "2026-11-02T08:01:00+00:00",
-  "schema": {"version": 5, "current": true},
+  "schema": {"version": 6, "current": true},
   "summary": {"health": "ok", "rules": 1, "attention": 0, "last_sync_at": "2026-11-02T08:00:41+00:00",
               "changes_24h": 3, "delivered_today": 3},
   "accounts": [
@@ -449,10 +541,17 @@ series appears once per instance.
 {
   "from": "2026-11-03T00:00:00+08:00",
   "to": "2026-11-05T00:00:00+08:00",
-  "schema": {"version": 5, "current": true},
+  "schema": {"version": 6, "current": true},
   "truncated": false,
   "events": [
     {
+      "source_id": "abc123",
+      "updated": "2026-11-01T09:12:00.000Z",
+      "series_updated": null,
+      "created": "2026-11-01T09:12:00.000Z",
+      "key": null,
+      "repeats": null,
+      "editable": {"ok": true, "reason": null, "write_access": true, "command": null},
       "id": "bWUtZ29vZ2xlL2ZhbWlseUBncm91cC5jYWxlbmRhci5nb29nbGUuY29tL2FiYzEyMw",
       "title": "Swimming lesson",
       "start": "2026-11-03T16:00:00+08:00",
@@ -489,6 +588,14 @@ series appears once per instance.
 | `blocked` | not delivered, and the rule is blocked by the delete guard | [approve](#approving-blocked-deletes) or ask the person |
 | `failing` | not delivered, and the rule's latest run failed (auth too) | `status --json` → `attention` |
 | `pending` | not written yet | `trigger --wait`, then look again |
+
+The source facts: `source_id` (Google's id of the event or series),
+`updated` (of this occurrence; `series_updated`: of its series), `created`,
+`key` (from `event apply`), `repeats` (the recurrence lines, or `null`) and
+`editable`: `ok` false with a `reason` (`read_only_calendar`, `invitation`)
+when calsync may not change it; `write_access` false (with the `command` a
+person runs) when the account's grant has no write scope, `null` when not
+known yet.
 
 `delivered_at` is the last time calsync wrote the copy (`null`: never
 recorded); it stays set while the rule is paused. `alarms_minutes_before` on

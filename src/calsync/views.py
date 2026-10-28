@@ -153,6 +153,62 @@ class ConfigChangeView:
 
 
 @dataclass(frozen=True, slots=True)
+class WriteView:
+    """One write to Google through calsync (``GET /api/writes``, ``calsync writes``)."""
+
+    id: int
+    at: datetime
+    origin: str  # cli | ui
+    op: str  # create | edit | move | delete | apply
+    account: str
+    calendar: str
+    event_id: str | None
+    title: str | None
+    detail: dict[str, Any] | None
+    status: str
+
+    def to_json(self, calendar_name: str | None = None) -> dict[str, Any]:
+        detail = self.detail or {}
+        return {
+            "id": self.id,
+            "at": _iso(self.at),
+            "origin": self.origin,
+            "op": self.op,
+            "account": self.account,
+            "calendar": self.calendar,
+            "calendar_name": calendar_name,
+            "event_id": self.event_id,
+            "title": self.title,
+            "changes": detail.get("changes") or [],
+            "scope": detail.get("scope"),
+            "counts": detail.get("counts"),
+            "status": self.status,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class WritesView:
+    writes: tuple[WriteView, ...]
+    names: dict[tuple[str, str], str]  # (account, calendar id) -> the calendar's name
+
+    def to_json(self) -> dict[str, Any]:
+        return {"writes": [w.to_json(self.names.get((w.account, w.calendar))) for w in self.writes]}
+
+
+def build_writes(reader: "StateReader", limit: int) -> WritesView:
+    rows = reader.writes(limit)
+    names: dict[tuple[str, str], str] = {}
+    for account in {w.account for w in rows}:
+        for cal in reader.account_calendars(account):
+            names[(account, cal.id)] = cal.name
+    return WritesView(tuple(rows), names)
+
+
+def writes_json(reader: "StateReader", limit: int) -> dict[str, Any]:
+    return build_writes(reader, limit).to_json()
+
+
+@dataclass(frozen=True, slots=True)
 class AccountCalendarView:
     account: str
     id: str
@@ -391,6 +447,43 @@ class StateReader:
             f"SELECT {', '.join(columns)} FROM config_change ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
         return [ConfigChangeView(r[0], _parse_time(r[1]), *r[2:]) for r in rows]
+
+    def scopes(self, account: str) -> frozenset[str] | None:
+        """The scopes the account's grant was last seen with (never seen: None)."""
+        if not {"account", "scopes"} <= self.columns("account_access"):
+            return None
+        row = self._db.execute("SELECT scopes FROM account_access WHERE account = ?", (account,)).fetchone()
+        return frozenset(str(row[0]).split()) if row else None
+
+    def writes(self, limit: int = 50) -> list["WriteView"]:
+        """Writes to Google made through calsync, newest first (no table: none)."""
+        columns = ("id", "at", "origin", "op", "account", "calendar", "event_id", "title", "detail", "status")
+        if not set(columns) <= self.columns("event_write"):
+            return []
+        rows = self._db.execute(
+            f"SELECT {', '.join(columns)} FROM event_write ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        out: list[WriteView] = []
+        for r in rows:
+            try:
+                detail = json.loads(r[8]) if r[8] else None
+            except (TypeError, ValueError):
+                detail = None
+            out.append(
+                WriteView(
+                    id=r[0],
+                    at=_parse_time(r[1]),
+                    origin=r[2],
+                    op=r[3],
+                    account=r[4],
+                    calendar=r[5],
+                    event_id=r[6],
+                    title=r[7],
+                    detail=detail if isinstance(detail, dict) else None,
+                    status=r[9],
+                )
+            )
+        return out
 
     def account_calendars(self, account: str) -> list[AccountCalendarView]:
         """The account's cached calendar list, by id (none cached: empty)."""
@@ -856,6 +949,9 @@ class AccountView:
     # using it last succeeded; else ``unknown`` (no rule, never run, or failing otherwise).
     auth: AccountAuth = "unknown"
     calendars: tuple[CalendarStatus, ...] = ()  # from the calendar cache; none cached: empty
+    # Google: whether its grant may change events (the scopes a token refresh reported); None:
+    # not seen yet, or not a Google account.
+    can_write: bool | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -864,6 +960,7 @@ class AccountView:
             "host": self.host,
             "auth": self.auth,
             "calendars": [c.to_json() for c in self.calendars],
+            "can_write": self.can_write,
         }
 
 
@@ -1126,7 +1223,16 @@ def _account_view(
         host_for(account.provider, account.server_url),
         auth=_account_auth(account.name, config.rules, last),
         calendars=tuple(calendars),
+        can_write=can_write(reader, account.name) if account.provider == "google" else None,
     )
+
+
+def can_write(reader: StateReader, account: str) -> bool | None:
+    """Whether the account's grant may change Google events (None: not seen yet)."""
+    from calsync.sources.google_write import WRITE_SCOPE
+
+    scopes = reader.scopes(account)
+    return None if scopes is None else WRITE_SCOPE in scopes
 
 
 def _midnight(now: datetime) -> datetime:

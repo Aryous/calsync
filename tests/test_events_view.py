@@ -132,6 +132,13 @@ async def test_one_source_event_with_two_rules_is_one_event_with_two_deliveries(
     await synced(tmp_path)
     dinner = next(e for e in events(tmp_path, two_rules()) if e["title"] == "Dinner")
     assert dinner == {
+        "source_id": dinner["source_id"],
+        "updated": dinner["updated"],
+        "series_updated": None,
+        "created": None,
+        "key": None,
+        "repeats": None,
+        "editable": {"ok": True, "reason": None, "write_access": None, "command": None},
         "id": dinner["id"],
         "title": "Dinner",
         "start": f"2026-10-28T18:00:00{TZ}",
@@ -568,3 +575,9 @@ async def test_a_series_cut_at_the_expansion_limit_marks_the_view_truncated(tmp_
     assert out.getvalue().splitlines()[-1] == (
         "note: a recurring event has more instances than shown (at most 1000 per event); narrow the range"
     )
+
+
+async def test_events_carry_what_writes_need(tmp_path: Path) -> None:
+    await synced(tmp_path)
+    dinner = next(e for e in events(tmp_path, two_rules()) if e["title"] == "Dinner")
+    assert isinstance(dinner["source_id"], str) and dinner["updated"]  # the fake stamps updated

@@ -23,7 +23,15 @@ if TYPE_CHECKING:  # type-only: importing these at runtime would load httpx/ical
     from calsync.model import When
     from calsync.ops import OpResult
     from calsync.store import Store
-    from calsync.views import BlockedView, ChangesView, RunsView, StateReader, StatusView, UpcomingView
+    from calsync.views import (
+        BlockedView,
+        ChangesView,
+        RunsView,
+        StateReader,
+        StatusView,
+        UpcomingView,
+        WritesView,
+    )
 
 EXIT_OK, EXIT_FAILED, EXIT_CONFIG, EXIT_AUTH, EXIT_RUNNING = 0, 1, 2, 3, 4
 
@@ -255,6 +263,11 @@ def _parser() -> argparse.ArgumentParser:
     show = event_sub.add_parser("show", help="the event, its original and its copies")
     show.add_argument("id", help="an id from `calsync events --json`")
     show.add_argument("--json", action="store_true", help="print JSON")
+    _event_writers(event_sub)
+
+    writes = sub.add_parser("writes", help="writes to Google made through calsync, newest first")
+    writes.add_argument("--limit", type=_positive_int, default=50, help="at most this many (default: 50)")
+    writes.add_argument("--json", action="store_true", help="print JSON")
 
     runs = sub.add_parser("runs", help="recorded sync runs, newest first")
     runs.add_argument("--rule", help="only this rule")
@@ -278,6 +291,149 @@ def _writer(
     command.add_argument("--json", action="store_true", help="print JSON")
     command.set_defaults(op_command=True)
     return command
+
+
+def _event_fields(command: argparse.ArgumentParser, *, insert: bool) -> None:
+    command.add_argument("--title", required=insert, help="the title")
+    command.add_argument(
+        "--start",
+        required=insert,
+        help="2026-10-25 (all day) or 2026-10-25T09:30 (the calendar's zone) or with an offset",
+    )
+    command.add_argument(
+        "--end", required=insert, help="as --start; an all-day event ends the day after its last day"
+    )
+    command.add_argument("--all-day", action="store_true", default=None, help="the times are dates")
+    command.add_argument("--location", help="the location")
+    command.add_argument("--description", help="the description")
+    command.add_argument("--alarms", help='"default", "none", or minutes before (10,0) or offsets (-10m,0m)')
+    command.add_argument("--wait", action="store_true", help="wait for the cycle that syncs the copies")
+
+
+def _event_writers(event_sub: "argparse._SubParsersAction[argparse.ArgumentParser]") -> None:
+    """``calsync event new|edit|delete|apply``: writes to Google's originals."""
+    new = _writer(event_sub, "new", "create an event in a Google calendar")
+    new.add_argument("--account", required=True, help="the Google account")
+    new.add_argument("--calendar", required=True, help="the calendar (its id or name)")
+    new.add_argument(
+        "--repeat", action="append", help="an RRULE line (repeatable), e.g. RRULE:FREQ=DAILY;COUNT=10"
+    )
+    new.add_argument("--key", help="an identity of your own for the event (as in event apply)")
+    new.add_argument("--tz", help="the zone of times without an offset (default: the calendar's)")
+    _event_fields(new, insert=True)
+    for name, text in (("edit", "change an event in Google"), ("delete", "delete an event in Google")):
+        command = _writer(event_sub, name, text)
+        command.add_argument("id", help="an id from `calsync events --json`")
+        scope = command.add_mutually_exclusive_group()
+        scope.add_argument(
+            "--this",
+            dest="scope",
+            action="store_const",
+            const="this",
+            help="a repeating event: only this one",
+        )
+        scope.add_argument(
+            "--series",
+            dest="scope",
+            action="store_const",
+            const="series",
+            help="a repeating event: all of them",
+        )
+        command.add_argument("--expect", help="the etag you read: refuse if the event changed since")
+        command.add_argument(
+            "--expect-updated", help="the updated time you read: refuse if the event changed since"
+        )
+        if name == "edit":
+            _event_fields(command, insert=False)
+        else:
+            command.add_argument(
+                "--wait", action="store_true", help="wait for the cycle that syncs the copies"
+            )
+    apply = _writer(event_sub, "apply", "write many events to one calendar (a JSON file, idempotent by key)")
+    apply.add_argument(
+        "file", help='a JSON file, or "-" for stdin: a list of events, or {"events": [...], ...}'
+    )
+    apply.add_argument("--account", help="the Google account (or the file's)")
+    apply.add_argument("--calendar", help="the calendar (or the file's)")
+    apply.add_argument(
+        "--prune-prefix", help="also delete keyed events whose key starts with this and are not listed"
+    )
+    apply.add_argument("--tz", help="the zone of times without an offset (default: the calendar's)")
+    apply.add_argument("--wait", action="store_true", help="wait for the cycle that syncs the copies")
+
+
+def _event_op(args: argparse.Namespace, stdin: TextIO) -> tuple[str, dict[str, object]]:
+    """The operation and its arguments for ``calsync event new|edit|delete|apply``."""
+    import json
+
+    from calsync.errors import ConfigError
+
+    command = args.event_command
+    if command == "apply":
+        try:
+            text = stdin.read() if args.file == "-" else Path(args.file).expanduser().read_text()
+            body = json.loads(text)
+        except OSError as exc:
+            raise ConfigError([f"{args.file}: cannot read it ({type(exc).__name__})"]) from None
+        except ValueError as exc:
+            raise ConfigError([f"{args.file}: not JSON ({exc})"]) from None
+        op_args: dict[str, object] = (
+            {"events": body} if isinstance(body, list) else dict(body) if isinstance(body, dict) else {}
+        )
+        if not op_args:
+            raise ConfigError([f'{args.file}: expected a list of events or an object with "events"'])
+        for key, value in (
+            ("account", args.account),
+            ("calendar", args.calendar),
+            ("prune_prefix", args.prune_prefix),
+            ("tz", args.tz),
+        ):
+            if value is not None:
+                op_args[key] = value
+        if args.wait:
+            op_args["wait"] = True
+        return "events.apply", op_args
+    names = {
+        "new": (
+            "account",
+            "calendar",
+            "title",
+            "start",
+            "end",
+            "all_day",
+            "location",
+            "description",
+            "alarms",
+            "repeat",
+            "key",
+            "tz",
+            "wait",
+        ),
+        "edit": (
+            "id",
+            "scope",
+            "expect",
+            "expect_updated",
+            "title",
+            "start",
+            "end",
+            "all_day",
+            "location",
+            "description",
+            "alarms",
+            "wait",
+        ),
+        "delete": ("id", "scope", "expect", "expect_updated", "wait"),
+    }[command]
+    op_args = {n: getattr(args, n) for n in names if getattr(args, n, None) not in (None, False)}
+    op = {"new": "event.create", "edit": "event.edit", "delete": "event.delete"}[command]
+    return op, op_args
+
+
+def cmd_writes(args: argparse.Namespace, out: TextIO) -> int:
+    from calsync.views import build_writes
+
+    return _show(args, out, lambda config, reader: build_writes(reader, args.limit))
 
 
 LISTEN_HELP = 'the web UI\'s address: HOST:PORT, or "off" for no web UI (default: [web] listen)'
@@ -441,9 +597,12 @@ def _error_kind(exc: BaseException) -> str:
     from calsync.errors import AuthError, ConfigError
     from calsync.lock import AlreadyRunning
     from calsync.opsclient import DaemonLost
+    from calsync.sources.google_write import WriteConflict
 
     if isinstance(exc, ConfigConflict):
         return "conflict"
+    if isinstance(exc, WriteConflict):
+        return "event_conflict"
     if isinstance(exc, ConfigError):
         return "config"
     if isinstance(exc, AuthError):
@@ -1282,7 +1441,9 @@ def _now() -> datetime:
 
 
 # Evaluated lazily (the classes are imported for type checking only).
-type View = StatusView | UpcomingView | RunsView | ChangesView | BlockedView | EventsView | EventDetail
+type View = (
+    StatusView | UpcomingView | RunsView | ChangesView | BlockedView | EventsView | EventDetail | WritesView
+)
 ViewBuilder = Callable[["Config", "StateReader"], View]
 
 
@@ -1355,9 +1516,21 @@ def _print_event(view: "EventDetail", out: TextIO) -> None:
 
 def _print_view(view: View, out: TextIO) -> None:
     from calsync.events_view import EventDetail, EventsView
-    from calsync.views import BlockedView, ChangesView, RunsView, StatusView, UpcomingView, flat
+    from calsync.views import BlockedView, ChangesView, RunsView, StatusView, UpcomingView, WritesView, flat
 
-    if isinstance(view, StatusView):
+    if isinstance(view, WritesView):
+        if not view.writes:
+            out.write("no writes recorded\n")
+        for w in view.writes:
+            counts = (w.detail or {}).get("counts")
+            what = (
+                ", ".join(f"{v} {k}" for k, v in counts.items() if v)
+                if isinstance(counts, dict)
+                else flat(w.title or "")
+            )
+            at = w.at.astimezone().isoformat(timespec="seconds")
+            out.write(f"{at}  {w.origin}  {w.op}  {w.account}  {what}  {w.status}\n")
+    elif isinstance(view, StatusView):
         for status in view.rules:
             last = status.last_ok_at.isoformat() if status.last_ok_at else "never"
             out.write(
@@ -1578,7 +1751,11 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO = sys.stdout, stdin: 
         if args.command == "events":
             return cmd_events(args, out)
         if args.command == "event":
+            if args.event_command != "show":
+                return _ops_command(args, out, *_event_op(args, stdin))
             return cmd_event(args, out)
+        if args.command == "writes":
+            return cmd_writes(args, out)
         if args.command == "runs":
             return cmd_runs(args, out)
         if args.command == "changes":

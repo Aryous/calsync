@@ -415,15 +415,23 @@ def _calendar_for(
             meta = reader.source_state(account).get("meta") or {}
     except views.StateUnavailable:
         cached, meta = [], {}
+    from calsync.sources.google import resolve_calendar_ref
+
+    meta = meta if isinstance(meta, dict) else {}
     match = [c for c in cached if c.id == ref] or [c for c in cached if c.name == ref]
     if len(match) > 1:
         raise ConfigError([f'calendar name "{ref}" is ambiguous; use its id'])
     if match:
         cid, role = match[0].id, match[0].role
-    elif "@" in ref:
-        cid, role = ref, None
     else:
-        raise ConfigError([f'calendar "{ref}" not found; run `calsync calendars {account} --refresh`'])
+        # Not in the calendar cache (never refreshed): the names the sync's own listing knows.
+        try:
+            cid = resolve_calendar_ref(ref, meta)
+        except ConfigError:
+            raise ConfigError(
+                [f'calendar "{ref}" not found; run `calsync calendars {account} --refresh`']
+            ) from None
+        role = None
     entry = meta.get(cid) if isinstance(meta, dict) else None
     tz = entry.get("timezone") if isinstance(entry, dict) else None
     return cid, role, tz

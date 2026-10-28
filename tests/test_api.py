@@ -385,7 +385,7 @@ async def test_an_op_rejects_a_bad_body(tmp_path: Path, body: bytes) -> None:
 
 async def test_a_large_body_is_413(tmp_path: Path) -> None:
     daemon = OpsDaemon(None)
-    big = b'{"args": {"name": "' + b"x" * (64 * 1024) + b'"}}'
+    big = b'{"args": {"name": "' + b"x" * api.MAX_BODY + b'"}}'
     async with client(tmp_path, daemon) as c:
         op = await c.post("/api/ops/rule.pause", content=big, headers={"content-type": "application/json"})
         trigger = await c.post("/api/trigger", content=big, headers={"content-type": "application/json"})
@@ -671,3 +671,45 @@ async def test_62_calendar_days_across_a_dst_change_are_fine(state: Path) -> Non
             "/api/events", params={"from": "2026-10-01T00:00-04:00", "to": "2026-12-02T00:01-05:00"}
         )
     assert ok.status_code == 200 and over.status_code == 400
+
+
+async def test_write_errors_keep_their_kinds(tmp_path: Path) -> None:
+    from calsync.errors import AuthError, ForbiddenError, NotFoundError, TransientError
+    from calsync.opsclient import _write_error  # pyright: ignore[reportPrivateUsage]
+    from calsync.sources.google_write import WriteConflict
+
+    cases: list[tuple[Exception, int, str]] = [
+        (WriteConflict("/calendars/secret-id/events/x: changed"), 409, "conflict"),
+        (NotFoundError("/calendars/secret-id/events/x"), 404, "not_found"),
+        (AuthError("revoked"), 409, "auth"),
+        (TransientError("down"), 502, "unreachable"),
+        (TimeoutError(), 502, "unreachable"),
+        (ForbiddenError("no"), 403, "forbidden"),
+    ]
+    for exc, status, kind in cases:
+        async with client(tmp_path, OpsDaemon(exc)) as c:
+            response = await c.post("/api/ops/event.edit", json={"args": {"id": "x"}})
+        error = response.json()["error"]
+        assert (response.status_code, error["kind"]) == (status, kind)
+        assert "secret-id" not in response.text  # never an exception's text: it can carry ids
+        mapped = _write_error(status, kind, error["message"])
+        assert mapped is not None and isinstance(
+            mapped, type(exc) if not isinstance(exc, TimeoutError) else TransientError
+        )
+
+
+async def test_get_writes(tmp_path: Path) -> None:
+    from calsync.store import Store, WriteRecord
+
+    async with client(tmp_path) as c:
+        empty = await c.get("/api/writes")
+    assert empty.json() == {"writes": []}
+    with Store(tmp_path / "state.db") as store:
+        store.record_write(
+            WriteRecord(NOW, "ui", "move", "me", "cal", "ev1", "Walk", {"changes": [{"field": "time"}]}, "ok")
+        )
+    async with client(tmp_path) as c:
+        body = (await c.get("/api/writes", params={"limit": 5})).json()
+    [row] = body["writes"]
+    assert row["op"] == "move" and row["origin"] == "ui" and row["changes"] == [{"field": "time"}]
+    assert row["at"] == NOW.isoformat()

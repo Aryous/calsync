@@ -40,8 +40,18 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from calsync import __version__, credentials, debug, events_view, ops, views
 from calsync.config import Config
 from calsync.configfile import ConfigConflict
-from calsync.errors import ConfigError, ListenError, RulePaused
+from calsync.errors import (
+    AuthError,
+    ConfigError,
+    ForbiddenError,
+    ListenError,
+    NotFoundError,
+    RulePaused,
+    TransientError,
+    plain_error,
+)
 from calsync.lock import DaemonServing
+from calsync.sources.google_write import WriteConflict
 from calsync.wiring import state_paths
 
 if TYPE_CHECKING:
@@ -55,7 +65,9 @@ MAX_HOURS = 168
 MAX_RUNS = 500
 MAX_CHANGES = 1000
 MAX_CONFIG_CHANGES = 200  # the store keeps no more
-MAX_BODY = 64 * 1024  # bytes: a request body (an operation's arguments) is never larger
+MAX_BODY = 1024 * 1024  # bytes: a request body (an operation's arguments; a batch of events) is never larger
+MAX_WRITES = 500  # the store keeps no more
+CONFLICT = "The event changed in Google since it was read; read it again."
 NO_STATE = "No sync has run yet."
 UNREADABLE = "The state database could not be read."
 
@@ -364,6 +376,15 @@ class _Endpoints:
             )
         )
 
+    async def writes(self, request: Request) -> Response:
+        """``GET /api/writes?limit``: writes to Google made through calsync, newest first."""
+        limit = _clamped(request, "limit", 50, MAX_WRITES)
+        return JSONResponse(
+            await self._view(
+                lambda config, reader: _Json(views.writes_json(reader, limit)), no_state={"writes": []}
+            )
+        )
+
     async def trigger(self, request: Request) -> Response:
         rule = await _trigger_rule(request)
         if self._daemon is None:
@@ -411,6 +432,21 @@ class _Endpoints:
                 raise ApiError(409, "read_only", str(exc)) from None
             except ops.TooSoon as exc:
                 raise ApiError(429, "too_soon", str(exc)) from None
+            except WriteConflict:
+                raise ApiError(409, "conflict", CONFLICT) from None
+            except NotFoundError:
+                raise ApiError(404, "not_found", "Google has no such event (any more).") from None
+            except AuthError as exc:  # the grant itself failed (revoked, expired)
+                account = args.get("account") if isinstance(args.get("account"), str) else None
+                extra = {
+                    "needs_human": True,
+                    "command": f"calsync auth {account}" if account else "calsync auth",
+                }
+                raise ApiError(409, "auth", plain_error(exc, "Google"), extra=extra) from None
+            except (TransientError, TimeoutError):
+                raise ApiError(502, "unreachable", "Google did not answer; try again.") from None
+            except ForbiddenError:
+                raise ApiError(403, "forbidden", "Google refused the change for this calendar.") from None
             return JSONResponse(result.to_json())
 
         return endpoint
@@ -532,6 +568,7 @@ def api_routes(
         Route("/api/calendars", guarded(endpoints.calendars), methods=["GET"]),
         Route("/api/runs", guarded(endpoints.runs), methods=["GET"]),
         Route("/api/changes", guarded(endpoints.changes), methods=["GET"]),
+        Route("/api/writes", guarded(endpoints.writes), methods=["GET"]),
         Route("/api/trigger", guarded(endpoints.trigger), methods=["POST"]),
     ]
     if ops_source is not None:

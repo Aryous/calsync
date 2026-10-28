@@ -168,6 +168,21 @@ def _over_socket(
     return _result(name, response)
 
 
+def _write_error(status: int, kind: str, message: str) -> CalsyncError | None:
+    """The error a write to Google raised in the daemon, as the API answered it."""
+    from calsync.errors import AuthError, ForbiddenError, NotFoundError, TransientError
+    from calsync.sources.google_write import WriteConflict
+
+    errors: dict[tuple[int, str], CalsyncError] = {
+        (409, "conflict"): WriteConflict(message),
+        (409, "auth"): AuthError(message),
+        (404, "not_found"): NotFoundError(message),
+        (502, "unreachable"): TransientError(message),
+        (403, "forbidden"): ForbiddenError(message),
+    }
+    return errors.get((status, kind))
+
+
 def _result(name: str, response: "httpx.Response") -> "OpResult":
     from calsync.configfile import ConfigConflict
     from calsync.errors import RulePaused
@@ -191,6 +206,9 @@ def _result(name: str, response: "httpx.Response") -> "OpResult":
         )
     if response.status_code == 409 and error.get("kind") == "paused" and isinstance(error.get("rule"), str):
         raise RulePaused(error["rule"])
+    written = _write_error(response.status_code, str(error.get("kind") or ""), message)
+    if written is not None:
+        raise written
     if response.status_code == 409:
         raise OpsUnavailable(message)
     if response.status_code == 503 and error.get("kind") == "unavailable":
