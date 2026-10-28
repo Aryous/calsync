@@ -11,12 +11,13 @@ import os
 import re
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 from playwright.sync_api import Page
 
-from tests.browser.conftest import DESKTOP, PHONE, OpenPage, watch_of
-from tests.browser.live import SCHOOL, LiveDaemon
+from tests.browser.conftest import DESKTOP, PHONE, OpenPage, refresh_status, watch_of
+from tests.browser.live import SCHOOL, FakeKeychain, LiveDaemon
 
 pytestmark = pytest.mark.browser
 
@@ -35,6 +36,37 @@ def _delete(page: Page) -> None:
     page.locator("aside.insp [data-role=delete]").wait_for()
 
 
+def _remove_refused(page: Page) -> None:
+    watch_of(page).allow(r"status of 422")  # the dry run's refusal (lines use the account)
+    page.locator("aside.insp .ifoot").get_by_role("button", name="断开这个账号").click()
+    page.locator("aside.insp [data-role=remove-refused]").wait_for()
+
+
+def _wizard_details(page: Page) -> None:
+    page.locator('aside.insp .step[data-step="name"]').get_by_role("button", name="下一步").click()
+    page.locator('aside.insp .step[data-step="details"][aria-current="step"]').wait_for()
+
+
+def _icloud_details(page: Page) -> None:
+    _wizard_details(page)
+    page.locator("aside.insp").get_by_label("Apple ID").fill("grandma@example.com")
+
+
+def _google_setup(page: Page) -> None:
+    """The one-time client setup: the config is served as if no client secret were set."""
+
+    def unset(route: Any) -> None:
+        response = route.fetch()
+        body = response.json()
+        body["google"]["client_secret_file"] = {"configured": False}
+        route.fulfill(response=response, json=body)
+
+    page.route("**/api/config", unset)
+    page.evaluate("location.hash = '#/connect/google'")
+    _wizard_details(page)
+    page.locator("aside.insp [data-role=waiting]").wait_for()
+
+
 # ``focus``: a line's inspector open, the map dimmed around that line. ``rule``, ``calendar``,
 # ``newline`` (with its preview) and ``delete``: the inspectors of Task 3. Each state is a path
 # and what to do there (read-only: the preview writes nothing).
@@ -46,6 +78,14 @@ STATES: dict[str, tuple[str, Callable[[Page], None] | None]] = {
     "calendar": ("/#/calendar/family-icloud/%2Fdav%2Fhome%2F%E5%AE%B6%E5%BA%AD%2F", None),
     "newline": (f"/#/new?source=personal&calendar={SCHOOL.replace('@', '%40')}", _preview),
     "delete": ("/#/rule/school-home", _delete),
+    # Task 4: the account inspector, 断开 refused, the wizard's first two steps (read-only: the
+    # refusal is a dry run, and nothing is added).
+    "account": ("/#/account/personal", None),
+    "remove-refused": ("/#/account/personal", _remove_refused),
+    "connect-icloud-name": ("/#/connect/icloud", None),
+    "connect-icloud-details": ("/#/connect/icloud", _icloud_details),
+    "connect-google-details": ("/#/connect/google", _wizard_details),
+    "connect-google-setup": ("/", _google_setup),
 }
 
 
@@ -120,3 +160,71 @@ def test_screenshot_with_attention(
     )
     watch.console.clear()
     watch.csp.clear()
+
+
+def _shoot(page: Page, name: str) -> None:
+    settle(page)
+    page.locator("aside.insp .ih button").wait_for(state="visible")
+    page.wait_for_timeout(400)
+    watch = watch_of(page)
+    assert watch.problems() == []
+    page.screenshot(path=str(Path(SHOTS or ".") / f"{name}.png"), caret="initial")
+    watch.console.clear()
+    watch.csp.clear()
+
+
+@pytest.mark.skipif(not SHOTS, reason="set CALSYNC_SHOTS to a directory to take screenshots")
+@pytest.mark.parametrize("theme", ["light", "dark"])
+@pytest.mark.parametrize("size", list(SIZES))
+def test_screenshot_of_an_expired_account(
+    open_page: OpenPage, fresh_live: LiveDaemon, browser_name: str, size: str, theme: str
+) -> None:
+    fresh_live.stage_auth()
+    page = open_page(
+        daemon=fresh_live,
+        viewport=SIZES[size],
+        color_scheme=theme,
+        reduced_motion="reduce",
+        path="/#/account/work",
+    )
+    page.locator("aside.insp [data-role=auth]").wait_for()
+    _shoot(page, f"{browser_name}-{size}-{theme}-account-auth")
+
+
+@pytest.mark.skipif(not SHOTS, reason="set CALSYNC_SHOTS to a directory to take screenshots")
+@pytest.mark.parametrize("theme", ["light", "dark"])
+@pytest.mark.parametrize("size", list(SIZES))
+@pytest.mark.parametrize("service", ["icloud", "google"])
+def test_screenshot_of_the_wizard_waiting_and_done(
+    keychain: FakeKeychain,
+    open_page: OpenPage,
+    fresh_live: LiveDaemon,
+    browser_name: str,
+    size: str,
+    theme: str,
+    service: str,
+) -> None:
+    """Steps 3 and 4: the account is added (its own daemon), the page waits for ``calsync auth``,
+    then the calendars appear."""
+    page = open_page(
+        daemon=fresh_live,
+        viewport=SIZES[size],
+        color_scheme=theme,
+        reduced_motion="reduce",
+        path=f"/#/connect/{service}",
+    )
+    insp = page.locator("aside.insp")
+    name = "grandma" if service == "icloud" else "family-google"
+    insp.get_by_label("账号名字").fill(name)
+    _wizard_details(page)
+    if service == "icloud":
+        insp.get_by_label("Apple ID").fill("grandma@example.com")
+    insp.get_by_role("button", name="添加账号").click()
+    page.locator('aside.insp .step[data-step="auth"][aria-current="step"]').wait_for()
+    _shoot(page, f"{browser_name}-{size}-{theme}-connect-{service}-auth")
+    fresh_live.authorise(
+        name, ["外婆的日历", "外婆的生日"] if service == "icloud" else ["家庭安排", "孩子活动"]
+    )
+    refresh_status(page)
+    page.locator('aside.insp .step[data-step="calendars"][aria-current="step"] .row').first.wait_for()
+    _shoot(page, f"{browser_name}-{size}-{theme}-connect-{service}-calendars")

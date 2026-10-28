@@ -86,6 +86,24 @@ export function slots(template, nodes) {
   });
 }
 
+/** Why an account's authorisation usually fails, for a person (the auth card, the account
+ * inspector): Google's three, or the Apple ID's two. */
+export function authReasons(service) {
+  if (service === "google") {
+    return [
+      t("The Google account's password changed"),
+      t("calsync's access was revoked in the Google account"),
+      t("The Google app is still in “testing”: its authorisation has to be renewed every 7 days"),
+    ];
+  }
+  return [t("The Apple ID password changed"), t("The app-specific password was revoked or replaced")];
+}
+
+/** ``word`` as one shell word, quoted only when it has to be (a command a person pastes). */
+export function shellWord(word) {
+  return /^[A-Za-z0-9._@:\/=+-]+$/.test(word) ? word : `'${String(word).replace(/'/g, "'\\''")}'`;
+}
+
 /** What went wrong with an op, for a person (never the API's English text). */
 export function failureText(error) {
   if (!error) return "";

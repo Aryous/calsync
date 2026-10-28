@@ -3,6 +3,8 @@ paired with it, in Chromium and WebKit.
 
 - ``live``: the session's daemon, seeded as ``live.py`` describes. Read-only tests share it.
 - ``fresh_live``: a daemon of the test's own, for tests that run cycles or change the config.
+- ``keychain``: an in-memory keychain in place of the seal's refusing one, for tests that add
+  accounts (``account.add`` from the UI asks it; ``LiveDaemon.authorise`` stores a secret).
 - ``browser``: one per engine, parametrized over ``BROWSERS`` (every browser test runs in each).
 - ``viewport``: ``DESKTOP`` unless a test parametrizes it (``@pytest.mark.parametrize("viewport",
   [PHONE, DESKTOP], ids=VIEWPORT_IDS)``).
@@ -40,7 +42,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-from tests.browser.live import LiveDaemon, live_daemon, seal_session
+from tests.browser.live import FakeKeychain, LiveDaemon, live_daemon, seal_session
 
 
 def _browsers_path() -> str:
@@ -132,6 +134,19 @@ def fresh_live(session_seal: None) -> Iterator[LiveDaemon]:
     """A daemon of this test's own, for tests that run cycles or change the config."""
     with live_daemon() as daemon:
         yield daemon
+
+
+@pytest.fixture
+def keychain(monkeypatch: pytest.MonkeyPatch) -> FakeKeychain:
+    """An in-memory keychain for this test (``credentials._keyring``, read at call time, on the
+    daemon's thread too), in place of the seal's refusing one: adding an account asks it whether
+    an entry exists, and ``LiveDaemon.authorise`` stores one. Request it before ``fresh_live``,
+    so it outlives the test's daemon."""
+    from calsync import credentials
+
+    fake = FakeKeychain()
+    monkeypatch.setattr(credentials, "_keyring", lambda: fake)
+    return fake
 
 
 @pytest.fixture(scope="session")

@@ -784,13 +784,27 @@ def test_hovering_never_remeasures_and_polls_keep_one_observer(paired_page: Page
     page = paired_page
     ready(page)
     canvas = page.locator(".canvas")
-    measured = canvas.get_attribute("data-measured")
-    for f in (0.05, 0.08, 0.1, 0.12, 0.14, 0.1, 0.06):
-        x, y = point_on(page, "work-mine", f)
-        page.mouse.move(x, y)
-    expect(page.locator(".canvas .tip")).to_have_class(re.compile(r"\bon\b"))
-    page.mouse.move(5, 5)
-    assert canvas.get_attribute("data-measured") == measured
+    # A status poll (every 10 s) is a new model and measures once, as it should; a hover never
+    # does. Under load a poll can land during the hover: such a pass is retried. The fonts settle
+    # first (their late arrival measures too).
+    polls: list[str] = []
+    page.on("request", lambda r: polls.append(r.url) if r.url.endswith("/api/status") else None)
+    page.evaluate(
+        "document.fonts.ready.then(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))))"
+    )
+    for _ in range(3):
+        before, measured = len(polls), canvas.get_attribute("data-measured")
+        for f in (0.05, 0.08, 0.1, 0.12, 0.14, 0.1, 0.06):
+            x, y = point_on(page, "work-mine", f)
+            page.mouse.move(x, y)
+        expect(page.locator(".canvas .tip")).to_have_class(re.compile(r"\bon\b"))
+        page.mouse.move(5, 5)
+        after = canvas.get_attribute("data-measured")
+        if len(polls) == before:
+            assert after == measured
+            break
+    else:
+        pytest.fail("a status poll landed during every hover pass")
     for _ in range(3):
         with page.expect_response("**/api/status"):
             refresh_status(page)

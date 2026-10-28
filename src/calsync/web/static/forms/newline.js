@@ -1,4 +1,5 @@
-// A new line (#/new, prefilled with ?source=<account>&calendar=<id> or ?target=…): choose a
+// A new line (#/new, prefilled with ?source=<account>&calendar=<id> or ?target=…, or led by an
+// account alone: ?source=<account> / ?target=<account>): choose a
 // source calendar (grouped by account, with its service mark), then a target (or a new iCloud
 // calendar, created on the first sync: ``create_target``); pairs that already sync are disabled.
 // Once both ends are chosen, 预演 asks ``rule.preview`` what the first sync would do — writing
@@ -115,14 +116,24 @@ function previewBody(state, target) {
   </div>`;
 }
 
+/** ``groups`` with ``account``'s first (an account the person came here from). */
+function leading(groups, account) {
+  if (!account) return groups;
+  return [...groups.filter((g) => g.account === account), ...groups.filter((g) => g.account !== account)];
+}
+
 export function NewLineForm({ route, onClose, onCreated, onReplace }) {
   const { status, refresh } = useStatus();
-  const sources = sideOf(status, true);
-  const targets = sideOf(status, false);
+  const q = route.query || {};
+  // ?source=<account> or ?target=<account> without a calendar: that account comes first, and its
+  // calendar is chosen when it has only one (a newly connected account, from the wizard).
+  const leadSource = q.source && !q.calendar ? q.source : null;
+  const leadTarget = q.target && !q.calendar ? q.target : null;
+  const sources = leading(sideOf(status, true), leadSource);
+  const targets = leading(sideOf(status, false), leadTarget);
   const all = (groups) => groups.flatMap((g) => g.calendars.map((c) => [g, c]));
   const find = (groups, key) => all(groups).find(([, c]) => c.key === key) || null;
 
-  const q = route.query || {};
   const [src, setSrc] = useState(q.source && q.calendar ? `${q.source}/${q.calendar}` : null);
   const [tgt, setTgt] = useState(q.target && q.calendar ? `${q.target}/${q.calendar}` : null); // a key, or "new"
   const [newAccount, setNewAccount] = useState(null);
@@ -136,6 +147,15 @@ export function NewLineForm({ route, onClose, onCreated, onReplace }) {
   useEffect(() => () => {
     alive.current = false;
   }, []);
+  const prefilled = useRef(false);
+  useEffect(() => {
+    if (prefilled.current || !status || !(leadSource || leadTarget)) return;
+    prefilled.current = true;
+    const group = (leadSource ? sources : targets).find((g) => g.account === (leadSource || leadTarget));
+    if (!group || group.calendars.length !== 1) return;
+    if (leadSource) setSrc(group.calendars[0].key);
+    else setTgt(group.calendars[0].key);
+  }, [Boolean(status)]);
 
   const srcPair = find(sources, src);
   const tgtPair = tgt && tgt !== "new" ? find(targets, tgt) : null;

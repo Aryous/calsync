@@ -11,6 +11,7 @@ import { Command } from "/static/command.js";
 import { SyncMap } from "/static/map.js";
 import { Inspector } from "/static/inspector.js";
 import { headline } from "/static/sentence.js";
+import { authReasons } from "/static/forms/parts.js";
 
 // ----- router ---------------------------------------------------------------------------------
 // #/                              the map (no inspector)
@@ -323,18 +324,6 @@ function LineNames({ status, rules }) {
   return html`<span class="routes">${rules.map((rule) => html`<${LineName} status=${status} rule=${rule}/>`)}</span>`;
 }
 
-const REASONS = {
-  google: () => [
-    t("The Google account's password changed"),
-    t("calsync's access was revoked in the Google account"),
-    t("The Google app is still in “testing”: its authorisation has to be renewed every 7 days"),
-  ],
-  caldav: () => [
-    t("The Apple ID password changed"),
-    t("The app-specific password was revoked or replaced"),
-  ],
-};
-
 function Card({ kind, tone, children, action }) {
   return html`<div class=${`attn ${tone}`} data-kind=${kind}>
     <span class="mk"><${Icon} name="alert"/></span>
@@ -346,7 +335,7 @@ function Card({ kind, tone, children, action }) {
 function AuthCard({ status, account, rules, command }) {
   const service = serviceOfAccount(status, account);
   const since = rules.map((r) => r.last_ok_at).filter(Boolean).sort().pop();
-  const reasons = (service === "google" ? REASONS.google : REASONS.caldav)();
+  const reasons = authReasons(service);
   return html`<${Card} kind="auth" tone="bad"
       action=${html`<a class="btn" href=${`#/account/${encodeURIComponent(account)}`}>${t("The account")}</a>`}>
     <b><${Service} service=${service} small=${true}/> ${t("{account}'s authorisation has expired", { account: accountLabel(account) })}</b>

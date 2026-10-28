@@ -400,6 +400,50 @@ a.row:hover { background: linear-gradient(90deg, transparent, var(--sunk) 12%, v
 .del .radio small { margin-left: 0; white-space: normal; font-size: 12.5px; line-height: 1.5; }
 .del .radio small .cm { vertical-align: -3px; white-space: normal; }
 .del-acts { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+/* ----- accounts: the inspector, the remove panel, the connect wizard -------------------------- */
+.ih p > .svc { vertical-align: -3px; margin-right: 6px; }
+.row .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.insp .routes { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 2px; }
+.insp .route { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; }
+.insp .route .cm { vertical-align: 0; white-space: normal; }
+.insp .route .arrow { color: var(--ink-3); }
+.insp .note .why { margin: 4px 0 0; padding-left: 18px; font-size: 12.5px; color: var(--ink-2); }
+.insp .note .why li + li { margin-top: 2px; }
+.insp .note p + p { margin-top: 4px; }
+.del-p { margin: 8px 0 8px; font-size: 13px; color: var(--ink-2); }
+.del .note { margin-top: 8px; }
+.del .rows { max-height: 36vh; overflow-y: auto; margin-top: 4px; }
+.steps { list-style: none; margin: 8px 0 0; padding: 0; }
+.step { position: relative; padding: 0 0 20px 38px; }
+.step:not(:last-child)::before { content: ""; position: absolute; left: 11.5px; top: 30px; bottom: 6px; width: 1px; background: var(--line); }
+.step .n {
+  position: absolute; left: 0; top: 0; width: 24px; height: 24px; border-radius: 50%;
+  display: grid; place-items: center; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums;
+  border: 1px solid var(--line-2); color: var(--ink-3); background: var(--surface);
+  transition: background-color .3s var(--ease), color .3s var(--ease), border-color .3s var(--ease);
+}
+.step.current .n { background: var(--ink); border-color: var(--ink); color: var(--surface); }
+.step.done .n { background: var(--accent-wash); border-color: transparent; color: var(--accent); }
+.step .n svg.i { width: 13px; height: 13px; }
+.st-h { display: flex; align-items: baseline; gap: 12px; min-height: 24px; }
+.st-t { font-weight: 600; font-size: 13.5px; line-height: 24px; }
+.step.todo .st-t { color: var(--ink-3); font-weight: 500; }
+.st-h .sum { margin-left: auto; min-width: 0; color: var(--ink-3); font-size: 12.5px; text-align: right; overflow-wrap: anywhere; }
+.st-b { padding-top: 4px; }
+.st-b .hp { margin: 2px 0 10px; color: var(--ink-2); font-size: 13px; line-height: 1.6; }
+.st-b .hp.after { margin: 8px 0 0; color: var(--ink-3); font-size: 12.5px; line-height: 1.5; }
+.st-b .rows { margin-top: -4px; }
+.ib > .note[data-role="auth"] { margin: 14px 0 16px; }
+.ib .cmd code { white-space: normal; overflow-wrap: anywhere; }
+.st-b .note { margin-top: 6px; }
+.st-b .seg { display: flex; width: 100%; margin-top: 4px; }
+.st-b .seg button { flex: 1; }
+.fl { display: block; margin-top: 14px; font-size: 12.5px; color: var(--ink-2); }
+.fl .field { display: block; margin-top: 6px; }
+.howto { margin: 12px 0 0; padding-left: 18px; color: var(--ink-2); font-size: 13px; line-height: 1.6; }
+.howto li + li { margin-top: 4px; }
+.hp.wait { display: flex; align-items: baseline; gap: 8px; }
+.wdot { width: 7px; height: 7px; border-radius: 50%; border: 1px solid var(--accent); flex: none; transform: translateY(-1px); }
 .new-line { position: absolute; left: 50%; bottom: -6px; transform: translateX(-50%); z-index: 2; }
 .wires .comet.born { stroke-width: 2.4; }
 
@@ -435,7 +479,7 @@ a.row:hover { background: linear-gradient(90deg, transparent, var(--sunk) 12%, v
   .ib .btn, .ifoot .btn:not(.danger) { height: 44px; }
   .ifoot .btn.danger { height: 44px; padding: 0 8px; }
   .seg button { height: 38px; }
-  .fs .seg button { height: 44px; padding: 0 8px; white-space: normal; line-height: 1.25; }
+  .fs .seg button, .st-b .seg button { height: 44px; padding: 0 8px; white-space: normal; line-height: 1.25; }
   .field { height: 44px; }
   .pill { height: 44px; padding-left: 14px; }
   .pill .x { width: 40px; height: 44px; border-radius: 12px; }

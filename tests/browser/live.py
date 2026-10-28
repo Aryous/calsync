@@ -43,11 +43,12 @@ from typing import Any, TypeVar
 import httpx
 import pytest
 
-from calsync import configfile
+from calsync import configfile, credentials
 from calsync.config import Config
 from calsync.daemon import Daemon
+from calsync.errors import AuthError
 from calsync.http import RequestLog, make_client
-from calsync.ops import OpResult
+from calsync.ops import OpResult, account_credential
 from calsync.sources.google import GoogleSource
 from calsync.sources.google_auth import StaticToken
 from calsync.web import auth
@@ -197,6 +198,20 @@ def seed_work(fake: FakeGoogle) -> None:
 # The seeded accounts without a single line (the map's empty state).
 CONFIG_WITHOUT_LINES = CONFIG.split("[[rules]]", 1)[0]
 
+# Only the iCloud accounts, no line and no Google client secret: connecting the first Google
+# account starts with the one-time client setup.
+CONFIG_WITHOUT_GOOGLE = """\
+[runtime]
+interval = "1h"
+jitter = 0.0
+
+[accounts.family-icloud]
+provider = "caldav"
+server_url = "icloud"
+username = "family@example.com"
+credential = { backend = "env", ref = "UNUSED" }
+"""
+
 
 def pending_event() -> dict[str, Any]:
     return _timed("lunch", PENDING_TITLE, "2026-10-26", "12:30", "13:30", location="国贸")
@@ -213,6 +228,28 @@ class LiveClock:
 
     def advance(self, delta: timedelta) -> None:
         self.now += delta
+
+
+class FakeKeychain:
+    """Stands in for the ``keyring`` module (``credentials._keyring``) in a test that adds
+    accounts: entries in memory, keyed like keyring's (service, user). The ``keychain`` fixture
+    installs one; nothing reaches the real keychain."""
+
+    def __init__(self) -> None:
+        self.store: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service: str, user: str) -> str | None:
+        return self.store.get((service, user))
+
+    def set_password(self, service: str, user: str, value: str) -> None:
+        self.store[(service, user)] = value
+
+    def delete_password(self, service: str, user: str) -> None:
+        import keyring.errors
+
+        if (service, user) not in self.store:
+            raise keyring.errors.PasswordDeleteError("not found")
+        del self.store[(service, user)]
 
 
 @dataclass
@@ -245,6 +282,15 @@ class World:
         adapters = Adapters(log or RequestLog())
         for name in sorted(names):
             account = config.accounts[name]
+            # An account added with ``account.add`` keeps its secret in the keychain: until a
+            # person stores it (``calsync auth``, ``LiveDaemon.authorise``), its setup fails as
+            # ``wiring.build_adapters``'s does, on the missing entry.
+            if (
+                account.credential.backend == "keychain"
+                and credentials.secret_exists(account.credential) is not True
+            ):
+                adapters.errors[name] = AuthError(f"no keychain entry {account.credential.ref!r}")
+                continue
             if account.provider == "caldav":
                 adapters.targets[name] = self.targets.setdefault(name, FakeTarget())
                 continue
@@ -459,6 +505,25 @@ class LiveDaemon:
 
         self.in_loop(fail)
         assert self.trigger(rule)["rules"][rule]["status"] == "failed"
+
+    def authorise(self, account: str, calendars: list[str]) -> None:
+        """What ``calsync auth <account>`` leaves behind for an account ``account.add`` made: its
+        secret in the (fake) keychain, so its adapter can be built, and — standing in for the
+        service on the other side — the calendars it holds. The next ``calendars.refresh`` lists
+        them. Needs the ``keychain`` fixture."""
+        credentials.write_secret(account_credential(account), "fake-token")
+
+        def seed() -> None:
+            config = self.daemon.config
+            google = config.accounts[account].provider == "google"
+            for i, name in enumerate(calendars):
+                if google:
+                    fake = self.world.google.setdefault(account, FakeGoogle())
+                    fake.add_calendar(f"{account}-{i}@group.calendar.google.com", name)
+                else:
+                    self.world.targets.setdefault(account, FakeTarget()).add_calendar(name)
+
+        self.in_loop(seed)
 
     # ----- access -----------------------------------------------------------------------
     @property

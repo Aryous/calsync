@@ -9,20 +9,17 @@ import { Head } from "/static/forms/parts.js";
 import { RuleForm } from "/static/forms/rule.js";
 import { CalendarForm } from "/static/forms/calendar.js";
 import { NewLineForm } from "/static/forms/newline.js";
+import { AccountForm, ConnectForm } from "/static/forms/account.js";
 
 /** The title and subtitle of a route whose inspector comes with a later task. */
 function placeholderHead(route) {
   switch (route.name) {
     case "settings":
       return [t("Settings"), t("Shared by every line")];
-    case "account":
-      return [t("Account"), route.account];
     case "event":
       return [t("Event"), ""];
     case "blocked":
       return [t("Blocked deletes"), route.rule];
-    case "connect":
-      return [route.service === "google" ? t("Connect a Google account") : t("Connect an iCloud account"), t("Step by step; passwords stay in the terminal")];
     default:
       return ["", ""];
   }
@@ -33,10 +30,11 @@ function Placeholder({ route, onClose }) {
   return html`<${Head} title=${title} sub=${sub} onClose=${onClose}/><div class="ib"></div>`;
 }
 
-const FORMS = { rule: RuleForm, calendar: CalendarForm, new: NewLineForm };
+const FORMS = { rule: RuleForm, calendar: CalendarForm, new: NewLineForm, account: AccountForm, connect: ConnectForm };
 
 /** ``open``: the route opens an inspector. ``onCreated(rule)``: a new line was added.
- * ``onReplace(hash)``: this inspector becomes another, in the same history entry. */
+ * ``onReplace(hash)``: this inspector becomes another, in the same history entry. A form gets
+ * ``active``: false while it slides out after a close (whatever it polls stops then). */
 export function Inspector({ route, open, onClose, onCreated, onReplace }) {
   const panel = useRef(null);
   const returnTo = useRef(null);
@@ -77,6 +75,6 @@ export function Inspector({ route, open, onClose, onCreated, onReplace }) {
   return html`<aside class=${open ? "insp open" : "insp"} ref=${panel} tabindex="-1"
       role="dialog" aria-modal="false" aria-labelledby="insp-title" aria-hidden=${open ? "false" : "true"}
       inert=${!open} data-route=${open ? route.name : ""}>
-    ${Form ? html`<${Form} key=${current.key} route=${current} onClose=${onClose} onCreated=${onCreated} onReplace=${onReplace}/>` : html`<div class="ih"><div><h2 id="insp-title"></h2></div></div><div class="ib"></div>`}
+    ${Form ? html`<${Form} key=${current.key} route=${current} onClose=${onClose} onCreated=${onCreated} onReplace=${onReplace} active=${open}/>` : html`<div class="ih"><div><h2 id="insp-title"></h2></div></div><div class="ib"></div>`}
   </aside>`;
 }
