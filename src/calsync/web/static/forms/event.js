@@ -121,9 +121,9 @@ export function EventForm({ route, onClose, active = true }) {
       if (mine === reads.current && (e.kind === "not_found" || e.status === 404)) setEv(null);
     }
   }, [id]);
-  const cycles = status && status.daemon ? status.daemon.cycles : 0;
+  const cycles = status && status.daemon ? status.daemon.cycles : null;
   useEffect(() => {
-    if (active) load();
+    if (active && cycles != null) load(); // again after each cycle: its delivery may change
   }, [load, cycles, active]);
 
   if (ev === undefined) return html`<${Head} title=${t("Event")} sub="" onClose=${onClose}/><div class="ib"><p class="hp">${t("Reading the event…")}</p></div>`;

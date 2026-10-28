@@ -10,6 +10,7 @@ import { CalendarName, Icon, Mark, Service, Sprite } from "/static/icons.js";
 import { Command } from "/static/command.js";
 import { SyncMap } from "/static/map.js";
 import { CalendarPane } from "/static/calendar.js";
+import { ActivityPane } from "/static/activity.js";
 import { Inspector } from "/static/inspector.js";
 import { headline } from "/static/sentence.js";
 import { authReasons } from "/static/forms/parts.js";
@@ -448,7 +449,7 @@ function Lower({ route }) {
           tabindex=${tab === id ? "0" : "-1"} onClick=${() => setTab(id)}>${label(id)}</button>`)}
     </div>
     ${TABS.map((id) => html`<div class="pane" role="tabpanel" id=${`pane-${id}`} tabindex="0"
-        aria-labelledby=${`tab-${id}`} hidden=${tab !== id}>${id === "calendar" ? html`<${CalendarPane}/>` : null}</div>`)}
+        aria-labelledby=${`tab-${id}`} hidden=${tab !== id}>${id === "calendar" ? html`<${CalendarPane}/>` : tab === "activity" ? html`<${ActivityPane}/>` : null}</div>`)}
   </section>`;
 }
 

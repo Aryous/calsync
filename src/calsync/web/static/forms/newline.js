@@ -88,8 +88,34 @@ function Picker({ groups, chosen, onPick, isTaken, source, extra, role }) {
   </div>`;
 }
 
-function PreviewBlock({ state, target }) {
-  return html`<div data-role="preview" role="status">${previewBody(state, target)}</div>`;
+function PreviewBlock({ state, target, leftover, choice, onChoice }) {
+  return html`<div data-role="preview" role="status">${previewBody(state, target)}</div>
+    ${leftover ? html`<${Leftover} leftover=${leftover} target=${target} choice=${choice} onChoice=${onChoice}/>` : null}`;
+}
+
+/** The old copies in the target that a removed line left (``leftover``: {name, copies, total}):
+ * created as it is, the new line writes its own beside them. The person chooses: take them over
+ * (the new line takes the earlier line's name) or delete them first. */
+function Leftover({ leftover, target, choice, onChoice }) {
+  const count = html`<b class="num">${leftover.total === 1 ? t("1 old copy") : t("{n} old copies", { n: leftover.total })}</b>`;
+  const warn = leftover.name
+    ? slots(t("{calendar} still has {copies} left by the removed line “{name}”. Created as it is, this line would write its own beside them: the events would show twice."), { calendar: target, copies: count, name: leftover.name })
+    : slots(t("{calendar} still has {copies} left by a removed line. Created as it is, this line would write its own beside them: the events would show twice."), { calendar: target, copies: count });
+  if (!leftover.name) {
+    return html`<div class="note warn leftover" data-role="leftover"><p>${warn}</p>
+      <p class="why-h">${t("calsync does not know that line's name any more, so it can't clean them up from here.")}</p></div>`;
+  }
+  const choices = [
+    ["adopt", t("Take the old copies over"), t("The new line takes the name “{name}”: copies that match Google are kept as they are, the others are deleted (when there are many, it stops and asks you first).", { name: leftover.name })],
+    ["clear", t("Delete the old copies first"), t("calsync deletes the old copies (when there are many, it stops and asks you first), then creates the new line.")],
+  ];
+  return html`<div class="note warn leftover" data-role="leftover"><p>${warn}</p>
+    <div role="radiogroup" aria-label=${t("What to do with the old copies")} onKeyDown=${onRadioKeys}>
+      ${choices.map(([id, title, text]) => html`<button class="radio" type="button" role="radio" data-choice=${id}
+          aria-checked=${choice === id ? "true" : "false"} tabindex=${choice === id ? "0" : "-1"} onClick=${() => onChoice(id)}>
+        <span class="o" aria-hidden="true"></span><span class="txt"><b>${title}</b><small>${text}</small></span>
+      </button>`)}
+    </div></div>`;
 }
 
 function previewBody(state, target) {
@@ -110,7 +136,7 @@ function previewBody(state, target) {
       : d.target_would_be_created
         ? t("This calendar does not exist yet: creating the line creates it in iCloud.")
         : t("This calendar was not found in the account.")}</p>
-    ${(state.earlier || []).map((e) => html`<p class="earlier" data-role="earlier">${e.copies === 1
+    ${(state.earlier || []).filter((e) => !(d.leftover || []).some((l) => l.name === e.name)).map((e) => html`<p class="earlier" data-role="earlier">${e.copies === 1
       ? t("An earlier line called {name} left 1 copy behind; it stays in its calendar, and this line does not touch it.", { name: e.name })
       : t("An earlier line called {name} left {n} copies behind; they stay in their calendar, and this line does not touch them.", { name: e.name, n: e.copies })}</p>`)}
   </div>`;
@@ -142,6 +168,8 @@ export function NewLineForm({ route, onClose, onCreated, onReplace }) {
   const [preview, setPreview] = useState(null); // {loading} | {error, command} | {data, name, args}
   const [creating, setCreating] = useState(false);
   const [failure, setFailure] = useState("");
+  const [choice, setChoice] = useState("adopt"); // the old copies: "adopt" | "clear"
+  const [stage, setStage] = useState(""); // what creating does now (the old copies first)
   const seq = useRef(0);
   const alive = useRef(true);
   useEffect(() => () => {
@@ -159,7 +187,10 @@ export function NewLineForm({ route, onClose, onCreated, onReplace }) {
 
   const srcPair = find(sources, src);
   const tgtPair = tgt && tgt !== "new" ? find(targets, tgt) : null;
-  const taken = (s, c) => Boolean(s) && (s.rules || []).some((r) => (c.rules || []).includes(r));
+  // The line that deletes old copies before this one is created holds the same pair meanwhile:
+  // not a line that takes the pair.
+  const clearing = useRef(null);
+  const taken = (s, c) => Boolean(s) && (s.rules || []).some((r) => r !== clearing.current && (c.rules || []).includes(r));
   const isTakenTarget = (c) => Boolean(srcPair) && taken(srcPair[1], c);
   const isTakenSource = (c) => Boolean(tgtPair) && taken(c, tgtPair[1]);
   const newGroups = targets.filter((g) => g.account);
@@ -221,13 +252,43 @@ export function NewLineForm({ route, onClose, onCreated, onReplace }) {
   }, [argsKey]);
 
   const ready = Boolean(preview && preview.data && (preview.data.target_exists || preview.data.target_would_be_created));
+  const left = (preview && preview.data && preview.data.leftover) || [];
+  const leftover = left.length
+    ? { name: left[0].name, copies: left[0].copies, total: left.reduce((n, x) => n + x.copies, 0) }
+    : null;
+
+  /** Delete the copies the removed line ``old`` left (a line of that name that only retires),
+   * then report whether they are gone (false: held back, or not finished). */
+  const clearOld = async (old, chosen) => {
+    setStage(t("Deleting the old copies…"));
+    clearing.current = old;
+    const added = await op("rule.add", { name: old, source: chosen.source, target: chosen.target, retire: true });
+    if (added.needs_human) return false;
+    for (let i = 0; i < 50; i += 1) {
+      const now = await get("/api/status");
+      if ((now.rules || []).some((r) => r.name === old)) break;
+      await sleep(100);
+    }
+    await op("trigger", { rule: old, wait: true, timeout: 120 });
+    const config = await get("/api/config");
+    return !(config.rules || []).some((r) => r.name === old);
+  };
 
   const create = async () => {
     if (!ready || creating) return;
-    const { name, args: chosen } = preview;
+    const { args: chosen } = preview;
+    let { name } = preview;
     setCreating(true);
     setFailure("");
     try {
+      if (leftover && leftover.name && choice === "adopt") name = leftover.name;
+      if (leftover && leftover.name && choice === "clear" && !(await clearOld(leftover.name, chosen))) {
+        refresh();
+        setFailure(t("Deleting the old copies was held back or did not finish: look at it first, then create the line again."));
+        setPreview((p) => ({ ...p, blockedOld: leftover.name }));
+        return;
+      }
+      setStage("");
       const added = await op("rule.add", { name, ...chosen });
       if (added.needs_human) {
         setPreview({ error: t("This needs you, in a terminal on the computer calsync runs on:"), command: added.command });
@@ -253,6 +314,7 @@ export function NewLineForm({ route, onClose, onCreated, onReplace }) {
       if (e.kind !== "unpaired") setFailure(e.kind === "config" ? t("calsync refused this line.") : failureText(e));
     } finally {
       setCreating(false);
+      setStage("");
     }
   };
 
@@ -282,8 +344,11 @@ export function NewLineForm({ route, onClose, onCreated, onReplace }) {
         <${Picker} role="targets" groups=${targets} chosen=${tgt} onPick=${pickTarget} isTaken=${isTakenTarget} source=${false} extra=${newCalendar}/>
         ${newCalendarDetails}
       </div>
-      <div class="fs"><span class="lb">${t("Preview")}</span><${PreviewBlock} state=${preview} target=${targetName}/></div>
-      ${failure ? html`<p class="errt" role="alert">${failure}</p>` : null}
+      <div class="fs"><span class="lb">${t("Preview")}</span><${PreviewBlock} state=${preview} target=${targetName}
+          leftover=${ready ? leftover : null} choice=${choice} onChoice=${setChoice}/></div>
+      ${failure ? html`<p class="errt" role="alert">${failure}${preview && preview.blockedOld
+        ? html` <a href=${`#/blocked/${encodeURIComponent(preview.blockedOld)}`}>${t("Review")}</a>` : null}</p>` : null}
+      ${stage ? html`<p class="inote" role="status" data-role="stage">${stage}</p>` : null}
     </div>
     <div class="ifoot">
       <span class="hp flush">${t("The other settings can be changed afterwards")}</span>

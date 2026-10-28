@@ -358,6 +358,7 @@ svg.svc.xs { width: 15px; height: 15px; }
 .pill.choice:hover, .pill.add:hover { border-color: var(--slate); color: var(--ink); }
 .locked { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 10px; background: var(--sunk); font-size: 13px; }
 .rows { display: flex; flex-direction: column; }
+ol.rows { list-style: none; margin: 0; padding: 0; }
 .row { display: flex; align-items: center; gap: 12px; width: 100%; padding: 11px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; text-decoration: none; color: inherit; transition: background-color .2s; }
 .row:last-child { border-bottom: 0; }
 a.row:hover { background: linear-gradient(90deg, transparent, var(--sunk) 12%, var(--sunk) 88%, transparent); }
@@ -613,6 +614,39 @@ a.row:hover { background: linear-gradient(90deg, transparent, var(--sunk) 12%, v
   .dn { min-height: 32px; }
   .lr { grid-template-columns: 1fr; gap: 2px; padding: 12px 16px; }
   .ls h3 { padding: 18px 16px 6px; }
+}
+
+/* ----- activity, blocked deletes, old copies -------------------------------------------------- */
+.af { display: flex; gap: 6px; padding: 18px 0 8px; }
+.activity .pad { padding: 20px 0; margin: 0; }
+.ad h3 { margin: 0; padding: 18px 0 6px; font-size: 13px; font-weight: 600; color: var(--ink-2); }
+.ar { display: grid; grid-template-columns: 52px 28px minmax(0, 1fr); align-items: start; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--line); color: var(--ink); text-decoration: none; }
+a.ar:hover { background: linear-gradient(90deg, transparent, var(--sunk) 12%, var(--sunk) 88%, transparent); }
+.ar time { color: var(--ink-3); font-size: 13px; padding-top: 4px; }
+.ar .ic { width: 28px; height: 28px; border-radius: 9px; background: var(--sunk); display: grid; place-items: center; color: var(--ink-2); }
+.ar .ic.rev { color: var(--accent); background: var(--accent-wash); }
+.ar .ic.bad { color: var(--bad); background: var(--bad-wash); }
+.ar .ic.held { color: var(--wait); background: var(--wait-wash); }
+.ar .grow { padding-top: 3px; min-width: 0; }
+.ar .grow b { font-weight: 500; font-size: 14px; }
+.ar .grow small { display: block; color: var(--ink-3); font-size: 12.5px; margin-top: 2px; overflow-wrap: anywhere; }
+.ar .from { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.ar .from .cm { vertical-align: 0; }
+.ar .from .arrow { color: var(--ink-3); margin: 0 2px; }
+.held-sum { display: flex; flex-direction: column; gap: 2px; margin: 14px 0 6px; padding: 12px 14px; border-radius: 12px; background: var(--wait-wash); font-size: 13px; color: var(--ink-2); }
+.held-sum b { font-size: 18px; color: var(--ink); font-weight: 600; }
+.held-list { max-height: 44vh; overflow-y: auto; }
+.held-list .row { font-size: 13.5px; }
+.leftover { margin-top: 10px; }
+.leftover p { margin: 0 0 6px; }
+.leftover .radio { align-items: flex-start; background: var(--surface); }
+.leftover .radio .o { margin-top: 2px; }
+.leftover .radio .txt { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.leftover .radio small { margin-left: 0; white-space: normal; font-size: 12.5px; line-height: 1.5; color: var(--ink-3); }
+@media (max-width: 760px), (hover: none) and (pointer: coarse) and (max-width: 1024px) {
+  .ar { grid-template-columns: 44px 28px minmax(0, 1fr); }
+  .af .seg { width: 100%; }
+  .af .seg button { flex: 1; min-height: 44px; }
 }
 
 /* ----- phone ------------------------------------------------------------------------------ */

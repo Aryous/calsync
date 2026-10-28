@@ -805,25 +805,61 @@ def test_a_new_line_never_takes_a_name_in_use(open_page: OpenPage, fresh_live: L
     assert refused == []
 
 
-def test_copies_left_by_an_earlier_line_are_mentioned(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
-    """A line of the name the new one would get left copies behind (deleted, copies kept): the new
-    line takes another name, and the preview says those copies stay and are not touched."""
-    fresh_live.op(
+def leave_old_copies(daemon: LiveDaemon) -> None:
+    """A line 孩子学校 → 我的日历 synced 3 copies, then was removed with its copies kept."""
+    daemon.op(
         "rule.add",
         {"name": "personal-to-my-icloud", "source": "personal:孩子学校", "target": "my-icloud:我的日历"},
     )
-    fresh_live.trigger("personal-to-my-icloud")
-    fresh_live.op("rule.remove", {"name": "personal-to-my-icloud"})
+    daemon.trigger("personal-to-my-icloud")
+    daemon.op("rule.remove", {"name": "personal-to-my-icloud"})
+
+
+def copies_of(daemon: LiveDaemon, rule: str) -> int:
+    found = next((r for r in daemon.get("/api/status")["rules"] if r["name"] == rule), None)
+    return int(found["copies"]) if found else 0
+
+
+def test_old_copies_in_the_target_are_taken_over_by_default(
+    open_page: OpenPage, fresh_live: LiveDaemon
+) -> None:
+    """Old copies in the target (a line removed with its copies kept): the preview warns the
+    events would show twice and offers to take them over (the default) or delete them first.
+    Taken over, the new line has the earlier line's name and no copy is written twice."""
+    leave_old_copies(fresh_live)
     page = open_page(daemon=fresh_live, path=f"/#/new?source=personal&calendar={SCHOOL_Q}")
     radio(page, "targets", "我的日历").click()
-    note = inspector(page).locator("[data-role=earlier]")
-    expect(note).to_have_text(
-        "以前一条叫 personal-to-my-icloud 的线路留下了 3 个副本，它们留在原来的日历里，这条线路不会动它们。"
+    box = inspector(page).locator("[data-role=leftover]")
+    expect(box).to_contain_text(
+        "我的日历 · my-icloud里还有已删除的线路「personal-to-my-icloud」留下的 3 个旧副本"
     )
+    expect(box).to_contain_text("日程会重复")
+    expect(box.get_by_role("radio", name=re.compile("^接管这些旧副本"))).to_have_attribute(
+        "aria-checked", "true"
+    )
+    expect(inspector(page).locator("[data-role=earlier]")).to_have_count(0)  # said once, in the box
     inspector(page).get_by_role("button", name="创建并开始同步").click()
-    expect(page).to_have_url(
-        re.compile(r"#/rule/personal-to-my-icloud-2$"), timeout=15_000
-    )  # after its first cycle
+    expect(page).to_have_url(re.compile(r"#/rule/personal-to-my-icloud$"), timeout=15_000)
+    assert copies_of(fresh_live, "personal-to-my-icloud") == 3
+
+
+def test_old_copies_can_be_deleted_first(open_page: OpenPage, fresh_live: LiveDaemon) -> None:
+    """Deleting all 3 old copies is over the delete guard: the deletes are held back, the new line
+    is not created, and the way to review them is shown."""
+    leave_old_copies(fresh_live)
+    page = open_page(daemon=fresh_live, path=f"/#/new?source=personal&calendar={SCHOOL_Q}")
+    radio(page, "targets", "我的日历").click()
+    box = inspector(page).locator("[data-role=leftover]")
+    box.get_by_role("radio", name=re.compile("^先删掉旧副本")).click()
+    inspector(page).get_by_role("button", name="创建并开始同步").click()
+    alert = inspector(page).get_by_role("alert")
+    expect(alert).to_contain_text("删除旧副本被拦下了", timeout=15_000)
+    expect(alert.get_by_role("link", name="查看并处理")).to_have_attribute(
+        "href", "#/blocked/personal-to-my-icloud"
+    )
+    rules = [r["name"] for r in fresh_live.get("/api/config")["rules"]]
+    assert "personal-to-my-icloud" in rules  # retiring, held back
+    assert not any(n.startswith("personal-to-my-icloud-") for n in rules)  # no new line yet
 
 
 def test_preview_and_disabled_pairs_follow_the_status(open_page: OpenPage, live: LiveDaemon) -> None:

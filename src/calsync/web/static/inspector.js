@@ -12,12 +12,11 @@ import { NewLineForm } from "/static/forms/newline.js";
 import { AccountForm, ConnectForm } from "/static/forms/account.js";
 import { SettingsForm } from "/static/forms/settings.js";
 import { EventForm } from "/static/forms/event.js";
+import { BlockedForm } from "/static/forms/blocked.js";
 
 /** The title and subtitle of a route whose inspector comes with a later task. */
 function placeholderHead(route) {
   switch (route.name) {
-    case "blocked":
-      return [t("Blocked deletes"), route.rule];
     default:
       return ["", ""];
   }
@@ -28,7 +27,7 @@ function Placeholder({ route, onClose }) {
   return html`<${Head} title=${title} sub=${sub} onClose=${onClose}/><div class="ib"></div>`;
 }
 
-const FORMS = { rule: RuleForm, calendar: CalendarForm, new: NewLineForm, account: AccountForm, connect: ConnectForm, settings: SettingsForm, event: EventForm };
+const FORMS = { rule: RuleForm, calendar: CalendarForm, new: NewLineForm, account: AccountForm, connect: ConnectForm, settings: SettingsForm, event: EventForm, blocked: BlockedForm };
 
 /** ``open``: the route opens an inspector. ``onCreated(rule)``: a new line was added.
  * ``onReplace(hash)``: this inspector becomes another, in the same history entry. A form gets
