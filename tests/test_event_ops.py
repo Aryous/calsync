@@ -153,7 +153,9 @@ async def test_a_repeating_event_needs_a_scope(live: Live) -> None:
 
 async def test_only_this_occurrence(live: Live) -> None:
     eid = live.event_id("Reminder")
-    result = await live.op("event.edit", {"id": eid, "scope": "this", "title": "Reminder (left)", "wait": True})
+    result = await live.op(
+        "event.edit", {"id": eid, "scope": "this", "title": "Reminder (left)", "wait": True}
+    )
     assert result.changed
     exceptions = [e for e in live.world.fake.events(GCAL) if e.get("recurringEventId") == "drops"]
     assert [e["summary"] for e in exceptions] == ["Reminder (left)"]

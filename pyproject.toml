@@ -3,6 +3,8 @@ name = "calsync"
 version = "0.1.0"
 description = "One-way calendar sync engine: Google Calendar to CalDAV (iCloud and more)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "httpx[http2]>=0.28,<1",
@@ -14,6 +16,10 @@ dependencies = [
     "uvicorn>=0.54,<1",
     "tomlkit>=0.13",
 ]
+
+[project.urls]
+Repository = "https://github.com/Aryous/calsync"
+Issues = "https://github.com/Aryous/calsync/issues"
 
 [project.scripts]
 calsync = "calsync.cli:main"

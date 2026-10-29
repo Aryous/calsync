@@ -988,4 +988,7 @@ never commit real calendar content or credentials.
 
 ## License
 
-Not licensed yet. A license will be added before the first public release.
+MIT © 2026 Aryous. See [LICENSE](LICENSE).
+
+Bundled third-party libraries and fonts retain their own licenses; see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

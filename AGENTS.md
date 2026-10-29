@@ -194,9 +194,9 @@ uv run pytest -m browser -q    # the web UI in Chromium and WebKit against a liv
   environment part (HOME, `CALSYNC_*`, the fail keyring, `NO_PROXY`): give a
   child's config no real credential and no `[notify]` channel. Fake the keychain per test (patch `credentials._keyring`); never weaken
   the seal.
-- **Commits:** small, one logical change, Conventional Commits subject; end the
-  message with `Co-Authored-By: Claude <model> <noreply@anthropic.com>` naming
-  the model that actually made the change.
+- **Commits:** small, one logical change, Conventional Commits subject.
+  Attribute AI assistance accurately with a `Co-Authored-By` trailer naming
+  the assistant that actually made the change.
 - **Branches:** work on a feature branch; `main` is kept green and is what is
   pushed. History was rewritten once to remove personal data — never
   reintroduce it.

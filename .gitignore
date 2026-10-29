@@ -58,3 +58,7 @@ tests/e2e/.radicale-data/
 
 # ---- Claude Code 本地设置 ----
 .claude/settings.local.json
+
+# ---- Local design artifacts and screenshots ----
+.superpowers/
+.impeccable/
